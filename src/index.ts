@@ -107,6 +107,11 @@ async function main(): Promise<void> {
       const r = await bot.enableTelegram(settings.telegram.token, settings.telegram.allowedChats ?? []);
       console.log(r.ok ? `[pibot] telegram enabled (web config) as ${r.botName}` : `[pibot] telegram (web config) failed: ${r.error}`);
     }
+    // per-agent sub-bots
+    for (const [agentId, sub] of Object.entries(settings.telegram?.subBots ?? {})) {
+      const r = await bot.attachSubBot(agentId, sub.token);
+      console.log(r.ok ? `[pibot] sub-bot for ${agentId} → ${r.botName}` : `[pibot] sub-bot for ${agentId} failed: ${r.error}`);
+    }
   }
 
   const shutdown = () => {

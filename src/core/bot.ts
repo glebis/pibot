@@ -10,7 +10,7 @@ import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
 import { QuestionBus, type QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
-import type { Config } from "../config.js";
+import { loadSettings, saveSettings, type Config } from "../config.js";
 import type { Card, ChatRef, Schedule, Transport } from "./types.js";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS } from "./agent-factory.js";
 import { errorMessage, fmtWhen, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
@@ -30,6 +30,8 @@ export class PiBot implements HeartbeatHost {
   private chatAgent = new Map<string, string>(); // chatKey → agentId
   private agentChats = new Map<string, Set<string>>(); // agentId → chatKeys
   private wizardChats = new Set<string>(); // chats running /newagent interview
+  private pendingSubBots = new Map<string, string>(); // chatKey → agentId awaiting its sub-bot creation
+  private subBots = new Map<string, { token: string; username?: string }>(); // agentId → token
   private questions = new QuestionBus({
     getTransport: (name) => this.transports.get(name),
     notify: (chatKey, text) => {
@@ -59,6 +61,34 @@ export class PiBot implements HeartbeatHost {
     this.transports.set(t.name, t);
     t.onMessage((text, chatId) => this.handleIncoming(t, chatId, text).catch((e) => console.error("[bot] message error:", e)));
     t.onAction((action, chatId) => this.handleAction(t, chatId, action).catch((e) => console.error("[bot] action error:", e)));
+    if (t.onManagedBot) {
+      t.onManagedBot(async (info) => this.handleManagedBot(t, info).catch((e) => console.error("[bot] managed bot error:", e)));
+    }
+  }
+
+  /** Manager-mode: a user confirmed a managed sub-bot creation → fetch its token and wire it */
+  private async handleManagedBot(t: Transport, info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }): Promise<void> {
+    const tg = t as import("../transports/telegram.js").TelegramTransport;
+    const chatKey = `telegram:${info.creatorId}`;
+    const agentId = this.pendingSubBots.get(chatKey);
+    const botName = info.botUsername ?? info.firstName ?? `bot_${info.botId}`;
+    if (!agentId) {
+      console.log(`[telegram] managed bot ${botName} created by ${info.creatorId} — no pending request, ignoring`);
+      return;
+    }
+    try {
+      const token = await (t as import("../transports/telegram.js").TelegramTransport).getManagedBotToken(info.botId);
+      const r = await this.attachSubBot(agentId, token);
+      this.pendingSubBots.delete(chatKey);
+      if (r.ok) {
+        this.deps.events.log(agentId, "system", `sub-bot created: ${r.botName}`);
+        await this.deliverToAgent(agentId, `🟢 My own Telegram bot is live: **${r.botName}** — its own chat, its own identity.`);
+      } else {
+        this.deps.events.log(agentId, "system", `sub-bot wiring failed: ${r.error}`);
+      }
+    } catch (e) {
+      this.deps.events.log("system", "system", `managed bot token fetch failed: ${errorMessage(e)}`);
+    }
   }
 
   async start(): Promise<void> {
@@ -90,8 +120,69 @@ export class PiBot implements HeartbeatHost {
     }
   }
 
-  // ── live transport control (used by web dashboard) ───────────────────────────
+  // ── sub-bots (per-agent Telegram identities) ──────────────────────────────
 
+  private persistSubBot(agentId: string, token: string, username?: string): void {
+    const cur = loadSettings(this.deps.config.dataDir);
+    const subBots = { ...(cur.telegram?.subBots ?? {}), [agentId]: { token, username } };
+    saveSettings(this.deps.config.dataDir, { telegram: { ...cur.telegram, subBots } });
+  }
+
+  private removeSubBotFromSettings(agentId: string): void {
+    const cur = loadSettings(this.deps.config.dataDir);
+    const subBots = { ...(cur.telegram?.subBots ?? {}) };
+    delete subBots[agentId];
+    saveSettings(this.deps.config.dataDir, { telegram: { ...cur.telegram, subBots } });
+  }
+
+  /** Wire a dedicated bot for one agent (token verified against Telegram first) */
+  async attachSubBot(agentId: string, token: string): Promise<{ ok: boolean; botName?: string; error?: string }> {
+    const existingName = `telegram:${agentId}`;
+    if (this.transports.has(existingName)) {
+      await this.transports.get(existingName)?.stop().catch(() => {});
+      this.transports.delete(existingName);
+    }
+    const t = new TelegramTransport(token, [], { nameSuffix: agentId, boundAgentId: agentId });
+    let botName: string;
+    try {
+      botName = await t.verify();
+    } catch (e) {
+      return { ok: false, error: `Token rejected by Telegram: ${errorMessage(e)}` };
+    }
+    this.addTransport(t);
+    try {
+      await t.start();
+    } catch (e) {
+      this.transports.delete(existingName);
+      return { ok: false, error: `Started but polling failed: ${errorMessage(e)}` };
+    }
+    this.persistSubBot(agentId, token, botName.startsWith("@") ? botName.slice(1) : botName);
+    this.deps.events.log("system", "system", `sub-bot attached for ${agentId} as ${botName}`);
+    return { ok: true, botName };
+  }
+
+  async detachSubBot(agentId: string): Promise<boolean> {
+    const t = this.transports.get(`telegram:${agentId}`);
+    if (!t) return false;
+    await t.stop().catch(() => {});
+    this.transports.delete(`telegram:${agentId}`);
+    this.persistSubBot; // keep the record removal explicit:
+    const cur = loadSettings(this.deps.config.dataDir);
+    const subBots = { ...(cur.telegram?.subBots ?? {}) };
+    delete subBots[agentId];
+    saveSettings(this.deps.config.dataDir, { telegram: { ...cur.telegram, subBots } });
+    this.deps.events.log("system", "system", `sub-bot detached for ${agentId}`);
+    return true;
+  }
+
+  /** Deep link that lets the chat owner create a managed sub-bot for an agent */
+  subBotDeepLink(agentId: string, username: string, displayName?: string): string {
+    const usernameT = this.telegramUsername() ?? "";
+    const name = encodeURIComponent(displayName ?? agentId);
+    return `https://t.me/newbot/${this.telegramUsername() ?? "pimother_bot"}/${username}?name=${name}`;
+  }
+
+  // ── HeartbeatHost ────────────────────────────────────────────────────────
   hasTransport(name: string): boolean {
     return this.transports.has(name);
   }
@@ -99,6 +190,20 @@ export class PiBot implements HeartbeatHost {
   telegramUsername(): string | undefined {
     const t = this.transports.get("telegram");
     return t instanceof TelegramTransport ? t.botUsername() : undefined;
+  }
+
+  managerMode(): boolean {
+    const t = this.transports.get("telegram");
+    return t instanceof TelegramTransport ? t.managerMode() : false;
+  }
+
+  managerUsername(): string | undefined {
+    return this.telegramUsername();
+  }
+
+  subBotFor(agentId: string): { username?: string } | undefined {
+    const t = this.transports.get(`telegram:${agentId}`);
+    return t instanceof TelegramTransport && t.botUsername() ? { username: t.botUsername() } : undefined;
   }
 
   /** Validate a token against Telegram, then enable the transport live. */
@@ -137,8 +242,16 @@ export class PiBot implements HeartbeatHost {
     return `${t.name}:${chatId}`;
   }
 
+  private splitChatKey(ck: string): { transport: string; chatId: string } {
+    const idx = ck.lastIndexOf(":");
+    return { transport: ck.slice(0, idx), chatId: ck.slice(idx + 1) };
+  }
+
   private currentAgent(ck: string): string | undefined {
-    return this.chatAgent.get(ck) ?? this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId();
+    const idx = ck.lastIndexOf(":");
+    const transportName = ck.slice(0, idx);
+    const bound = this.transports.get(transportName)?.boundAgentId;
+    return bound ?? this.chatAgent.get(ck) ?? this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId();
   }
 
   private rememberChat(agentId: string, ck: string): void {
@@ -251,6 +364,8 @@ export class PiBot implements HeartbeatHost {
 
   /** Returns a short toast string for Telegram callback feedback */
   async handleAction(t: Transport, chatId: string, action: string): Promise<string | void> {
+    if (action.startsWith("url:")) return; // URL buttons open in the client; no callback
+
     if (action.startsWith("q:")) {
       const answer = this.questions.resolveCallback(action); // stale/unknown ids → null
       this.deps.events.log("system", "system", `question tap: ${action} → ${answer ? `resolved: ${answer.choice}` : "stale (ignored)"}`);
@@ -532,6 +647,8 @@ export class PiBot implements HeartbeatHost {
       if (aborted || proRes == null) { await t.push(chatId, { text: "Wizard aborted — nothing created. /newagent to restart." }); return; }
       const proactivity: Proactivity = proRes.startsWith("quiet") ? "quiet" : proRes.startsWith("chatty") ? "chatty" : proRes.startsWith("off") ? "off" : "balanced";
 
+      // (sub-bot offer happens after creation below)
+
       // build
       const draft: AgentDraft = { name, job: job ?? "", vibe, proactivity };
       const err = this.deps.agents.createAgent(name, buildPersona(draft));
@@ -557,9 +674,58 @@ export class PiBot implements HeartbeatHost {
         ].join("\n"),
       });
       void t.push(chatId, { text: `Say hi to **${name}** — try: "what can you do for me?"` });
+
+      // 5. own Telegram identity (optional)
+      const wantBot = await ask(`Give ${name} its own Telegram bot? (separate chat, its own @identity)`, [
+        "yes — create it now",
+        "skip for now",
+      ]);
+      if (wantBot?.startsWith("yes") && fresh) {
+        await this.setupSubBot(t, chatId, fresh);
+      }
     } finally {
       this.wizardChats.delete(ck);
     }
+  }
+
+  /**
+   * Sub-bot setup for one agent. Manager mode ON → deep link + automatic token
+   * fetch. Otherwise: @BotFather instructions + pasted token.
+   */
+  private async setupSubBot(t: Transport, chatId: string, agent: LoadedAgent): Promise<void> {
+    const ck = this.chatKey(t, chatId);
+    const tg = this.transports.get("telegram") as import("../transports/telegram.js").TelegramTransport | undefined;
+    const username = agent.id.replace(/-/g, "");
+    const suggestedUsername = `${username}bot`;
+
+    if (tg?.managerMode()) {
+      const link = this.subBotDeepLink(agent.id, `${username}bot`, agent.id);
+      await t.push(chatId, {
+        text: `Give **${agent.id}** its own Telegram identity? Tap — Telegram will create the bot and I'll wire it automatically.`,
+        card: { text: "", buttons: [{ label: `Create @${suggestedUsername} bot`, action: `url:${this.subBotDeepLink(agent.id, suggestedUsername, agent.id)}`, url: this.subBotDeepLink(agent.id, suggestedUsername, agent.id) }] },
+      });
+      this.pendingSubBots.set(ck, agent.id);
+      return;
+    }
+
+    // fallback: manual BotFather + token paste
+    await t.push(chatId, {
+      text: [
+        `Want **${agent.id}** to have its own Telegram identity?`,
+        ``,
+        `1. Open @BotFather → /newbot`,
+        `2. Name: ${agent.id} · Username: must end in "bot" (e.g. ${suggestedUsername})`,
+        `3. Paste the token here as your answer.`,
+      ].join("\n"),
+    });
+    const token = await this.questions.ask("system", { transport: t.name, chatId }, { text: "Paste the BotFather token here (or type /cancel to skip):", options: [], timeoutMs: 600e3 });
+    if (!token || token.replaced) return;
+    const r = await this.attachSubBot(agent.id, token.choice.trim());
+    await t.push(chatId, { text: r.ok ? `🟢 ${agent.id} is live as **${r.botName}** — its own bot, its own chat.` : `⚠︎ ${r.error}` });
+  }
+
+  private pendingSubBotFor(ck: string): string | undefined {
+    return this.pendingSubBots.get(ck);
   }
 
   private ensureEvolutionJob(agent: LoadedAgent): void {
@@ -665,7 +831,7 @@ export class PiBot implements HeartbeatHost {
     if (!cks.size) throw new Error(`no chats registered for "${agentId}" — message it in Telegram first`);
     await Promise.allSettled(
       [...cks].map((ck) => {
-        const idx = ck.indexOf(":");
+        const idx = ck.lastIndexOf(":");
         return this.questions.ask(agentId, { transport: ck.slice(0, idx), chatId: ck.slice(idx + 1) }, { text: question, options, poll: options.length > 6 });
       })
     );
@@ -685,8 +851,9 @@ export class PiBot implements HeartbeatHost {
   async escalateToAgent(agentId: string, instruction: string): Promise<void> {
     const ck = this.primaryChat({ agentId } as Schedule);
     if (!ck) return;
-    const idx = ck.indexOf(":");
+    const idx = ck.lastIndexOf(":");
     const t = this.transports.get(ck.slice(0, idx));
+    if (!t) return;
     if (!t) return;
     await this.promptAgent(t, ck.slice(idx + 1), agentId, `[heartbeat] ${instruction}`);
   }

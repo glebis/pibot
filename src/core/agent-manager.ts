@@ -11,6 +11,8 @@ import {
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
+import { gmailPlugin } from "../plugins/gmail-plugin.js";
+import { linearPlugin } from "../plugins/linear-plugin.js";
 import { memoryPlugin } from "../plugins/memory-plugin.js";
 import { questionPlugin } from "../plugins/question-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
@@ -126,35 +128,39 @@ export class AgentManager {
       // per-agent evolved skills (+ staging during evolution)
       additionalSkillPaths: listSkillDirs(path.join(agent.dir, "skills")).map((s) => path.dirname(s.filePath)),
       // shared plugins bound to this agent + chat
-      extensionFactories: [
-        schedulerPlugin({ scheduler, agentId, chat }),
-        memoryPlugin({ agentDir: agent.dir }),
-        calendarPlugin(),
-        skillManagePlugin({ agentDir: agent.dir, agentId }),
-        ...(ask ? [questionPlugin({ chat, ask })] : []),
-      ],
-    });
-    await loader.reload();
+        extensionFactories: [
+          schedulerPlugin({ scheduler, agentId, chat }),
+          memoryPlugin({ agentDir: agent.dir }),
+          calendarPlugin(),
+          gmailPlugin(),
+          linearPlugin(),
+          skillManagePlugin({ agentDir: agent.dir, agentId }),
+          ...(ask ? [questionPlugin({ chat, ask })] : []),
+        ],
+      });
+      await loader.reload();
 
-    const model = this.resolveModel(agent.manifest.model);
-    const { session, modelFallbackMessage } = await createAgentSession({
-      cwd: agent.dir,
-      agentDir: getAgentDir(),
-      modelRuntime: this.modelRuntime,
-      model,
-      thinkingLevel: agent.manifest.thinking ?? "off",
-      tools: [
-        ...(agent.manifest.tools ?? DEFAULT_AGENT_TOOLS),
-        "schedule_create", "schedule_list", "schedule_cancel", "snooze",
-        "promise_make", "promise_keep", "calendar_today",
-        "memory_save", "memory_recall",
-        "skill_save", "skill_patch", "skill_list",
-        ...(ask ? ["ask_user"] : []),
-      ],
-      resourceLoader: loader,
-      sessionManager: manager,
-      settingsManager: SettingsManager.inMemory({}),
-    });
+      const model = this.resolveModel(agent.manifest.model);
+      const { session, modelFallbackMessage } = await createAgentSession({
+        cwd: agent.dir,
+        agentDir: getAgentDir(),
+        modelRuntime: this.modelRuntime,
+        model,
+        thinkingLevel: agent.manifest.thinking ?? "off",
+        tools: [
+          ...(agent.manifest.tools ?? DEFAULT_AGENT_TOOLS),
+          "schedule_create", "schedule_list", "schedule_cancel", "snooze",
+          "promise_make", "promise_keep", "calendar_today", "calendar_create_event", "calendar_delete_event", "calendar_move_event",
+          "gmail_list", "gmail_read",
+          "linear_list", "linear_create", "linear_update",
+          "memory_save", "memory_recall",
+          "skill_save", "skill_patch", "skill_list",
+          ...(ask ? ["ask_user"] : []),
+        ],
+        resourceLoader: loader,
+        sessionManager: manager,
+        settingsManager: SettingsManager.inMemory({}),
+      });
 
     if (modelFallbackMessage) console.warn(`[${agentId}] model fallback:`, modelFallbackMessage);
 

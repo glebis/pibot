@@ -1,4 +1,5 @@
 import { Bot, type Context } from "grammy";
+import type { InlineKeyboardButton } from "grammy/types";
 import type { Card, PushOptions, Transport } from "../core/types.js";
 import { truncate } from "../core/util.js";
 
@@ -30,9 +31,15 @@ function toTelegramHtml(text: string): string {
 
 function keyboard(card: Card | undefined) {
   if (!card?.buttons.length) return undefined;
-  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+  const rows: InlineKeyboardButton[][] = [];
   for (let i = 0; i < card.buttons.length; i += 2) {
-    rows.push(card.buttons.slice(i, i + 2).map((b) => ({ text: b.label, callback_data: b.action.slice(0, 64) })));
+    rows.push(
+      card.buttons.slice(i, i + 2).map((b): InlineKeyboardButton =>
+        b.url
+          ? { text: b.label, url: b.url }
+          : { text: b.label, callback_data: b.action.slice(0, 64) }
+      )
+    );
   }
   return { inline_keyboard: rows };
 }
@@ -43,18 +50,21 @@ function keyboard(card: Card | undefined) {
  * TELEGRAM_ALLOWED_CHATS). Each chat picks its agent with /agent.
  */
 export class TelegramTransport implements Transport {
-  readonly name = "telegram";
+  readonly name: string;
+  readonly boundAgentId?: string;
   private bot: Bot;
   private allowed: Set<string>;
-  private me?: { id: number; username?: string; first_name: string };
+  private me?: { id: number; username?: string; first_name: string; can_manage_bots?: boolean };
   private lastCallbackQuery?: { id: string; data?: string };
   private onMessageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   private onPollAnswerCb: ((pollId: string, optionIndex: number, voterId: string) => Promise<void>) | null = null;
 
-  constructor(token: string, allowedChats: string[]) {
+  constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string } = {}) {
     this.bot = new Bot(token);
     this.allowed = new Set(allowedChats);
+    this.name = opts.nameSuffix ? `telegram:${opts.nameSuffix}` : "telegram";
+    this.boundAgentId = opts.boundAgentId;
 
     this.bot.on("message:text", (ctx: Context) => {
       if (!this.check(ctx)) return;
@@ -85,11 +95,44 @@ export class TelegramTransport implements Transport {
       }
     });
 
+    // managed-bot lifecycle (Bot API 9.6): creation / token rotation by the manager
+    this.bot.use((ctx, next) => {
+      const u = ctx.update as { managed_bot?: { user?: { id: number }; bot?: { id: number; username?: string; first_name?: string } } };
+      if (u.managed_bot && this.onManagedBotCb) {
+        const mb = u.managed_bot;
+        void this.onManagedBotCb({ creatorId: String(u.managed_bot.user?.id ?? ""), botId: u.managed_bot.bot?.id ?? 0, botUsername: u.managed_bot.bot?.username, firstName: u.managed_bot.bot?.first_name }).catch(() => {});
+      }
+      return next();
+    });
+
     this.bot.on("poll_answer", (ctx) => {
       const pa = ctx.pollAnswer;
       if (this.onPollAnswerCb) void this.onPollAnswerCb(pa.poll_id, pa.option_ids[0] ?? -1, String(pa.user?.id ?? "")).catch(() => {});
     });
+
+    // raw middleware: managed-bot updates (Bot API 9.6) — not in grammy 1.46 types yet
+    this.bot.use((ctx, next) => {
+      const u = ctx.update as { managed_bot?: { user?: { id: number }; bot?: { id: number; username?: string; first_name?: string } } };
+      if (u.managed_bot && this.onManagedBotCb) {
+        void this.onManagedBotCb({ creatorId: String(u.managed_bot.user?.id ?? ""), botId: u.managed_bot.bot?.id ?? 0, botUsername: u.managed_bot.bot?.username });
+      }
+      return next();
+    });
   }
+
+  private onManagedBotCb: ((info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>) | null = null;
+
+  /** Manager-mode flag from the last getMe */
+  isManager(): boolean {
+    return Boolean(this.me?.can_manage_bots);
+  }
+
+  /** Fetch a managed bot's token (manager bots only; Bot API 9.6) */
+  async getManagedBotToken(botUserId: number): Promise<string> {
+    const r = await this.bot.api.getManagedBotToken({ user_id: botUserId } as never);
+    return String(r);
+  }
+
 
   private check(ctx: Context): boolean {
     if (!this.allowed.size) return true;
@@ -125,6 +168,10 @@ export class TelegramTransport implements Transport {
     return this.lastCallbackQuery?.data === action ? this.lastCallbackQuery : null;
   }
 
+  onManagedBot(cb: (info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>): void {
+    this.onManagedBotCb = cb;
+  }
+
   async sendPoll(chatId: string, question: string, options: string[]): Promise<{ pollId: string }> {
     const msg = await this.bot.api.sendPoll(chatId, question, options, { is_anonymous: false });
     return { pollId: msg.poll?.id ?? "" };
@@ -133,8 +180,12 @@ export class TelegramTransport implements Transport {
   /** Validate the token against Telegram and cache the bot identity */
   async verify(): Promise<string> {
     const me = await this.bot.api.getMe();
-    this.me = me;
+    this.me = me as typeof this.me;
     return me.username ? `@${me.username}` : me.first_name;
+  }
+
+  managerMode(): boolean {
+    return Boolean(this.me && (this.me as { can_manage_bots?: boolean }).can_manage_bots);
   }
 
   botUsername(): string | undefined {

@@ -17,6 +17,11 @@ export interface TelegramControl {
   enableTelegram(token: string, allowedChats: string[]): Promise<{ ok: boolean; botName?: string; error?: string }>;
   disableTelegram(): Promise<boolean>;
   askUserAllChats(agentId: string, question: string, options: string[]): Promise<void>;
+  managerMode(): boolean;
+  managerUsername(): string | undefined;
+  subBotFor(agentId: string): { username?: string } | undefined;
+  attachSubBot(agentId: string, token: string): Promise<{ ok: boolean; botName?: string; error?: string }>;
+  detachSubBot(agentId: string): Promise<boolean>;
 }
 
 export interface WebDeps {
@@ -323,6 +328,24 @@ ${manifestForm(agent)}
   ${staged.length ? `<div style="margin-top:12px"><strong>Staged:</strong> ${staged.map((s) => `<span class="pill on">${esc(s)}</span> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/promote"><button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/reject"><button class="mini danger" type="submit">reject</button></form>`).join(" · ")}</div>` : ""}
 </div>
 
+<h2>Telegram sub-bot <span class="muted">(its own @identity)</span></h2>
+<div class="card">
+  ${deps.telegram?.subBotFor(agent.id)?.username
+    ? `<span class="pill on">🟢 @${esc(deps.telegram.subBotFor(agent.id)!.username)}</span>
+       <form method="post" action="/agents/${esc(agent.id)}/subbot/detach" class="inline"><button class="danger mini" type="submit">Detach</button></form>`
+    : `<span class="pill">⚪ shared bot only</span>`}
+  ${deps.telegram?.managerMode()
+    ? `<p class="muted">Manager mode is ON — tap the button below in Telegram, or use the link here.</p>
+       <a class="btn ghost" href="https://t.me/newbot/${esc(deps.telegram.managerUsername() ?? "pimother_bot")}/${esc(agent.id.replace(/-/g, ""))}bot?name=${encodeURIComponent(agent.id)}" target="_blank">Create @${esc(agent.id.replace(/-/g, ""))}bot via Telegram →</a>
+       <p class="muted">After you confirm in Telegram, pibot fetches the token and wires it automatically.</p>`
+    : `<p class="muted">Manager mode is off — create a bot with @BotFather (/newbot) and paste its token here to give ${esc(agent.id)} its own identity.</p>`}
+</div>
+<form method="post" action="/agents/${esc(agent.id)}/subbot" class="card">
+  <label>Sub-bot token (from @BotFather — or leave empty if using the manager flow)</label>
+  <input type="password" name="token" placeholder="123456:ABC…" autocomplete="off">
+  <button type="submit">Attach sub-bot</button>
+</form>
+
 <h2>Run evolution now</h2>
 <form method="post" action="/agents/${esc(agent.id)}/evolve" class="card">
   <label>Goal (optional — empty = self-directed)</label>
@@ -441,6 +464,21 @@ ${manifestForm(agent)}
   app.post("/agents/:id/staged/:name/reject", (c) => {
     deps.evolution.reject(c.req.param("id"), c.req.param("name"));
     return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Rejected 🗑")}`);
+  });
+
+  app.post("/agents/:id/subbot", async (c) => {
+    const agent = agentOr404(c.req.param("id"));
+    if (!agent || !deps.telegram) return c.notFound();
+    const b = await c.req.parseBody();
+    const token = String(b.token ?? "").trim();
+    if (!token) return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("No token given")}`);
+    const r = await deps.telegram.attachSubBot(agent.id, token);
+    return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent(r.ok ? `🟢 Sub-bot live as ${r.botName}` : `⛔ ${r.error}`)}`);
+  });
+
+  app.post("/agents/:id/subbot/detach", async (c) => {
+    await deps.telegram?.detachSubBot(c.req.param("id"));
+    return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Sub-bot detached")}`);
   });
 
   // ── telegram settings ──
