@@ -1,0 +1,38 @@
+{"t":1787855597643,"type":"system","summary":"telegram connected as @pimother_bot"}
+{"t":1787858851391,"type":"system","summary":"question tap: q:q_abbhm4:0 → resolved"}
+{"t":1787858933927,"type":"system","summary":"question tap: q:q_ketuyf:0 → resolved"}
+{"t":1787858946378,"type":"system","summary":"question tap: q:q_ketuyf:0 → stale (ignored)"}
+{"t":1787858947109,"type":"system","summary":"question tap: q:q_abbhm4:1 → stale (ignored)"}
+{"t":1787859223202,"type":"system","summary":"question tap: q:q_i62djq:1 → resolved"}
+{"t":1787859230776,"type":"system","summary":"question tap: q:q_i62djq:1 → stale (ignored)"}
+{"t":1787859231528,"type":"system","summary":"question tap: q:q_i62djq:0 → stale (ignored)"}
+{"t":1787859320462,"type":"system","summary":"question tap: q:q_6d7pvh:0 → resolved"}
+{"t":1787859322395,"type":"system","summary":"question tap: q:q_6d7pvh:1 → stale (ignored)"}
+{"t":1787859323124,"type":"system","summary":"question tap: q:q_6d7pvh:1 → stale (ignored)"}
+{"t":1787859324389,"type":"system","summary":"question tap: q:q_6d7pvh:2 → stale (ignored)"}
+{"t":1787859400981,"type":"system","summary":"question tap: q:q_6d7pvh:1 → stale (ignored)"}
+{"t":1787859493656,"type":"system","summary":"question tap: q:q_oibnik:1 → resolved"}
+{"t":1787859494640,"type":"system","summary":"question tap: q:q_oibnik:2 → stale (ignored)"}
+{"t":1787859495965,"type":"system","summary":"question tap: q:q_oibnik:2 → stale (ignored)"}
+{"t":1787859496613,"type":"system","summary":"question tap: q:q_oibnik:3 → stale (ignored)"}
+{"t":1787859497690,"type":"system","summary":"question tap: q:q_oibnik:1 → stale (ignored)"}
+{"t":1787859501341,"type":"system","summary":"question tap: q:q_oibnik:0 → stale (ignored)"}
+{"t":1787859612260,"type":"system","summary":"question tap: q:q_mspnz4:0 → resolved"}
+{"t":1787859614216,"type":"system","summary":"question tap: q:q_mspnz4:1 → stale (ignored)"}
+{"t":1787859614846,"type":"system","summary":"question tap: q:q_mspnz4:2 → stale (ignored)"}
+{"t":1787859615107,"type":"system","summary":"question tap: q:q_mspnz4:3 → stale (ignored)"}
+{"t":1787859801316,"type":"system","summary":"question tap: q:toasttest:1 → stale (ignored)"}
+{"t":1787859801396,"type":"system","summary":"question tap: q:toasttest:0 → stale (ignored)"}
+{"t":1787859801438,"type":"system","summary":"question tap: q:toasttest:0 → stale (ignored)"}
+{"t":1787859801478,"type":"system","summary":"question tap: q:toasttest:1 → stale (ignored)"}
+{"t":1787859801522,"type":"system","summary":"question tap: q:toasttest:2 → stale (ignored)"}
+{"t":1787859801566,"type":"system","summary":"question tap: q:toasttest:1 → stale (ignored)"}
+{"t":1787859827998,"type":"system","summary":"question tap: q:q_qcxiew:3 → resolved"}
+{"t":1787859829169,"type":"system","summary":"question tap: q:q_qcxiew:3 → stale (ignored)"}
+{"t":1787859829819,"type":"system","summary":"question tap: q:q_qcxiew:1 → stale (ignored)"}
+{"t":1787859963698,"type":"system","summary":"question tap: q:q_93whjz:0 → resolved"}
+{"t":1787859970947,"type":"system","summary":"question tap: q:q_93whjz:1 → stale (ignored)"}
+{"t":1787860066699,"type":"system","summary":"question tap: q:q_c4gff7:0 → resolved"}
+{"t":1787860067853,"type":"system","summary":"question tap: q:q_c4gff7:1 → stale (ignored)"}
+{"t":1787860068675,"type":"system","summary":"question tap: q:q_c4gff7:2 → stale (ignored)"}
+{"t":1787860220691,"type":"system","summary":"question tap: q:q_4v7rxq:2 → resolved: own-account"}

@@ -3,4 +3,4 @@ data/
 .env
 *.log
 agents/*/sessions/
-agents/*/state/
+agents/*/state/.staging/
