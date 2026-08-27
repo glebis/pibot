@@ -82,9 +82,14 @@ async function main(): Promise<void> {
     }),
   });
 
+  const settings = loadSettings(config.dataDir);
+  const telegramToken = config.telegramToken ?? settings.telegram?.token;
+  const allowedChats = config.allowedChats.length
+    ? config.allowedChats
+    : settings.telegram?.allowedChats ?? [];
   const transports =
-    config.transport === "telegram" && config.telegramToken
-      ? [new TelegramTransport(config.telegramToken, config.allowedChats)]
+    telegramToken && config.transport !== "cli"
+      ? [new TelegramTransport(telegramToken, allowedChats)]
       : [new CliTransport()];
 
   bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution });
@@ -103,7 +108,6 @@ async function main(): Promise<void> {
 
   // telegram configured via web (settings.json) survives restarts
   if (!bot.hasTransport("telegram")) {
-    const settings = loadSettings(config.dataDir);
     if (settings.telegram?.token) {
       const r = await bot.enableTelegram(settings.telegram.token, settings.telegram.allowedChats ?? []);
       console.log(r.ok ? `[pibot] telegram enabled (web config) as ${r.botName}` : `[pibot] telegram (web config) failed: ${r.error}`);
