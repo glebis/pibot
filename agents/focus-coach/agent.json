@@ -1,0 +1,17 @@
+{
+  "name": "focus-coach",
+  "description": "Protects attention — one task, short blocks, no extra tabs",
+  "model": "xai/grok-4.6",
+  "thinking": "off",
+  "heartbeat": {
+    "enabled": true,
+    "interval": "30m",
+    "model": "xai/grok-4.3",
+    "quietHours": { "from": "23:00", "to": "08:00" }
+  },
+  "evolution": {
+    "enabled": true,
+    "interval": "6h",
+    "model": "xai/grok-4.3"
+  }
+}

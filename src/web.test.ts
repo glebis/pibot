@@ -72,7 +72,7 @@ describe("web dashboard", () => {
     const html = await res.text();
     expect(res.status).toBe(200);
     expect(html).toContain("assistant");
-    expect(html).toContain("Create agent");
+    expect(html).toContain("/agents/new");
   });
 
   it("GET /agents/:id renders manifest form, schedules, persona, events", async () => {
@@ -316,5 +316,53 @@ describe("web /telegram", () => {
     expect(res.headers.get("location")).toContain("disconnected");
     expect(control.disableTelegram).toHaveBeenCalled();
     expect(loadSettings(dir).telegram).toBeUndefined();
+  });
+});
+describe("web /agents/new", () => {
+  let dir: string;
+  let app: ReturnType<typeof createWebApp>;
+  let scheduler: Scheduler;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-"));
+    const agents = new AgentManager(dir, { getModels: () => [] } as unknown as ModelRuntime);
+    agents.createAgent("assistant");
+    scheduler = new Scheduler(path.join(dir, "data"), () => {});
+    const events = new EventLog(dir);
+    const evolution = new EvolutionEngine({
+      agents,
+      modelRuntime: {} as ModelRuntime,
+      events,
+      dataDir: dir,
+      host: { announce: async () => {} },
+      io: { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() },
+    });
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir } satisfies WebDeps);
+  });
+
+  afterEach(() => {
+    scheduler.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("renders the structured creation form", async () => {
+    const res = await app.request("/agents/new");
+    const html = await res.text();
+    expect(html).toContain('name="name"');
+    expect(html).toContain('name="job"');
+    expect(html).toContain("proactivity");
+  });
+
+  it("POST /agents/new creates the agent with rhythm from the preset", async () => {
+    const form = new FormData();
+    form.set("name", "research");
+    form.set("job", "Tracks AI research papers weekly.");
+    form.set("vibe", "dry & efficient");
+    form.set("proactivity", "quiet");
+    const res = await app.request("/agents/new", { method: "POST", body: form });
+    expect(res.status).toBe(302);
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, "research", "agent.json"), "utf8"));
+    expect(manifest.heartbeat).toMatchObject({ enabled: true, interval: "90m" });
+    expect(fs.readFileSync(path.join(dir, "research", "AGENTS.md"), "utf8")).toContain("Tracks AI research papers weekly.");
   });
 });

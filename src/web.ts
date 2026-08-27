@@ -8,6 +8,7 @@ import type { EvolutionEngine } from "./core/evolution.js";
 import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
 import { loadSettings, saveSettings } from "./config.js";
+import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, validateAgentName, type Proactivity } from "./core/agent-factory.js";
 import { errorMessage, fmtWhen, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
 
 export interface TelegramControl {
@@ -159,13 +160,7 @@ export function createWebApp(deps: WebDeps): Hono {
   <a href="/telegram">Configure →</a>
 </div>
 <h2>New agent</h2>
-<form method="post" action="/agents" class="card">
-  <div class="row">
-    <div><label>Name (lowercase-dashes)</label><input type="text" name="name" placeholder="coach" required></div>
-    <div><label>Persona (who it is, how it talks)</label><input type="text" name="persona" placeholder="You are a no-nonsense fitness coach…"></div>
-  </div>
-  <button type="submit">Create agent</button>
-</form>`));
+<div class="card"><a href="/agents/new">Create a new agent →</a> <span class="muted">guided form — or /newagent in chat for the interview wizard</span></div>`));
   });
 
   // ── create agent ──
@@ -197,6 +192,67 @@ export function createWebApp(deps: WebDeps): Hono {
       }
     }
     return c.redirect(`/agents/${encodeURIComponent(name)}?msg=${encodeURIComponent(`Agent "${name}" created`)}`);
+  });
+
+  // ── create agent (structured form, shares agent-factory with the chat wizard) ──
+  app.get("/agents/new", (c) => {
+    const body = `<h2>New agent</h2>
+<form method="post" action="/agents/new" class="card">
+  <label>Name (lowercase, dashes)</label>
+  <input type="text" name="name" placeholder="coach" required>
+  <label>What is its main job? One or two sentences</label>
+  <textarea name="job" style="min-height:70px" placeholder="Keeps me on top of German tax filings and pushes the next sendable action." required></textarea>
+  <label>Vibe</label>
+  <select name="vibe">
+    <option>warm & casual</option>
+    <option>dry & efficient</option>
+    <option>coach-like: encouraging but demanding</option>
+  </select>
+  <label>Proactivity</label>
+  <select name="proactivity">
+    ${PROACTIVITY_OPTIONS.map((o) => `<option>${o}</option>`).join("")}
+  </select>
+  <button type="submit">Create agent</button>
+</form>`;
+    return c.html(page("new agent", body, c.req.query("msg")));
+  });
+
+  app.post("/agents/new", async (c) => {
+    const b = await c.req.parseBody();
+    const name = String(b.name ?? "").toLowerCase().trim();
+    const job = String(b.job ?? "").trim();
+    const vibe = String(b.vibe ?? "warm & casual");
+    const proRaw = String(b.proactivity ?? "balanced");
+    const proactivity: Proactivity = proRaw.startsWith("quiet") ? "quiet" : proRaw.startsWith("chatty") ? "chatty" : proRaw.startsWith("off") ? "off" : "balanced";
+    const nameErr = validateAgentName(name, deps.agents.list().map((a) => a.id));
+    if (nameErr) return c.redirect(`/agents/new?msg=${encodeURIComponent(nameErr)}`);
+    if (!job.trim()) return c.redirect(`/agents/new?msg=${encodeURIComponent("The job description is required")}`);
+
+    const draft = { name, job, vibe, proactivity };
+    const err = deps.agents.createAgent(name, buildPersona(draft));
+    if (err) return c.redirect(`/agents/new?msg=${encodeURIComponent(err)}`);
+    const agent = deps.agents.getAgent(name)!;
+    writeJsonAtomic(path.join(agent.dir, "agent.json"), buildManifest(draft));
+    await deps.agents.discover();
+    const fresh = deps.agents.getAgent(name)!;
+    const hb = fresh.manifest.heartbeat;
+    if (hb?.enabled) {
+      const everyMs = parseDuration(hb.interval) ?? 45 * 60e3;
+      deps.scheduler.ensure({
+        id: `hb:${fresh.id}`, agentId: fresh.id, chat: { transport: "internal", chatId: "heartbeat" },
+        title: "heartbeat", kind: "heartbeat", dueAt: Date.now() + everyMs, repeat: { everyMs },
+        wake: "normal", delivery: "direct", status: "pending", createdAt: Date.now(), firedCount: 0, internal: true,
+      });
+    }
+    if (fresh.manifest.evolution?.enabled) {
+      const everyMs = parseDuration(fresh.manifest.evolution.interval ?? "6h") ?? 6 * 3600e3;
+      deps.scheduler.ensure({
+        id: `ev:${fresh.id}`, agentId: fresh.id, chat: { transport: "internal", chatId: "evolution" },
+        title: "evolution", kind: "evolution", dueAt: Date.now() + everyMs, repeat: { everyMs },
+        wake: "normal", delivery: "direct", status: "pending", createdAt: Date.now(), firedCount: 0, internal: true,
+      });
+    }
+    return c.redirect(`/agents/${encodeURIComponent(name)}?msg=${encodeURIComponent(`Agent "${name}" created — rhythm armed`)}`);
   });
 
   // ── agent detail ──

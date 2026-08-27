@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { buildManifest, buildPersona, validateAgentName, type AgentDraft, type Proactivity } from "./agent-factory.js";
 import { listSkillDirs } from "./agent-manager.js";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { TelegramTransport } from "../transports/telegram.js";
@@ -11,12 +12,13 @@ import { QuestionBus, type QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
 import type { Card, ChatRef, Schedule, Transport } from "./types.js";
+import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS } from "./agent-factory.js";
 import { errorMessage, fmtWhen, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 
 const HELP = [
   `**pibot** — your agents. Talk normally; ask to schedule anything ("remind me to stretch in 20m", "daily standup note at 9am").`,
   ``,
-  `/agents — list agents  ·  /agent <name> — switch  ·  /newagent <name> <persona> — create`,
+  `/agents — list agents  ·  /agent <name> — switch  ·  /newagent — guided wizard`,
   `/schedules — pending items  ·  /cancel <id>`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
   `/status — what's running`,
@@ -27,6 +29,7 @@ export class PiBot implements HeartbeatHost {
   private wired = new Set<string>();
   private chatAgent = new Map<string, string>(); // chatKey → agentId
   private agentChats = new Map<string, Set<string>>(); // agentId → chatKeys
+  private wizardChats = new Set<string>(); // chats running /newagent interview
   private questions = new QuestionBus({
     getTransport: (name) => this.transports.get(name),
     notify: (chatKey, text) => {
@@ -330,10 +333,25 @@ export class PiBot implements HeartbeatHost {
         return;
       }
 
+      case "cancel":
+        if (this.wizardChats.has(ck)) {
+          this.questions.cancelPending(ck);
+          await reply("Wizard cancelled. Nothing was created.");
+        } else if (this.questions.cancelPending(ck)) {
+          await reply("Question dismissed.");
+        } else {
+          await reply("Nothing to cancel.");
+        }
+        return;
+
       case "newagent": {
+        if (!arg) {
+          void this.runNewAgentWizard(t, chatId).catch((e) => console.error("[wizard]", e));
+          return;
+        }
         const m = arg.match(/^([a-z0-9][a-z0-9-]{1,31})\s*([\s\S]*)$/i);
         if (!m) {
-          await reply("Usage: /newagent <name> <persona instructions — who it is, how it talks, what it cares about>");
+          await reply("Usage: /newagent (guided wizard) or /newagent <name> <persona instructions>");
           return;
         }
         const err = this.deps.agents.createAgent(m[1].toLowerCase(), m[2] || undefined);
@@ -464,6 +482,85 @@ export class PiBot implements HeartbeatHost {
   }
 
   // ── scheduler fire delivery ───────────────────────────────────────────────
+
+  /**
+   * Guided /newagent interview: name → job → vibe → proactivity.
+   * Uses ask_user buttons; each new question replaces the last; /cancel aborts.
+   */
+  private async runNewAgentWizard(t: Transport, chatId: string): Promise<void> {
+    const ck = this.chatKey(t, chatId);
+    const chat: ChatRef = { transport: t.name, chatId };
+    this.wizardChats.add(ck);
+    let aborted = false;
+
+    const ask = async (text: string, options?: string[]): Promise<string | null> => {
+      if (aborted) return null;
+      const res = await this.questions.ask("system", chat, { text, options: options ?? [], timeoutMs: 600e3 });
+      if (!res || res.timedOut || res.replaced) return null;
+      return res.choice;
+    };
+
+    try {
+      await t.push(chatId, { text: "🧙 New agent wizard — answer the questions (taps or typing). /cancel anytime." });
+
+      // 1. name
+      let name = "";
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const raw = await ask(attempt === 0 ? "What should I call this agent? (lowercase, dashes — e.g. 'coach')" : "That name didn't work. Try another (lowercase, dashes, 2–32 chars):");
+        if (raw == null) { aborted = true; break; }
+        const err = validateAgentName(raw.trim().toLowerCase(), this.deps.agents.list().map((a) => a.id));
+        if (err) { await t.push(chatId, { text: `⚠︎ ${err}` }); continue; }
+        name = raw.trim().toLowerCase();
+        break;
+      }
+      if (aborted || !name) { await t.push(chatId, { text: "Wizard aborted — nothing created. /newagent to restart." }); return; }
+
+      // 2. job
+      const job = await ask(`What is ${name}'s main job? One or two sentences.`);
+      if (job == null) { aborted = true; }
+      if (aborted) { await t.push(chatId, { text: "Wizard aborted — nothing created. /newagent to restart." }); return; }
+
+      // 3. vibe
+      const vibeRes = await ask(`What vibe should ${name} have?`, VIBE_OPTIONS);
+      if (vibeRes == null) { aborted = true; }
+      if (aborted || vibeRes == null) { await t.push(chatId, { text: "Wizard aborted — nothing created. /newagent to restart." }); return; }
+      const vibe = vibeRes;
+
+      // 4. proactivity
+      const proRes = await ask(`How proactive should ${name} be?`, PROACTIVITY_OPTIONS);
+      if (proRes == null) { aborted = true; }
+      if (aborted || proRes == null) { await t.push(chatId, { text: "Wizard aborted — nothing created. /newagent to restart." }); return; }
+      const proactivity: Proactivity = proRes.startsWith("quiet") ? "quiet" : proRes.startsWith("chatty") ? "chatty" : proRes.startsWith("off") ? "off" : "balanced";
+
+      // build
+      const draft: AgentDraft = { name, job: job ?? "", vibe, proactivity };
+      const err = this.deps.agents.createAgent(name, buildPersona(draft));
+      if (err) { await t.push(chatId, { text: `Couldn't create: ${err}` }); return; }
+      const agent = this.deps.agents.getAgent(name)!;
+      // write the wizard-built manifest (heartbeat rhythm per proactivity)
+      writeJsonAtomic(path.join(agent.dir, "agent.json"), buildManifest(draft));
+      await this.deps.agents.discover();
+      const fresh = this.deps.agents.getAgent(name)!;
+      this.ensureHeartbeatJob(fresh);
+      this.ensureEvolutionJob(fresh);
+      this.rememberChat(name, ck);
+
+      const proLabel = draft.proactivity === "off" ? "react-only (no heartbeat)" : `heartbeat every ${PROACTIVITY_INTERVAL[draft.proactivity]}`;
+      await t.push(chatId, {
+        text: [
+          `Born: **${name}** 🎉`,
+          `— ${draft.job}`,
+          `— vibe: ${vibe}`,
+          `— ${proLabel}${draft.proactivity !== "off" ? `, quiet 23:00–08:00` : ""}`,
+          ``,
+          `You're talking to it now. Its files: agents/${name}/ (persona, memory, skills — all editable on the dashboard).`,
+        ].join("\n"),
+      });
+      void t.push(chatId, { text: `Say hi to **${name}** — try: "what can you do for me?"` });
+    } finally {
+      this.wizardChats.delete(ck);
+    }
+  }
 
   private ensureEvolutionJob(agent: LoadedAgent): void {
     const ev = agent.manifest.evolution;
