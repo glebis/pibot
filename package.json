@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Personal agent companion built on the pi SDK — chat with agents that have independent plugin systems, memory, and a scheduling heartbeat.",
+  "description": "Personal agent companion built on the pi SDK \u2014 chat with agents that have independent plugin systems, memory, and a scheduling heartbeat.",
   "engines": {
     "node": ">=22"
   },
@@ -30,5 +30,11 @@
     "tsx": "^4.20.0",
     "typescript": "^5.9.0",
     "vitest": "^4.1.11"
+  },
+  "license": "MIT",
+  "author": "Gleb Kalinin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/glebis/pibot.git"
   }
 }

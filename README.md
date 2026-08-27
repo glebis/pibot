@@ -106,3 +106,6 @@ npm run evolve -- assistant "goal text"   # CLI evolution cycle
 - Multi-strategy mutation archive (compress/quality/radical, from `@artale/pi-evolve`)
 - Linear plugin (task creation + scheduled sync), image plugin
 - Per-agent Telegram bot tokens (one agent = one bot identity)
+## License
+
+MIT — see [LICENSE](LICENSE).
