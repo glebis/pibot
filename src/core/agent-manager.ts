@@ -12,6 +12,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
 import { memoryPlugin } from "../plugins/memory-plugin.js";
+import { questionPlugin } from "../plugins/question-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
 import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
 import type { Scheduler } from "./scheduler.js";
@@ -92,7 +93,13 @@ export class AgentManager {
    * Each session binds: persona (AGENTS.md), per-agent extensions dir,
    * shared plugins (scheduler + memory), and a per-chat session file.
    */
-  async getOrCreateSession(agentId: string, chatKey: string, chat: ChatRef, scheduler: Scheduler): Promise<AgentSession> {
+  async getOrCreateSession(
+    agentId: string,
+    chatKey: string,
+    chat: ChatRef,
+    scheduler: Scheduler,
+    ask?: (spec: import("./questions.js").QuestionSpec) => Promise<import("./questions.js").QuestionAnswer | null>
+  ): Promise<AgentSession> {
     const key = `${agentId}::${chatKey}`;
     const cached = this.sessions.get(key);
     if (cached) return cached;
@@ -124,6 +131,7 @@ export class AgentManager {
         memoryPlugin({ agentDir: agent.dir }),
         calendarPlugin(),
         skillManagePlugin({ agentDir: agent.dir, agentId }),
+        ...(ask ? [questionPlugin({ chat, ask })] : []),
       ],
     });
     await loader.reload();
@@ -141,6 +149,7 @@ export class AgentManager {
         "promise_make", "promise_keep", "calendar_today",
         "memory_save", "memory_recall",
         "skill_save", "skill_patch", "skill_list",
+        ...(ask ? ["ask_user"] : []),
       ],
       resourceLoader: loader,
       sessionManager: manager,
@@ -210,6 +219,7 @@ function systemPromptFor(agent: LoadedAgent): string {
     `- Time-sensitive requests: use the schedule_create tool. It is instant — no confirmation ritual needed. Confirm briefly in your reply.`,
     `- Things worth remembering: memory_save (or write files directly into memory/ — that directory is yours).`,
     `- The user may say "snooze" — use the snooze tool. Important items still fire through snooze.`,
+    `- Decisions with clear options: use the ask_user tool — it renders tappable buttons (2–6 options) or a poll (7–10) in the chat and returns the user's choice. Always include an "unsure" option when the user might not know.`,
     `- You have a heartbeat that wakes you periodically${hb?.enabled ? ` (every ${hb.interval})` : ""}. Between chats it is your chance to be proactive; the heartbeat decides whether anything is worth saying.`,
     `- You may READ files your persona points you to (e.g. notes in your owner's vault). Write only inside your own directory.`,
     ``,

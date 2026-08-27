@@ -68,6 +68,10 @@ export interface Transport {
   onAction(cb: (action: string, chatId: string) => Promise<void>): void;
   /** Show "typing…" while the agent works (optional) */
   setTyping?(chatId: string, on: boolean): void;
+  /** Structured question as a native poll (optional; returns its poll id) */
+  sendPoll?(chatId: string, question: string, options: string[]): Promise<{ pollId: string }>;
+  /** Poll votes (optional) */
+  onPollAnswer?(cb: (pollId: string, optionIndex: number, voterId: string) => Promise<void>): void;
 }
 
 // ─── Agent manifest (agents/<name>/agent.json) ──────────────────────────────

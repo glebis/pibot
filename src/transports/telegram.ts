@@ -49,6 +49,7 @@ export class TelegramTransport implements Transport {
   private me?: { id: number; username?: string; first_name: string };
   private onMessageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
+  private onPollAnswerCb: ((pollId: string, optionIndex: number, voterId: string) => Promise<void>) | null = null;
 
   constructor(token: string, allowedChats: string[]) {
     this.bot = new Bot(token);
@@ -67,6 +68,11 @@ export class TelegramTransport implements Transport {
       const action = ctx.callbackQuery?.data;
       if (action && this.onActionCb) await this.onActionCb(action, String(ctx.chat?.id ?? ctx.from?.id ?? ""));
     });
+
+    this.bot.on("poll_answer", async (ctx) => {
+      const pa = ctx.pollAnswer;
+      if (this.onPollAnswerCb) await this.onPollAnswerCb(pa.poll_id, pa.option_ids[0] ?? -1, String(pa.user?.id ?? ""));
+    });
   }
 
   private check(ctx: Context): boolean {
@@ -80,6 +86,15 @@ export class TelegramTransport implements Transport {
 
   onAction(cb: (action: string, chatId: string) => Promise<void>): void {
     this.onActionCb = cb;
+  }
+
+  onPollAnswer(cb: (pollId: string, optionIndex: number, voterId: string) => Promise<void>): void {
+    this.onPollAnswerCb = cb;
+  }
+
+  async sendPoll(chatId: string, question: string, options: string[]): Promise<{ pollId: string }> {
+    const msg = await this.bot.api.sendPoll(chatId, question, options, { is_anonymous: false });
+    return { pollId: msg.poll?.id ?? "" };
   }
 
   /** Validate the token against Telegram and cache the bot identity */
