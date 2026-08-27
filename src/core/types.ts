@@ -5,7 +5,7 @@ export interface ChatRef {
   chatId: string;
 }
 
-export type ScheduleKind = "reminder" | "task" | "note" | "subject" | "heartbeat" | "morning-brief" | "promise" | "evolution" | "custom";
+export type ScheduleKind = "reminder" | "task" | "note" | "subject" | "heartbeat" | "morning-brief" | "attend-pass" | "promise" | "evolution" | "custom";
 
 export interface ScheduleRepeat {
   /** Fire again this many ms after each fire */

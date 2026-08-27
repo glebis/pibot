@@ -17,6 +17,8 @@ import { memoryPlugin } from "../plugins/memory-plugin.js";
 import { questionPlugin } from "../plugins/question-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
 import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
+import { tgResponderPlugin } from "../plugins/tg-responder-plugin.js";
+import { attendPlugin } from "../plugins/attend-plugin.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
 import { ensureDir, readJson, truncate, writeJsonAtomic } from "./util.js";
