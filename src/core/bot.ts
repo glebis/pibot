@@ -13,7 +13,7 @@ import type { Scheduler } from "./scheduler.js";
 import { loadSettings, saveSettings, type Config } from "../config.js";
 import type { Card, ChatRef, Schedule, Transport } from "./types.js";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
-import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
+import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 
 const HELP = [
   `**pibot** — your agents. Talk normally; ask to schedule anything ("remind me to stretch in 20m", "daily standup note at 9am").`,
@@ -31,6 +31,7 @@ export class PiBot implements HeartbeatHost {
   private agentChats = new Map<string, Set<string>>(); // agentId → chatKeys
   private wizardChats = new Set<string>(); // chats running /newagent interview
   private pendingSubBots = new Map<string, string>(); // chatKey → agentId awaiting its sub-bot creation
+  private lastUserMessage = new Map<string, number>(); // agentId → last real user message
   private subBots = new Map<string, { token: string; username?: string }>(); // agentId → token
   private questions = new QuestionBus({
     getTransport: (name) => this.transports.get(name),
@@ -104,6 +105,7 @@ export class PiBot implements HeartbeatHost {
     }
     for (const agent of this.deps.agents.list()) {
       this.ensureHeartbeatJob(agent);
+      this.ensureMorningBriefJob(agent);
       if (agent.manifest.evolution?.enabled) this.ensureEvolutionJob(agent);
     }
 
@@ -303,10 +305,23 @@ export class PiBot implements HeartbeatHost {
     }
   }
 
+  private static QUICK_ACTIONS: Record<string, string> = {
+    "😴 snooze 1h": "/snooze 1h",
+    "😴 until morning": "/snooze until morning",
+    "☀️ wake": "/wake",
+    "📋 status": "/status",
+    "snooze 1h": "/snooze 1h",
+    "snooze until morning": "/snooze until morning",
+    "wake": "/wake",
+  };
+
   async handleIncoming(t: Transport, chatId: string, raw: string): Promise<void> {
     const text = raw.trim();
     if (!text) return;
     const ck = this.chatKey(t, chatId);
+    // quick-action keyboard buttons arrive as plain text
+    const quick = PiBot.QUICK_ACTIONS[text.toLowerCase()];
+    if (quick) return void (await this.handleCommand(t, chatId, quick));
     // slash commands always work, even with a question pending
     if (text.startsWith("/")) return void (await this.handleCommand(t, chatId, text));
     // a pending structured question eats the next plain message in this chat
@@ -316,6 +331,8 @@ export class PiBot implements HeartbeatHost {
       await t.notifyError(chatId, "No agents yet. Create one: /newagent myfriend <persona text>");
       return;
     }
+    this.lastUserMessage.set(agentId, Date.now());
+    this.deps.heartbeat.noteUserMessage?.(agentId);
     await this.promptAgent(t, chatId, agentId, text);
   }
 
@@ -370,6 +387,26 @@ export class PiBot implements HeartbeatHost {
   /** Returns a short toast string for Telegram callback feedback */
   async handleAction(t: Transport, chatId: string, action: string): Promise<string | void> {
     if (action.startsWith("url:")) return; // URL buttons open in the client; no callback
+
+    if (action.startsWith("snz:")) {
+      const dur = action.slice(4);
+      const agentId = this.currentAgent(this.chatKey(t, chatId));
+      if (!agentId) return void (await t.push(chatId, { text: "No agent selected." }));
+      if (dur === "morning") {
+        const quietEnd = nextQuietEnd(this.deps.agents.getAgent(agentId)?.manifest.heartbeat?.quietHours);
+        if (!quietEnd) return void (await t.push(chatId, { text: "No quiet hours configured." }));
+        const st = this.deps.scheduler.snooze(agentId, quietEnd, "until morning", quietEnd);
+        this.deps.events.log(agentId, "snooze", `until morning (${fmtWhen(st.until)})`);
+        await t.push(chatId, { text: `😴 Until **${fmtWhen(st.until)}** — good ${new Date().getHours() < 12 ? "night" : "rest"} 🌙` });
+        return;
+      }
+      const ms = parseDuration(dur);
+      if (!ms) return void (await t.push(chatId, { text: "Unknown snooze duration." }));
+      const quietEnd = nextQuietEnd(this.deps.agents.getAgent(agentId)?.manifest.heartbeat?.quietHours);
+      const st = this.deps.scheduler.snooze(agentId, Date.now() + ms, "card", quietEnd ?? undefined);
+      await t.push(chatId, { text: `😴 Snoozed until **${fmtWhen(st.until)}**` });
+      return;
+    }
 
     if (action.startsWith("q:")) {
       const answer = this.questions.resolveCallback(action); // stale/unknown ids → null
@@ -491,7 +528,23 @@ export class PiBot implements HeartbeatHost {
 
       case "snooze": {
         if (!agentId) return void (await reply("No agent selected."));
-        const ms = arg ? parseDuration(arg) : 3600e3;
+        if (!arg) {
+          // button-first: render duration choices
+          await t.push(chatId, {
+            text: "😴 Snooze the whole rhythm for…",
+            card: {
+              text: "",
+              buttons: [
+                { label: "30 min", action: "snz:30m" },
+                { label: "1 h", action: "snz:1h" },
+                { label: "3 h", action: "snz:3h" },
+                { label: "Until morning", action: "snz:morning" },
+              ],
+            },
+          });
+          return;
+        }
+        const ms = parseDuration(arg);
         if (!ms) {
           await reply(`Couldn't parse "${arg}". Try /snooze 2h or /snooze 30m.`);
           return;
@@ -759,6 +812,27 @@ export class PiBot implements HeartbeatHost {
     }
   }
 
+  private ensureMorningBriefJob(agent: LoadedAgent): void {
+    const hb = agent.manifest.heartbeat;
+    if (!hb?.enabled) return;
+    const at = hb.quietHours?.to ?? "08:00";
+    this.deps.scheduler.ensure({
+      id: `brief:${agent.id}`,
+      agentId: agent.id,
+      chat: { transport: "internal", chatId: "brief" },
+      title: "morning brief",
+      kind: "morning-brief",
+      dueAt: nextDailyAt(at),
+      repeat: { dailyAt: at },
+      wake: "normal",
+      delivery: "direct",
+      status: "pending",
+      createdAt: Date.now(),
+      firedCount: 0,
+      internal: true,
+    });
+  }
+
   private ensureEvolutionJob(agent: LoadedAgent): void {
     const ev = agent.manifest.evolution;
     if (!ev?.enabled) return;
@@ -804,6 +878,10 @@ export class PiBot implements HeartbeatHost {
   async deliverFire(job: Schedule, snoozed: boolean): Promise<void> {
     if (job.kind === "heartbeat") {
       await this.deps.heartbeat.tick(job.agentId);
+      return;
+    }
+    if (job.kind === "morning-brief") {
+      await this.deps.heartbeat.tick(job.agentId, { brief: true });
       return;
     }
     if (job.kind === "evolution" && this.deps.evolution) {
@@ -870,7 +948,11 @@ export class PiBot implements HeartbeatHost {
 
   // ── HeartbeatHost ─────────────────────────────────────────────────────────
 
-  async deliverToAgent(agentId: string, text: string): Promise<void> {
+  lastUserMessageAt(agentId: string): number {
+    return this.lastUserMessage.get(agentId) ?? 0;
+  }
+
+  async deliverToAgent(agentId: string, text: string) {
     const cks = this.agentChats.get(agentId) ?? new Set<string>();
     for (const ck of cks) {
       const idx = ck.indexOf(":");

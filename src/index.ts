@@ -58,6 +58,7 @@ async function main(): Promise<void> {
     host: {
       deliverToAgent: (agentId, text) => bot.deliverToAgent(agentId, text),
       escalateToAgent: (agentId, instruction) => bot.escalateToAgent(agentId, instruction),
+      lastUserMessageAt: (agentId) => bot.lastUserMessageAt(agentId),
     },
   });
 

@@ -11,6 +11,7 @@ import {
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { calendarPlugin } from "../plugins/calendar-plugin.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
@@ -21,7 +22,15 @@ export interface HeartbeatHost {
   deliverToAgent(agentId: string, text: string): Promise<void>;
   /** Heartbeat flags something that needs the full agent brain */
   escalateToAgent(agentId: string, instruction: string): Promise<void>;
+  /** timestamp (ms) of the last message the user actually sent to this agent */
+  lastUserMessageAt(agentId: string): number;
 }
+
+const BRIEF_SYSTEM_PROMPT = `You deliver the user's MORNING BRIEF. Check calendar_today, then compose a short, warm brief in the agent's voice:
+- today's schedule (2-4 bullets, what matters)
+- pending items and open promises
+- the single most important thing today
+Keep it under 10 lines. No lecture, no productivity sermon.`;
 
 const HEARTBEAT_SYSTEM_PROMPT = `You are the heartbeat process of a personal agent companion. You run on a timer, independent of the user — they did NOT write to you just now.
 
@@ -44,6 +53,30 @@ interface HeartbeatAct {
 
 export class HeartbeatEngine {
   private inflight = new Set<string>();
+  /** proactive speaks that got no user reaction — 2 in a row = back off */
+  private unansweredSpeaks = new Map<string, number>();
+
+  /** the user just talked to this agent — reset the backoff */
+  noteUserMessage(agentId: string): void {
+    this.unansweredSpeaks.delete(agentId);
+  }
+
+  /** Should a heartbeat tick run at all? (economics guards, pure) */
+  shouldTick(
+    agent: LoadedAgent,
+    opts: { snoozed: boolean; lastUserMessageAt: number; now?: number }
+  ): { ok: boolean; reason?: string } {
+    const now = opts.now ?? Date.now();
+    const hb = agent.manifest.heartbeat;
+    if (!hb?.enabled) return { ok: false, reason: "disabled" };
+    if (opts.snoozed) return { ok: false, reason: "snoozed" };
+    if (inQuietHours(hb.quietHours, now)) return { ok: false, reason: "quiet hours" };
+    // active conversation: don't interrupt mid-chat
+    if (opts.lastUserMessageAt && now - opts.lastUserMessageAt < 15 * 60e3) {
+      return { ok: false, reason: "recent user activity" };
+    }
+    return { ok: true };
+  }
 
   constructor(
     private deps: {
@@ -55,24 +88,28 @@ export class HeartbeatEngine {
     }
   ) {}
 
-  async tick(agentId: string): Promise<void> {
+  async tick(agentId: string, opts: { brief?: boolean } = {}): Promise<void> {
     const agent = this.deps.agents.getAgent(agentId);
     if (!agent) return;
     const hb = agent.manifest.heartbeat;
     if (!hb?.enabled) return;
-    if (this.deps.scheduler.snoozeState(agentId)) return; // sleeping — skip a beat
-    if (inQuietHours(hb.quietHours)) return;
     if (this.inflight.has(agentId)) return; // previous tick still running
+
+    const guard = this.shouldTick(agent, {
+      snoozed: Boolean(this.deps.scheduler.snoozeState(agentId)),
+      lastUserMessageAt: this.deps.host.lastUserMessageAt(agentId),
+    });
+    if (!guard.ok) return;
 
     this.inflight.add(agentId);
     try {
-      await this.tickInner(agent);
+      await this.tickInner(agent, opts);
     } finally {
       this.inflight.delete(agentId);
     }
   }
 
-  private async tickOnce(agent: LoadedAgent): Promise<HeartbeatAct | null> {
+  private async tickOnce(agent: LoadedAgent, opts: { brief?: boolean } = {}): Promise<HeartbeatAct | null> {
     const digest = this.buildDigest(agent);
     const act: HeartbeatAct = {};
     let called = false;
@@ -101,7 +138,8 @@ export class HeartbeatEngine {
       noThemes: true,
       noPromptTemplates: true,
       noContextFiles: true,
-      systemPrompt: HEARTBEAT_SYSTEM_PROMPT,
+      systemPrompt: opts.brief ? BRIEF_SYSTEM_PROMPT : HEARTBEAT_SYSTEM_PROMPT,
+      extensionFactories: opts.brief ? [calendarPlugin()] : [],
     });
     await loader.reload();
 
@@ -114,7 +152,7 @@ export class HeartbeatEngine {
           modelRuntime: this.deps.modelRuntime,
           model: this.heartbeatModelWithFallback(agent),
           thinkingLevel: "off",
-          tools: ["heartbeat_act"],
+          tools: opts.brief ? ["heartbeat_act", "calendar_today"] : ["heartbeat_act"],
           customTools: [actTool],
           resourceLoader: loader,
           sessionManager: SessionManager.inMemory(agent.dir),
@@ -128,7 +166,9 @@ export class HeartbeatEngine {
 
     try {
       await session.prompt(
-        `HEARTBEAT TICK — ${new Date().toLocaleString([], { weekday: "long", hour: "2-digit", minute: "2-digit" })}\n\n${digest}\n\nDecide. Call heartbeat_act exactly once.`,
+        opts.brief
+          ? `MORNING BRIEF — ${new Date().toLocaleString([], { weekday: "long", hour: "2-digit", minute: "2-digit" })}\n\n${digest}\n\nCompose the user's morning brief: check calendar_today first, then cover pending items and open promises, and suggest the single most important thing today. Keep it short.`
+          : `HEARTBEAT TICK — ${new Date().toLocaleString([], { weekday: "long", hour: "2-digit", minute: "2-digit" })}\n\n${digest}\n\nDecide. Call heartbeat_act exactly once.`,
         {}
       );
     } catch (e) {
@@ -145,8 +185,8 @@ export class HeartbeatEngine {
     return called ? act : null;
   }
 
-  private async tickInner(agent: LoadedAgent): Promise<void> {
-    const act = await this.tickOnce(agent);
+  private async tickInner(agent: LoadedAgent, opts: { brief?: boolean } = {}): Promise<void> {
+    const act = await this.tickOnce(agent, opts);
     if (!act) return;
 
     const summary = act.speak ?? act.escalate ?? act.note ?? "(silent)";
@@ -155,6 +195,9 @@ export class HeartbeatEngine {
     if (act.escalate) {
       await this.deps.host.escalateToAgent(agent.id, act.escalate);
     } else if (act.speak) {
+      // backoff: proactive speaks that go unanswered make the heartbeat quieter
+      const n = (this.unansweredSpeaks.get(agent.id) ?? 0) + 1;
+      this.unansweredSpeaks.set(agent.id, n);
       await this.deps.host.deliverToAgent(agent.id, act.speak);
     }
   }

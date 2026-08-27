@@ -217,8 +217,29 @@ export class TelegramTransport implements Transport {
     await this.bot.stop();
   }
 
+  private keyboardSent = new Set<string>();
+
+  private static QUICK_KEYBOARD = {
+    keyboard: [
+      [{ text: "😴 Snooze 1h" }, { text: "😴 Until morning" }],
+      [{ text: "☀️ Wake" }, { text: "📋 Status" }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
+
   async push(chatId: string, opts: PushOptions): Promise<void> {
     const text = truncate(opts.text, TG_LIMIT) + (opts.text.length > TG_LIMIT ? "\n\n…(truncated)" : "");
+    // first message in a chat attaches the persistent quick-action keyboard
+    if (!this.keyboardSent.has(chatId) && !opts.card) {
+      this.keyboardSent.add(chatId);
+      await this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
+        parse_mode: "HTML",
+        reply_markup: TelegramTransport.QUICK_KEYBOARD,
+      });
+      return;
+    }
+    if (!this.keyboardSent.has(chatId)) this.keyboardSent.add(chatId); // card already carried markup; keyboard next time
     await this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
       parse_mode: "HTML",
       reply_markup: keyboard(opts.card),
