@@ -4,6 +4,7 @@ import { buildManifest, buildPersona, validateAgentName, type AgentDraft, type P
 import { listSkillDirs } from "./agent-manager.js";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { TelegramTransport } from "../transports/telegram.js";
+import { createCommandHandler, type CommandContext } from "./commands.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
@@ -15,21 +16,13 @@ import type { Card, ChatRef, Schedule, Transport } from "./types.js";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 
-const HELP = [
-  `**pibot** — your agents. Talk normally; ask to schedule anything ("remind me to stretch in 20m", "daily standup note at 9am").`,
-  ``,
-  `/agents — list agents  ·  /agent <name> — switch  ·  /newagent — guided wizard`,
-  `/schedules — pending items  ·  /cancel <id>`,
-  `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
-  `/status — what's running`,
-].join("\n");
-
 export class PiBot implements HeartbeatHost {
   private transports = new Map<string, Transport>();
   private wired = new Set<string>();
   private chatAgent = new Map<string, string>(); // chatKey → agentId
   private agentChats = new Map<string, Set<string>>(); // agentId → chatKeys
   private wizardChats = new Set<string>(); // chats running /newagent interview
+  private commandHandler: ((t: Transport, chatId: string, text: string) => Promise<void>) | null = null;
   private pendingSubBots = new Map<string, string>(); // chatKey → agentId awaiting its sub-bot creation
   private lastUserMessage = new Map<string, number>(); // agentId → last real user message
   private subBots = new Map<string, { token: string; username?: string }>(); // agentId → token
@@ -451,210 +444,35 @@ export class PiBot implements HeartbeatHost {
 
   // ── commands ──────────────────────────────────────────────────────────────
 
-  private async handleCommand(t: Transport, chatId: string, text: string): Promise<void> {
-    const [rawCmd, ...rest] = text.slice(1).split(/\s+/);
-    const cmd = rawCmd.toLowerCase();
-    const arg = rest.join(" ").trim();
-    const ck = this.chatKey(t, chatId);
-    const agentId = this.currentAgent(ck);
-    const reply = (s: string) => t.push(chatId, { text: s });
+  handleCommand(t: Transport, chatId: string, text: string): Promise<void> {
+    this.commandHandler ??= createCommandHandler(this.commandContext());
+    return this.commandHandler(t, chatId, text);
+  }
 
-    switch (cmd) {
-      case "start":
-      case "help":
-        await reply(HELP);
-        return;
-        return;
-
-      case "agents": {
-        await this.deps.agents.discover(); // pick up agents added on disk since boot
-        const lines = this.deps.agents.list().map((a) => {
-          const cur = a.id === agentId ? " ← here" : "";
-          return `• **${a.id}** — ${a.manifest.description ?? "agent"}${cur}`;
-        });
-        await reply(lines.join("\n") || "No agents.");
-        return;
-      }
-
-      case "agent": {
-        if (!arg) {
-          await reply(`Current agent: **${agentId ?? "none"}**. Switch with /agent <name>.`);
-          return;
-        }
-        if (!this.deps.agents.getAgent(arg)) {
-          await reply(`No agent "${arg}". /agents for the list.`);
-          return;
-        }
-        this.rememberChat(arg, ck);
-        await reply(`Switched to **${arg}**. Its memory and rhythm are its own.`);
-        return;
-      }
-
-      case "cancel":
-        if (this.wizardChats.has(ck)) {
-          this.questions.cancelPending(ck);
-          await reply("Wizard cancelled. Nothing was created.");
-        } else if (this.questions.cancelPending(ck)) {
-          await reply("Question dismissed.");
-        } else {
-          await reply("Nothing to cancel.");
-        }
-        return;
-
-      case "newagent": {
-        if (!arg) {
-          void this.runNewAgentWizard(t, chatId).catch((e) => console.error("[wizard]", e));
-          return;
-        }
-        const m = arg.match(/^([a-z0-9][a-z0-9-]{1,31})\s*([\s\S]*)$/i);
-        if (!m) {
-          await reply("Usage: /newagent (guided wizard) or /newagent <name> <persona instructions>");
-          return;
-        }
-        const err = this.deps.agents.createAgent(m[1].toLowerCase(), m[2] || undefined);
-        if (err) {
-          await reply(err);
-          return;
-        }
-        const agent = this.deps.agents.getAgent(m[1].toLowerCase())!;
-        this.ensureHeartbeatJob(agent);
-        this.ensureEvolutionJob(agent);
-        this.rememberChat(agent.id, ck);
-        await reply(
-          `Born: **${agent.id}** 🎉\nPersona: ${agent.dir}/AGENTS.md · plugins: agent.json · memory: memory/\nYou're talking to it now. It wakes every ${agent.manifest.heartbeat?.interval ?? "45m"}.`
-        );
-        return;
-      }
-
-      case "snooze": {
-        if (!agentId) return void (await reply("No agent selected."));
-        if (!arg) {
-          // button-first: render duration choices
-          await t.push(chatId, {
-            text: "😴 Snooze the whole rhythm for…",
-            card: {
-              text: "",
-              buttons: [
-                { label: "30 min", action: "snz:30m" },
-                { label: "1 h", action: "snz:1h" },
-                { label: "3 h", action: "snz:3h" },
-                { label: "Until morning", action: "snz:morning" },
-              ],
-            },
-          });
-          return;
-        }
-        const ms = parseDuration(arg);
-        if (!ms) {
-          await reply(`Couldn't parse "${arg}". Try /snooze 2h or /snooze 30m.`);
-          return;
-        }
-        const agent = this.deps.agents.getAgent(agentId);
-        const quietEnd = nextQuietEnd(agent?.manifest.heartbeat?.quietHours);
-        const st = this.deps.scheduler.snooze(agentId, Date.now() + ms, "manual", quietEnd ?? undefined);
-        this.deps.events.log(agentId, "snooze", `until ${new Date(st.until).toLocaleTimeString()}`);
-        const nightNote = quietEnd && st.until >= (quietEnd ?? 0) ? "" : quietEnd ? " (capped at your wake time)" : "";
-        await reply(`😴 Everything paused until **${fmtWhen(st.until)}**${nightNote}. Important items still come through. /wake to end early.`);
-        return;
-      }
-
-      case "wake": {
-        const resumed = this.deps.scheduler.unsnoozeAll();
-        await reply(resumed.length ? `☀️ Rhythm resumed for: ${resumed.map((a) => `**${a}**`).join(", ")}` : "Nothing was snoozed.");
-        return;
-      }
-
-      case "evolve": {
-        if (!this.deps.evolution) {
-          await reply("Evolution engine not wired.");
-          return;
-        }
-        if (!agentId) return void (await reply("No agent selected."));
-        const sub = arg.split(/\s+/)[0];
-        if (sub === "status") {
-          const staged = this.deps.evolution.staged(agentId);
-          await reply(staged.length ? `Staged: ${staged.map((s) => `**${s}**`).join(", ")}\nPromote: /evolve promote <name>` : "Nothing staged.");
-          return;
-        }
-        if (sub === "promote" || sub === "reject") {
-          const name = arg.split(/\s+/)[1] ?? "";
-          const done = sub === "promote" ? this.deps.evolution.promote(agentId, name) : this.deps.evolution.reject(agentId, name);
-          await reply(done ? `${sub === "promote" ? "Promoted" : "Rejected"} **${name}**.` : `Nothing staged named "${name}".`);
-          return;
-        }
-        const goal = arg.trim() || undefined;
-        await reply(`🧬 Running an evolution cycle${goal ? ` — goal: “${goal}”` : " (self-directed)"}. This runs cheap probes, takes a minute…`);
-        const report = await this.deps.evolution.evolve(agentId, goal, { force: true });
-        this.deps.events.log(agentId, "system", `evolution run: ${report.summary}`);
-        await reply(`${report.ok ? "🧬" : "⛔"} ${report.summary}${report.staged ? "\nReview: /evolve status → /evolve promote <name>" : ""}`);
-        return;
-      }
-
-      case "skills": {
-        if (!agentId) return void (await reply("No agent selected."));
-        const agent = this.deps.agents.getAgent(agentId);
-        const skills = agent ? listSkillDirs(path.join(agent.dir, "skills")) : [];
-        await reply(skills.length ? skills.map((s) => `• **${s.name}** — ${s.description}`).join("\n") : `No skills yet for **${agentId}**. /evolve can create some.`);
-        return;
-      }
-
-      case "schedules": {
-        if (!agentId) return void (await reply("No agent selected."));
-        const jobs = this.deps.scheduler.list(agentId).filter((j) => !j.internal);
-        if (!jobs.length) {
-          await reply("Nothing pending. Ask the agent to schedule something.");
-          return;
-        }
-        await reply(
-          jobs
-            .slice(0, 20)
-            .map((j) => `• [${j.id}] **${j.title}** — ${fmtWhen(j.dueAt)}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " ⚡" : ""}`)
-            .join("\n")
-        );
-        return;
-      }
-
-      case "cancel": {
-        if (!agentId) return void (await reply("No agent selected."));
-        const job = this.deps.scheduler.cancel(arg);
-        await reply(job ? `🗑 Cancelled: ${job.title}` : `Nothing matches "${arg}". /schedules for ids.`);
-        return;
-      }
-
-      case "promises": {
-        if (!agentId) return void (await reply("No agent selected."));
-        const jobs = this.deps.scheduler.list(agentId).filter((j) => j.kind === "promise");
-        await reply(jobs.length ? jobs.map((j) => `• [${j.id}] **${j.title}** — ${fmtWhen(j.dueAt)}`).join("\n") : "No open promises.");
-        return;
-      }
-
-      case "status": {
-        if (!agentId) return void (await reply("No agent selected."));
-        const agent = this.deps.agents.getAgent(agentId)!;
-        const hb = agent.manifest.heartbeat;
-        const sn = this.deps.scheduler.snoozeState(agentId);
-        const pending = this.deps.scheduler.list(agentId);
-        const next = pending[0];
-        await reply(
-          [
-            `**${agent.id}** — ${agent.manifest.description ?? ""}`,
-            `model: ${agent.manifest.model ?? "auto"} · thinking: ${agent.manifest.thinking ?? "off"}`,
-            `heartbeat: ${hb?.enabled ? `every ${hb.interval}${hb.model ? ` (${hb.model})` : ""}` : "off"}${hb?.quietHours ? ` · quiet ${hb.quietHours.from}–${hb.quietHours.to}` : ""}`,
-            `snoozed: ${sn ? `until ${fmtWhen(sn.until)}` : "no"}`,
-            `pending: ${pending.filter((j) => !j.internal).length}${next && !next.internal ? ` · next: “${next.title}” ${fmtWhen(next.dueAt)}` : ""}`,
-          ].join("\n")
-        );
-        return;
-      }
-
-      case "quit":
-        if (t.name === "cli") process.exit(0);
-        await reply("/quit only works in the CLI.");
-        return;
-
-      default:
-        await reply(`Unknown /${cmd} — try /help`);
-    }
+  /** @internal narrow surface for the command layer */
+  private commandContext(): CommandContext {
+    return {
+      config: this.deps.config,
+      agents: this.deps.agents,
+      scheduler: this.deps.scheduler,
+      events: this.deps.events,
+      transports: this.transports,
+      agentChats: this.agentChats,
+      pendingSubBots: this.pendingSubBots,
+      wizardChats: this.wizardChats,
+      evolution: this.deps.evolution,
+      heartbeat: this.deps.heartbeat,
+      telegram: this,
+      currentAgent: (ck) => this.currentAgent(ck),
+      chatKey: (t, chatId) => this.chatKey(t, chatId),
+      rememberChat: (agentId, c) => this.rememberChat(agentId, c),
+      ensureHeartbeatJob: (a) => this.ensureHeartbeatJob(a as never),
+      ensureEvolutionJob: (a) => this.ensureEvolutionJob(a as never),
+      ensureMorningBriefJob: (a) => this.ensureMorningBriefJob(a as never),
+      deliverToAgent: (id, text) => this.deliverToAgent(id, text),
+      questions: this.questions,
+      wizard: this,
+    };
   }
 
   // ── scheduler fire delivery ───────────────────────────────────────────────
@@ -663,7 +481,7 @@ export class PiBot implements HeartbeatHost {
    * Guided /newagent interview: name → job → vibe → proactivity.
    * Uses ask_user buttons; each new question replaces the last; /cancel aborts.
    */
-  private async runNewAgentWizard(t: Transport, chatId: string): Promise<void> {
+  async runNewAgentWizard(t: Transport, chatId: string): Promise<void> {
     const ck = this.chatKey(t, chatId);
     const chat: ChatRef = { transport: t.name, chatId };
     this.wizardChats.add(ck);
