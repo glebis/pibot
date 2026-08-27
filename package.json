@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Personal agent companion built on the pi SDK — chat with agents that have independent plugin systems, memory, and a scheduling heartbeat.",
+  "description": "Personal agent companion built on the pi SDK \u2014 chat with agents that have independent plugin systems, memory, and a scheduling heartbeat.",
   "engines": {
     "node": ">=22"
   },
@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "evolve": "tsx scripts/evolve.ts"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.3",

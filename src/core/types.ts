@@ -5,7 +5,7 @@ export interface ChatRef {
   chatId: string;
 }
 
-export type ScheduleKind = "reminder" | "task" | "note" | "subject" | "heartbeat" | "promise" | "custom";
+export type ScheduleKind = "reminder" | "task" | "note" | "subject" | "heartbeat" | "promise" | "evolution" | "custom";
 
 export interface ScheduleRepeat {
   /** Fire again this many ms after each fire */
@@ -90,6 +90,8 @@ export interface AgentManifest {
   /** built-in + custom tool names; default excludes bash (safer for remote chats) */
   tools?: string[];
   heartbeat?: HeartbeatConfig;
+  /** goal-driven skill self-evolution (Hermes-style propose → gate → eval → apply) */
+  evolution?: { enabled?: boolean; interval?: string; model?: string };
 }
 
 export const DEFAULT_AGENT_TOOLS = ["read", "write", "edit", "grep", "find", "ls"];

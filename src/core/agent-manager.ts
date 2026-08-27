@@ -13,6 +13,7 @@ import {
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
 import { memoryPlugin } from "../plugins/memory-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
+import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
 import { ensureDir, readJson, truncate, writeJsonAtomic } from "./util.js";
@@ -115,11 +116,14 @@ export class AgentManager {
       systemPromptOverride: () => systemPromptFor(agent),
       // per-agent private plugins
       additionalExtensionPaths: listTsFiles(path.join(agent.dir, "extensions")),
+      // per-agent evolved skills (+ staging during evolution)
+      additionalSkillPaths: listSkillDirs(path.join(agent.dir, "skills")).map((s) => path.dirname(s.filePath)),
       // shared plugins bound to this agent + chat
       extensionFactories: [
         schedulerPlugin({ scheduler, agentId, chat }),
         memoryPlugin({ agentDir: agent.dir }),
         calendarPlugin(),
+        skillManagePlugin({ agentDir: agent.dir, agentId }),
       ],
     });
     await loader.reload();
@@ -136,6 +140,7 @@ export class AgentManager {
         "schedule_create", "schedule_list", "schedule_cancel", "snooze",
         "promise_make", "promise_keep", "calendar_today",
         "memory_save", "memory_recall",
+        "skill_save", "skill_patch", "skill_list",
       ],
       resourceLoader: loader,
       sessionManager: manager,
@@ -174,6 +179,25 @@ function listTsFiles(dir: string): string[] {
     .readdirSync(dir, { withFileTypes: true })
     .filter((e) => e.isFile() && e.name.endsWith(".ts"))
     .map((e) => path.join(dir, e.name));
+}
+
+/** Discover per-agent skills: skills/<name>/SKILL.md (skips dot-dirs like .staging) */
+export function listSkillDirs(skillsDir: string): Array<{ name: string; description: string; filePath: string; baseDir: string }> {
+  if (!fs.existsSync(skillsDir)) return [];
+  const skills: Array<{ name: string; description: string; filePath: string; baseDir: string }> = [];
+  for (const e of fs.readdirSync(skillsDir, { withFileTypes: true })) {
+    if (!e.isDirectory() || e.name.startsWith(".")) continue;
+    const file = path.join(skillsDir, e.name, "SKILL.md");
+    if (!fs.existsSync(file)) continue;
+    const raw = fs.readFileSync(file, "utf8");
+    skills.push({
+      name: raw.match(/^name:\s*(.+)$/m)?.[1]?.trim() ?? e.name,
+      description: raw.match(/^description:\s*(.+)$/m)?.[1]?.trim() ?? "",
+      filePath: file,
+      baseDir: path.dirname(file),
+    });
+  }
+  return skills;
 }
 
 function systemPromptFor(agent: LoadedAgent): string {

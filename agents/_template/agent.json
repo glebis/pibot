@@ -9,5 +9,10 @@
     "interval": "45m",
     "model": "same",
     "quietHours": { "from": "23:00", "to": "08:00" }
+  },
+  "evolution": {
+    "enabled": false,
+    "interval": "6h",
+    "model": "same"
   }
 }
