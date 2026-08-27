@@ -133,6 +133,15 @@ export class TelegramTransport implements Transport {
     return String(r);
   }
 
+  /** Restrict a managed bot to its owner (Bot API 9.6) */
+  async setManagedBotAccessSettings(botUserId: number, restricted: boolean): Promise<void> {
+    await fetch(`https://api.telegram.org/bot${(this.bot as unknown as { token: string }).token}/setManagedBotAccessSettings`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ user_id: botUserId, is_access_restricted: restricted }),
+    }).then((r) => r.json());
+  }
+
 
   private check(ctx: Context): boolean {
     if (!this.allowed.size) return true;
