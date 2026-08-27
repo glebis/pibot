@@ -4,6 +4,7 @@ import { buildManifest, buildPersona, validateAgentName, type AgentDraft, type P
 import { listSkillDirs } from "./agent-manager.js";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { TelegramTransport } from "../transports/telegram.js";
+import { attendCli } from "../plugins/attend-plugin.js";
 import { createCommandHandler, type CommandContext } from "./commands.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EvolutionEngine } from "./evolution.js";
@@ -13,6 +14,7 @@ import { QuestionBus, type QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import { loadSettings, saveSettings, type Config } from "../config.js";
 import type { Card, ChatRef, Schedule, Transport } from "./types.js";
+import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 
@@ -101,6 +103,9 @@ export class PiBot implements HeartbeatHost {
       this.ensureMorningBriefJob(agent);
       if (agent.manifest.evolution?.enabled) this.ensureEvolutionJob(agent);
     }
+    // attend surfacing: one pass/day within its active hours, on the default agent
+    const defaultAgent = this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId();
+    if (defaultAgent) this.ensureAttendPassJob(defaultAgent);
 
     const state = readJson<{ chats?: Record<string, string>; agentChats?: Record<string, string[]> }>(this.statePath, {});
     for (const [ck, agentId] of Object.entries(state.chats ?? {})) this.chatAgent.set(ck, agentId);
@@ -630,6 +635,68 @@ export class PiBot implements HeartbeatHost {
     }
   }
 
+  private ensureAttendPassJob(agentId: string): void {
+    this.deps.scheduler.ensure({
+      id: `attend:${agentId}`,
+      agentId,
+      chat: { transport: "internal", chatId: "attend" },
+      title: "attend pass",
+      kind: "attend-pass",
+      dueAt: nextDailyAt("10:30"),
+      repeat: { dailyAt: "10:30" },
+      wake: "normal",
+      delivery: "direct",
+      status: "pending",
+      createdAt: Date.now(),
+      firedCount: 0,
+      internal: true,
+    });
+  }
+
+  /** Surface one attend item (respects attend's active hours + daily cap) via buttons */
+  private async runAttendPass(t: Transport, chatId: string, agentId: string): Promise<void> {
+    try {
+      const items = await attendCli(["list", "--status", "pending"]);
+      const parsed = items ? (JSON.parse(items) as Array<{ id: string; title: string; body?: string; category: string }>) : [];
+      if (!parsed.length) return;
+      // policy: max 1/day — count today's responses
+      const stateDir = path.join(os.homedir(), "attend", "state");
+      let answeredToday = 0;
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        for (const line of fs.readFileSync(path.join(stateDir, "responses.jsonl"), "utf8").split("\n")) {
+          if (line.includes(today) && line.includes('"answered"')) answeredToday++;
+        }
+      } catch {
+        /* no responses file */
+      }
+      if (answeredToday >= 1) return; // attend's default max_per_day
+      const item = parsed[0];
+      this.pendingAttend.set(this.chatKey(t, chatId), item.id);
+      const bodyText = item.body ? `\n\n${item.body}` : "";
+      await this.questions.ask(agentId, { transport: t.name, chatId }, {
+        text: `🧠 (attend · ${item.category}) ${item.title}${bodyText}`,
+        options: [],
+        timeoutMs: 12 * 3600e3,
+      }).then(async (res) => {
+        if (!res || res.timedOut) return;
+        await attendCli(["mark", "--id", item.id, "--status", "answered"]).catch(() => {});
+        // record for attend's daily-cap policy
+        const rec = {
+          ts: new Date().toISOString(), item_id: item.id, category: item.category,
+          channel: "telegram", machine: process.env.HOST ?? "local", outcome: res.index >= 0 ? "answered" : "answered",
+          answer: res.choice, counted: true,
+        };
+        fs.mkdirSync(path.join(os.homedir(), "attend", "state"), { recursive: true });
+        fs.appendFileSync(path.join(stateDir, "responses.jsonl"), JSON.stringify(rec) + "\n");
+      });
+    } catch (e) {
+      this.deps.events.log(agentId, "system", `attend pass failed: ${errorMessage(e)}`);
+    }
+  }
+
+  private pendingAttend = new Map<string, string>(); // chatKey → attend item id
+
   private ensureMorningBriefJob(agent: LoadedAgent): void {
     const hb = agent.manifest.heartbeat;
     if (!hb?.enabled) return;
@@ -696,6 +763,15 @@ export class PiBot implements HeartbeatHost {
   async deliverFire(job: Schedule, snoozed: boolean): Promise<void> {
     if (job.kind === "heartbeat") {
       await this.deps.heartbeat.tick(job.agentId);
+      return;
+    }
+    if (job.kind === "attend-pass") {
+      const ck = this.primaryChat(job);
+      if (ck) {
+        const idx = ck.lastIndexOf(":");
+        const t = this.transports.get(ck.slice(0, idx));
+        if (t) await this.runAttendPass(t, ck.slice(idx + 1), job.agentId);
+      }
       return;
     }
     if (job.kind === "morning-brief") {
