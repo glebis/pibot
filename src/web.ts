@@ -15,6 +15,7 @@ export interface TelegramControl {
   telegramUsername(): string | undefined;
   enableTelegram(token: string, allowedChats: string[]): Promise<{ ok: boolean; botName?: string; error?: string }>;
   disableTelegram(): Promise<boolean>;
+  askUserAllChats(agentId: string, question: string, options: string[]): Promise<void>;
 }
 
 export interface WebDeps {
@@ -445,6 +446,38 @@ ${enabled
     if (deps.telegram) await deps.telegram.disableTelegram();
     saveSettings(deps.dataDir, { telegram: undefined });
     return c.redirect(`/telegram?msg=${encodeURIComponent("Bot disconnected")}`);
+  });
+
+  // ── manual structured question (also the live test surface) ──
+  app.get("/agents/:id/ask", (c) => {
+    const agent = agentOr404(c.req.param("id"));
+    if (!agent) return c.notFound();
+    const body = `<h2>Ask ${esc(agent.id)} a question</h2>
+<form method="post" action="/agents/${esc(agent.id)}/ask" class="card">
+  <label>Question</label>
+  <input type="text" name="question" placeholder="Which account?" required>
+  <label>Options (comma-separated, 2–6 → buttons, 7–10 → poll)</label>
+  <input type="text" name="options" placeholder="client, personal, own-account, unsure" required>
+  <button type="submit">Send to registered chats</button>
+</form>`;
+    return c.html(page(`${agent.id} · ask`, body, c.req.query("msg")));
+  });
+
+  app.post("/agents/:id/ask", async (c) => {
+    const agent = agentOr404(c.req.param("id"));
+    if (!agent) return c.notFound();
+    if (!deps.telegram) return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("telegram control not wired")}`);
+    const b = await c.req.parseBody();
+    const question = String(b.question ?? "").trim();
+    const options = String(b.options ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (!question || options.length < 2) {
+      return c.redirect(`/agents/${encodeURIComponent(agent.id)}/ask?msg=${encodeURIComponent("Question + at least 2 options required")}`);
+    }
+    void deps.telegram
+      .askUserAllChats(agent.id, question, options)
+      .then(() => deps.events.log(agent.id, "system", `web question sent: "${question}"`))
+      .catch((e: unknown) => deps.events.log(agent.id, "system", `web question failed: ${errorMessage(e)}`));
+    return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Question sent — waiting for taps")}`);
   });
 
   return app;

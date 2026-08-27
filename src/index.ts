@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { serve } from "@hono/node-server";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { loadConfig, loadSettings } from "./config.js";
@@ -15,6 +17,29 @@ import { TelegramTransport } from "./transports/telegram.js";
 async function main(): Promise<void> {
   const config = loadConfig();
   ensureDir(config.dataDir);
+
+  // single-instance guard: two processes would fight over the bot's getUpdates
+  const lockFile = path.join(config.dataDir, "pibot.lock");
+  if (fs.existsSync(lockFile)) {
+    const pid = parseInt(fs.readFileSync(lockFile, "utf8").trim(), 10);
+    if (Number.isInteger(pid)) {
+      try {
+        process.kill(pid, 0); // throws if not running
+        console.error(`[pibot] another instance is running (pid ${pid}) — exiting. Kill it first or delete ${lockFile}.`);
+        process.exit(1);
+      } catch {
+        /* stale lock */
+      }
+    }
+  }
+  fs.writeFileSync(lockFile, String(process.pid));
+  process.on("exit", () => {
+    try {
+      if (fs.readFileSync(lockFile, "utf8").trim() === String(process.pid)) fs.unlinkSync(lockFile);
+    } catch {
+      /* ignore */
+    }
+  });
 
   const modelRuntime = await ModelRuntime.create();
   const agents = new AgentManager(config.agentsDir, modelRuntime);

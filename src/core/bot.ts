@@ -546,6 +546,18 @@ export class PiBot implements HeartbeatHost {
     return this.questions.ask(agentId, chat, spec);
   }
 
+  /** Fire a structured question to all chats registered for an agent (dashboard surface) */
+  async askUserAllChats(agentId: string, question: string, options: string[]): Promise<void> {
+    const cks = this.agentChats.get(agentId) ?? new Set<string>();
+    if (!cks.size) throw new Error(`no chats registered for "${agentId}" — message it in Telegram first`);
+    await Promise.allSettled(
+      [...cks].map((ck) => {
+        const idx = ck.indexOf(":");
+        return this.questions.ask(agentId, { transport: ck.slice(0, idx), chatId: ck.slice(idx + 1) }, { text: question, options, poll: options.length > 6 });
+      })
+    );
+  }
+
   // ── HeartbeatHost ─────────────────────────────────────────────────────────
 
   async deliverToAgent(agentId: string, text: string): Promise<void> {
