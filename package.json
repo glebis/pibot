@@ -11,7 +11,10 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "cli": "PIBOT_TRANSPORT=cli tsx src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.3",
@@ -20,7 +23,9 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^4.1.11",
     "tsx": "^4.20.0",
-    "typescript": "^5.9.0"
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.11"
   }
 }
