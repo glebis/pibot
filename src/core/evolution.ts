@@ -389,7 +389,7 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
       const session = await ephemeral(ctx.agent, { systemPrompt: PROPOSE_SYSTEM, tools: [proposeTool] });
       try {
         const skills = ctx.existingSkills.map((s) => `- ${s.name}: ${s.description}`).join("\n") || "(none yet)";
-        await session.prompt(
+        const ask = (nudge?: string) =>
           [
             `EVOLUTION CYCLE for agent "${ctx.agent.id}".`,
             ctx.goal ? `Goal: ${ctx.goal}` : `Goal: (none given — derive the highest-value improvement from recent activity)`,
@@ -398,11 +398,16 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
             ``,
             `# Existing skills\n${skills}`,
             ``,
-            `Propose exactly one skill (create new, or patch existing). Call evolution_propose exactly once.`,
-          ].join("\n")
-        );
+            `Propose exactly one skill (create new, or patch existing).`,
+            nudge ?? `Call the evolution_propose tool exactly once — text-only replies are discarded.`,
+          ].join("\n");
+        await session.prompt(ask());
         const merr = sessionError(session);
         if (merr) throw new Error(merr);
+        if (!proposal) {
+          // some models reply in text first — one explicit retry
+          await session.prompt(`You did not call the tool. Call evolution_propose exactly once now.`);
+        }
       } finally {
         try {
           session.dispose();
@@ -410,7 +415,10 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
           /* ignore */
         }
       }
-      if (!proposal) throw new Error("model made no proposal");
+      if (!proposal) {
+        const modelId = (deps.modelFor(ctx.agent) as { id?: string } | undefined)?.id ?? "configured model";
+        throw new Error(`model made no proposal (no tool call) — consider a different evolution.model than "${modelId}"`);
+      }
       return proposal;
     },
 
