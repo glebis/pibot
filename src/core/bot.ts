@@ -27,7 +27,14 @@ export class PiBot implements HeartbeatHost {
   private wired = new Set<string>();
   private chatAgent = new Map<string, string>(); // chatKey → agentId
   private agentChats = new Map<string, Set<string>>(); // agentId → chatKeys
-  private questions = new QuestionBus({ getTransport: (name) => this.transports.get(name) });
+  private questions = new QuestionBus({
+    getTransport: (name) => this.transports.get(name),
+    notify: (chatKey, text) => {
+      const idx = chatKey.indexOf(":");
+      const t = this.transports.get(chatKey.slice(0, idx));
+      if (t) void t.push(chatKey.slice(idx + 1), { text }).catch(() => {});
+    },
+  });
   private statePath: string;
 
   constructor(

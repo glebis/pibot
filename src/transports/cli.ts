@@ -9,7 +9,7 @@ import { truncate } from "../core/util.js";
 export class CliTransport implements Transport {
   readonly name = "cli";
   private onMessageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
-  private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
+  private onActionCb: ((action: string, chatId: string) => Promise<string | void>) | null = null;
   private pendingCard: { buttons: { label: string; action: string }[] } | null = null;
   private rl: readline.Interface | null = null;
 
@@ -17,7 +17,7 @@ export class CliTransport implements Transport {
     this.onMessageCb = cb;
   }
 
-  onAction(cb: (action: string, chatId: string) => Promise<void>): void {
+  onAction(cb: (action: string, chatId: string) => Promise<string | void>): void {
     this.onActionCb = cb;
   }
 
@@ -40,7 +40,8 @@ export class CliTransport implements Transport {
         this.pendingCard = null;
         if (btn && this.onActionCb) {
           console.log();
-          await this.onActionCb(btn.action, "local");
+          const feedback = await this.onActionCb(btn.action, "local");
+          if (feedback) console.log(`✓ ${feedback}\n`);
         }
         rl.prompt();
         return;

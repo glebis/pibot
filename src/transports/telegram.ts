@@ -64,10 +64,16 @@ export class TelegramTransport implements Transport {
     });
 
     this.bot.on("callback_query:data", async (ctx) => {
-      await ctx.answerCallbackQuery().catch(() => {});
-      if (!this.check(ctx)) return;
+      if (!this.check(ctx)) { await ctx.answerCallbackQuery().catch(() => {}); return; }
       const action = ctx.callbackQuery?.data;
-      if (action && this.onActionCb) void this.onActionCb(action, String(ctx.chat?.id ?? ctx.from?.id ?? "")).catch((e) => console.error("[telegram] action handler:", e));
+      if (!action || !this.onActionCb) { await ctx.answerCallbackQuery().catch(() => {}); return; }
+      let feedback: string | void;
+      try {
+        feedback = await this.onActionCb(action, String(ctx.chat?.id ?? ctx.from?.id ?? ""));
+      } catch (e) {
+        feedback = `⚠︎ ${e instanceof Error ? e.message : String(e)}`;
+      }
+      await ctx.answerCallbackQuery({ text: feedback ? truncate(String(feedback), 190) : undefined }).catch(() => {});
     });
 
     this.bot.on("poll_answer", (ctx) => {

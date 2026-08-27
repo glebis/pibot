@@ -65,7 +65,8 @@ export interface Transport {
   /** System-level error notice (agent crashed, bad model, …) */
   notifyError(chatId: string, message: string): Promise<void>;
   onMessage(cb: (text: string, chatId: string) => Promise<void>): void;
-  onAction(cb: (action: string, chatId: string) => Promise<void>): void;
+  /** cb may return a short toast string for Telegram callback feedback */
+  onAction(cb: (action: string, chatId: string) => Promise<string | void>): void;
   /** Show "typing…" while the agent works (optional) */
   setTyping?(chatId: string, on: boolean): void;
   /** Structured question as a native poll (optional; returns its poll id) */

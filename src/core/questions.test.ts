@@ -35,7 +35,7 @@ describe("QuestionBus buttons", () => {
     expect(card.buttons.map((b) => b.label)).toEqual(["client", "personal", "own-account", "unsure"]);
     expect(card.buttons[2].action).toMatch(/^q:q_[a-z0-9]+:2$/);
 
-    expect(bus.resolveCallback(card.buttons[2].action)).toBe(true);
+    expect(bus.resolveCallback(card.buttons[2].action)).toEqual({ choice: "own-account", index: 2, via: "button" });
     const answer = await promise;
     expect(answer).toEqual({ choice: "own-account", index: 2, via: "button" });
   });
@@ -78,8 +78,8 @@ describe("QuestionBus buttons", () => {
 
   it("unknown qid callbacks are ignored", async () => {
     const { bus } = makeBus();
-    expect(bus.resolveCallback("q:doesnotexist:1")).toBe(false);
-    expect(bus.resolveCallback("scd:xyz:ok")).toBe(false);
+    expect(bus.resolveCallback("q:doesnotexist:1")).toBeNull();
+    expect(bus.resolveCallback("scd:xyz:ok")).toBeNull();
   });
 });
 
@@ -91,7 +91,7 @@ describe("QuestionBus polls", () => {
     await vi.waitFor(() => expect(pollSent).toHaveLength(1));
     expect(pollSent[0].options).toHaveLength(8);
     expect(pushed).toHaveLength(0); // no button card when polling
-    expect(bus.resolvePoll(pollSent[0].pollId, 3)).toBe(true);
+    expect(bus.resolvePoll(pollSent[0].pollId, 3)).toEqual({ choice: "d", index: 3, via: "poll" });
     expect(await promise).toEqual({ choice: "d", index: 3, via: "poll" });
   });
 
@@ -99,8 +99,8 @@ describe("QuestionBus polls", () => {
     const { bus, pollSent } = makeBus(true);
     const promise = bus.ask("a1", CHAT, spec({ options: ["a", "b", "c", "d", "e", "f", "g", "h"], poll: true }));
     await vi.waitFor(() => expect(pollSent).toHaveLength(1));
-    expect(bus.resolvePoll("unknown-poll", 0)).toBe(false);
-    expect(bus.resolvePoll(pollSent[0].pollId, 6)).toBe(true);
+    expect(bus.resolvePoll("unknown-poll", 0)).toBeNull();
+    expect(bus.resolvePoll(pollSent[0].pollId, 6)).toEqual({ choice: "g", index: 6, via: "poll" });
     expect((await promise)?.choice).toBe("g");
   });
 

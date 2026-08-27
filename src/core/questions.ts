@@ -40,6 +40,8 @@ export class QuestionBus {
   constructor(
     private deps: {
       getTransport: (name: string) => Transport | undefined;
+      /** small confirmation push for poll votes (buttons get a toast instead) */
+      notify?: (chatKey: string, text: string) => void;
     }
   ) {}
 
@@ -91,27 +93,31 @@ export class QuestionBus {
     };
   }
 
-  /** Inline-keyboard tap */
-  resolveCallback(action: string): boolean {
-    if (!action.startsWith("q:")) return false;
+  /** Inline-keyboard tap — returns the recorded answer, or null if stale/unknown */
+  resolveCallback(action: string): QuestionAnswer | null {
+    if (!action.startsWith("q:")) return null;
     const [, qid, idxStr] = action.split(":");
     const p = this.pending.get(qid);
-    if (!p) return false;
+    if (!p) return null;
     const idx = parseInt(idxStr, 10);
-    if (!Number.isInteger(idx) || idx < 0 || idx >= p.spec.options.length) return false;
-    this.finish(qid, { choice: p.spec.options[idx], index: idx, via: "button" });
-    return true;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= p.spec.options.length) return null;
+    const answer: QuestionAnswer = { choice: p.spec.options[idx], index: idx, via: "button" };
+    this.finish(qid, answer);
+    return answer;
   }
 
   /** Telegram poll vote */
-  resolvePoll(pollId: string, optionIndex: number): boolean {
+  resolvePoll(pollId: string, optionIndex: number): QuestionAnswer | null {
     const qid = this.pollMap.get(pollId);
-    if (!qid) return false;
+    if (!qid) return null;
     this.pollMap.delete(pollId);
     const p = this.pending.get(qid);
-    if (!p || optionIndex < 0 || optionIndex >= p.spec.options.length) return false;
-    this.finish(qid, { choice: p.spec.options[optionIndex], index: optionIndex, via: "poll" });
-    return true;
+    if (!p || optionIndex < 0 || optionIndex >= p.spec.options.length) return null;
+    const answer: QuestionAnswer = { choice: p.spec.options[optionIndex], index: optionIndex, via: "poll" };
+    this.finish(qid, answer);
+    // polls have no callback toast — push a tiny confirmation instead
+    this.deps.notify?.(p.chatKey, `🗳 Noted: ${answer.choice}`);
+    return answer;
   }
 
   /**
