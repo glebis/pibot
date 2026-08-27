@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildManifest, buildPersona, validateAgentName } from "./agent-factory.js";
+import { buildManifest, buildPersona, suggestedSubBotUsername, validateAgentName } from "./agent-factory.js";
 
 describe("agent factory", () => {
   it("builds a manifest per proactivity preset", () => {
@@ -35,5 +35,22 @@ describe("agent factory", () => {
     expect(validateAgentName("good-name")).toBeNull();
     expect(validateAgentName("Bad!", ["a"])).toContain("lowercase");
     expect(validateAgentName("coach", ["coach"])).toContain("already exists");
+  });
+});
+describe("suggestedSubBotUsername", () => {
+  it("namespaces under the parent bot", () => {
+    expect(suggestedSubBotUsername("tax", "pimother_bot")).toBe("pimother_tax_bot");
+    expect(suggestedSubBotUsername("focuscoach", "pimother_bot")).toBe("pimother_focuscoach_bot");
+  });
+
+  it("handles dashes and truncates to Telegram's 32-char limit", () => {
+    expect(suggestedSubBotUsername("research-assistant-2", "pimother_bot")).toBe("pimother_research_assistant_bot");
+    const long = suggestedSubBotUsername("a-very-long-agent-name-that-keeps-going", "pimother_bot");
+    expect(long.length).toBeLessThanOrEqual(32);
+    expect(long.endsWith("_bot")).toBe(true);
+  });
+
+  it("defaults to pimother_bot when the manager is unknown", () => {
+    expect(suggestedSubBotUsername("tax")).toBe("pimother_tax_bot");
   });
 });

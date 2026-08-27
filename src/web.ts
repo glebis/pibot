@@ -8,7 +8,7 @@ import type { EvolutionEngine } from "./core/evolution.js";
 import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
 import { loadSettings, saveSettings } from "./config.js";
-import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, validateAgentName, type Proactivity } from "./core/agent-factory.js";
+import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
 import { errorMessage, fmtWhen, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
 
 export interface TelegramControl {
