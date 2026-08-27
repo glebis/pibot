@@ -1,0 +1,13 @@
+{
+  "name": "focuscoach",
+  "description": "Help me stay focused on key subjects and not get distracted for too much",
+  "heartbeat": {
+    "enabled": true,
+    "interval": "45m",
+    "model": "same",
+    "quietHours": {
+      "from": "23:00",
+      "to": "08:00"
+    }
+  }
+}
