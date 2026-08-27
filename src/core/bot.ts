@@ -7,9 +7,10 @@ import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
+import { QuestionBus, type QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
-import type { Card, Schedule, Transport } from "./types.js";
+import type { Card, ChatRef, Schedule, Transport } from "./types.js";
 import { errorMessage, fmtWhen, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 
 const HELP = [
@@ -26,6 +27,7 @@ export class PiBot implements HeartbeatHost {
   private wired = new Set<string>();
   private chatAgent = new Map<string, string>(); // chatKey → agentId
   private agentChats = new Map<string, Set<string>>(); // agentId → chatKeys
+  private questions = new QuestionBus({ getTransport: (name) => this.transports.get(name) });
   private statePath: string;
 
   constructor(
@@ -145,7 +147,13 @@ export class PiBot implements HeartbeatHost {
   }
 
   private async sessionFor(t: Transport, chatId: string, agentId: string, ck: string): Promise<AgentSession> {
-    const session = await this.deps.agents.getOrCreateSession(agentId, ck, { transport: t.name, chatId }, this.deps.scheduler);
+    const session = await this.deps.agents.getOrCreateSession(
+      agentId,
+      ck,
+      { transport: t.name, chatId },
+      this.deps.scheduler,
+      (spec: QuestionSpec) => this.questions.ask(agentId, { transport: t.name, chatId }, spec)
+    );
     const wkey = `${agentId}::${ck}`;
     if (!this.wired.has(wkey)) {
       this.wired.add(wkey);
@@ -171,7 +179,10 @@ export class PiBot implements HeartbeatHost {
     const text = raw.trim();
     if (!text) return;
     const ck = this.chatKey(t, chatId);
+    // slash commands always work, even with a question pending
     if (text.startsWith("/")) return void (await this.handleCommand(t, chatId, text));
+    // a pending structured question eats the next plain message in this chat
+    if (this.questions.answerViaText(ck, text)) return;
     const agentId = this.currentAgent(ck);
     if (!agentId) {
       await t.notifyError(chatId, "No agents yet. Create one: /newagent myfriend <persona text>");
@@ -228,6 +239,10 @@ export class PiBot implements HeartbeatHost {
   // ── inline card actions ───────────────────────────────────────────────────
 
   async handleAction(t: Transport, chatId: string, action: string): Promise<void> {
+    if (action.startsWith("q:")) {
+      this.questions.resolveCallback(action); // stale/unknown question ids are ignored
+      return;
+    }
     if (!action.startsWith("scd:")) return;
     const [, id, verb] = action.split(":");
     const job = this.deps.scheduler.get(id);
@@ -524,6 +539,11 @@ export class PiBot implements HeartbeatHost {
         ],
       },
     });
+  }
+
+  /** Structured question with tappable options; resolves on tap/vote/typed answer */
+  askUser(agentId: string, chat: ChatRef, spec: QuestionSpec) {
+    return this.questions.ask(agentId, chat, spec);
   }
 
   // ── HeartbeatHost ─────────────────────────────────────────────────────────

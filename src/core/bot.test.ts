@@ -265,3 +265,41 @@ describe("PiBot fire delivery", () => {
     expect(String(t.promptSpy.mock.calls[0][0])).toContain("[heartbeat]");
   });
 });
+describe("PiBot question interception", () => {
+  function spec() {
+    return { text: "Which account?", options: ["client", "personal", "own-account", "unsure"] };
+  }
+
+  it("text answers a pending question instead of prompting the agent", async () => {
+    const t = makeBot();
+    const promise = t.bot.askUser("assistant", { transport: "mock", chatId: "42" }, spec());
+    await vi.waitFor(() => expect(t.transport.lastCard()).toBeDefined());
+    t.promptSpy.mockClear();
+    await t.transport.say("personal");
+    expect(t.promptSpy).not.toHaveBeenCalled();
+    expect(await promise).toMatchObject({ choice: "personal", via: "text" });
+  });
+
+  it("button taps resolve pending questions", async () => {
+    const t = makeBot();
+    const promise = t.bot.askUser("assistant", { transport: "mock", chatId: "42" }, spec());
+    await vi.waitFor(() => expect(t.transport.lastCard()).toBeDefined());
+    const action = t.transport.lastCard()![1].action;
+    t.promptSpy.mockClear();
+    await t.transport.act(action);
+    expect(t.promptSpy).not.toHaveBeenCalled();
+    expect(await promise).toMatchObject({ choice: "personal", index: 1, via: "button" });
+  });
+
+  it("slash commands still work while a question is pending", async () => {
+    const t = makeBot();
+    const promise = t.bot.askUser("assistant", { transport: "mock", chatId: "42" }, spec());
+    await vi.waitFor(() => expect(t.transport.lastCard()).toBeDefined());
+    await t.transport.say("/status");
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("assistant"))).toBe(true);
+    
+    t.promptSpy.mockClear();
+    await t.transport.say("unsure");
+    expect(await promise).toMatchObject({ choice: "unsure" });
+  });
+});
