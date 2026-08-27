@@ -2,13 +2,15 @@ import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Scheduler } from "../core/scheduler.js";
 import type { ChatRef } from "../core/types.js";
-import { fmtWhen, parseDuration, parseWhen, uid } from "../core/util.js";
+import { fmtWhen, nextQuietEnd, parseDuration, parseWhen, uid } from "../core/util.js";
 
 export interface SchedulerPluginDeps {
   scheduler: Scheduler;
   agentId: string;
   /** chat that owns the session this plugin instance is bound to */
   chat: ChatRef;
+  /** the agent's quiet hours — night snoozes are capped at the wake time */
+  getQuietHours?: () => { from: string; to: string } | undefined;
 }
 
 const KINDS = `one of: reminder (ping me), task (something I must do), note (capture this later), subject (recurring topic to think about), custom`;
@@ -207,7 +209,8 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
             }
             until = parsed.dueAt;
           }
-          const st = scheduler.snooze(agentId, Date.now() + until, params.reason);
+          const quietEnd = nextQuietEnd(deps.getQuietHours?.());
+          const st = scheduler.snooze(agentId, Date.now() + until, params.reason, quietEnd ?? undefined);
           return {
             content: [{ type: "text", text: `Snoozed everything until ${fmtWhen(st.until)}${params.reason ? ` (${params.reason})` : ""}. Important items still come through.` }],
             details: {},

@@ -193,3 +193,26 @@ describe("Scheduler", () => {
     s.stop();
   });
 });
+describe("Scheduler night-snooze capping", () => {
+  it("caps snoozes at the wake time (end of quiet hours)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-cap-"));
+    const s = new Scheduler(dir, () => {});
+    // 22:00 + 12h snooze → would end at 10:00, capped at 08:00
+    const at22 = new Date(); at22.setHours(22, 0, 0, 0);
+    const capAt = new Date(at22); capAt.setDate(capAt.getDate() + 1); capAt.setHours(8, 0, 0, 0);
+    const st = s.snooze("a1", at22.getTime() + 12 * 3600e3, "night", capAt.getTime());
+    expect(st.until).toBe(capAt.getTime());
+    s.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("daytime snoozes are not capped", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-cap-"));
+    const s = new Scheduler(dir, () => {});
+    const now = Date.now();
+    const st = s.snooze("a1", now + 2 * 3600e3, "day", now + 10 * 3600e3);
+    expect(st.until).toBe(now + 2 * 3600e3);
+    s.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});

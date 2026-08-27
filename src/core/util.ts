@@ -237,6 +237,16 @@ export function fmtWhen(ms: number, now = Date.now()): string {
   })} at ${time}`;
 }
 
+/** Timestamp of the NEXT quiet-hours end (morning wake time) after `now` */
+export function nextQuietEnd(qh: { from: string; to: string } | undefined, now = Date.now()): number | null {
+  if (!qh) return null;
+  const [toH, toM] = qh.to.split(":").map(Number);
+  const d = new Date(now);
+  d.setHours(toH || 0, toM || 0, 0, 0);
+  if (d.getTime() <= now) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
 export function inQuietHours(qh: { from: string; to: string } | undefined, now = Date.now()): boolean {
   if (!qh) return false;
   const toMin = (s: string) => {

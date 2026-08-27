@@ -97,6 +97,7 @@ function makeBot() {
     list: vi.fn(() => [] as Schedule[]),
     snooze: vi.fn(() => ({ until: Date.now() + 3600e3, reason: "manual" })),
     unsnooze: vi.fn(() => true),
+    unsnoozeAll: vi.fn(() => ["assistant"]),
     snoozeState: vi.fn(() => null),
     takePendingCards: vi.fn(() => [] as Schedule[]),
   } as unknown as Scheduler;
@@ -128,12 +129,15 @@ describe("PiBot commands", () => {
   });
 
   it("/snooze snoozes the current agent and /wake resumes", async () => {
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "assistant" ? { id: "assistant", dir: "/x", manifest: { name: "assistant", heartbeat: { enabled: true, interval: "45m" } } } : undefined
+    );
     await t.transport.say("/snooze 2h");
-    expect(t.scheduler.snooze).toHaveBeenCalledWith("assistant", expect.any(Number), "manual");
+    expect(t.scheduler.snooze).toHaveBeenCalledWith("assistant", expect.any(Number), "manual", undefined);
     expect(t.transport.lastText()).toContain("paused");
 
     await t.transport.say("/wake");
-    expect(t.scheduler.unsnooze).toHaveBeenCalledWith("assistant");
+    expect(t.scheduler.unsnoozeAll).toHaveBeenCalled();
     expect(t.transport.lastText()).toContain("resumed");
   });
 

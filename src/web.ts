@@ -9,7 +9,7 @@ import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
 import { loadSettings, saveSettings } from "./config.js";
 import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
-import { errorMessage, fmtWhen, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
+import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
 
 export interface TelegramControl {
   hasTransport(name: string): boolean;
@@ -426,7 +426,8 @@ ${manifestForm(agent)}
     const b = await c.req.parseBody();
     const ms = parseDuration(String(b.duration ?? ""));
     if (!ms) return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Couldn't parse duration — try 2h or 30m")}`);
-    deps.scheduler.snooze(agent.id, Date.now() + ms, "web");
+    const quietEnd = nextQuietEnd(agent.manifest.heartbeat?.quietHours);
+    deps.scheduler.snooze(agent.id, Date.now() + ms, "web", quietEnd ?? undefined);
     deps.events.log(agent.id, "snooze", `web snooze ${String(b.duration)}`);
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent(`Snoozed ${String(b.duration)} — important items still fire`)}`);
   });
