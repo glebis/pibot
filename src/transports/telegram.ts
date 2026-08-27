@@ -55,23 +55,24 @@ export class TelegramTransport implements Transport {
     this.bot = new Bot(token);
     this.allowed = new Set(allowedChats);
 
-    this.bot.on("message:text", async (ctx: Context) => {
+    this.bot.on("message:text", (ctx: Context) => {
       if (!this.check(ctx)) return;
       const text = ctx.message?.text?.trim();
       if (!text || !this.onMessageCb) return;
-      await this.onMessageCb(text, String(ctx.chat?.id));
+      // fire-and-forget: agent turns can run long (ask_user blocks) — never stall polling
+      void this.onMessageCb(text, String(ctx.chat?.id)).catch((e) => console.error("[telegram] message handler:", e));
     });
 
     this.bot.on("callback_query:data", async (ctx) => {
       await ctx.answerCallbackQuery().catch(() => {});
       if (!this.check(ctx)) return;
       const action = ctx.callbackQuery?.data;
-      if (action && this.onActionCb) await this.onActionCb(action, String(ctx.chat?.id ?? ctx.from?.id ?? ""));
+      if (action && this.onActionCb) void this.onActionCb(action, String(ctx.chat?.id ?? ctx.from?.id ?? "")).catch((e) => console.error("[telegram] action handler:", e));
     });
 
-    this.bot.on("poll_answer", async (ctx) => {
+    this.bot.on("poll_answer", (ctx) => {
       const pa = ctx.pollAnswer;
-      if (this.onPollAnswerCb) await this.onPollAnswerCb(pa.poll_id, pa.option_ids[0] ?? -1, String(pa.user?.id ?? ""));
+      if (this.onPollAnswerCb) void this.onPollAnswerCb(pa.poll_id, pa.option_ids[0] ?? -1, String(pa.user?.id ?? "")).catch(() => {});
     });
   }
 
