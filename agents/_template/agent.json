@@ -1,0 +1,13 @@
+{
+  "name": "TEMPLATE",
+  "description": "(describe this agent in one line — shown in /agents)",
+  "model": "",
+  "thinking": "off",
+  "tools": ["read", "write", "edit", "grep", "find", "ls"],
+  "heartbeat": {
+    "enabled": true,
+    "interval": "45m",
+    "model": "same",
+    "quietHours": { "from": "23:00", "to": "08:00" }
+  }
+}

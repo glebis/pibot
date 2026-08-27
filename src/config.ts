@@ -1,0 +1,48 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+export interface Config {
+  transport: "telegram" | "cli";
+  dataDir: string;
+  agentsDir: string;
+  defaultAgentId?: string;
+  heartbeatModel?: string;
+  telegramToken?: string;
+  allowedChats: string[];
+}
+
+/** Minimal .env loader (no dependency) — existing env vars win. */
+function loadDotEnv(): void {
+  const p = path.resolve(".env");
+  if (!fs.existsSync(p)) return;
+  for (const line of fs.readFileSync(p, "utf8").split("\n")) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+    if (!m) continue;
+    const key = m[1];
+    let val = m[2].trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = val;
+  }
+}
+
+export function loadConfig(): Config {
+  loadDotEnv();
+  const token = process.env.TELEGRAM_BOT_TOKEN || undefined;
+  const transport = (process.env.PIBOT_TRANSPORT as Config["transport"]) || (token ? "telegram" : "cli");
+  return {
+    transport,
+    dataDir: path.resolve(process.env.PIBOT_DATA_DIR || "./data"),
+    agentsDir: path.resolve(process.env.PIBOT_AGENTS_DIR || "./agents"),
+    defaultAgentId: process.env.PIBOT_DEFAULT_AGENT || undefined,
+    heartbeatModel: process.env.PIBOT_HEARTBEAT_MODEL && process.env.PIBOT_HEARTBEAT_MODEL !== "same"
+      ? process.env.PIBOT_HEARTBEAT_MODEL
+      : undefined,
+    telegramToken: token,
+    allowedChats: (process.env.TELEGRAM_ALLOWED_CHATS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  };
+}
