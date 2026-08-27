@@ -237,6 +237,15 @@ export function fmtWhen(ms: number, now = Date.now()): string {
   })} at ${time}`;
 }
 
+/** Next occurrence of a daily HH:MM time (for daily jobs) */
+export function nextDailyAt(hhmm: string, now = Date.now()): number {
+  const [h, m] = hhmm.split(":").map(Number);
+  const d = new Date(now);
+  d.setHours(h || 0, m || 0, 0, 0);
+  if (d.getTime() <= now) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
 /** Timestamp of the NEXT quiet-hours end (morning wake time) after `now` */
 export function nextQuietEnd(qh: { from: string; to: string } | undefined, now = Date.now()): number | null {
   if (!qh) return null;
