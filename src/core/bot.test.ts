@@ -62,9 +62,13 @@ function fakeAgentManager(promptSpy = vi.fn()) {
     subscribe: vi.fn(),
   } as unknown as AgentSession;
   return {
+    createAgent: vi.fn(() => undefined),
+    discover: vi.fn(async () => {}),
     getOrCreateSession: vi.fn(async () => fakeSession),
     getAgent: vi.fn((id: string) =>
-      id === "assistant" ? { id: "assistant", dir: "/x", manifest: { name: "assistant", description: "d", heartbeat: { enabled: true, interval: "45m" } } } : undefined
+      id === "assistant" || id === "fitness"
+        ? { id, dir: `/tmp/fake-${id}`, manifest: { name: id, description: "d", heartbeat: { enabled: true, interval: "45m" }, evolution: { enabled: true, interval: "6h" } } }
+        : undefined
     ),
     list: vi.fn(() => [{ id: "assistant", dir: "/x", manifest: { name: "assistant" } }]),
     defaultAgentId: () => "assistant",
@@ -301,5 +305,31 @@ describe("PiBot question interception", () => {
     t.promptSpy.mockClear();
     await t.transport.say("unsure");
     expect(await promise).toMatchObject({ choice: "unsure" });
+  });
+});
+
+describe("PiBot /newagent wizard", () => {
+  it("walks name → job → vibe → proactivity and creates the agent", async () => {
+    const t = makeBot();
+    await t.transport.say("/newagent");
+
+    // step 1: name
+    await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.opts.text.includes("What should I call"))).toBe(true));
+    await t.transport.say("fitness");
+    // step 2: job
+    await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.opts.text.includes("main job"))).toBe(true));
+    await t.transport.say("Keeps me moving every day.");
+    // step 3: vibe (buttons — tap the second option)
+    await vi.waitFor(() => expect(t.transport.lastCard()).toBeDefined());
+    await t.transport.act(t.transport.lastCard()![1].action);
+    // step 4: proactivity
+    await vi.waitFor(() => expect(t.transport.pushed.filter((p) => p.opts.text.includes("How proactive")).length).toBeGreaterThan(0));
+    await t.transport.say("quiet — a couple of proactive messages a day");
+
+    // creation happened with persona built from answers
+    await vi.waitFor(() => expect(t.agents.createAgent).toHaveBeenCalled());
+    expect(t.agents.createAgent).toHaveBeenCalledWith("fitness", expect.stringContaining("Keeps me moving every day."));
+    await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.opts.text.includes("Born: **fitness**"))).toBe(true));
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Born: **fitness**"))).toBe(true);
   });
 });

@@ -155,6 +155,14 @@ export class QuestionBus {
     return this.pending.size;
   }
 
+  /** Abort the pending question for a chat (its resolver gets replaced:true) */
+  cancelPending(chatKey: string): boolean {
+    const entry = [...this.pending.values()].find((p) => p.chatKey === chatKey);
+    if (!entry) return false;
+    this.cancel(entry.qid, true);
+    return true;
+  }
+
   private finish(qid: string, answer: QuestionAnswer): void {
     const p = this.pending.get(qid);
     if (!p) return;
