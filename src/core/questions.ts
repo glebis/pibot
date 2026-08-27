@@ -15,6 +15,8 @@ export interface QuestionAnswer {
   index: number; // -1 for free text
   via: "button" | "text" | "poll";
   timedOut?: boolean;
+  /** a newer question replaced this one */
+  replaced?: boolean;
 }
 
 interface PendingQuestion {
@@ -47,8 +49,9 @@ export class QuestionBus {
 
   async ask(agentId: string, chat: ChatRef, spec: QuestionSpec): Promise<QuestionAnswer | null> {
     const chatKey = `${chat.transport}:${chat.chatId}`;
-    // one pending question per chat
-    if ([...this.pending.values()].some((p) => p.chatKey === chatKey)) return null;
+    // one pending question per chat — a new question REPLACES the old one
+    const previous = [...this.pending.values()].find((p) => p.chatKey === chatKey);
+    if (previous) this.cancel(previous.qid, true);
 
     const qid = uid("q", 6);
     const timeoutMs = Math.min(Math.max(spec.timeoutMs ?? 600e3, 5e3), 23 * 3600e3);
@@ -156,5 +159,14 @@ export class QuestionBus {
     clearTimeout(p.timer);
     this.pending.delete(qid);
     p.resolve(answer);
+  }
+
+  /** Drop a pending question (replaced/failed delivery); resolver gets timedOut */
+  private cancel(qid: string, replaced = false): void {
+    const p = this.pending.get(qid);
+    if (!p) return;
+    clearTimeout(p.timer);
+    this.pending.delete(qid);
+    p.resolve({ choice: "", index: -1, via: "button", timedOut: true, replaced });
   }
 }

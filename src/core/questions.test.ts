@@ -40,16 +40,15 @@ describe("QuestionBus buttons", () => {
     expect(answer).toEqual({ choice: "own-account", index: 2, via: "button" });
   });
 
-  it("returns null when a question is already pending for the chat", async () => {
+  it("a new question replaces the pending one (latest wins)", async () => {
     const { bus } = makeBus();
-    const first = bus.ask("a1", CHAT, spec());
-    const second = await bus.ask("a1", CHAT, spec());
-    expect(second).toBeNull();
-    bus.resolveCallback("q:x:0"); // unknown qid ignored
+    const firstPromise = bus.ask("a1", CHAT, spec({ text: "old" }));
+    const secondPromise = bus.ask("a1", CHAT, spec({ text: "new" }));
+    const a1 = await firstPromise;
+    expect(a1?.replaced).toBe(true); // old one superseded
     expect(bus.pendingCount()).toBe(1);
-    // cleanup
-    bus.answerViaText("mock:42", "client");
-    await first;
+    bus.answerViaText("mock:42", "client"); // answers the NEW question
+    expect((await secondPromise)?.choice).toBe("client");
   });
 
   it("numeric text answers map to options", async () => {
