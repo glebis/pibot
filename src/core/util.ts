@@ -198,10 +198,7 @@ function nextWeekday(now: number, weekday: number, hh: number, mm: number): numb
 /** Next due time for a repeating schedule, from a fire time */
 export function nextRepeatAt(repeat: ScheduleRepeat, from: number): number | null {
   if (repeat.everyMs) return from + repeat.everyMs;
-  if (repeat.dailyAt) {
-    const [hh, mm] = repeat.dailyAt.split(":").map(Number);
-    return nextAt(from, hh, mm);
-  }
+  // weekday + dailyAt together = weekly on those days at that time — checked before plain daily
   if (repeat.weekdays?.length) {
     const [hh, mm] = (repeat.dailyAt ?? "09:00").split(":").map(Number);
     let best = Infinity;
@@ -210,6 +207,10 @@ export function nextRepeatAt(repeat: ScheduleRepeat, from: number): number | nul
       if (t < best) best = t;
     }
     return best === Infinity ? null : best;
+  }
+  if (repeat.dailyAt) {
+    const [hh, mm] = repeat.dailyAt.split(":").map(Number);
+    return nextAt(from, hh, mm);
   }
   return null;
 }

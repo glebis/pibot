@@ -432,8 +432,8 @@ export class PiBot implements HeartbeatHost {
     await this.promptAgent(t, ck.slice(idx + 1), agentId, `[heartbeat] ${instruction}`);
   }
 
-  private primaryChat(job: Schedule): string | null {
-    if (job.chat.transport !== "internal") return `${job.chat.transport}:${job.chat.chatId}`;
+  private primaryChat(job: Pick<Schedule, "agentId" | "chat">): string | null {
+    if (job.chat && job.chat.transport !== "internal") return `${job.chat.transport}:${job.chat.chatId}`;
     const cks = this.agentChats.get(job.agentId);
     return cks && cks.size ? [...cks][0] : null;
   }

@@ -207,7 +207,7 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
             }
             until = parsed.dueAt;
           }
-          const st = scheduler.snooze(agentId, until, params.reason);
+          const st = scheduler.snooze(agentId, Date.now() + until, params.reason);
           return {
             content: [{ type: "text", text: `Snoozed everything until ${fmtWhen(st.until)}${params.reason ? ` (${params.reason})` : ""}. Important items still come through.` }],
             details: {},

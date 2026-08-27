@@ -170,38 +170,47 @@ export class HeartbeatEngine {
   }
 
   private buildDigest(agent: LoadedAgent): string {
-    const parts: string[] = [];
-
-    // persona digest
-    const personaFile = path.join(agent.dir, "AGENTS.md");
-    if (fs.existsSync(personaFile)) {
-      parts.push(`# Who you are\n${truncate(fs.readFileSync(personaFile, "utf8").trim(), 800)}`);
-    }
-
-    // memory digest
-    const memoryFile = path.join(agent.dir, "memory", "MEMORY.md");
-    if (fs.existsSync(memoryFile)) {
-      parts.push(`# Memory digest\n${truncate(fs.readFileSync(memoryFile, "utf8").trim(), 1200)}`);
-    }
-
-    // pending schedule
-    const jobs = this.deps.scheduler.list(agent.id).filter((j) => !j.internal).slice(0, 6);
-    if (jobs.length) {
-      parts.push(
-        `# Pending scheduled items\n${jobs.map((j) => `- "${j.title}" — ${fmtWhen(j.dueAt)}${j.wake === "important" ? " (!important)" : ""}`).join("\n")}`
-      );
-    } else {
-      parts.push("# Pending scheduled items\n(none)");
-    }
-
-    // recent events
-    const events = this.deps.events.tail(agent.id, 8);
-    if (events.length) {
-      parts.push(
-        `# Recent activity (avoid repeating any of this)\n${events.map((e) => `- [${e.type}] ${e.summary}`).join("\n")}`
-      );
-    }
-
-    return parts.join("\n\n");
+    return buildHeartbeatDigest(agent, this.deps.scheduler, this.deps.events);
   }
+}
+
+/** Pure digest builder — exported for tests and reuse (evolution plugin reuses it) */
+export function buildHeartbeatDigest(
+  agent: LoadedAgent,
+  scheduler: Pick<Scheduler, "list">,
+  events: Pick<EventLog, "tail">
+): string {
+  const parts: string[] = [];
+
+  // persona digest
+  const personaFile = path.join(agent.dir, "AGENTS.md");
+  if (fs.existsSync(personaFile)) {
+    parts.push(`# Who you are\n${truncate(fs.readFileSync(personaFile, "utf8").trim(), 800)}`);
+  }
+
+  // memory digest
+  const memoryFile = path.join(agent.dir, "memory", "MEMORY.md");
+  if (fs.existsSync(memoryFile)) {
+    parts.push(`# Memory digest\n${truncate(fs.readFileSync(memoryFile, "utf8").trim(), 1200)}`);
+  }
+
+  // pending schedule
+  const jobs = scheduler.list(agent.id).filter((j) => !j.internal).slice(0, 6);
+  if (jobs.length) {
+    parts.push(
+      `# Pending scheduled items\n${jobs.map((j) => `- "${j.title}" — ${fmtWhen(j.dueAt)}${j.wake === "important" ? " (!important)" : ""}`).join("\n")}`
+    );
+  } else {
+    parts.push("# Pending scheduled items\n(none)");
+  }
+
+  // recent events
+  const evts = events.tail(agent.id, 8);
+  if (evts.length) {
+    parts.push(
+      `# Recent activity (avoid repeating any of this)\n${evts.map((e) => `- [${e.type}] ${e.summary}`).join("\n")}`
+    );
+  }
+
+  return parts.join("\n\n");
 }
