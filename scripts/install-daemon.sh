@@ -47,11 +47,11 @@ cat > "$PLIST" <<PLIST
   <key>StandardErrorPath</key><string>$ROOT/data/daemon.log</string>
 </dict>
 </plist>
-EOF
+PLIST
 
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || launchctl load "$PLIST"
+launchctl unload "$PLIST" 2>/dev/null || true
+launchctl load -w "$PLIST"
 sleep 2
-launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -E "state|pid" | head -2
+launchctl list | grep "$LABEL" || true
 echo "pibot daemon installed → logs: $ROOT/data/daemon.log"
 echo "dashboard: http://127.0.0.1:7860 · logs: tail -f $ROOT/data/daemon.log"
