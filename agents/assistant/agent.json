@@ -1,0 +1,11 @@
+{
+  "name": "assistant",
+  "description": "Your default everyday companion",
+  "thinking": "off",
+  "heartbeat": {
+    "enabled": true,
+    "interval": "45m",
+    "model": "same",
+    "quietHours": { "from": "23:00", "to": "08:00" }
+  }
+}
