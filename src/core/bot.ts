@@ -206,7 +206,8 @@ export class PiBot implements HeartbeatHost {
 
     t.setTyping?.(chatId, true);
     try {
-      await session.prompt(envelope(text));
+      // followUp: concurrent messages queue behind the running turn instead of erroring
+      await session.prompt(envelope(text), { streamingBehavior: "followUp" });
     } catch (e) {
       this.deps.events.log(agentId, "system", `prompt error: ${errorMessage(e)}`);
       await t.notifyError(chatId, errorMessage(e));
@@ -240,7 +241,8 @@ export class PiBot implements HeartbeatHost {
 
   async handleAction(t: Transport, chatId: string, action: string): Promise<void> {
     if (action.startsWith("q:")) {
-      this.questions.resolveCallback(action); // stale/unknown question ids are ignored
+      const resolved = this.questions.resolveCallback(action); // stale/unknown ids ignored
+      this.deps.events.log("system", "system", `question tap: ${action} → ${resolved ? "resolved" : "stale (ignored)"}`);
       return;
     }
     if (!action.startsWith("scd:")) return;
