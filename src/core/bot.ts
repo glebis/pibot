@@ -276,6 +276,7 @@ export class PiBot implements HeartbeatHost {
         return;
 
       case "agents": {
+        await this.deps.agents.discover(); // pick up agents added on disk since boot
         const lines = this.deps.agents.list().map((a) => {
           const cur = a.id === agentId ? " ← here" : "";
           return `• **${a.id}** — ${a.manifest.description ?? "agent"}${cur}`;
@@ -311,6 +312,7 @@ export class PiBot implements HeartbeatHost {
         }
         const agent = this.deps.agents.getAgent(m[1].toLowerCase())!;
         this.ensureHeartbeatJob(agent);
+        this.ensureEvolutionJob(agent);
         this.rememberChat(agent.id, ck);
         await reply(
           `Born: **${agent.id}** 🎉\nPersona: ${agent.dir}/AGENTS.md · plugins: agent.json · memory: memory/\nYou're talking to it now. It wakes every ${agent.manifest.heartbeat?.interval ?? "45m"}.`
