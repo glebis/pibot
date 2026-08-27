@@ -22,6 +22,7 @@ export interface TelegramControl {
   subBotFor(agentId: string): { username?: string } | undefined;
   attachSubBot(agentId: string, token: string): Promise<{ ok: boolean; botName?: string; error?: string }>;
   detachSubBot(agentId: string): Promise<boolean>;
+  requestSubBotCreation(agentId: string): Promise<void>;
 }
 
 export interface WebDeps {
@@ -336,8 +337,10 @@ ${manifestForm(agent)}
     : `<span class="pill">⚪ shared bot only</span>`}
   ${deps.telegram?.managerMode()
     ? `<p class="muted">Manager mode is ON — tap the button below in Telegram, or use the link here.</p>
-       <a class="btn ghost" href="https://t.me/newbot/${esc(deps.telegram.managerUsername() ?? "pimother_bot")}/${esc(agent.id.replace(/-/g, ""))}bot?name=${encodeURIComponent(agent.id)}" target="_blank">Create @${esc(agent.id.replace(/-/g, ""))}bot via Telegram →</a>
-       <p class="muted">After you confirm in Telegram, pibot fetches the token and wires it automatically.</p>`
+       <form method="post" action="/agents/${esc(agent.id)}/subbot/request" class="inline">
+         <button class="ghost" type="submit">Send creation link to my chats →</button>
+       </form>
+       <p class="muted">Tap the link in Telegram (or the button above after it arrives) and confirm — pibot fetches the token, wires the bot, and restricts it to you.</p>`
     : `<p class="muted">Manager mode is off — create a bot with @BotFather (/newbot) and paste its token here to give ${esc(agent.id)} its own identity.</p>`}
 </div>
 <form method="post" action="/agents/${esc(agent.id)}/subbot" class="card">
@@ -474,6 +477,14 @@ ${manifestForm(agent)}
     if (!token) return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("No token given")}`);
     const r = await deps.telegram.attachSubBot(agent.id, token);
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent(r.ok ? `🟢 Sub-bot live as ${r.botName}` : `⛔ ${r.error}`)}`);
+  });
+
+  // manager-mode flow: register a pending creation, then send the deep link into the agent's chats
+  app.post("/agents/:id/subbot/request", async (c) => {
+    const agent = agentOr404(c.req.param("id"));
+    if (!agent || !deps.telegram) return c.notFound();
+    await deps.telegram.requestSubBotCreation(agent.id);
+    return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Sub-bot creation requested — tap the link in Telegram and confirm")}`);
   });
 
   app.post("/agents/:id/subbot/detach", async (c) => {

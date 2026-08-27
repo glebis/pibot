@@ -68,21 +68,22 @@ export class PiBot implements HeartbeatHost {
 
   /** Manager-mode: a user confirmed a managed sub-bot creation → fetch its token and wire it */
   private async handleManagedBot(t: Transport, info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }): Promise<void> {
-    const tg = t as import("../transports/telegram.js").TelegramTransport;
-    const chatKey = `telegram:${info.creatorId}`;
-    const agentId = this.pendingSubBots.get(chatKey);
     const botName = info.botUsername ?? info.firstName ?? `bot_${info.botId}`;
+    const agentId = this.pendingSubBots.get(botName.replace(/bot$/, "")) ?? this.pendingSubBots.get(botName);
     if (!agentId) {
       console.log(`[telegram] managed bot ${botName} created by ${info.creatorId} — no pending request, ignoring`);
       return;
     }
     try {
-      const token = await (t as import("../transports/telegram.js").TelegramTransport).getManagedBotToken(info.botId);
+      const tg = t as import("../transports/telegram.js").TelegramTransport;
+      const token = await tg.getManagedBotToken(info.botId);
       const r = await this.attachSubBot(agentId, token);
-      this.pendingSubBots.delete(chatKey);
+      this.pendingSubBots.delete(agentId);
+      // managed sub-bots are private: only the manager's owner can use them
+      await tg.setManagedBotAccessSettings(info.botId, true).catch((e) => console.error("[telegram] access restriction failed:", errorMessage(e)));
       if (r.ok) {
-        this.deps.events.log(agentId, "system", `sub-bot created: ${r.botName}`);
-        await this.deliverToAgent(agentId, `🟢 My own Telegram bot is live: **${r.botName}** — its own chat, its own identity.`);
+        this.deps.events.log(agentId, "system", `sub-bot created: ${r.botName} (restricted to owner)`);
+        await this.deliverToAgent(agentId, `🟢 My own Telegram bot is live: **${r.botName}** — its own chat, its own identity, restricted to you.`);
       } else {
         this.deps.events.log(agentId, "system", `sub-bot wiring failed: ${r.error}`);
       }
@@ -704,7 +705,7 @@ export class PiBot implements HeartbeatHost {
         text: `Give **${agent.id}** its own Telegram identity? Tap — Telegram will create the bot and I'll wire it automatically.`,
         card: { text: "", buttons: [{ label: `Create @${suggestedUsername} bot`, action: `url:${this.subBotDeepLink(agent.id, suggestedUsername, agent.id)}`, url: this.subBotDeepLink(agent.id, suggestedUsername, agent.id) }] },
       });
-      this.pendingSubBots.set(ck, agent.id);
+      this.pendingSubBots.set(agent.id, agent.id);
       return;
     }
 
@@ -726,6 +727,30 @@ export class PiBot implements HeartbeatHost {
 
   private pendingSubBotFor(ck: string): string | undefined {
     return this.pendingSubBots.get(ck);
+  }
+
+  /** Manager-mode: register a pending sub-bot creation + push the deep link into the agent's chats */
+  async requestSubBotCreation(agentId: string): Promise<void> {
+    const agent = this.deps.agents.getAgent(agentId);
+    if (!agent) throw new Error(`unknown agent "${agentId}"`);
+    if (!this.managerMode()) throw new Error("manager mode is off — enable bot management mode for @pimother_bot in BotFather's mini app");
+    const suggestedUsername = `${agentId.replace(/-/g, "")}bot`;
+    this.pendingSubBots.set(agentId, agentId);
+    const link = this.subBotDeepLink(agentId, suggestedUsername, agentId);
+    await this.deliverToAgent(agentId, [
+      `Tap to give **${agentId}** its own Telegram identity:`,
+      ``,
+      `Telegram pre-fills @${suggestedUsername} — confirm and I'll fetch the token and wire it automatically. The bot will be restricted to you.`,
+    ].join("\n"));
+    // deep-link URL button into the agent's registered chats
+    for (const ck of this.agentChats.get(agentId) ?? new Set<string>()) {
+      const idx = ck.lastIndexOf(":");
+      const t = this.transports.get(ck.slice(0, idx));
+      if (t) void t.push(ck.slice(idx + 1), {
+        text: `🧬 Create **@${suggestedUsername}** for ${agentId}:`,
+        card: { text: "", buttons: [{ label: `Create @${suggestedUsername}`, action: `url:${this.subBotDeepLink(agentId, suggestedUsername, agent.id)}`, url: this.subBotDeepLink(agentId, suggestedUsername, agent.id) }] },
+      }).catch(() => {});
+    }
   }
 
   private ensureEvolutionJob(agent: LoadedAgent): void {
