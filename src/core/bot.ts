@@ -269,8 +269,10 @@ export class PiBot implements HeartbeatHost {
     const reply = (s: string) => t.push(chatId, { text: s });
 
     switch (cmd) {
+      case "start":
       case "help":
         await reply(HELP);
+        return;
         return;
 
       case "agents": {
