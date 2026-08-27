@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   });
 
   const modelRuntime = await ModelRuntime.create();
-  const agents = new AgentManager(config.agentsDir, modelRuntime);
+  const agents = new AgentManager(config.agentsDir, modelRuntime, config.vaultDir);
   const events = new EventLog(config.agentsDir);
 
   // bot is created after its collaborators; they reach it through this ref
@@ -55,6 +55,7 @@ async function main(): Promise<void> {
     scheduler,
     modelRuntime,
     events,
+    vaultDir: config.vaultDir,
     host: {
       deliverToAgent: (agentId, text) => bot.deliverToAgent(agentId, text),
       escalateToAgent: (agentId, instruction) => bot.escalateToAgent(agentId, instruction),

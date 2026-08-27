@@ -84,6 +84,7 @@ export class HeartbeatEngine {
       scheduler: Scheduler;
       modelRuntime: ModelRuntime;
       events: EventLog;
+      vaultDir: string;
       host: HeartbeatHost;
     }
   ) {}
@@ -213,7 +214,7 @@ export class HeartbeatEngine {
   }
 
   private buildDigest(agent: LoadedAgent): string {
-    return buildHeartbeatDigest(agent, this.deps.scheduler, this.deps.events);
+    return buildHeartbeatDigest(agent, this.deps.scheduler, this.deps.events, this.deps.vaultDir);
   }
 }
 
@@ -221,7 +222,8 @@ export class HeartbeatEngine {
 export function buildHeartbeatDigest(
   agent: LoadedAgent,
   scheduler: Pick<Scheduler, "list">,
-  events: Pick<EventLog, "tail">
+  events: Pick<EventLog, "tail">,
+  vaultDir?: string
 ): string {
   const parts: string[] = [];
 
