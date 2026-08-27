@@ -58,6 +58,7 @@ export function questionPlugin(deps: QuestionPluginDeps): InlineExtension {
           } catch (e) {
             err = String(e);
           }
+          const superseded = res?.replaced === true;
           const answered: QuestionAnswer | null = res !== null && !res.timedOut ? res : null;
           const details: AskResult = answered
             ? { choice: answered.choice, index: answered.index, via: answered.via, timedOut: false }
@@ -65,11 +66,13 @@ export function questionPlugin(deps: QuestionPluginDeps): InlineExtension {
           const text =
             err !== null
               ? `ERROR asking: ${err}`
-              : !answered
-                ? `No answer within the timeout — proceed with your best judgement; don't block on it.`
-                : answered.index >= 0
+              : answered
+                ? answered.index >= 0
                   ? `User chose: "${answered.choice}"`
-                  : `User replied (free text): "${answered.choice}"`;
+                  : `User replied (free text): "${answered.choice}"`
+                : res?.replaced
+                  ? `Superseded by a newer question — skip it.`
+                  : `No answer within the timeout — proceed with your best judgement; don't block on it.`;
           return { content: [{ type: "text", text }], details };
         },
       });

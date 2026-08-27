@@ -73,7 +73,13 @@ export class TelegramTransport implements Transport {
       } catch (e) {
         feedback = `⚠︎ ${e instanceof Error ? e.message : String(e)}`;
       }
-      await ctx.answerCallbackQuery({ text: feedback ? truncate(String(feedback), 190) : undefined }).catch(() => {});
+      await ctx
+        .answerCallbackQuery({ text: feedback ? truncate(String(feedback), 190) : undefined })
+        .then((ok) => {
+          if (!feedback) return;
+          console.log(`[telegram] cb answered (${feedback.slice(0, 40)}) ok=${ok}`);
+        })
+        .catch((e) => console.error("[telegram] answerCallbackQuery failed:", e.message ?? e));
     });
 
     this.bot.on("poll_answer", (ctx) => {
