@@ -69,9 +69,13 @@ export class PiBot implements HeartbeatHost {
   /** Manager-mode: a user confirmed a managed sub-bot creation → fetch its token and wire it */
   private async handleManagedBot(t: Transport, info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }): Promise<void> {
     const botName = info.botUsername ?? info.firstName ?? `bot_${info.botId}`;
-    const agentId = this.pendingSubBots.get(botName.replace(/bot$/, "")) ?? this.pendingSubBots.get(botName);
+    console.log(`[telegram] managed bot update: ${botName} (id ${info.botId}) by ${info.creatorId}`);
+    const agentId =
+      this.pendingSubBots.get(botName) ??
+      this.pendingSubBots.get(botName.replace(/_?bot$/, "")) ??
+      [...this.pendingSubBots.keys()].find((id) => botName.toLowerCase().startsWith(id.replace(/-/g, "").toLowerCase()));
     if (!agentId) {
-      console.log(`[telegram] managed bot ${botName} created by ${info.creatorId} — no pending request, ignoring`);
+      console.log(`[telegram] managed bot ${botName} — no pending request, ignoring`);
       return;
     }
     try {
