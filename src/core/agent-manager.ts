@@ -211,7 +211,7 @@ function systemPromptFor(agent: LoadedAgent): string {
     `- Things worth remembering: memory_save (or write files directly into memory/ — that directory is yours).`,
     `- The user may say "snooze" — use the snooze tool. Important items still fire through snooze.`,
     `- You have a heartbeat that wakes you periodically${hb?.enabled ? ` (every ${hb.interval})` : ""}. Between chats it is your chance to be proactive; the heartbeat decides whether anything is worth saying.`,
-    `- Stay inside your own directory when reading/writing files.`,
+    `- You may READ files your persona points you to (e.g. notes in your owner's vault). Write only inside your own directory.`,
     ``,
     `# Schedule tool semantics`,
     `- "when" strings: "in 20m", "tomorrow 9am", "daily at 08:00", "every 2h", "friday 18:00", "every day at 9am".`,
