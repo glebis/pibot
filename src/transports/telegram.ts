@@ -4,6 +4,20 @@ import { truncate } from "../core/util.js";
 
 const TG_LIMIT = 4000;
 
+const BOT_COMMANDS = [
+  { command: "help", description: "What pibot can do" },
+  { command: "status", description: "Rhythm, snooze, next item" },
+  { command: "agents", description: "List your agents" },
+  { command: "agent", description: "Switch agent: /agent coach" },
+  { command: "newagent", description: "Create an agent: /newagent coach <persona>" },
+  { command: "schedules", description: "Pending scheduled items" },
+  { command: "snooze", description: "Pause the rhythm: /snooze 2h" },
+  { command: "wake", description: "Resume the rhythm" },
+  { command: "skills", description: "Agent's skills" },
+  { command: "evolve", description: "Run a skill-evolution cycle" },
+  { command: "promises", description: "Open promises" },
+];
+
 function toTelegramHtml(text: string): string {
   // Minimal, safe markdown→HTML: **bold**, *italic*, `code`. Everything else escaped.
   const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -32,6 +46,7 @@ export class TelegramTransport implements Transport {
   readonly name = "telegram";
   private bot: Bot;
   private allowed: Set<string>;
+  private me?: { id: number; username?: string; first_name: string };
   private onMessageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
 
@@ -67,8 +82,24 @@ export class TelegramTransport implements Transport {
     this.onActionCb = cb;
   }
 
+  /** Validate the token against Telegram and cache the bot identity */
+  async verify(): Promise<string> {
+    const me = await this.bot.api.getMe();
+    this.me = me;
+    return me.username ? `@${me.username}` : me.first_name;
+  }
+
+  botUsername(): string | undefined {
+    return this.me?.username;
+  }
+
   async start(): Promise<void> {
     await this.bot.init();
+    this.me = this.bot.botInfo;
+    void this.bot.api
+      .setMyCommands(BOT_COMMANDS)
+      .then(() => console.log("[telegram] command menu registered"))
+      .catch((e) => console.error("[telegram] setMyCommands failed:", e.message));
     void this.bot.start({
       onStart: (me) => console.log(`[telegram] polling as @${me.username} · allowed chats: ${this.allowed.size ? [...this.allowed].join(",") : "any"}`),
     });

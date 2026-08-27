@@ -7,7 +7,15 @@ import type { EventLog } from "./core/events.js";
 import type { EvolutionEngine } from "./core/evolution.js";
 import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
+import { loadSettings, saveSettings } from "./config.js";
 import { errorMessage, fmtWhen, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
+
+export interface TelegramControl {
+  hasTransport(name: string): boolean;
+  telegramUsername(): string | undefined;
+  enableTelegram(token: string, allowedChats: string[]): Promise<{ ok: boolean; botName?: string; error?: string }>;
+  disableTelegram(): Promise<boolean>;
+}
 
 export interface WebDeps {
   agents: AgentManager;
@@ -15,6 +23,7 @@ export interface WebDeps {
   events: EventLog;
   evolution: EvolutionEngine;
   dataDir: string;
+  telegram?: TelegramControl;
 }
 
 // ─── rendering helpers ──────────────────────────────────────────────────────
@@ -141,6 +150,13 @@ export function createWebApp(deps: WebDeps): Hono {
       })
       .join("\n");
     return c.html(page("overview", `${cards || '<p class="muted">No agents yet.</p>'}
+<h2>Telegram</h2>
+<div class="card">
+  ${deps.telegram?.hasTransport("telegram")
+    ? `<span class="pill on">🟢 connected${deps.telegram.telegramUsername() ? ` as <strong>@${esc(deps.telegram.telegramUsername())}</strong>` : ""}</span>`
+    : `<span class="pill">⚪ not connected</span>`}
+  <a href="/telegram">Configure →</a>
+</div>
 <h2>New agent</h2>
 <form method="post" action="/agents" class="card">
   <div class="row">
@@ -368,6 +384,67 @@ ${manifestForm(agent)}
   app.post("/agents/:id/staged/:name/reject", (c) => {
     deps.evolution.reject(c.req.param("id"), c.req.param("name"));
     return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Rejected 🗑")}`);
+  });
+
+  // ── telegram settings ──
+  app.get("/telegram", (c) => {
+    const enabled = deps.telegram?.hasTransport("telegram") ?? false;
+    const username = deps.telegram?.telegramUsername();
+    const settings = loadSettings(deps.dataDir);
+    const configured = Boolean(settings.telegram?.token);
+    const body = `<h2>Telegram bot</h2>
+<div class="card">
+  ${enabled
+    ? `<span class="pill on">🟢 connected${username ? ` as <strong>@${esc(username)}</strong>` : ""}</span>`
+    : configured
+      ? `<span class="pill">⚪ configured but not running</span>`
+      : `<span class="pill">⚪ not connected</span>`}
+  <p class="muted">Any chat that can see the bot can talk to it (allowlist below to restrict). Agents are switched per chat with /agent.</p>
+</div>
+<form method="post" action="/telegram" class="card">
+  <label>Bot token <span class="muted">(from @BotFather — /newbot)</span></label>
+  <input type="password" name="token" placeholder="${configured ? "•••••••• (configured — leave empty to keep)" : "123456:ABC-your-token"}" autocomplete="off">
+  <label>Allowed chat IDs (comma-separated, empty = anyone with access to the bot)</label>
+  <input type="text" name="allowedChats" value="${esc((settings.telegram?.allowedChats ?? []).join(","))}" placeholder="123456789, 987654321">
+  <button type="submit">${enabled ? "Test & reconnect" : "Test & connect"}</button>
+</form>
+${enabled
+  ? `<form method="post" action="/telegram/disable"><button type="submit" class="danger">Disconnect bot</button></form>`
+  : ""}`;
+    return c.html(page("telegram", body, c.req.query("msg")));
+  });
+
+  app.post("/telegram", async (c) => {
+    if (!deps.telegram) {
+      return c.redirect(`/telegram?msg=${encodeURIComponent("Telegram control not wired")}`);
+    }
+    const b = await c.req.parseBody();
+    const token = String(b.token ?? "").trim();
+    const allowedChats = String(b.allowedChats ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const settings = loadSettings(deps.dataDir);
+    const effectiveToken = token || settings.telegram?.token || "";
+    if (!effectiveToken) {
+      return c.redirect(`/telegram?msg=${encodeURIComponent("No token provided — create a bot with @BotFather (/newbot) and paste the token")}`);
+    }
+    // hot-swap: disable current instance, validate, enable with new config
+    await deps.telegram.disableTelegram();
+    const r = await deps.telegram.enableTelegram(effectiveToken, allowedChats);
+    if (!r.ok) {
+      saveSettings(deps.dataDir, { telegram: undefined });
+      return c.redirect(`/telegram?msg=${encodeURIComponent(`⛔ ${r.error}`)}`);
+    }
+    saveSettings(deps.dataDir, { telegram: { token: effectiveToken, allowedChats } });
+    deps.events.log("system", "system", `telegram connected as ${r.botName}`);
+    return c.redirect(`/telegram?msg=${encodeURIComponent(`🟢 Connected as ${r.botName} — say hi in Telegram!`)}`);
+  });
+
+  app.post("/telegram/disable", async (c) => {
+    if (deps.telegram) await deps.telegram.disableTelegram();
+    saveSettings(deps.dataDir, { telegram: undefined });
+    return c.redirect(`/telegram?msg=${encodeURIComponent("Bot disconnected")}`);
   });
 
   return app;

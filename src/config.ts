@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { readJson, writeJsonAtomic } from "./core/util.js";
 
 export interface Config {
   transport: "telegram" | "cli";
@@ -9,6 +10,25 @@ export interface Config {
   heartbeatModel?: string;
   telegramToken?: string;
   allowedChats: string[];
+}
+
+// ─── runtime-editable settings (web-configurable, survives restarts) ───────
+
+export interface Settings {
+  telegram?: {
+    token?: string;
+    allowedChats?: string[];
+  };
+}
+
+export function loadSettings(dataDir: string): Settings {
+  return readJson<Settings>(path.join(dataDir, "settings.json"), {});
+}
+
+export function saveSettings(dataDir: string, patch: Settings): Settings {
+  const merged = { ...loadSettings(dataDir), ...patch };
+  writeJsonAtomic(path.join(dataDir, "settings.json"), merged);
+  return merged;
 }
 
 /** Minimal .env loader (no dependency) — existing env vars win. */

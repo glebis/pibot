@@ -7,7 +7,20 @@ import { AgentManager } from "./core/agent-manager.js";
 import { EventLog } from "./core/events.js";
 import { EvolutionEngine, type EvolutionIO } from "./core/evolution.js";
 import { Scheduler } from "./core/scheduler.js";
-import { createWebApp, type WebDeps } from "./web.js";
+import { loadSettings, saveSettings } from "./config.js";
+import { createWebApp, type TelegramControl, type WebDeps } from "./web.js";
+
+function fakeControl(over: Partial<TelegramControl> = {}): TelegramControl & { enableSpy: ReturnType<typeof vi.fn> } {
+  const enableSpy = vi.fn(async () => ({ ok: true, botName: "@test_bot" }));
+  return {
+    hasTransport: vi.fn(() => false),
+    telegramUsername: vi.fn(() => undefined),
+    enableTelegram: enableSpy,
+    disableTelegram: vi.fn(async () => true),
+    ...over,
+    enableSpy,
+  } as never;
+}
 
 function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "pibot-web-"));
@@ -191,5 +204,117 @@ describe("web dashboard", () => {
     const res = await app.request("/agents/assistant/staged/stage-me/promote", { method: "POST" });
     expect(res.headers.get("location")).toContain("Promoted");
     expect(fs.existsSync(path.join(dir, "assistant", "skills", "stage-me", "SKILL.md"))).toBe(true);
+  });
+});
+
+describe("telegram settings", () => {
+  it("loadSettings/saveSettings round-trip and merge", () => {
+    const dir = tmpDir();
+    expect(loadSettings(dir)).toEqual({});
+    saveSettings(dir, { telegram: { token: "t1", allowedChats: ["1"] } });
+    expect(loadSettings(dir).telegram?.token).toBe("t1");
+    // clearing: patch with undefined drops the key from the file
+    saveSettings(dir, { telegram: undefined });
+    expect(loadSettings(dir).telegram).toBeUndefined();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("web /telegram", () => {
+  let dir: string;
+  let app: ReturnType<typeof createWebApp>;
+  let control: ReturnType<typeof fakeControl>;
+
+  function boot(over: Partial<TelegramControl> = {}) {
+    dir = tmpDir();
+    const agents = new AgentManager(dir, { getModels: () => [] } as unknown as ModelRuntime);
+    agents.createAgent("assistant");
+    scheduler = new Scheduler(path.join(dir, "data"), () => {});
+    const events = new EventLog(dir);
+    const evolution = new EvolutionEngine({
+      agents,
+      modelRuntime: {} as ModelRuntime,
+      events,
+      dataDir: dir,
+      host: { announce: async () => {} },
+      io: { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() },
+    });
+    control = fakeControl(over);
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, telegram: control } satisfies WebDeps);
+  }
+
+  let scheduler: Scheduler;
+
+  beforeEach(() => {
+    scheduler = undefined as never;
+  });
+
+  afterEach(() => {
+    scheduler?.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("GET /telegram shows not-connected state and the token form", async () => {
+    boot();
+    const res = await app.request("/telegram");
+    const html = await res.text();
+    expect(html).toContain("not connected");
+    expect(html).toContain('name="token"');
+    expect(html).toContain("@BotFather");
+  });
+
+  it("overview links to telegram config and shows status", async () => {
+    boot({ hasTransport: vi.fn(() => true), telegramUsername: vi.fn(() => "test_bot") });
+    const res = await app.request("/");
+    const html = await res.text();
+    expect(html).toContain("connected as");
+    expect(html).toContain("@test_bot");
+    expect(html).toContain("/telegram");
+  });
+
+  it("POST connects with a valid token and persists settings", async () => {
+    boot();
+    const form = new FormData();
+    form.set("token", "123:valid");
+    form.set("allowedChats", "111, 222");
+    const res = await app.request("/telegram", { method: "POST", body: form });
+    expect(res.headers.get("location")).toContain("Connected");
+    expect(control.enableTelegram).toHaveBeenCalledWith("123:valid", ["111", "222"]);
+    expect(loadSettings(dir).telegram).toEqual({ token: "123:valid", allowedChats: ["111", "222"] });
+  });
+
+  it("POST with rejected token shows the error and does not persist", async () => {
+    boot({ enableTelegram: vi.fn(async () => ({ ok: false, error: "Token rejected by Telegram: 401" })) });
+    const form = new FormData();
+    form.set("token", "123:bad");
+    const res = await app.request("/telegram", { method: "POST", body: form });
+    expect(res.headers.get("location")).toContain("rejected");
+    expect(loadSettings(dir).telegram).toBeUndefined();
+  });
+
+  it("POST without a token and none configured asks for BotFather", async () => {
+    boot();
+    const form = new FormData();
+    const res = await app.request("/telegram", { method: "POST", body: form });
+    expect(res.headers.get("location")).toContain("BotFather");
+  });
+
+  it("keeps the stored token when re-submitting with an empty token field", async () => {
+    boot();
+    saveSettings(dir, { telegram: { token: "123:existing", allowedChats: [] } });
+    const form = new FormData();
+    form.set("allowedChats", "999");
+    const res = await app.request("/telegram", { method: "POST", body: form });
+    expect(res.headers.get("location")).toContain("Connected");
+    expect(control.enableTelegram).toHaveBeenCalledWith("123:existing", ["999"]);
+  });
+
+  it("disable clears settings", async () => {
+    boot({ hasTransport: vi.fn(() => true) });
+    saveSettings(dir, { telegram: { token: "123:x", allowedChats: [] } });
+    const res = await app.request("/telegram/disable", { method: "POST" });
+    expect(res.headers.get("location")).toContain("disconnected");
+    expect(control.disableTelegram).toHaveBeenCalled();
+    expect(loadSettings(dir).telegram).toBeUndefined();
   });
 });
