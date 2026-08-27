@@ -135,8 +135,11 @@ export class Scheduler {
 
   // ── snooze ────────────────────────────────────────────────────────────────
 
-  snooze(agentId: string, untilMs: number, reason?: string): SnoozeState {
-    const st = { until: Math.max(untilMs, Date.now() + 1000), reason };
+  snooze(agentId: string, untilMs: number, reason?: string, capAt?: number): SnoozeState {
+    let until = Math.max(untilMs, Date.now() + 1000);
+    // a snooze never survives past the agent's wake time (end of quiet hours)
+    if (capAt && until > capAt) until = capAt;
+    const st = { until, reason };
     this.snoozeByAgent.set(agentId, st);
     this.save();
     this.rearm(); // re-evaluate pending jobs against the new snooze window
@@ -150,6 +153,17 @@ export class Scheduler {
       this.rearm();
     }
     return had;
+  }
+
+  /** Morning wake: clear every agent's snooze; returns the agents resumed */
+  unsnoozeAll(): string[] {
+    const resumed = [...this.snoozeByAgent.keys()];
+    if (resumed.length) {
+      this.snoozeByAgent.clear();
+      this.save();
+      this.rearm();
+    }
+    return resumed;
   }
 
   snoozeState(agentId: string): SnoozeState | null {

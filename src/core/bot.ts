@@ -13,7 +13,7 @@ import type { Scheduler } from "./scheduler.js";
 import { loadSettings, saveSettings, type Config } from "../config.js";
 import type { Card, ChatRef, Schedule, Transport } from "./types.js";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
-import { errorMessage, fmtWhen, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
+import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 
 const HELP = [
   `**pibot** — your agents. Talk normally; ask to schedule anything ("remind me to stretch in 20m", "daily standup note at 9am").`,
@@ -496,15 +496,18 @@ export class PiBot implements HeartbeatHost {
           await reply(`Couldn't parse "${arg}". Try /snooze 2h or /snooze 30m.`);
           return;
         }
-        const st = this.deps.scheduler.snooze(agentId, Date.now() + ms, "manual");
+        const agent = this.deps.agents.getAgent(agentId);
+        const quietEnd = nextQuietEnd(agent?.manifest.heartbeat?.quietHours);
+        const st = this.deps.scheduler.snooze(agentId, Date.now() + ms, "manual", quietEnd ?? undefined);
         this.deps.events.log(agentId, "snooze", `until ${new Date(st.until).toLocaleTimeString()}`);
-        await reply(`😴 Everything paused until **${fmtWhen(st.until)}**. Important items still come through. /wake to end early.`);
+        const nightNote = quietEnd && st.until >= (quietEnd ?? 0) ? "" : quietEnd ? " (capped at your wake time)" : "";
+        await reply(`😴 Everything paused until **${fmtWhen(st.until)}**${nightNote}. Important items still come through. /wake to end early.`);
         return;
       }
 
       case "wake": {
-        const had = agentId ? this.deps.scheduler.unsnooze(agentId) : false;
-        await reply(had ? "☀️ Rhythm resumed." : "Nothing was snoozed.");
+        const resumed = this.deps.scheduler.unsnoozeAll();
+        await reply(resumed.length ? `☀️ Rhythm resumed for: ${resumed.map((a) => `**${a}**`).join(", ")}` : "Nothing was snoozed.");
         return;
       }
 

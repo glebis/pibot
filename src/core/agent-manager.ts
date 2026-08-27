@@ -129,7 +129,7 @@ export class AgentManager {
       additionalSkillPaths: listSkillDirs(path.join(agent.dir, "skills")).map((s) => path.dirname(s.filePath)),
       // shared plugins bound to this agent + chat
         extensionFactories: [
-          schedulerPlugin({ scheduler, agentId, chat }),
+          schedulerPlugin({ scheduler, agentId, chat, getQuietHours: () => agent.manifest.heartbeat?.quietHours }),
           memoryPlugin({ agentDir: agent.dir }),
           calendarPlugin(),
           gmailPlugin(),
