@@ -12,7 +12,7 @@
   },
   "thinking": "off",
   "evolution": {
-    "enabled": false,
+    "enabled": true,
     "interval": "6h",
     "model": "same"
   }

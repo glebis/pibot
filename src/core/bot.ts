@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { listSkillDirs } from "./agent-manager.js";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { TelegramTransport } from "../transports/telegram.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
@@ -75,6 +76,47 @@ export class PiBot implements HeartbeatHost {
         /* ignore */
       }
     }
+  }
+
+  // ── live transport control (used by web dashboard) ───────────────────────────
+
+  hasTransport(name: string): boolean {
+    return this.transports.has(name);
+  }
+
+  telegramUsername(): string | undefined {
+    const t = this.transports.get("telegram");
+    return t instanceof TelegramTransport ? t.botUsername() : undefined;
+  }
+
+  /** Validate a token against Telegram, then enable the transport live. */
+  async enableTelegram(token: string, allowedChats: string[]): Promise<{ ok: boolean; botName?: string; error?: string }> {
+    if (this.transports.has("telegram")) {
+      return { ok: false, error: "Telegram is already enabled — disable it first." };
+    }
+    const t = new TelegramTransport(token, allowedChats);
+    let botName: string;
+    try {
+      botName = await t.verify();
+    } catch (e) {
+      return { ok: false, error: `Token rejected by Telegram: ${errorMessage(e)}` };
+    }
+    this.addTransport(t);
+    try {
+      await t.start();
+    } catch (e) {
+      this.transports.delete("telegram");
+      return { ok: false, error: `Started but polling failed: ${errorMessage(e)}` };
+    }
+    return { ok: true, botName };
+  }
+
+  async disableTelegram(): Promise<boolean> {
+    const t = this.transports.get("telegram");
+    if (!t) return false;
+    await t.stop().catch(() => {});
+    this.transports.delete("telegram");
+    return true;
   }
 
   // ── chat plumbing ─────────────────────────────────────────────────────────

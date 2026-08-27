@@ -1,6 +1,6 @@
 import { serve } from "@hono/node-server";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { loadConfig } from "./config.js";
+import { loadConfig, loadSettings } from "./config.js";
 import { AgentManager } from "./core/agent-manager.js";
 import { PiBot } from "./core/bot.js";
 import { EventLog } from "./core/events.js";
@@ -69,10 +69,19 @@ async function main(): Promise<void> {
   // web dashboard (config CRUD) — always on unless disabled
   const webPort = parseInt(process.env.PIBOT_WEB_PORT || "7860", 10);
   if (process.env.PIBOT_WEB !== "0") {
-    const webApp = createWebApp({ agents, scheduler, events, evolution, dataDir: config.dataDir });
+    const webApp = createWebApp({ agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot });
     const server = serve({ fetch: webApp.fetch, port: webPort, hostname: "127.0.0.1" });
     console.log(`[pibot] dashboard → http://127.0.0.1:${webPort}`);
     server.addListener("error", (e) => console.error("[web]", e.message));
+  }
+
+  // telegram configured via web (settings.json) survives restarts
+  if (!bot.hasTransport("telegram")) {
+    const settings = loadSettings(config.dataDir);
+    if (settings.telegram?.token) {
+      const r = await bot.enableTelegram(settings.telegram.token, settings.telegram.allowedChats ?? []);
+      console.log(r.ok ? `[pibot] telegram enabled (web config) as ${r.botName}` : `[pibot] telegram (web config) failed: ${r.error}`);
+    }
   }
 
   const shutdown = () => {
