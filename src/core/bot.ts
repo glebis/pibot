@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { listSkillDirs } from "./agent-manager.js";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
+import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
 import type { Scheduler } from "./scheduler.js";
@@ -33,6 +35,7 @@ export class PiBot implements HeartbeatHost {
       heartbeat: HeartbeatEngine;
       events: EventLog;
       transports: Transport[];
+      evolution?: EvolutionEngine;
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
@@ -51,7 +54,10 @@ export class PiBot implements HeartbeatHost {
       this.deps.agents.createAgent("assistant");
       console.log("[pibot] scaffolded default agent 'assistant'");
     }
-    for (const agent of this.deps.agents.list()) this.ensureHeartbeatJob(agent);
+    for (const agent of this.deps.agents.list()) {
+      this.ensureHeartbeatJob(agent);
+      if (agent.manifest.evolution?.enabled) this.ensureEvolutionJob(agent);
+    }
 
     const state = readJson<{ chats?: Record<string, string>; agentChats?: Record<string, string[]> }>(this.statePath, {});
     for (const [ck, agentId] of Object.entries(state.chats ?? {})) this.chatAgent.set(ck, agentId);
@@ -287,6 +293,40 @@ export class PiBot implements HeartbeatHost {
         return;
       }
 
+      case "evolve": {
+        if (!this.deps.evolution) {
+          await reply("Evolution engine not wired.");
+          return;
+        }
+        if (!agentId) return void (await reply("No agent selected."));
+        const sub = arg.split(/\s+/)[0];
+        if (sub === "status") {
+          const staged = this.deps.evolution.staged(agentId);
+          await reply(staged.length ? `Staged: ${staged.map((s) => `**${s}**`).join(", ")}\nPromote: /evolve promote <name>` : "Nothing staged.");
+          return;
+        }
+        if (sub === "promote" || sub === "reject") {
+          const name = arg.split(/\s+/)[1] ?? "";
+          const done = sub === "promote" ? this.deps.evolution.promote(agentId, name) : this.deps.evolution.reject(agentId, name);
+          await reply(done ? `${sub === "promote" ? "Promoted" : "Rejected"} **${name}**.` : `Nothing staged named "${name}".`);
+          return;
+        }
+        const goal = arg.trim() || undefined;
+        await reply(`🧬 Running an evolution cycle${goal ? ` — goal: “${goal}”` : " (self-directed)"}. This runs cheap probes, takes a minute…`);
+        const report = await this.deps.evolution.evolve(agentId, goal, { force: true });
+        this.deps.events.log(agentId, "system", `evolution run: ${report.summary}`);
+        await reply(`${report.ok ? "🧬" : "⛔"} ${report.summary}${report.staged ? "\nReview: /evolve status → /evolve promote <name>" : ""}`);
+        return;
+      }
+
+      case "skills": {
+        if (!agentId) return void (await reply("No agent selected."));
+        const agent = this.deps.agents.getAgent(agentId);
+        const skills = agent ? listSkillDirs(path.join(agent.dir, "skills")) : [];
+        await reply(skills.length ? skills.map((s) => `• **${s.name}** — ${s.description}`).join("\n") : `No skills yet for **${agentId}**. /evolve can create some.`);
+        return;
+      }
+
       case "schedules": {
         if (!agentId) return void (await reply("No agent selected."));
         const jobs = this.deps.scheduler.list(agentId).filter((j) => !j.internal);
@@ -348,6 +388,27 @@ export class PiBot implements HeartbeatHost {
 
   // ── scheduler fire delivery ───────────────────────────────────────────────
 
+  private ensureEvolutionJob(agent: LoadedAgent): void {
+    const ev = agent.manifest.evolution;
+    if (!ev?.enabled) return;
+    const everyMs = parseDuration(ev.interval ?? "6h");
+    this.deps.scheduler.ensure({
+      id: `ev:${agent.id}`,
+      agentId: agent.id,
+      chat: { transport: "internal", chatId: "evolution" },
+      title: "evolution",
+      kind: "evolution",
+      dueAt: Date.now() + (everyMs ?? 6 * 3600e3),
+      repeat: { everyMs: everyMs ?? 6 * 3600e3 },
+      wake: "normal",
+      delivery: "direct",
+      status: "pending",
+      createdAt: Date.now(),
+      firedCount: 0,
+      internal: true,
+    });
+  }
+
   private ensureHeartbeatJob(agent: LoadedAgent): void {
     const hb = agent.manifest.heartbeat;
     if (!hb?.enabled) return;
@@ -372,6 +433,13 @@ export class PiBot implements HeartbeatHost {
   async deliverFire(job: Schedule, snoozed: boolean): Promise<void> {
     if (job.kind === "heartbeat") {
       await this.deps.heartbeat.tick(job.agentId);
+      return;
+    }
+    if (job.kind === "evolution" && this.deps.evolution) {
+      const report = await this.deps.evolution.evolve(job.agentId);
+      if (report.staged) {
+        await this.deliverToAgent(job.agentId, `🧬 Evolution staged **${report.skill}** for your review: ${report.summary}`);
+      }
       return;
     }
     this.deps.events.log(job.agentId, "fire", `${job.title} (${job.kind})`);

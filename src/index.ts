@@ -3,6 +3,7 @@ import { loadConfig } from "./config.js";
 import { AgentManager } from "./core/agent-manager.js";
 import { PiBot } from "./core/bot.js";
 import { EventLog } from "./core/events.js";
+import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
 import { HeartbeatEngine } from "./core/heartbeat.js";
 import { Scheduler } from "./core/scheduler.js";
 import { ensureDir } from "./core/util.js";
@@ -33,12 +34,32 @@ async function main(): Promise<void> {
     },
   });
 
+  const evolution = new EvolutionEngine({
+    agents,
+    modelRuntime,
+    events,
+    dataDir: config.dataDir,
+    host: { announce: (agentId, text) => bot.deliverToAgent(agentId, text) },
+    io: createLlmEvolutionIO({
+      agents,
+      modelRuntime,
+      modelFor: (agent) => {
+        const spec = agent.manifest.evolution?.model ?? config.heartbeatModel;
+        try {
+          return agents.resolveModel(spec) ?? agents.resolveModel(agent.manifest.model);
+        } catch {
+          return undefined;
+        }
+      },
+    }),
+  });
+
   const transports =
     config.transport === "telegram" && config.telegramToken
       ? [new TelegramTransport(config.telegramToken, config.allowedChats)]
       : [new CliTransport()];
 
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution });
 
   await bot.start();
   scheduler.rearm();
