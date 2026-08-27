@@ -1,0 +1,19 @@
+{
+  "name": "coach",
+  "description": "No-nonsense fitness coach",
+  "heartbeat": {
+    "enabled": true,
+    "interval": "30m",
+    "model": "same",
+    "quietHours": {
+      "from": "23:00",
+      "to": "08:00"
+    }
+  },
+  "thinking": "off",
+  "evolution": {
+    "enabled": false,
+    "interval": "6h",
+    "model": "same"
+  }
+}

@@ -323,6 +323,11 @@ export class EvolutionEngine {
 // ─── default LLM-backed IO (cheap-model ephemeral sessions) ─────────────────
 
 export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime: ModelRuntime; modelFor: (agent: LoadedAgent) => unknown }): EvolutionIO {
+  /** Extract model errors from a finished session and surface them loudly */
+  function sessionError(session: AgentSession): string | null {
+    const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; errorMessage?: string }>;
+    return [...msgs].reverse().find((m) => m.role === "assistant" && m.errorMessage)?.errorMessage ?? null;
+  }
   const ephemeral = async (agent: LoadedAgent, opts: { systemPrompt: string; skillsDirs?: string[]; tools?: ReturnType<typeof defineTool>[] }): Promise<AgentSession> => {
     const loader = new DefaultResourceLoader({
       cwd: agent.dir,
@@ -396,6 +401,8 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
             `Propose exactly one skill (create new, or patch existing). Call evolution_propose exactly once.`,
           ].join("\n")
         );
+        const merr = sessionError(session);
+        if (merr) throw new Error(merr);
       } finally {
         try {
           session.dispose();
@@ -414,6 +421,8 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
       });
       try {
         await session.prompt(probe.task);
+        const merr = sessionError(session);
+        if (merr) throw new Error(merr);
         const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (msgs[i]?.role !== "assistant") continue;
@@ -436,6 +445,8 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
       });
       try {
         await session.prompt(`TASK: ${args.task}\nCRITERIA: ${args.criteria}\nREPLY: ${truncate(args.reply, 4000)}`);
+        const merr = sessionError(session);
+        if (merr) return 3;
         const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
         const last = [...msgs].reverse().find((m) => m.role === "assistant");
         const text = (last?.content ?? []).filter((b) => b?.type === "text").map((b) => b.text).join(" ");

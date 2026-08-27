@@ -23,10 +23,14 @@ The host process (`src/`) runs a **scheduler** (JSON-backed timer wheel with sno
 
 ```bash
 npm install
-npm run cli                      # terminal chat, no tokens needed
+npm run cli                      # terminal chat + dashboard, no tokens needed
 cp .env.example .env             # add TELEGRAM_BOT_TOKEN for the real thing
 npm start                        # telegram bot
 ```
+
+The **web dashboard** runs at `http://127.0.0.1:7860` (disable: `PIBOT_WEB=0`, port: `PIBOT_WEB_PORT`):
+agent CRUD, manifest editor (model/heartbeat/evolution/quiet hours), persona + memory editors,
+schedule table with cancel, snooze/wake, staged-skill review (promote/reject), run-evolution, event tail.
 
 Chat commands: `/help` `/agents` `/agent <name>` `/newagent <name> <persona>` `/schedules` `/snooze 2h` `/wake` `/status` `/skills` `/evolve [goal]` `/evolve status|promote|reject`
 

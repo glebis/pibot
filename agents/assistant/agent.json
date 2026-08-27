@@ -1,16 +1,17 @@
 {
   "name": "assistant",
   "description": "Your default everyday companion",
+  "model": "xai/grok-4.6",
   "thinking": "off",
-  "heartbeat": {
-    "enabled": true,
-    "interval": "45m",
-    "model": "same",
-    "quietHours": { "from": "23:00", "to": "08:00" }
-  },
   "evolution": {
     "enabled": true,
     "interval": "6h",
-    "model": "same"
+    "model": "xai/grok-4.3"
+  },
+  "heartbeat": {
+    "enabled": true,
+    "interval": "45m",
+    "model": "xai/grok-4.3",
+    "quietHours": { "from": "23:00", "to": "08:00" }
   }
 }
