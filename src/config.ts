@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { readJson, writeJsonAtomic } from "./core/util.js";
 
@@ -6,6 +7,8 @@ export interface Config {
   transport: "telegram" | "cli";
   dataDir: string;
   agentsDir: string;
+  /** the owner's Obsidian vault — read-only ground truth for all agents */
+  vaultDir: string;
   defaultAgentId?: string;
   heartbeatModel?: string;
   telegramToken?: string;
@@ -57,6 +60,7 @@ export function loadConfig(): Config {
     transport,
     dataDir: path.resolve(process.env.PIBOT_DATA_DIR || "./data"),
     agentsDir: path.resolve(process.env.PIBOT_AGENTS_DIR || "./agents"),
+    vaultDir: path.resolve((process.env.PIBOT_VAULT_DIR || "~/Brains/brain").replace("~", os.homedir())),
     defaultAgentId: process.env.PIBOT_DEFAULT_AGENT || undefined,
     heartbeatModel: process.env.PIBOT_HEARTBEAT_MODEL && process.env.PIBOT_HEARTBEAT_MODEL !== "same"
       ? process.env.PIBOT_HEARTBEAT_MODEL

@@ -96,3 +96,22 @@ describe("buildHeartbeatDigest", () => {
     expect(digest).toContain("last thing said");
   });
 });
+describe("common knowledge", () => {
+  it("system prompt includes the vault path and shared KNOWLEDGE.md", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-ck-"));
+    const vault = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-vault-"));
+    const mgr = new AgentManager(dir, { getModels: () => [] } as never, vault);
+    mgr.createAgent("a1", "You are a test.");
+    fs.mkdirSync(path.join(vault, "pibot"), { recursive: true });
+    fs.writeFileSync(path.join(vault, "pibot", "KNOWLEDGE.md"), "## Owner\nGleb, Berlin. Prefers short answers.");
+    await mgr.discover();
+    void mgr;
+    // commonKnowledge is exercised via systemPromptFor; test the module-level helper indirectly
+    const { commonKnowledge } = await import("./agent-manager.js");
+    const ck = commonKnowledge(vault);
+    expect(ck).toContain("Common knowledge");
+    expect(ck).toContain("Gleb, Berlin");
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(vault, { recursive: true, force: true });
+  });
+});

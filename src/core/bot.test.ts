@@ -81,6 +81,7 @@ function makeBot() {
     transport: "cli",
     dataDir: dir,
     agentsDir: dir,
+    vaultDir: path.join(dir, "vault"),
     defaultAgentId: "assistant",
     allowedChats: [],
   };

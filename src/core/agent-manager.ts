@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
   createAgentSession,
@@ -18,6 +19,7 @@ import { questionPlugin } from "../plugins/question-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
 import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
 import { tgResponderPlugin } from "../plugins/tg-responder-plugin.js";
+import { knowledgePlugin } from "../plugins/knowledge-plugin.js";
 import { attendPlugin } from "../plugins/attend-plugin.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
@@ -33,11 +35,17 @@ export class AgentManager {
   private agents = new Map<string, LoadedAgent>();
   private sessions = new Map<string, AgentSession>(); // `${agentId}::${chatKey}` → session
   private agentsDir: string;
+  private vaultDir: string;
   private modelRuntime: ModelRuntime;
 
-  constructor(agentsDir: string, modelRuntime: ModelRuntime) {
+  constructor(agentsDir: string, modelRuntime: ModelRuntime, vaultDir?: string) {
     this.agentsDir = path.resolve(agentsDir);
+    this.vaultDir = vaultDir ?? path.join(os.homedir(), "Brains", "brain");
     this.modelRuntime = modelRuntime;
+  }
+
+  get vault(): string {
+    return this.vaultDir;
   }
 
   // ── discovery & scaffolding ───────────────────────────────────────────────
@@ -124,7 +132,7 @@ export class AgentManager {
     const loader = new DefaultResourceLoader({
       cwd: agent.dir,
       agentDir: getAgentDir(),
-      systemPromptOverride: () => systemPromptFor(agent),
+      systemPromptOverride: () => systemPromptFor(agent, this.vaultDir),
       // per-agent private plugins
       additionalExtensionPaths: listTsFiles(path.join(agent.dir, "extensions")),
       // per-agent evolved skills (+ staging during evolution)
@@ -217,7 +225,18 @@ export function listSkillDirs(skillsDir: string): Array<{ name: string; descript
   return skills;
 }
 
-function systemPromptFor(agent: LoadedAgent): string {
+/** Common knowledge: the shared KNOWLEDGE.md every agent sees in its prompt */
+export function commonKnowledge(vaultDir: string): string {
+  const file = path.join(vaultDir, "pibot", "KNOWLEDGE.md");
+  try {
+    const raw = fs.readFileSync(file, "utf8").trim();
+    return raw ? `\n\n# Common knowledge (shared between agents)\n${truncate(raw, 2000)}` : "";
+  } catch {
+    return "";
+  }
+}
+
+function systemPromptFor(agent: LoadedAgent, vaultDir: string): string {
   const hb = agent.manifest.heartbeat;
   return [
     `You are "${agent.manifest.name}", a personal agent companion living inside pibot.`,
@@ -229,12 +248,12 @@ function systemPromptFor(agent: LoadedAgent): string {
     `- The user may say "snooze" — use the snooze tool. Important items still fire through snooze.`,
     `- Decisions with clear options: use the ask_user tool — it renders tappable buttons (2–6 options) or a poll (7–10) in the chat and returns the user's choice. Always include an "unsure" option when the user might not know.`,
     `- You have a heartbeat that wakes you periodically${hb?.enabled ? ` (every ${hb.interval})` : ""}. Between chats it is your chance to be proactive; the heartbeat decides whether anything is worth saying.`,
-    `- You may READ files your persona points you to (e.g. notes in your owner's vault). Write only inside your own directory.`,
+    `- The owner's Obsidian vault lives at ${vaultDir} — READ it freely (grep/find are your friends); it is the ground truth. Write only inside your own directory.`,
     ``,
     `# Schedule tool semantics`,
     `- "when" strings: "in 20m", "tomorrow 9am", "daily at 08:00", "every 2h", "friday 18:00", "every day at 9am".`,
     `- kind: reminder | task | note | subject | custom.`,
     `- delivery "direct" sends a quick formatted ping when due; "agent" wakes you to compose the message yourself (more personal, more tokens).`,
-    `- wake "important" pierces the user's snooze — reserve it for hard commitments (deadlines, meds).`,
-  ].join("\n");
+    `- wake "important" — reserve it for hard commitments (deadlines, meds).`,
+  ].join("\n") + commonKnowledge(vaultDir);
 }
