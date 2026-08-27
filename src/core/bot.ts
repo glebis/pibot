@@ -246,11 +246,12 @@ export class PiBot implements HeartbeatHost {
 
   // ── inline card actions ───────────────────────────────────────────────────
 
-  async handleAction(t: Transport, chatId: string, action: string): Promise<void> {
+  /** Returns a short toast string for Telegram callback feedback */
+  async handleAction(t: Transport, chatId: string, action: string): Promise<string | void> {
     if (action.startsWith("q:")) {
-      const resolved = this.questions.resolveCallback(action); // stale/unknown ids ignored
-      this.deps.events.log("system", "system", `question tap: ${action} → ${resolved ? "resolved" : "stale (ignored)"}`);
-      return;
+      const answer = this.questions.resolveCallback(action); // stale/unknown ids → null
+      this.deps.events.log("system", "system", `question tap: ${action} → ${answer ? `resolved: ${answer.choice}` : "stale (ignored)"}`);
+      return answer ? `✅ ${answer.choice}` : "⏳ This question expired";
     }
     if (!action.startsWith("scd:")) return;
     const [, id, verb] = action.split(":");
@@ -259,13 +260,16 @@ export class PiBot implements HeartbeatHost {
       await t.push(chatId, { text: "That item is already gone." });
       return;
     }
+    let toast = "";
     switch (verb) {
       case "ok":
+        toast = "✅ Locked in";
         await t.push(chatId, { text: "✅ Locked in." });
         break;
       case "cancel": {
         const c = this.deps.scheduler.cancel(id);
-        await t.push(chatId, { text: c ? `🗑 Cancelled: ${c.title}` : "Already done." });
+        toast = c ? `🗑 Cancelled: ${c.title}` : "Already done";
+        await t.push(chatId, { text: toast + "." });
         break;
       }
       case "+10m":
@@ -273,13 +277,16 @@ export class PiBot implements HeartbeatHost {
       case "+1d": {
         const delta = verb === "+10m" ? 600e3 : verb === "+1h" ? 3600e3 : 86400e3;
         const r = this.deps.scheduler.reschedule(id, Date.now() + delta);
-        await t.push(chatId, { text: r ? `⏰ “${r.title}” → ${fmtWhen(r.dueAt)}` : "Already done." });
+        toast = r ? `⏰ “${r.title}” → ${fmtWhen(r.dueAt)}` : "Already done";
+        await t.push(chatId, { text: toast });
         break;
       }
       default:
-        await t.push(chatId, { text: `Unknown action.` });
+        toast = "Unknown action";
+        await t.push(chatId, { text: "Unknown action." });
     }
     this.deps.events.log(job.agentId, "system", `card ${verb} → ${job.title}`);
+    return toast;
   }
 
   // ── commands ──────────────────────────────────────────────────────────────

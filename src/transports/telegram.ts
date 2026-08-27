@@ -47,6 +47,7 @@ export class TelegramTransport implements Transport {
   private bot: Bot;
   private allowed: Set<string>;
   private me?: { id: number; username?: string; first_name: string };
+  private lastCallbackQuery?: { id: string; data?: string };
   private onMessageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   private onPollAnswerCb: ((pollId: string, optionIndex: number, voterId: string) => Promise<void>) | null = null;
@@ -64,6 +65,8 @@ export class TelegramTransport implements Transport {
     });
 
     this.bot.on("callback_query:data", async (ctx) => {
+      console.log(`[telegram] callback received: ${ctx.callbackQuery?.data?.slice(0, 40)} at ${new Date().toISOString().slice(11, 19)}`);
+      this.lastCallbackQuery = ctx.callbackQuery ?? undefined;
       if (!this.check(ctx)) { await ctx.answerCallbackQuery().catch(() => {}); return; }
       const action = ctx.callbackQuery?.data;
       if (!action || !this.onActionCb) { await ctx.answerCallbackQuery().catch(() => {}); return; }
@@ -73,13 +76,13 @@ export class TelegramTransport implements Transport {
       } catch (e) {
         feedback = `⚠︎ ${e instanceof Error ? e.message : String(e)}`;
       }
-      await ctx
-        .answerCallbackQuery({ text: feedback ? truncate(String(feedback), 190) : undefined })
-        .then((ok) => {
-          if (!feedback) return;
-          console.log(`[telegram] cb answered (${feedback.slice(0, 40)}) ok=${ok}`);
-        })
-        .catch((e) => console.error("[telegram] answerCallbackQuery failed:", e.message ?? e));
+      console.log(`[telegram] answering cb with feedback: ${feedback ? truncate(String(feedback), 40) : "(none)"}`);
+      try {
+        const ok = await ctx.answerCallbackQuery({ text: feedback ? truncate(String(feedback), 190) : undefined });
+        console.log(`[telegram] cb answered (${feedback ? truncate(String(feedback), 40) : "silent"}) ok=${ok} at ${new Date().toISOString().slice(11, 19)}`);
+      } catch (e) {
+        console.error(`[telegram] answerCallbackQuery failed at ${new Date().toISOString().slice(11, 19)}:`, (e as Error).message ?? e);
+      }
     });
 
     this.bot.on("poll_answer", (ctx) => {
@@ -103,6 +106,23 @@ export class TelegramTransport implements Transport {
 
   onPollAnswer(cb: (pollId: string, optionIndex: number, voterId: string) => Promise<void>): void {
     this.onPollAnswerCb = cb;
+  }
+
+  /** Manually answer a callback query (used by tests); toast shows when text given */
+  async answerCallback(action: string, feedback: string): Promise<boolean> {
+    const q = this.pendingCallbackQuery(action);
+    if (!q) return false;
+    try {
+      const ok = await this.bot.api.answerCallbackQuery(q.id, { text: truncate(feedback, 190) });
+      return ok === true;
+    } catch (e) {
+      console.error("[telegram] answerCallbackQuery failed:", (e as Error).message);
+      return false;
+    }
+  }
+
+  private pendingCallbackQuery(action: string): { id: string } | null {
+    return this.lastCallbackQuery?.data === action ? this.lastCallbackQuery : null;
   }
 
   async sendPoll(chatId: string, question: string, options: string[]): Promise<{ pollId: string }> {

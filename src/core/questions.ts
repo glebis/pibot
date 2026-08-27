@@ -62,6 +62,7 @@ export class QuestionBus {
         resolve({ choice: "", index: -1, via: "button", timedOut: true });
       }, timeoutMs);
       this.pending.set(qid, { qid, agentId, chatKey, spec, resolve, timer });
+    console.log(`[questions] registered ${qid} → ${chatKey} (${spec.options.length} options, poll=${Boolean(spec.poll)})`);
 
       const transport = this.deps.getTransport(chat.transport);
       if (!transport) {
@@ -105,6 +106,7 @@ export class QuestionBus {
     const idx = parseInt(idxStr, 10);
     if (!Number.isInteger(idx) || idx < 0 || idx >= p.spec.options.length) return null;
     const answer: QuestionAnswer = { choice: p.spec.options[idx], index: idx, via: "button" };
+    console.log(`[questions] tap ${action} → resolved: ${answer.choice}`);
     this.finish(qid, answer);
     return answer;
   }
