@@ -1,3 +1,4 @@
+import { serve } from "@hono/node-server";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.js";
 import { AgentManager } from "./core/agent-manager.js";
@@ -7,6 +8,7 @@ import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
 import { HeartbeatEngine } from "./core/heartbeat.js";
 import { Scheduler } from "./core/scheduler.js";
 import { ensureDir } from "./core/util.js";
+import { createWebApp } from "./web.js";
 import { CliTransport } from "./transports/cli.js";
 import { TelegramTransport } from "./transports/telegram.js";
 
@@ -63,6 +65,15 @@ async function main(): Promise<void> {
 
   await bot.start();
   scheduler.rearm();
+
+  // web dashboard (config CRUD) — always on unless disabled
+  const webPort = parseInt(process.env.PIBOT_WEB_PORT || "7860", 10);
+  if (process.env.PIBOT_WEB !== "0") {
+    const webApp = createWebApp({ agents, scheduler, events, evolution, dataDir: config.dataDir });
+    const server = serve({ fetch: webApp.fetch, port: webPort, hostname: "127.0.0.1" });
+    console.log(`[pibot] dashboard → http://127.0.0.1:${webPort}`);
+    server.addListener("error", (e) => console.error("[web]", e.message));
+  }
 
   const shutdown = () => {
     console.log("\n[pibot] stopping…");
