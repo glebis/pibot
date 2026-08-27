@@ -44,6 +44,8 @@ export interface CardButton {
   label: string;
   /** opaque action string routed back via transport.onAction */
   action: string;
+  /** URL buttons open the link client-side (no callback) */
+  url?: string;
 }
 
 export interface Card {
@@ -58,6 +60,8 @@ export interface PushOptions {
 
 export interface Transport {
   readonly name: string;
+  /** sub-bot transports are bound to exactly one agent */
+  readonly boundAgentId?: string;
   start(): Promise<void>;
   stop(): Promise<void>;
   /** Send a message (and optional button card) to a chat */
@@ -73,6 +77,8 @@ export interface Transport {
   sendPoll?(chatId: string, question: string, options: string[]): Promise<{ pollId: string }>;
   /** Poll votes (optional) */
   onPollAnswer?(cb: (pollId: string, optionIndex: number, voterId: string) => Promise<void>): void;
+  /** Manager-mode bots receive managed-bot creation/token updates (optional) */
+  onManagedBot?(cb: (info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>): void;
 }
 
 // ─── Agent manifest (agents/<name>/agent.json) ──────────────────────────────

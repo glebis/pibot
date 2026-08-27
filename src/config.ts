@@ -18,6 +18,8 @@ export interface Settings {
   telegram?: {
     token?: string;
     allowedChats?: string[];
+    /** per-agent dedicated bots (sub-bots) */
+    subBots?: Record<string, { token: string; username?: string }>;
   };
 }
 

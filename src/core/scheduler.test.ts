@@ -124,13 +124,15 @@ describe("Scheduler", () => {
 
   it("recurs dailyAt jobs", async () => {
     const s = new Scheduler(dataDir, () => {});
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    tomorrow.setHours(9, 0, 0, 0);
     const job = s.create({ ...makeJob({ repeat: { dailyAt: "09:00" }, dueAt: Date.now() + 20 }) });
     // fire it manually
     (s as unknown as { fire: (j: Schedule) => Promise<void> }).fire(s.get(job.id)!);
-    await waitFor(() => s.get(job.id)?.dueAt === tomorrow.getTime());
+    // next occurrence = the next 09:00 local (today or tomorrow depending on the clock)
+    await waitFor(() => {
+      const due = s.get(job.id)?.dueAt ?? 0;
+      const d = new Date(due);
+      return d.getHours() === 9 && d.getMinutes() === 0 && due > Date.now() - 60e3;
+    });
     s.stop();
   });
 
