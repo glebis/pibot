@@ -12,7 +12,7 @@ import { QuestionBus, type QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import { loadSettings, saveSettings, type Config } from "../config.js";
 import type { Card, ChatRef, Schedule, Transport } from "./types.js";
-import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS } from "./agent-factory.js";
+import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { errorMessage, fmtWhen, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 
 const HELP = [
@@ -73,7 +73,7 @@ export class PiBot implements HeartbeatHost {
     const agentId =
       this.pendingSubBots.get(botName) ??
       this.pendingSubBots.get(botName.replace(/_?bot$/, "")) ??
-      [...this.pendingSubBots.keys()].find((id) => botName.toLowerCase().startsWith(id.replace(/-/g, "").toLowerCase()));
+      [...this.pendingSubBots.keys()].find((id) => botName.toLowerCase().includes(id.replace(/-/g, "").toLowerCase()));
     if (!agentId) {
       console.log(`[telegram] managed bot ${botName} — no pending request, ignoring`);
       return;
@@ -700,11 +700,10 @@ export class PiBot implements HeartbeatHost {
   private async setupSubBot(t: Transport, chatId: string, agent: LoadedAgent): Promise<void> {
     const ck = this.chatKey(t, chatId);
     const tg = this.transports.get("telegram") as import("../transports/telegram.js").TelegramTransport | undefined;
-    const username = agent.id.replace(/-/g, "");
-    const suggestedUsername = `${username}bot`;
+    const suggestedUsername = suggestedSubBotUsername(agent.id, this.telegramUsername());
 
     if (tg?.managerMode()) {
-      const link = this.subBotDeepLink(agent.id, `${username}bot`, agent.id);
+      const link = this.subBotDeepLink(agent.id, suggestedUsername);
       await t.push(chatId, {
         text: `Give **${agent.id}** its own Telegram identity? Tap — Telegram will create the bot and I'll wire it automatically.`,
         card: { text: "", buttons: [{ label: `Create @${suggestedUsername} bot`, action: `url:${this.subBotDeepLink(agent.id, suggestedUsername, agent.id)}`, url: this.subBotDeepLink(agent.id, suggestedUsername, agent.id) }] },
@@ -738,7 +737,7 @@ export class PiBot implements HeartbeatHost {
     const agent = this.deps.agents.getAgent(agentId);
     if (!agent) throw new Error(`unknown agent "${agentId}"`);
     if (!this.managerMode()) throw new Error("manager mode is off — enable bot management mode for @pimother_bot in BotFather's mini app");
-    const suggestedUsername = `${agentId.replace(/-/g, "")}bot`;
+    const suggestedUsername = suggestedSubBotUsername(agentId, this.telegramUsername());
     this.pendingSubBots.set(agentId, agentId);
     const link = this.subBotDeepLink(agentId, suggestedUsername, agentId);
     await this.deliverToAgent(agentId, [

@@ -43,6 +43,19 @@ export function validateAgentName(name: string, existing: string[] = []): string
   return null;
 }
 
+/**
+ * Suggested sub-bot username, namespaced under the parent bot:
+ * agent "tax" + manager "pimother_bot" → "pimother_tax_bot"
+ * (Telegram: 5–32 chars, ends in "bot", letters/digits/underscores)
+ */
+export function suggestedSubBotUsername(agentId: string, managerUsername?: string): string {
+  const parent = (managerUsername ?? "pimother_bot").toLowerCase().replace(/_?bot$/, "");
+  const agentSlug = agentId.replace(/-/g, "_");
+  const agentBudget = Math.max(32 - 4 - parent.length - 1, 4); // "_bot" + separator
+  const agentPart = agentSlug.slice(0, agentBudget).replace(/[\s_-]+$/, "");
+  return `${parent}_${agentPart}_bot`;
+}
+
 export function buildManifest(draft: AgentDraft): AgentManifest {
   const base = defaultManifest(draft.name);
   return {
