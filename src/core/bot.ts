@@ -29,6 +29,11 @@ export class PiBot implements HeartbeatHost {
   private pendingSubBots = new Map<string, string>(); // chatKey → agentId awaiting its sub-bot creation
   private lastUserMessage = new Map<string, number>(); // agentId → last real user message
   private subBots = new Map<string, { token: string; username?: string }>(); // agentId → token
+
+  /** @internal session cache access for handoff context extraction */
+  private get cachedSessions(): Map<string, AgentSession> {
+    return (this.deps.agents as unknown as { sessions: Map<string, AgentSession> }).sessions;
+  }
   private questions = new QuestionBus({
     getTransport: (name) => this.transports.get(name),
     notify: (chatKey, text) => {
@@ -878,6 +883,38 @@ export class PiBot implements HeartbeatHost {
     );
   }
 
+  /** Compact transcript tail for handoffs: last N user/assistant turns */
+  private transcriptTail(session: AgentSession, turns = 12): string {
+    const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
+    const turnsOut: string[] = [];
+    for (const m of msgs) {
+      if (m.role !== "user" && m.role !== "assistant") continue;
+      const text = (m.content ?? []).filter((b) => b?.type === "text" && b.text).map((b) => b.text).join(" ").trim();
+      if (!text) continue;
+      turnsOut.push(`${m.role === "user" ? "user" : "agent"}: ${truncate(text.replace(/\n+/g, " "), 220)}`);
+    }
+    return turnsOut.slice(-turns).join("\n") || "(no prior conversation)";
+  }
+
+  /** Handoff: move a conversation (with its context) from one agent to another, in the same chat */
+  private async runHandoff(t: Transport, chatId: string, fromAgent: string, toAgent: string, note?: string): Promise<void> {
+    const ck = this.chatKey(t, chatId);
+    if (!this.deps.agents.getAgent(toAgent)) {
+      await t.push(chatId, { text: `No agent "${toAgent}". /agents for the list.` });
+      return;
+    }
+    // context from the CURRENT session
+    const fromSession = await this.sessionFor(t, chatId, fromAgent, ck);
+    const tail = this.transcriptTail(fromSession, 12);
+    // deliver into the TARGET's session for this chat — its history now carries the context
+    const targetSession = await this.sessionFor(t, chatId, toAgent, ck);
+    await targetSession.prompt(envelope(
+      `[handoff from "${fromAgent}"] The user is moving this conversation to you. Continue where this left off — acknowledge in one short line, then pick up the thread.\n\n# Recent context\n${tail}${note ? `\n\n# Note from ${fromAgent}\n${note}` : ""}`
+    ));
+    this.rememberChat(toAgent, ck);
+    this.deps.events.log(toAgent, "system", `handoff from ${fromAgent} (${truncate(tail, 80)})`);
+  }
+
   // ── agent-to-agent messaging ─────────────────────────────────────────────
 
   /** Run one turn in an agent's inter-agent session and return the reply text */
@@ -897,6 +934,20 @@ export class PiBot implements HeartbeatHost {
         ])
       : await run.then(() => extractAssistantTextFromSession(session));
     return reply || "(no reply)";
+  }
+
+  /** Agent-initiated handoff: package the sender's transcript tail + deliver to the target's pair session */
+  async handoffContext(fromAgent: string, toAgent: string, note?: string): Promise<string> {
+    const fromCk = [...(this.agentChats.get(fromAgent) ?? [])][0];
+    let tail = "(no recent context)";
+    if (fromCk) {
+      const fromSession = this.cachedSessions.get(`${fromAgent}::${fromCk}`);
+      if (fromSession) tail = this.transcriptTail(fromSession, 12);
+    }
+    return this.agentTurn(toAgent, fromAgent,
+      `[handoff from "${fromAgent}"] The user is moving this thread to you.${note ? ` Note: ${note}` : ""}\n\n# Context from ${fromAgent}\n${tail}\n\nAcknowledge briefly and continue.`,
+      10 * 60e3
+    );
   }
 
   /** Blocking inter-agent question — used by the agent_ask tool */

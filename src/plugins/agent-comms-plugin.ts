@@ -5,6 +5,8 @@ import { truncate } from "../core/util.js";
 export interface CommsHooks {
   /** deliver a message into another agent's session; returns that agent's reply text */
   askAgent(fromAgentId: string, toAgentId: string, text: string, timeoutMs?: number): Promise<string>;
+  /** handoff: package this agent's context + deliver to the target; returns the target's ack */
+  handoffContext(fromAgentId: string, toAgentId: string, note?: string): Promise<string>;
   /** list available sibling agents */
   listAgents(): Array<{ id: string; description?: string }>;
 }
@@ -13,6 +15,7 @@ export interface AgentCommsPluginDeps {
   agentId: string;
   /** provided by the host (PiBot) — routes through inter-agent sessions */
   askAgent: (from: string, to: string, text: string, timeoutMs?: number) => Promise<string>;
+  handoffContext: (from: string, to: string, note?: string) => Promise<string>;
   listAgents: () => Array<{ id: string; description?: string }>;
 }
 
@@ -79,6 +82,35 @@ export function agentCommsPlugin(deps: AgentCommsPluginDeps): InlineExtension {
               details = { reply };
             } catch (e) {
               text = `ask failed: ${truncate(String(e), 200)}`;
+              details = { ok: false };
+            }
+          }
+          return { content: [{ type: "text", text }], details };
+        },
+      });
+
+      pi.registerTool({
+        name: "handoff",
+        label: "Handoff to agent",
+        description:
+          "Hand this conversation's context to another agent: your recent thread + a note are delivered to them, and they continue from there. Use when a sibling is better placed to continue.",
+        parameters: Type.Object({
+          to: Type.String({ description: "Target agent id" }),
+          note: Type.Optional(Type.String({ description: "One-line summary of what matters right now" })),
+        }),
+        async execute(_tcid, params) {
+          let text: string;
+          let details: Record<string, unknown>;
+          if (params.to === deps.agentId) {
+            text = "That's you.";
+            details = { ok: false };
+          } else {
+            try {
+              const reply = await deps.handoffContext(deps.agentId, params.to, params.note);
+              text = `Handed off to **${params.to}**. They have the context now.\n${truncate(reply, 300)}`;
+              details = { ok: true };
+            } catch (e) {
+              text = `handoff failed: ${truncate(String(e), 200)}`;
               details = { ok: false };
             }
           }
