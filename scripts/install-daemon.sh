@@ -40,6 +40,7 @@ cat > "$PLIST" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
     <key>PIBOT_TRANSPORT</key><string>telegram</string>
+    <key>PIBOT_DEFAULT_MODEL</key><string>xai/grok-4.6</string>
     <key>PIBOT_WEB</key><string>1</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>

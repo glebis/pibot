@@ -310,6 +310,10 @@ export class PiBot implements HeartbeatHost {
       if (text) {
         void t.push(chatId, { text }).catch((e) => console.error("[bot] push failed:", e));
         this.deps.events.log(agentId, "message", truncate(text, 200));
+      } else {
+        // failed turn (e.g. model auth) — tell the user instead of silence
+        const err = lastAssistantError((ev as { messages?: unknown[] }).messages ?? []);
+        if (err) void t.notifyError(chatId, `model error: ${err}`).catch(() => {});
       }
     }
   }
@@ -927,6 +931,14 @@ function envelope(text: string): string {
 
 function extractAssistantTextFromSession(session: AgentSession): string | null {
   return extractAssistantText((session.agent.state.messages ?? []) as unknown[]);
+}
+
+function lastAssistantError(messages: unknown[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: string; errorMessage?: string };
+    if (m?.role === "assistant" && m.errorMessage) return m.errorMessage;
+  }
+  return null;
 }
 
 function extractAssistantText(messages: unknown[]): string | null {
