@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "./agent-manager.js";
-import { applyPatch, EvolutionEngine, validateSkillFile, validateSkillName, type EvolutionIO, type EvolutionProposal } from "./evolution.js";
+import { applyPatch, EvolutionEngine, extractRecentProposals, validateSkillFile, validateSkillName, type EvolutionIO, type EvolutionProposal } from "./evolution.js";
 import { EventLog } from "./events.js";
 
 function tmpDir(): string {
@@ -163,5 +163,16 @@ describe("EvolutionEngine", () => {
     await engine.evolve("assistant", "mornings");
     expect(engine.reject("assistant", "morning-brief")).toBe(true);
     expect(engine.staged("assistant")).toHaveLength(0);
+  });
+});
+describe("extractRecentProposals", () => {
+  it("pulls deduplicated titles from evolution events", () => {
+    const entries = [
+      { type: "system", summary: 'evolution: create "morning-brief" staged, probes [4, 5]' },
+      { type: "system", summary: 'evolution: create "morning-brief" staged, probes [4, 5]' },
+      { type: "system", summary: "evolution: promoted skill morning-brief" },
+      { type: "message", summary: "hello" },
+    ];
+    expect(extractRecentProposals(entries)).toEqual(["morning-brief"]);
   });
 });
