@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Settings } from "../config.js";
+import { writeJsonAtomic } from "./util.js";
 
 const SOPS = process.env.SOPS_BIN || "sops";
 const AGE_KEY_FILE = path.join(os.homedir(), ".config/sops/age/keys.txt");
@@ -214,7 +215,7 @@ export class SecretStore {
 
   private writePlaintextWithoutSecrets(s: Settings): void {
     const p = path.join(this.dataDir, "settings.json");
-    writeJsonAtomic(stripSecrets(s), p);
+    writeJsonAtomic(p, stripSecrets(s));
   }
 
   private async flushEncrypted(): Promise<void> {
@@ -250,11 +251,4 @@ function loadPlain(dataDir: string): Settings {
   } catch {
     return {};
   }
-}
-
-function writeJsonAtomic(value: unknown, file: string): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n");
-  fs.renameSync(tmp, file);
 }

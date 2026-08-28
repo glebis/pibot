@@ -190,7 +190,6 @@ export class PiBot implements HeartbeatHost {
     if (!t) return false;
     await t.stop().catch(() => {});
     this.transports.delete(`telegram:${agentId}`);
-    this.persistSubBot; // keep the record removal explicit:
     const cur = loadSettings(this.deps.config.dataDir);
     const subBots = { ...(cur.telegram?.subBots ?? {}) };
     delete subBots[agentId];
@@ -201,7 +200,6 @@ export class PiBot implements HeartbeatHost {
 
   /** Deep link that lets the chat owner create a managed sub-bot for an agent */
   subBotDeepLink(agentId: string, username: string, displayName?: string): string {
-    const usernameT = this.telegramUsername() ?? "";
     const name = encodeURIComponent(displayName ?? agentId);
     return `https://t.me/newbot/${this.telegramUsername() ?? "pimother_bot"}/${username}?name=${name}`;
   }
@@ -988,7 +986,6 @@ export class PiBot implements HeartbeatHost {
     if (!ck) return;
     const idx = ck.lastIndexOf(":");
     const t = this.transports.get(ck.slice(0, idx));
-    if (!t) return;
     if (!t) return;
     await this.promptAgent(t, ck.slice(idx + 1), agentId, `[heartbeat] ${instruction}`);
   }

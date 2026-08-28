@@ -1,7 +1,10 @@
 node_modules/
 data/
+coverage/
 .env
 *.log
 agents/*/sessions/
+agents/*/state/
+!agents/_template/state/
 agents/*/state/.staging/
 agents/system/state/
