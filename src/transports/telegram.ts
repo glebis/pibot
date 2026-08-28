@@ -80,6 +80,8 @@ export class TelegramTransport implements Transport {
       if (!this.check(ctx)) { await ctx.answerCallbackQuery().catch(() => {}); return; }
       const action = ctx.callbackQuery?.data;
       if (!action || !this.onActionCb) { await ctx.answerCallbackQuery().catch(() => {}); return; }
+      // remove the buttons from the tapped message first — no double-taps, no stale clicks
+      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
       let feedback: string | void;
       try {
         feedback = await this.onActionCb(action, String(ctx.chat?.id ?? ctx.from?.id ?? ""));
