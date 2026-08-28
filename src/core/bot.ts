@@ -1,23 +1,19 @@
-import * as fs from "node:fs";
 import * as path from "node:path";
-import { buildManifest, buildPersona, validateAgentName, type AgentDraft, type Proactivity } from "./agent-factory.js";
-import { listSkillDirs } from "./agent-manager.js";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { TelegramTransport } from "../transports/telegram.js";
-import { attendCli } from "../plugins/attend-plugin.js";
 import { createCommandHandler, type CommandContext } from "./commands.js";
-import type { AgentManager, LoadedAgent } from "./agent-manager.js";
+import type { AgentManager } from "./agent-manager.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
 import { QuestionBus, type QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
-import { loadSettings, saveSettings, type Config } from "../config.js";
-import type { Card, ChatRef, Schedule, Transport } from "./types.js";
-import * as os from "node:os";
-import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
-import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
-import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
+import type { Config } from "../config.js";
+import type { ChatRef, Schedule, Transport } from "./types.js";
+import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./util.js";
+import { NewAgentWizard } from "./wizard.js";
+import { SubBotManager } from "./sub-bot-manager.js";
+import { Delivery } from "./delivery.js";
 
 export class PiBot implements HeartbeatHost {
   private transports = new Map<string, Transport>();
@@ -28,7 +24,6 @@ export class PiBot implements HeartbeatHost {
   private commandHandler: ((t: Transport, chatId: string, text: string) => Promise<void>) | null = null;
   private pendingSubBots = new Map<string, string>(); // chatKey → agentId awaiting its sub-bot creation
   private lastUserMessage = new Map<string, number>(); // agentId → last real user message
-  private subBots = new Map<string, { token: string; username?: string }>(); // agentId → token
 
   /** @internal session cache access for handoff context extraction */
   private get cachedSessions(): Map<string, AgentSession> {
@@ -44,6 +39,10 @@ export class PiBot implements HeartbeatHost {
   });
   private statePath: string;
 
+  private subBotManager: SubBotManager;
+  private delivery: Delivery;
+  private wizard: NewAgentWizard;
+
   constructor(
     private deps: {
       config: Config;
@@ -55,10 +54,53 @@ export class PiBot implements HeartbeatHost {
       evolution?: EvolutionEngine;
       modelRuntime?: import("@earendil-works/pi-coding-agent").ModelRuntime;
       secrets: import("./secrets.js").SecretStore;
-    }
+    },
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
     for (const t of deps.transports) this.addTransport(t);
+
+    this.subBotManager = new SubBotManager({
+      config: deps.config,
+      agents: deps.agents,
+      events: deps.events,
+      transports: this.transports,
+      pendingSubBots: this.pendingSubBots,
+      secrets: deps.secrets,
+      telegramUsername: () => this.telegramUsername(),
+      addTransport: (t) => this.addTransport(t),
+      deliverToAgent: (agentId, text) => this.deliverToAgent(agentId, text),
+    });
+
+    this.delivery = new Delivery({
+      agents: deps.agents,
+      scheduler: deps.scheduler,
+      heartbeat: deps.heartbeat,
+      events: deps.events,
+      evolution: deps.evolution,
+      transports: this.transports,
+      agentChats: this.agentChats,
+      questions: this.questions,
+      promptAgent: (tr, chatId, agentId, text) => this.promptAgent(tr, chatId, agentId, text),
+      deliverToAgent: (agentId, text) => this.deliverToAgent(agentId, text),
+      primaryChat: (job) => this.primaryChat(job),
+    });
+
+    this.wizard = new NewAgentWizard({
+      config: deps.config,
+      agents: deps.agents,
+      questions: this.questions,
+      transports: this.transports,
+      wizardChats: this.wizardChats,
+      pendingSubBots: this.pendingSubBots,
+      modelRuntime: deps.modelRuntime,
+      chatKey: (t, chatId) => this.chatKey(t, chatId),
+      rememberChat: (agentId, ck) => this.rememberChat(agentId, ck),
+      ensureHeartbeatJob: (a) => this.ensureHeartbeatJob(a as never),
+      ensureEvolutionJob: (a) => this.ensureEvolutionJob(a as never),
+      attachSubBot: (agentId, token) => this.attachSubBot(agentId, token),
+      subBotDeepLink: (agentId, username, displayName) => this.subBotDeepLink(agentId, username, displayName),
+      telegramUsername: () => this.telegramUsername(),
+    });
   }
 
   addTransport(t: Transport): void {
@@ -72,43 +114,7 @@ export class PiBot implements HeartbeatHost {
 
   /** Manager-mode: a user confirmed a managed sub-bot creation → fetch its token and wire it */
   private async handleManagedBot(t: Transport, info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }): Promise<void> {
-    const botName = info.botUsername ?? info.firstName ?? `bot_${info.botId}`;
-    console.log(`[telegram] managed bot update: ${botName} (id ${info.botId}) by ${info.creatorId}`);
-
-    // token rotation for an already-wired sub-bot: re-attach with the fresh token
-    for (const [agentId, sub] of Object.entries(loadSettings(this.deps.config.dataDir).telegram?.subBots ?? {})) {
-      if (sub.username && info.botUsername && sub.username.toLowerCase() === info.botUsername.toLowerCase()) {
-        const token = await (t as import("../transports/telegram.js").TelegramTransport).getManagedBotToken(info.botId);
-        const r = await this.attachSubBot(agentId, token);
-        this.deps.events.log(agentId, "system", `sub-bot token rotated → ${r.ok ? "re-attached" : r.error}`);
-        return;
-      }
-    }
-
-    const agentId =
-      this.pendingSubBots.get(botName) ??
-      this.pendingSubBots.get(botName.replace(/_?bot$/, "")) ??
-      [...this.pendingSubBots.keys()].find((id) => botName.toLowerCase().includes(id.replace(/-/g, "").toLowerCase()));
-    if (!agentId) {
-      console.log(`[telegram] managed bot ${botName} — no pending request, ignoring`);
-      return;
-    }
-    try {
-      const tg = t as import("../transports/telegram.js").TelegramTransport;
-      const token = await tg.getManagedBotToken(info.botId);
-      const r = await this.attachSubBot(agentId, token);
-      this.pendingSubBots.delete(agentId);
-      // managed sub-bots are private: only the manager's owner can use them
-      await tg.setManagedBotAccessSettings(info.botId, true).catch((e) => console.error("[telegram] access restriction failed:", errorMessage(e)));
-      if (r.ok) {
-        this.deps.events.log(agentId, "system", `sub-bot created: ${r.botName} (restricted to owner)`);
-        await this.deliverToAgent(agentId, `🟢 My own Telegram bot is live: **${r.botName}** — its own chat, its own identity, restricted to you.`);
-      } else {
-        this.deps.events.log(agentId, "system", `sub-bot wiring failed: ${r.error}`);
-      }
-    } catch (e) {
-      this.deps.events.log("system", "system", `managed bot token fetch failed: ${errorMessage(e)}`);
-    }
+    return this.subBotManager.handleManagedBot(t, info);
   }
 
   async start(): Promise<void> {
@@ -145,65 +151,17 @@ export class PiBot implements HeartbeatHost {
   }
 
   // ── sub-bots (per-agent Telegram identities) ──────────────────────────────
-
-  private async persistSubBot(agentId: string, token: string, username?: string): Promise<void> {
-    const cur = this.deps.secrets.get();
-    const subBots = { ...(cur.telegram?.subBots ?? {}), [agentId]: { token, username } };
-    await this.deps.secrets.save({ telegram: { ...cur.telegram, subBots } });
-  }
-
-  private removeSubBotFromSettings(agentId: string): void {
-    const cur = loadSettings(this.deps.config.dataDir);
-    const subBots = { ...(cur.telegram?.subBots ?? {}) };
-    delete subBots[agentId];
-    saveSettings(this.deps.config.dataDir, { telegram: { ...cur.telegram, subBots } });
-  }
-
-  /** Wire a dedicated bot for one agent (token verified against Telegram first) */
   async attachSubBot(agentId: string, token: string): Promise<{ ok: boolean; botName?: string; error?: string }> {
-    const existingName = `telegram:${agentId}`;
-    if (this.transports.has(existingName)) {
-      await this.transports.get(existingName)?.stop().catch(() => {});
-      this.transports.delete(existingName);
-    }
-    const t = new TelegramTransport(token, [], { nameSuffix: agentId, boundAgentId: agentId });
-    let botName: string;
-    try {
-      botName = await t.verify();
-    } catch (e) {
-      return { ok: false, error: `Token rejected by Telegram: ${errorMessage(e)}` };
-    }
-    this.addTransport(t);
-    try {
-      await t.start();
-    } catch (e) {
-      this.transports.delete(existingName);
-      return { ok: false, error: `Started but polling failed: ${errorMessage(e)}` };
-    }
-    await this.persistSubBot(agentId, token, botName.startsWith("@") ? botName.slice(1) : botName);
-    this.deps.events.log("system", "system", `sub-bot attached for ${agentId} as ${botName}`);
-    return { ok: true, botName };
+    return this.subBotManager.attachSubBot(agentId, token);
   }
 
   async detachSubBot(agentId: string): Promise<boolean> {
-    const t = this.transports.get(`telegram:${agentId}`);
-    if (!t) return false;
-    await t.stop().catch(() => {});
-    this.transports.delete(`telegram:${agentId}`);
-    this.persistSubBot; // keep the record removal explicit:
-    const cur = loadSettings(this.deps.config.dataDir);
-    const subBots = { ...(cur.telegram?.subBots ?? {}) };
-    delete subBots[agentId];
-    saveSettings(this.deps.config.dataDir, { telegram: { ...cur.telegram, subBots } });
-    this.deps.events.log("system", "system", `sub-bot detached for ${agentId}`);
-    return true;
+    return this.subBotManager.detachSubBot(agentId);
   }
 
   /** Deep link that lets the chat owner create a managed sub-bot for an agent */
   subBotDeepLink(agentId: string, username: string, displayName?: string): string {
-    const usernameT = this.telegramUsername() ?? "";
-    const name = encodeURIComponent(displayName ?? agentId);
-    return `https://t.me/newbot/${this.telegramUsername() ?? "pimother_bot"}/${username}?name=${name}`;
+    return this.subBotManager.subBotDeepLink(agentId, username, displayName);
   }
 
   // ── HeartbeatHost ────────────────────────────────────────────────────────
@@ -212,22 +170,19 @@ export class PiBot implements HeartbeatHost {
   }
 
   telegramUsername(): string | undefined {
-    const t = this.transports.get("telegram");
-    return t instanceof TelegramTransport ? t.botUsername() : undefined;
+    return this.subBotManager.telegramUsername();
   }
 
   managerMode(): boolean {
-    const t = this.transports.get("telegram");
-    return t instanceof TelegramTransport ? t.managerMode() : false;
+    return this.subBotManager.managerMode();
   }
 
   managerUsername(): string | undefined {
-    return this.telegramUsername();
+    return this.subBotManager.managerUsername();
   }
 
   subBotFor(agentId: string): { username?: string } | undefined {
-    const t = this.transports.get(`telegram:${agentId}`);
-    return t instanceof TelegramTransport && t.botUsername() ? { username: t.botUsername() } : undefined;
+    return this.subBotManager.subBotFor(agentId);
   }
 
   /** Validate a token against Telegram, then enable the transport live. */
@@ -266,11 +221,6 @@ export class PiBot implements HeartbeatHost {
     return `${t.name}:${chatId}`;
   }
 
-  private splitChatKey(ck: string): { transport: string; chatId: string } {
-    const idx = ck.lastIndexOf(":");
-    return { transport: ck.slice(0, idx), chatId: ck.slice(idx + 1) };
-  }
-
   private currentAgent(ck: string): string | undefined {
     const idx = ck.lastIndexOf(":");
     const transportName = ck.slice(0, idx);
@@ -299,7 +249,7 @@ export class PiBot implements HeartbeatHost {
       ck,
       { transport: t.name, chatId },
       this.deps.scheduler,
-      (spec: QuestionSpec) => this.questions.ask(agentId, { transport: t.name, chatId }, spec)
+      (spec: QuestionSpec) => this.questions.ask(agentId, { transport: t.name, chatId }, spec),
     );
     const wkey = `${agentId}::${ck}`;
     if (!this.wired.has(wkey)) {
@@ -505,366 +455,37 @@ export class PiBot implements HeartbeatHost {
 
   // ── scheduler fire delivery ───────────────────────────────────────────────
 
-  /**
-   * Guided /newagent interview: name → job → vibe → proactivity.
-   * Uses ask_user buttons; each new question replaces the last; /cancel aborts.
-   */
   async runNewAgentWizard(t: Transport, chatId: string): Promise<void> {
-    const ck = this.chatKey(t, chatId);
-    const chat: ChatRef = { transport: t.name, chatId };
-    this.wizardChats.add(ck);
-    let aborted = false;
-
-    const ask = async (text: string, options?: string[]): Promise<string | null> => {
-      if (aborted) return null;
-      const res = await this.questions.ask("system", chat, { text, options: options ?? [], timeoutMs: 600e3 });
-      if (!res || res.timedOut || res.replaced) return null;
-      return res.choice;
-    };
-
-    try {
-      await t.push(chatId, { text: "🧙 New agent wizard — answer the questions (taps or typing). /cancel anytime." });
-
-      // 1. name
-      let name = "";
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const raw = await ask(attempt === 0 ? "What should I call this agent? (lowercase, dashes — e.g. 'coach')" : "That name didn't work. Try another (lowercase, dashes, 2–32 chars):");
-        if (raw == null) { aborted = true; break; }
-        const err = validateAgentName(raw.trim().toLowerCase(), this.deps.agents.list().map((a) => a.id));
-        if (err) { await t.push(chatId, { text: `⚠︎ ${err}` }); continue; }
-        name = raw.trim().toLowerCase();
-        break;
-      }
-      if (aborted || !name) { await t.push(chatId, { text: "Wizard aborted — nothing created. /newagent to restart." }); return; }
-
-      // 2. job
-      const job = await ask(`What is ${name}'s main job? One or two sentences.`);
-      if (job == null) { aborted = true; }
-      if (aborted) { await t.push(chatId, { text: "Wizard aborted — nothing created. /newagent to restart." }); return; }
-
-      // 3. vibe
-      const vibeRes = await ask(`What vibe should ${name} have?`, VIBE_OPTIONS);
-      if (vibeRes == null) { aborted = true; }
-      if (aborted || vibeRes == null) { await t.push(chatId, { text: "Wizard aborted — nothing created. /newagent to restart." }); return; }
-      const vibe = vibeRes;
-
-      // 4. proactivity
-      const proRes = await ask(`How proactive should ${name} be?`, PROACTIVITY_OPTIONS);
-      if (proRes == null) { aborted = true; }
-      if (aborted || proRes == null) { await t.push(chatId, { text: "Wizard aborted — nothing created. /newagent to restart." }); return; }
-      const proactivity: Proactivity = proRes.startsWith("quiet") ? "quiet" : proRes.startsWith("chatty") ? "chatty" : proRes.startsWith("off") ? "off" : "balanced";
-
-      // (sub-bot offer happens after creation below)
-
-      // 5. ambiguity gate (Ouroboros-style): score the draft, ask follow-ups if vague
-      let extraAnswers: string[] = [];
-      const draft0: AgentDraft = { name, job: job ?? "", vibe, proactivity };
-      try {
-        const gate = await scorePersonaAmbiguity(buildPersona(draft0), {
-          modelRuntime: this.deps.modelRuntime as never,
-          model: this.deps.agents.resolveModel(process.env.PIBOT_DEFAULT_MODEL),
-          cwd: process.cwd(),
-        });
-        if (gate.score > AMBIGUITY_THRESHOLD) {
-          await t.push(chatId, { text: `🧙 A couple of clarifying questions to make ${name} sharper:` });
-          for (const q of gate.questions.slice(0, 2)) {
-            const answer = await this.questions.ask("system", chat, { text: q, options: [], timeoutMs: 600e3 });
-            if (!answer || answer.replaced) break;
-            extraAnswers.push(`Q: ${q}\nA: ${answer.choice}`);
-          }
-        }
-      } catch {
-        /* gate failure = proceed with what we have */
-      }
-
-      // build
-      const draft: AgentDraft = { name, job: [job ?? "", ...extraAnswers].filter(Boolean).join("\n"), vibe, proactivity };
-      const err = this.deps.agents.createAgent(name, buildPersona(draft));
-      if (err) { await t.push(chatId, { text: `Couldn't create: ${err}` }); return; }
-      const agent = this.deps.agents.getAgent(name)!;
-      // write the wizard-built manifest (heartbeat rhythm per proactivity)
-      writeJsonAtomic(path.join(agent.dir, "agent.json"), buildManifest(draft));
-      await this.deps.agents.discover();
-      const fresh = this.deps.agents.getAgent(name)!;
-      this.ensureHeartbeatJob(fresh);
-      this.ensureEvolutionJob(fresh);
-      this.rememberChat(name, ck);
-
-      const proLabel = draft.proactivity === "off" ? "react-only (no heartbeat)" : `heartbeat every ${PROACTIVITY_INTERVAL[draft.proactivity]}`;
-      await t.push(chatId, {
-        text: [
-          `Born: **${name}** 🎉`,
-          `— ${draft.job}`,
-          `— vibe: ${vibe}`,
-          `— ${proLabel}${draft.proactivity !== "off" ? `, quiet 23:00–08:00` : ""}`,
-          ``,
-          `You're talking to it now. Its files: agents/${name}/ (persona, memory, skills — all editable on the dashboard).`,
-        ].join("\n"),
-      });
-      void t.push(chatId, { text: `Say hi to **${name}** — try: "what can you do for me?"` });
-
-      // 5. own Telegram identity (optional)
-      const wantBot = await ask(`Give ${name} its own Telegram bot? (separate chat, its own @identity)`, [
-        "yes — create it now",
-        "skip for now",
-      ]);
-      if (wantBot?.startsWith("yes") && fresh) {
-        await this.setupSubBot(t, chatId, fresh);
-      }
-    } finally {
-      this.wizardChats.delete(ck);
-    }
+    return this.wizard.runNewAgentWizard(t, chatId);
   }
 
-  /**
-   * Sub-bot setup for one agent. Manager mode ON → deep link + automatic token
-   * fetch. Otherwise: @BotFather instructions + pasted token.
-   */
-  private async setupSubBot(t: Transport, chatId: string, agent: LoadedAgent): Promise<void> {
-    const ck = this.chatKey(t, chatId);
-    const tg = this.transports.get("telegram") as import("../transports/telegram.js").TelegramTransport | undefined;
-    const suggestedUsername = suggestedSubBotUsername(agent.id, this.telegramUsername());
-
-    if (tg?.managerMode()) {
-      const link = this.subBotDeepLink(agent.id, suggestedUsername);
-      await t.push(chatId, {
-        text: `Give **${agent.id}** its own Telegram identity? Tap — Telegram will create the bot and I'll wire it automatically.`,
-        card: { text: "", buttons: [{ label: `Create @${suggestedUsername} bot`, action: `url:${this.subBotDeepLink(agent.id, suggestedUsername, agent.id)}`, url: this.subBotDeepLink(agent.id, suggestedUsername, agent.id) }] },
-      });
-      this.pendingSubBots.set(agent.id, agent.id);
-      return;
-    }
-
-    // fallback: manual BotFather + token paste
-    await t.push(chatId, {
-      text: [
-        `Want **${agent.id}** to have its own Telegram identity?`,
-        ``,
-        `1. Open @BotFather → /newbot`,
-        `2. Name: ${agent.id} · Username: must end in "bot" (e.g. ${suggestedUsername})`,
-        `3. Paste the token here as your answer.`,
-      ].join("\n"),
-    });
-    const token = await this.questions.ask("system", { transport: t.name, chatId }, { text: "Paste the BotFather token here (or type /cancel to skip):", options: [], timeoutMs: 600e3 });
-    if (!token || token.replaced) return;
-    const r = await this.attachSubBot(agent.id, token.choice.trim());
-    await t.push(chatId, { text: r.ok ? `🟢 ${agent.id} is live as **${r.botName}** — its own bot, its own chat.` : `⚠︎ ${r.error}` });
-  }
-
-  private pendingSubBotFor(ck: string): string | undefined {
-    return this.pendingSubBots.get(ck);
+  private pendingSubBotFor(_ck: string): string | undefined {
+    return this.pendingSubBots.get(_ck);
   }
 
   /** Manager-mode: register a pending sub-bot creation + push the deep link into the agent's chats */
   async requestSubBotCreation(agentId: string): Promise<void> {
-    const agent = this.deps.agents.getAgent(agentId);
-    if (!agent) throw new Error(`unknown agent "${agentId}"`);
-    if (!this.managerMode()) throw new Error("manager mode is off — enable bot management mode for @pimother_bot in BotFather's mini app");
-    const suggestedUsername = suggestedSubBotUsername(agentId, this.telegramUsername());
-    this.pendingSubBots.set(agentId, agentId);
-    const link = this.subBotDeepLink(agentId, suggestedUsername, agentId);
-    await this.deliverToAgent(agentId, [
-      `Tap to give **${agentId}** its own Telegram identity:`,
-      ``,
-      `Telegram pre-fills @${suggestedUsername} — confirm and I'll fetch the token and wire it automatically. The bot will be restricted to you.`,
-    ].join("\n"));
-    // deep-link URL button into the agent's registered chats
-    for (const ck of this.agentChats.get(agentId) ?? new Set<string>()) {
-      const idx = ck.lastIndexOf(":");
-      const t = this.transports.get(ck.slice(0, idx));
-      if (t) void t.push(ck.slice(idx + 1), {
-        text: `🧬 Create **@${suggestedUsername}** for ${agentId}:`,
-        card: { text: "", buttons: [{ label: `Create @${suggestedUsername}`, action: `url:${this.subBotDeepLink(agentId, suggestedUsername, agent.id)}`, url: this.subBotDeepLink(agentId, suggestedUsername, agent.id) }] },
-      }).catch(() => {});
-    }
+    return this.subBotManager.requestSubBotCreation(agentId, this.agentChats, this.transports, (id, text) => this.deliverToAgent(id, text));
   }
 
   private ensureAttendPassJob(agentId: string): void {
-    this.deps.scheduler.ensure({
-      id: `attend:${agentId}`,
-      agentId,
-      chat: { transport: "internal", chatId: "attend" },
-      title: "attend pass",
-      kind: "attend-pass",
-      dueAt: nextDailyAt("10:30"),
-      repeat: { dailyAt: "10:30" },
-      wake: "normal",
-      delivery: "direct",
-      status: "pending",
-      createdAt: Date.now(),
-      firedCount: 0,
-      internal: true,
-    });
+    return this.delivery.ensureAttendPassJob(agentId);
   }
 
-  /** Surface one attend item (respects attend's active hours + daily cap) via buttons */
-  private async runAttendPass(t: Transport, chatId: string, agentId: string): Promise<void> {
-    try {
-      const items = await attendCli(["list", "--status", "pending"]);
-      const parsed = items ? (JSON.parse(items) as Array<{ id: string; title: string; body?: string; category: string }>) : [];
-      if (!parsed.length) return;
-      // policy: max 1/day — count today's responses
-      const stateDir = path.join(os.homedir(), "attend", "state");
-      let answeredToday = 0;
-      try {
-        const today = new Date().toISOString().slice(0, 10);
-        for (const line of fs.readFileSync(path.join(stateDir, "responses.jsonl"), "utf8").split("\n")) {
-          if (line.includes(today) && line.includes('"answered"')) answeredToday++;
-        }
-      } catch {
-        /* no responses file */
-      }
-      if (answeredToday >= 1) return; // attend's default max_per_day
-      const item = parsed[0];
-      this.pendingAttend.set(this.chatKey(t, chatId), item.id);
-      const bodyText = item.body ? `\n\n${item.body}` : "";
-      await this.questions.ask(agentId, { transport: t.name, chatId }, {
-        text: `🧠 (attend · ${item.category}) ${item.title}${bodyText}`,
-        options: [],
-        timeoutMs: 12 * 3600e3,
-      }).then(async (res) => {
-        if (!res || res.timedOut) return;
-        await attendCli(["mark", "--id", item.id, "--status", "answered"]).catch(() => {});
-        // record for attend's daily-cap policy
-        const rec = {
-          ts: new Date().toISOString(), item_id: item.id, category: item.category,
-          channel: "telegram", machine: process.env.HOST ?? "local", outcome: res.index >= 0 ? "answered" : "answered",
-          answer: res.choice, counted: true,
-        };
-        fs.mkdirSync(path.join(os.homedir(), "attend", "state"), { recursive: true });
-        fs.appendFileSync(path.join(stateDir, "responses.jsonl"), JSON.stringify(rec) + "\n");
-      });
-    } catch (e) {
-      this.deps.events.log(agentId, "system", `attend pass failed: ${errorMessage(e)}`);
-    }
+  private ensureMorningBriefJob(agent: Parameters<Delivery["ensureMorningBriefJob"]>[0]): void {
+    return this.delivery.ensureMorningBriefJob(agent);
   }
 
-  private pendingAttend = new Map<string, string>(); // chatKey → attend item id
-
-  private ensureMorningBriefJob(agent: LoadedAgent): void {
-    const hb = agent.manifest.heartbeat;
-    if (!hb?.enabled) return;
-    const at = hb.quietHours?.to ?? "08:00";
-    this.deps.scheduler.ensure({
-      id: `brief:${agent.id}`,
-      agentId: agent.id,
-      chat: { transport: "internal", chatId: "brief" },
-      title: "morning brief",
-      kind: "morning-brief",
-      dueAt: nextDailyAt(at),
-      repeat: { dailyAt: at },
-      wake: "normal",
-      delivery: "direct",
-      status: "pending",
-      createdAt: Date.now(),
-      firedCount: 0,
-      internal: true,
-    });
+  private ensureEvolutionJob(agent: Parameters<Delivery["ensureEvolutionJob"]>[0]): void {
+    return this.delivery.ensureEvolutionJob(agent);
   }
 
-  private ensureEvolutionJob(agent: LoadedAgent): void {
-    const ev = agent.manifest.evolution;
-    if (!ev?.enabled) return;
-    const everyMs = parseDuration(ev.interval ?? "6h");
-    this.deps.scheduler.ensure({
-      id: `ev:${agent.id}`,
-      agentId: agent.id,
-      chat: { transport: "internal", chatId: "evolution" },
-      title: "evolution",
-      kind: "evolution",
-      dueAt: Date.now() + (everyMs ?? 6 * 3600e3),
-      repeat: { everyMs: everyMs ?? 6 * 3600e3 },
-      wake: "normal",
-      delivery: "direct",
-      status: "pending",
-      createdAt: Date.now(),
-      firedCount: 0,
-      internal: true,
-    });
-  }
-
-  private ensureHeartbeatJob(agent: LoadedAgent): void {
-    const hb = agent.manifest.heartbeat;
-    if (!hb?.enabled) return;
-    const everyMs = parseDuration(hb.interval) ?? 45 * 60e3;
-    this.deps.scheduler.ensure({
-      id: `hb:${agent.id}`,
-      agentId: agent.id,
-      chat: { transport: "internal", chatId: "heartbeat" },
-      title: "heartbeat",
-      kind: "heartbeat",
-      dueAt: Date.now() + everyMs,
-      repeat: { everyMs },
-      wake: "normal",
-      delivery: "direct",
-      status: "pending",
-      createdAt: Date.now(),
-      firedCount: 0,
-      internal: true,
-    });
+  private ensureHeartbeatJob(agent: Parameters<Delivery["ensureHeartbeatJob"]>[0]): void {
+    return this.delivery.ensureHeartbeatJob(agent);
   }
 
   async deliverFire(job: Schedule, snoozed: boolean): Promise<void> {
-    if (job.kind === "heartbeat") {
-      await this.deps.heartbeat.tick(job.agentId);
-      return;
-    }
-    if (job.kind === "attend-pass") {
-      const ck = this.primaryChat(job);
-      if (ck) {
-        const idx = ck.lastIndexOf(":");
-        const t = this.transports.get(ck.slice(0, idx));
-        if (t) await this.runAttendPass(t, ck.slice(idx + 1), job.agentId);
-      }
-      return;
-    }
-    if (job.kind === "morning-brief") {
-      await this.deps.heartbeat.tick(job.agentId, { brief: true });
-      return;
-    }
-    if (job.kind === "evolution" && this.deps.evolution) {
-      const report = await this.deps.evolution.evolve(job.agentId);
-      if (report.staged) {
-        await this.deliverToAgent(job.agentId, `🧬 Evolution staged **${report.skill}** for your review: ${report.summary}`);
-      }
-      return;
-    }
-    this.deps.events.log(job.agentId, "fire", `${job.title} (${job.kind})`);
-
-    if (job.delivery === "agent") {
-      const ck = this.primaryChat(job);
-      if (ck) {
-        const idx = ck.indexOf(":");
-        const t = this.transports.get(ck.slice(0, idx));
-        if (t) {
-          await this.promptAgent(
-            t,
-            ck.slice(idx + 1),
-            job.agentId,
-            `[scheduler] It's time for “${job.title}”${job.detail ? ` — ${job.detail}` : ""}. Compose a short, natural message telling the user this is due now${snoozed ? " (it fired during their snooze — acknowledge that lightly)" : ""}.`
-          );
-          return;
-        }
-      }
-    }
-
-    const t = this.transports.get(job.chat.transport);
-    if (!t) return;
-    const icon = job.kind === "task" ? "📋" : job.kind === "note" ? "📝" : job.kind === "subject" ? "🧭" : "⏰";
-    const lines = [`${icon} **${job.title}**`];
-    if (job.detail) lines.push(job.detail);
-    if (snoozed) lines.push("_(fired during snooze — marked important)_");
-    await t.push(job.chat.chatId, {
-      text: lines.join("\n"),
-      card: {
-        text: "",
-        buttons: [
-          { label: "⏰ +10m", action: `scd:${job.id}:+10m` },
-          { label: "🕒 +1h", action: `scd:${job.id}:+1h` },
-          { label: "🗑 Done", action: `scd:${job.id}:cancel` },
-        ],
-      },
-    });
+    return this.delivery.deliverFire(job, snoozed);
   }
 
   /** Structured question with tappable options; resolves on tap/vote/typed answer */
@@ -880,7 +501,7 @@ export class PiBot implements HeartbeatHost {
       [...cks].map((ck) => {
         const idx = ck.lastIndexOf(":");
         return this.questions.ask(agentId, { transport: ck.slice(0, idx), chatId: ck.slice(idx + 1) }, { text: question, options, poll: options.length > 6 });
-      })
+      }),
     );
   }
 
@@ -909,9 +530,7 @@ export class PiBot implements HeartbeatHost {
     const tail = this.transcriptTail(fromSession, 12);
     // deliver into the TARGET's session for this chat — its history now carries the context
     const targetSession = await this.sessionFor(t, chatId, toAgent, ck);
-    await targetSession.prompt(envelope(
-      `[handoff from "${fromAgent}"] The user is moving this conversation to you. Continue where this left off — acknowledge in one short line, then pick up the thread.\n\n# Recent context\n${tail}${note ? `\n\n# Note from ${fromAgent}\n${note}` : ""}`
-    ));
+    await targetSession.prompt(envelope(`[handoff from "${fromAgent}"] The user is moving this conversation to you. Continue where this left off — acknowledge in one short line, then pick up the thread.\n\n# Recent context\n${tail}${note ? `\n\n# Note from ${fromAgent}\n${note}` : ""}`));
     this.rememberChat(toAgent, ck);
     this.deps.events.log(toAgent, "system", `handoff from ${fromAgent} (${truncate(tail, 80)})`);
   }
@@ -923,9 +542,7 @@ export class PiBot implements HeartbeatHost {
     const target = this.deps.agents.getAgent(agentId);
     if (!target) throw new Error(`unknown agent "${agentId}"`);
     const ck = `agent::${agentId}::from-${fromAgent}`;
-    const session = await this.deps.agents.getOrCreateSession(
-      agentId, ck, { transport: "agent", chatId: fromAgent }, this.deps.scheduler
-    );
+    const session = await this.deps.agents.getOrCreateSession(agentId, ck, { transport: "agent", chatId: fromAgent }, this.deps.scheduler);
     if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("target agent is busy");
     const run = session.prompt(envelope(`[agent-message from "${fromAgent}"]\n\n${text}`));
     const reply = timeoutMs
@@ -945,10 +562,7 @@ export class PiBot implements HeartbeatHost {
       const fromSession = this.cachedSessions.get(`${fromAgent}::${fromCk}`);
       if (fromSession) tail = this.transcriptTail(fromSession, 12);
     }
-    return this.agentTurn(toAgent, fromAgent,
-      `[handoff from "${fromAgent}"] The user is moving this thread to you.${note ? ` Note: ${note}` : ""}\n\n# Context from ${fromAgent}\n${tail}\n\nAcknowledge briefly and continue.`,
-      10 * 60e3
-    );
+    return this.agentTurn(toAgent, fromAgent, `[handoff from "${fromAgent}"] The user is moving this thread to you.${note ? ` Note: ${note}` : ""}\n\n# Context from ${fromAgent}\n${tail}\n\nAcknowledge briefly and continue.`, 10 * 60e3);
   }
 
   /** Blocking inter-agent question — used by the agent_ask tool */
