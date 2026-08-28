@@ -93,7 +93,7 @@ async function main(): Promise<void> {
       ? [new TelegramTransport(telegramToken, allowedChats)]
       : [new CliTransport()];
 
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime });
 
   await bot.start();
   scheduler.rearm();
