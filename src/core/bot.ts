@@ -840,7 +840,34 @@ export class PiBot implements HeartbeatHost {
     );
   }
 
-  // ── HeartbeatHost ─────────────────────────────────────────────────────────
+  // ── agent-to-agent messaging ─────────────────────────────────────────────
+
+  /** Run one turn in an agent's inter-agent session and return the reply text */
+  private async agentTurn(agentId: string, fromAgent: string, text: string, timeoutMs?: number): Promise<string> {
+    const target = this.deps.agents.getAgent(agentId);
+    if (!target) throw new Error(`unknown agent "${agentId}"`);
+    const ck = `agent::${agentId}::from-${fromAgent}`;
+    const session = await this.deps.agents.getOrCreateSession(
+      agentId, ck, { transport: "agent", chatId: fromAgent }, this.deps.scheduler
+    );
+    if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("target agent is busy");
+    const run = session.prompt(envelope(`[agent-message from "${fromAgent}"]\n\n${text}`));
+    const reply = timeoutMs
+      ? await Promise.race([
+          run.then(() => extractAssistantTextFromSession(session)),
+          new Promise<string>((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
+        ])
+      : await run.then(() => extractAssistantTextFromSession(session));
+    return reply || "(no reply)";
+  }
+
+  /** Blocking inter-agent question — used by the agent_ask tool */
+  async agentAsk(fromAgent: string, toAgent: string, question: string, timeoutMs?: number): Promise<string> {
+    if (!this.deps.agents.getAgent(toAgent)) throw new Error(`unknown agent "${toAgent}"`);
+    return this.agentTurn(toAgent, fromAgent, question, timeoutMs);
+  }
+
+  // ── HeartbeatHost ─────────────────────────────────────────────────────
 
   lastUserMessageAt(agentId: string): number {
     return this.lastUserMessage.get(agentId) ?? 0;
@@ -885,6 +912,10 @@ function envelope(text: string): string {
     minute: "2-digit",
   });
   return `[${now}]\n\n${text}`;
+}
+
+function extractAssistantTextFromSession(session: AgentSession): string | null {
+  return extractAssistantText((session.agent.state.messages ?? []) as unknown[]);
 }
 
 function extractAssistantText(messages: unknown[]): string | null {

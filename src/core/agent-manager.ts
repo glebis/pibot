@@ -20,6 +20,7 @@ import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
 import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
 import { tgResponderPlugin } from "../plugins/tg-responder-plugin.js";
 import { knowledgePlugin } from "../plugins/knowledge-plugin.js";
+import { agentCommsPlugin, type CommsHooks } from "../plugins/agent-comms-plugin.js";
 import { attendPlugin } from "../plugins/attend-plugin.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
@@ -110,7 +111,8 @@ export class AgentManager {
     chatKey: string,
     chat: ChatRef,
     scheduler: Scheduler,
-    ask?: (spec: import("./questions.js").QuestionSpec) => Promise<import("./questions.js").QuestionAnswer | null>
+    ask?: (spec: import("./questions.js").QuestionSpec) => Promise<import("./questions.js").QuestionAnswer | null>,
+    comms?: CommsHooks
   ): Promise<AgentSession> {
     const key = `${agentId}::${chatKey}`;
     const cached = this.sessions.get(key);
