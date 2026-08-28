@@ -105,11 +105,14 @@ async function main(): Promise<void> {
   scheduler.rearm();
 
   // web dashboard (config CRUD) — always on unless disabled
-  const webPort = parseInt(process.env.PIBOT_WEB_PORT || "7860", 10);
+  const webPort = config.webPort ?? parseInt(process.env.PIBOT_WEB_PORT || "7860", 10);
   if (process.env.PIBOT_WEB !== "0") {
-    const webApp = createWebApp({ agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore });
+    const webApp = createWebApp({
+      agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
+      webToken: config.webToken, webRpId: config.webRpId, webPort,
+    });
     const server = serve({ fetch: webApp.fetch, port: webPort, hostname: "127.0.0.1" });
-    console.log(`[pibot] dashboard → http://127.0.0.1:${webPort}`);
+    console.log(`[pibot] dashboard → http://127.0.0.1:${webPort}${config.webToken ? " 🔒 token" : ""}${config.webRpId ? ` (rpId=${config.webRpId})` : ""}`);
     server.addListener("error", (e) => console.error("[web]", e.message));
   }
 

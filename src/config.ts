@@ -13,6 +13,9 @@ export interface Config {
   heartbeatModel?: string;
   telegramToken?: string;
   allowedChats: string[];
+  webToken?: string;
+  webRpId?: string;
+  webPort?: number;
 }
 
 // ─── runtime-editable settings (web-configurable, survives restarts) ───────
@@ -70,5 +73,8 @@ export function loadConfig(): Config {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
+    webToken: process.env.PIBOT_WEB_TOKEN?.trim() || undefined,
+    webRpId: (process.env.PIBOT_WEB_RP_ID || process.env.PIBOT_WEB_AUTH || "").trim() || undefined,
+    webPort: parseInt(process.env.PIBOT_WEB_PORT || "7860", 10),
   };
 }
