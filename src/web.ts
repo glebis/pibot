@@ -347,6 +347,8 @@ ${hasToken ? `<div class="card">
       return c.json({ error: "authentication required to add more passkeys" }, 401);
     }
     const challenge = authStore.createChallenge("register");
+    // SimpleWebAuthn expects raw bytes — pass Uint8Array to avoid double-base64url encoding
+    const challengeBytes = Buffer.from(challenge, "base64url");
     // for open enrollment, we still generate options
     const opts = await generateRegistrationOptions({
       rpName,
@@ -354,7 +356,7 @@ ${hasToken ? `<div class="card">
       userName: "pibot",
       userDisplayName: "pibot",
       userID: new Uint8Array([1,2,3,4]),
-      challenge,
+      challenge: challengeBytes as any,
       attestationType: "none",
       authenticatorSelection: { residentKey: "preferred", userVerification: "preferred", authenticatorAttachment: "platform" },
       excludeCredentials: authStore.credentials.map((cc) => ({ id: cc.id, transports: cc.transports as any })),
@@ -414,10 +416,11 @@ ${hasToken ? `<div class="card">
   // ── WebAuthn: authentication ──
   app.get("/auth/webauthn/auth-options", async (c) => {
     const challenge = authStore.createChallenge("auth");
+    const challengeBytes = Buffer.from(challenge, "base64url");
     const allow = authStore.credentials.map((cc) => ({ id: cc.id, transports: cc.transports as any }));
     const opts = await generateAuthenticationOptions({
       rpID: rpId,
-      challenge,
+      challenge: challengeBytes as any,
       allowCredentials: allow.length ? allow : undefined,
       userVerification: "preferred",
     } as any);
