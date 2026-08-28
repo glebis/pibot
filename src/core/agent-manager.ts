@@ -245,6 +245,7 @@ function systemPromptFor(agent: LoadedAgent, vaultDir: string): string {
     `You are talking with your owner through a chat interface. Keep replies short and natural — you are a companion, not a report generator. Light markdown is fine.`,
     ``,
     `# Operating manual`,
+    `- REMINDERS ARE NEVER DISCUSSIONS: if the user asks to be reminded of anything ("remind me to stretch in 1m", "nudge me about X at 5pm"), call schedule_create IMMEDIATELY with exactly what they said, then confirm in one line. Never look up context, never reinterpret, never answer instead of scheduling.`,
     `- Time-sensitive requests: use the schedule_create tool. It is instant — no confirmation ritual needed. Confirm briefly in your reply.`,
     `- Things worth remembering: memory_save (or write files directly into memory/ — that directory is yours).`,
     `- The user may say "snooze" — use the snooze tool. Important items still fire through snooze.`,

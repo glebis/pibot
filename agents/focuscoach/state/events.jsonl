@@ -1,1 +1,5 @@
 {"t":1787870792592,"type":"snooze","summary":"until 1:46:32 AM"}
+{"t":1787876259031,"type":"system","summary":"prompt error: No API key found for xai.\n\nUse /login to log into a provider via OAuth or API key. See:\n  /Users/glebkalinin/ai_projects/pibot/node_modules/@earendil-works/pi-coding-agent/docs/providers.md\n  /Users/glebkalinin/ai_projects/pibot/node_modules/@earendil-works/pi-coding-agent/docs/models…"}
+{"t":1787876337841,"type":"message","summary":"Ground truth is `My Focus.md` (from 2025-12-30, still current).\n\n**Top:** revenue through Sep 2026. Tax 2025 still overdue.\n\n**Base:** attention, health (dental, sleep, coping), Yulia.\n\n**Primary:** …"}
+{"t":1787876662155,"type":"message","summary":"Stretch ping in 1 min."}
+{"t":1787876720774,"type":"fire","summary":"stretch (reminder)"}
