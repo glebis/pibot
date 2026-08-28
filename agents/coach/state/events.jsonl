@@ -5,3 +5,5 @@
 {"t":1787902081371,"type":"heartbeat","summary":"Silent: pre-14:00 micro-workout already nudged; nothing new due."}
 {"t":1787903881109,"type":"heartbeat","summary":"Silent: pre-14:00 micro-workout already nudged this morning; nothing new due."}
 {"t":1787905681562,"type":"heartbeat","summary":"Silent tick. Pre-14:00 micro-workout already nudged; calendar still thin; nothing new due."}
+{"t":1787909687815,"type":"system","summary":"heartbeat prompt error: No API key found for xai.\n\nUse /login to log into a provider via OAuth or API key. See:\n  /Users/glebkalinin/ai_projects/pibot/node_modules/@earendil-works/pi-coding-agent/docs/providers.md\n  /Users/glebkalinin/ai_projects/pibot/node_modules/@earendil-works/pi-coding-agent/d…"}
+{"t":1787910790893,"type":"system","summary":"evolution: promoted skill pre-deadline-micro-workout"}
