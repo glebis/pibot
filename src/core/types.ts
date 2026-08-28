@@ -108,9 +108,11 @@ export interface AgentManifest {
 export const DEFAULT_AGENT_TOOLS = ["read", "write", "edit", "grep", "find", "ls"];
 
 export function defaultManifest(name: string): AgentManifest {
+  const model = process.env.PIBOT_DEFAULT_MODEL || undefined;
   return {
     name,
     description: "A pibot agent",
+    model,
     heartbeat: {
       enabled: true,
       interval: "45m",

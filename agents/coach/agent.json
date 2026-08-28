@@ -15,5 +15,6 @@
     "enabled": true,
     "interval": "6h",
     "model": "same"
-  }
+  },
+  "model": "xai/grok-4.6"
 }
