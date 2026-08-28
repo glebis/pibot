@@ -10,17 +10,24 @@
  * - Legacy plaintext settings.json / .env secrets are migrated automatically
  *   (encrypted, then scrubbed from the plaintext files).
  */
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Settings } from "../config.js";
 
-const SOPS = process.env.SOPS_BIN || "sops";
-const AGE_KEY_FILE = path.join(os.homedir(), ".config/sops/age/keys.txt");
+export const SOPS = process.env.SOPS_BIN || "sops";
+export function getSopsBin(): string {
+  return process.env.SOPS_BIN || "sops";
+}
+export function getAgeKeyFile(): string {
+  return path.join(os.homedir(), ".config/sops/age/keys.txt");
+}
+export const AGE_KEY_FILE = getAgeKeyFile();
 
 export function sopsAvailable(): boolean {
-  const paths = [SOPS, "/opt/homebrew/bin/sops", "/usr/local/bin/sops"];
+  const sops = getSopsBin();
+  const paths = [sops, "/opt/homebrew/bin/sops", "/usr/local/bin/sops"];
   return paths.some((p) => {
     try {
       fs.accessSync(p, fs.constants.X_OK);
@@ -33,26 +40,27 @@ export function sopsAvailable(): boolean {
 
 export function ageRecipient(): string {
   ensureAgeKey();
-  const m = fs.readFileSync(AGE_KEY_FILE, "utf8").match(/public key:\s*(age1[0-9a-z]+)/);
-  if (!m) throw new Error("could not read the age public key from " + AGE_KEY_FILE);
+  const keyFile = getAgeKeyFile();
+  const m = fs.readFileSync(keyFile, "utf8").match(/public key:\s*(age1[0-9a-z]+)/);
+  if (!m) throw new Error("could not read the age public key from " + keyFile);
   return m[1];
 }
 
 export function ensureAgeKey(): void {
-  if (fs.existsSync(AGE_KEY_FILE)) return;
-  fs.mkdirSync(path.dirname(AGE_KEY_FILE), { recursive: true });
-  const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
-  execFileSync("age-keygen", ["-o", AGE_KEY_FILE], { stdio: "pipe" });
-  fs.chmodSync(AGE_KEY_FILE, 0o600);
+  const keyFile = getAgeKeyFile();
+  if (fs.existsSync(keyFile)) return;
+  fs.mkdirSync(path.dirname(keyFile), { recursive: true });
+  execFileSync("age-keygen", ["-o", keyFile], { stdio: "pipe" });
+  fs.chmodSync(keyFile, 0o600);
 }
 
 function sopsRun(args: string[], input?: string): Promise<string> {
-  return sopsRunEnv(args, input, { SOPS_AGE_KEY_FILE: AGE_KEY_FILE });
+  return sopsRunEnv(args, input, { SOPS_AGE_KEY_FILE: getAgeKeyFile() });
 }
 
 function sopsRunEnv(args: string[], input: string | undefined, extraEnv?: Record<string, string>): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(SOPS, args, {
+    const child = spawn(getSopsBin(), args, {
       stdio: input !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
       env: { ...process.env, ...extraEnv },
     });
@@ -71,7 +79,7 @@ function sopsRunEnv(args: string[], input: string | undefined, extraEnv?: Record
   });
 }
 
-function truncateErr(s: string): string {
+export function truncateErr(s: string): string {
   return s.trim().split("\n")[0]?.slice(0, 200) ?? "";
 }
 
@@ -102,11 +110,11 @@ async function sopsDecrypt(filePath: string): Promise<Settings> {
 }
 
 /** Fields that must never sit in plaintext */
-function isSecretSettings(s: Settings): boolean {
+export function isSecretSettings(s: Settings): boolean {
   return Boolean(s.telegram?.token || (s.telegram?.subBots && Object.values(s.telegram.subBots).some((b) => b.token)));
 }
 
-function stripSecrets(s: Settings): Settings {
+export function stripSecrets(s: Settings): Settings {
   const out: Settings = JSON.parse(JSON.stringify(s));
   if (out.telegram) {
     const tg = out.telegram as Record<string, unknown>;
@@ -121,7 +129,7 @@ function stripSecrets(s: Settings): Settings {
   return out;
 }
 
-const SECRET_ENV_RE = /(API_KEY|_TOKEN$|^TOKEN|SECRET)/;
+export const SECRET_ENV_RE = /(API_KEY|_TOKEN$|^TOKEN|SECRET)/;
 
 export class SecretStore {
   private mem: Settings = {};
@@ -144,7 +152,7 @@ export class SecretStore {
       try {
         this.mem = await sopsDecrypt(this.encPath);
       } catch (e) {
-        throw new Error(`FAIL-CLOSED: could not decrypt ${this.encPath} (${String(e)}). Check your age key at ${AGE_KEY_FILE}.`);
+        throw new Error(`FAIL-CLOSED: could not decrypt ${this.encPath} (${String(e)}). Check your age key at ${getAgeKeyFile()}.`);
       }
       // legacy plaintext secrets leftover → scrub
       if (isSecretSettings(plaintext)) this.writePlaintextWithoutSecrets(plaintext);
@@ -252,7 +260,7 @@ function loadPlain(dataDir: string): Settings {
   }
 }
 
-function writeJsonAtomic(value: unknown, file: string): void {
+export function writeJsonAtomic(value: unknown, file: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n");
