@@ -165,7 +165,7 @@ export class SecretStore {
   }
 
   /** Migrate .env secret lines into the encrypted store, scrub .env */
-  private migrateEnv(): void {
+  private async migrateEnv(): Promise<void> {
     const envFile = path.join(process.cwd(), ".env");
     if (!fs.existsSync(envFile)) return;
     const lines = fs.readFileSync(envFile, "utf8").split("\n");
@@ -186,6 +186,7 @@ export class SecretStore {
       envMap[m[1]] = m[2].replace(/^["']|["']$/g, "");
     }
     (this.mem as { env?: Record<string, string> }).env = envMap;
+    await this.flushEncrypted();
     fs.writeFileSync(envFile, kept.join("\n"));
   }
 

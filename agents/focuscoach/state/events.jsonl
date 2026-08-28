@@ -14,3 +14,8 @@
 {"t":1787903439143,"type":"heartbeat","summary":"Silent. Tax and screening already flagged this morning; stretch postponed; nothing new at 09:50."}
 {"t":1787906137842,"type":"heartbeat","summary":"Silent. Tax and screening already flagged; stretch postponed; nothing new at 10:35."}
 {"t":1787910587809,"type":"system","summary":"heartbeat prompt error: No API key found for xai.\n\nUse /login to log into a provider via OAuth or API key. See:\n  /Users/glebkalinin/ai_projects/pibot/node_modules/@earendil-works/pi-coding-agent/docs/providers.md\n  /Users/glebkalinin/ai_projects/pibot/node_modules/@earendil-works/pi-coding-agent/d…"}
+{"t":1787913284837,"type":"system","summary":"prompt error: No API key found for xai.\n\nUse /login to log into a provider via OAuth or API key. See:\n  /Users/glebkalinin/ai_projects/pibot/node_modules/@earendil-works/pi-coding-agent/docs/providers.md\n  /Users/glebkalinin/ai_projects/pibot/node_modules/@earendil-works/pi-coding-agent/docs/models…"}
+{"t":1787913359802,"type":"system","summary":"prompt error: No API key found for xai.\n\nUse /login to log into a provider via OAuth or API key. See:\n  /Users/glebkalinin/ai_projects/pibot/node_modules/@earendil-works/pi-coding-agent/docs/providers.md\n  /Users/glebkalinin/ai_projects/pibot/node_modules/@earendil-works/pi-coding-agent/docs/models…"}
+{"t":1787913512790,"type":"message","summary":"Stretch ping in 2 min."}
+{"t":1787913631180,"type":"fire","summary":"stretch (reminder)"}
+{"t":1787913636957,"type":"system","summary":"card cancel → stretch"}
