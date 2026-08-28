@@ -71,6 +71,10 @@ export class HeartbeatEngine {
     if (!hb?.enabled) return { ok: false, reason: "disabled" };
     if (opts.snoozed) return { ok: false, reason: "snoozed" };
     if (inQuietHours(hb.quietHours, now)) return { ok: false, reason: "quiet hours" };
+    // backoff: 2 proactive speaks with no user reaction — pause until user responds
+    if ((this.unansweredSpeaks.get(agent.id) ?? 0) >= 2) {
+      return { ok: false, reason: "backoff: 2 unanswered speaks" };
+    }
     // active conversation: don't interrupt mid-chat
     if (opts.lastUserMessageAt && now - opts.lastUserMessageAt < 15 * 60e3) {
       return { ok: false, reason: "recent user activity" };
@@ -95,6 +99,8 @@ export class HeartbeatEngine {
     const hb = agent.manifest.heartbeat;
     if (!hb?.enabled) return;
     if (this.inflight.has(agentId)) return; // previous tick still running
+    // fast-path backoff without invoking shouldTick (covers cases where caller bypasses it)
+    if ((this.unansweredSpeaks.get(agentId) ?? 0) >= 2) return;
 
     const guard = this.shouldTick(agent, {
       snoozed: Boolean(this.deps.scheduler.snoozeState(agentId)),
