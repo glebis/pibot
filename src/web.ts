@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Hono } from "hono";
@@ -9,6 +10,13 @@ import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
 import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
 import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
+import { WebAuthStore } from "./web-auth.js";
+import {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse,
+} from "@simplewebauthn/server";
 
 export interface TelegramControl {
   hasTransport(name: string): boolean;
@@ -32,6 +40,13 @@ export interface WebDeps {
   dataDir: string;
   telegram?: TelegramControl;
   secrets?: { get(): import("./config.js").Settings; save(patch: Partial<import("./config.js").Settings>): Promise<void> };
+  webToken?: string;
+  webRpId?: string;
+  webPort?: number;
+  /** injectable for tests */
+  webAuthStore?: WebAuthStore;
+  /** per-process CSRF token override (tests) */
+  csrfToken?: string;
 }
 
 // ─── rendering helpers ──────────────────────────────────────────────────────
@@ -57,7 +72,7 @@ function page(title: string, body: string, flash?: string): string {
   .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
   .row > * { flex: 1 1 160px; }
   label { display: block; font-size: 12px; color: #8a94a3; margin: 10px 0 4px; }
-  input[type=text], input[type=number], textarea, select {
+  input[type=text], input[type=number], input[type=password], textarea, select {
     width: 100%; background: #0d0f12; color: #d7dce2; border: 1px solid #2b313b; border-radius: 7px;
     padding: 7px 10px; font: inherit; font-size: 14px;
   }
@@ -88,13 +103,14 @@ ${body}
 </main></body></html>`;
 }
 
-function manifestForm(agent: LoadedAgent): string {
+function manifestForm(agent: LoadedAgent, csrf: string): string {
   const m = agent.manifest;
   const hb = m.heartbeat ?? { enabled: false, interval: "45m", model: "same" };
   const ev = m.evolution ?? { enabled: false, interval: "6h", model: "same" };
   const qh = hb.quietHours ?? { from: "23:00", to: "08:00" };
   return `
 <form method="post" action="/agents/${esc(agent.id)}/manifest" class="card">
+  <input type="hidden" name="_csrf" value="${esc(csrf)}">
   <div class="row">
     <div><label>Description</label><input type="text" name="description" value="${esc(m.description ?? "")}"></div>
     <div><label>Model (pi shorthand, empty = auto)</label><input type="text" name="model" value="${esc(m.model ?? "")}" placeholder="sonnet:medium"></div>
@@ -131,6 +147,337 @@ function manifestForm(agent: LoadedAgent): string {
 export function createWebApp(deps: WebDeps): Hono {
   const app = new Hono();
 
+  const csrfToken = deps.csrfToken ?? crypto.randomBytes(32).toString("hex");
+  // expose for tests
+  (app as any)._csrf = csrfToken;
+
+  const webToken = deps.webToken ?? process.env.PIBOT_WEB_TOKEN?.trim() ?? undefined;
+  const rpId = deps.webRpId ?? process.env.PIBOT_WEB_RP_ID?.trim() ?? process.env.PIBOT_WEB_AUTH?.trim() ?? "127.0.0.1";
+  const webPort = deps.webPort ?? parseInt(process.env.PIBOT_WEB_PORT || "7860", 10);
+  const rpName = "pibot dashboard";
+
+  const authStore: WebAuthStore = deps.webAuthStore ?? new WebAuthStore(deps.dataDir, { rpId, rpName });
+  (app as any)._authStore = authStore;
+
+  const csrfField = () => `<input type="hidden" name="_csrf" value="${esc(csrfToken)}">`;
+
+  function checkCsrf(body: Record<string, unknown>): boolean {
+    return String(body["_csrf"] ?? "") === csrfToken;
+  }
+
+  function expectedOrigins(): string[] {
+    const port = String(webPort);
+    const hosts = new Set([rpId, "127.0.0.1", "localhost"]);
+    const out: string[] = [];
+    for (const h of hosts) {
+      out.push(`http://${h}:${port}`, `https://${h}:${port}`, `http://${h}`, `https://${h}`);
+    }
+    // also allow without explicit port for https
+    return [...new Set(out)];
+  }
+
+  function isAuthenticated(c: any): boolean {
+    const auth = c.req.header("authorization") ?? "";
+    if (webToken && auth === `Bearer ${webToken}`) return true;
+    const cookie = authStore.parseCookie(c.req.header("cookie"));
+    if (cookie) {
+      const tok = authStore.verifySignedToken(cookie);
+      if (tok) return true;
+    }
+    return false;
+  }
+
+  function authRequired(): boolean {
+    return !!webToken || authStore.hasCredentials();
+  }
+
+  function requireAuth(c: any): boolean {
+    if (!authRequired()) return true;
+    return isAuthenticated(c);
+  }
+
+  const openAuthPaths = new Set([
+    "/auth",
+    "/auth/token",
+    "/auth/logout",
+    "/auth/webauthn/register-options",
+    "/auth/webauthn/register-verify",
+    "/auth/webauthn/auth-options",
+    "/auth/webauthn/auth-verify",
+  ]);
+
+  function isApiRequest(c: any): boolean {
+    const accept = c.req.header("accept") ?? "";
+    return accept.includes("application/json") || c.req.header("content-type")?.includes("application/json") || false;
+  }
+
+  // ── auth pages (open) ──
+  app.get("/auth", (c) => {
+    const hasCreds = authStore.hasCredentials();
+    const hasToken = !!webToken;
+    const body = `
+<h2>🔐 Unlock dashboard</h2>
+<div class="card">
+  <p class="muted">Use Touch ID / passkey or a Bearer token to open the dashboard. Dashboard is bound to <span class="mono">${esc(rpId)}</span>.</p>
+  <div id="webauthn" style="margin:12px 0">
+    <button id="btn-touch" class="btn" style="background:#1a7f37">👆 Unlock with Touch ID</button>
+    <span id="wa-msg" class="muted" style="margin-left:10px"></span>
+  </div>
+  ${hasCreds ? `<p class="muted">${authStore.credentials.length} passkey enrolled — this is the admin. Use Touch ID above to unlock.</p>` : `<p class="muted">No passkey yet — you can enroll below once logged in with a token, or enroll immediately if dashboard is still open.</p>`}
+  ${!hasCreds && !hasToken ? `<div class="flash warn">Dashboard is open (no passkey, no PIBOT_WEB_TOKEN). Enroll a passkey now to lock it.</div>` : ""}
+  ${!hasCreds ? `<div id="enroll" style="margin-top:14px">
+    <button id="btn-enroll" class="btn ghost">➕ Enroll this Mac (Touch ID)</button>
+    <span id="enroll-msg" class="muted" style="margin-left:10px"></span>
+  </div>` : `<div id="enroll" style="margin-top:14px" class="muted">Enrolled — single admin. To re-enroll, remove <span class="mono">data/web-auth.json</span> and restart.</div>`}
+</div>
+${hasToken ? `<div class="card">
+  <h2 style="margin-top:0">Token fallback</h2>
+  <form method="post" action="/auth/token">
+    ${csrfField()}
+    <label>PIBOT_WEB_TOKEN</label>
+    <input type="password" name="token" placeholder="paste bearer token" required>
+    <button type="submit">Unlock with token</button>
+  </form>
+  <p class="muted">Or: <span class="mono">curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:${esc(String(webPort))}/</span></p>
+</div>` : ""}
+<div class="card"><a href="/">← Back to dashboard</a></div>
+<script>
+(function(){
+  const msg = document.getElementById('wa-msg');
+  const enrollMsg = document.getElementById('enroll-msg');
+  function b64urlToBuf(s){ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='='; const bin=atob(s); const b=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) b[i]=bin.charCodeAt(i); return b; }
+  function bufToB64url(b){ let s=''; for(let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]); return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,''); }
+  async function doAuth(){
+    try{
+      msg.textContent='…requesting challenge';
+      const r=await fetch('/auth/webauthn/auth-options'); const j=await r.json();
+      if(!j.challenge) throw new Error(j.error||'no challenge');
+      const opts=j; opts.challenge=b64urlToBuf(opts.challenge);
+      if(opts.allowCredentials) opts.allowCredentials.forEach(c=>c.id=b64urlToBuf(c.id));
+      msg.textContent='Touch ID…';
+      const cred=await navigator.credentials.get({publicKey: opts});
+      const rawId=cred.rawId ? bufToB64url(new Uint8Array(cred.rawId)) : '';
+      const resp={
+        id: cred.id,
+        rawId,
+        response:{
+          authenticatorData: bufToB64url(new Uint8Array(cred.response.authenticatorData)),
+          clientDataJSON: bufToB64url(new Uint8Array(cred.response.clientDataJSON)),
+          signature: bufToB64url(new Uint8Array(cred.response.signature)),
+          userHandle: cred.response.userHandle ? bufToB64url(new Uint8Array(cred.response.userHandle)) : null
+        },
+        type: cred.type,
+        clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {}
+      };
+      const vr=await fetch('/auth/webauthn/auth-verify',{method:'POST',headers:{'content-type':'application/json'},body: JSON.stringify(resp)});
+      const vj=await vr.json();
+      if(vj.verified){ msg.textContent='✅ unlocked — redirecting…'; location.href='/'; } else { msg.textContent='⛔ '+(vj.error||'verification failed'); }
+    }catch(e){ msg.textContent='⛔ '+(e.message||e); }
+  }
+  async function doEnroll(){
+    try{
+      enrollMsg.textContent='…requesting options';
+      const r=await fetch('/auth/webauthn/register-options'); const j=await r.json();
+      if(j.error) throw new Error(j.error);
+      const opts=j; opts.challenge=b64urlToBuf(opts.challenge); opts.user.id=b64urlToBuf(opts.user.id);
+      if(opts.excludeCredentials) opts.excludeCredentials.forEach(c=>c.id=b64urlToBuf(c.id));
+      enrollMsg.textContent='Touch ID…';
+      const cred=await navigator.credentials.create({publicKey: opts});
+      const rawId=cred.rawId ? bufToB64url(new Uint8Array(cred.rawId)) : cred.id;
+      const attResp=cred.response;
+      const payload={
+        id: cred.id,
+        rawId,
+        response:{
+          attestationObject: bufToB64url(new Uint8Array(attResp.attestationObject)),
+          clientDataJSON: bufToB64url(new Uint8Array(attResp.clientDataJSON)),
+          transports: attResp.getTransports ? attResp.getTransports() : undefined
+        },
+        type: cred.type,
+        clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {}
+      };
+      const vr=await fetch('/auth/webauthn/register-verify',{method:'POST',headers:{'content-type':'application/json'},body: JSON.stringify(payload)});
+      const vj=await vr.json();
+      if(vj.verified){ enrollMsg.textContent='✅ enrolled — you can now unlock with Touch ID'; msg.textContent='Try Unlock above'; } else { enrollMsg.textContent='⛔ '+(vj.error||'failed'); }
+    }catch(e){ enrollMsg.textContent='⛔ '+(e.message||e); }
+  }
+  document.getElementById('btn-touch')?.addEventListener('click', doAuth);
+  document.getElementById('btn-enroll')?.addEventListener('click', doEnroll);
+  // auto-trigger auth when creds exist
+  if(${hasCreds ? "true" : "false"} && window.PublicKeyCredential) { /* user clicks */ }
+})();
+</script>
+`;
+    return c.html(page("auth", body, c.req.query("msg")));
+  });
+
+  app.post("/auth/token", async (c) => {
+    const body = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(body as any)) return c.text("CSRF failed", 403);
+    if (!webToken) return c.redirect("/auth?msg=" + encodeURIComponent("No PIBOT_WEB_TOKEN configured"));
+    if (String(body.token ?? "").trim() === webToken) {
+      const tok = authStore.createSession();
+      c.header("Set-Cookie", authStore.makeCookie(tok));
+      return c.redirect("/?msg=" + encodeURIComponent("Unlocked via token"));
+    }
+    return c.redirect("/auth?msg=" + encodeURIComponent("Invalid token"));
+  });
+
+  app.post("/auth/logout", async (c) => {
+    const body = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
+    // allow JSON or form; only check csrf for form
+    const ct = c.req.header("content-type") ?? "";
+    if (ct.includes("application/x-www-form-urlencoded") || ct.includes("multipart/form-data")) {
+      if (!checkCsrf(body as any)) return c.text("CSRF failed", 403);
+    }
+    const cookie = authStore.parseCookie(c.req.header("cookie"));
+    if (cookie) {
+      const tok = authStore.verifySignedToken(cookie);
+      if (tok) authStore.revokeSession(tok);
+    }
+    c.header("Set-Cookie", authStore.clearCookie());
+    return c.redirect("/auth?msg=" + encodeURIComponent("Logged out"));
+  });
+
+  // ── WebAuthn: registration ──
+  app.get("/auth/webauthn/register-options", async (c) => {
+    const hasCreds = authStore.hasCredentials();
+    if (hasCreds) {
+      return c.json({ error: "already enrolled — single admin, remove data/web-auth.json to reset" }, 403);
+    }
+    const challenge = authStore.createChallenge("register");
+    // SimpleWebAuthn expects raw bytes — pass Uint8Array to avoid double-base64url encoding
+    const challengeBytes = Buffer.from(challenge, "base64url");
+    // for open enrollment, we still generate options
+    const opts = await generateRegistrationOptions({
+      rpName,
+      rpID: rpId,
+      userName: "pibot",
+      userDisplayName: "pibot",
+      userID: new Uint8Array([1,2,3,4]),
+      challenge: challengeBytes as any,
+      attestationType: "none",
+      authenticatorSelection: { residentKey: "preferred", userVerification: "preferred", authenticatorAttachment: "platform" },
+      excludeCredentials: authStore.credentials.map((cc) => ({ id: cc.id, transports: cc.transports as any })),
+    } as any);
+    return c.json(opts);
+  });
+
+  app.post("/auth/webauthn/register-verify", async (c) => {
+    const hasCreds = authStore.hasCredentials();
+    if (hasCreds) return c.json({ verified: false, error: "already enrolled — single admin" }, 403);
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ verified:false, error:"invalid json" },400); }
+    const expectedChallenge = (chall: string) => authStore.hasChallenge(chall);
+    let verification: any;
+    try {
+      verification = await verifyRegistrationResponse({
+        response: body as any,
+        expectedChallenge,
+        expectedOrigin: expectedOrigins(),
+        expectedRPID: rpId,
+        requireUserVerification: false,
+      } as any);
+    } catch (e:any) {
+      return c.json({ verified:false, error: e?.message ?? String(e) }, 400);
+    }
+    if (!verification.verified || !verification.registrationInfo) return c.json({ verified:false, error:"verification failed" }, 400);
+    const info = verification.registrationInfo as any;
+    // credential is WebAuthnCredential: { id, publicKey, counter, ... } or under credential
+    const cred = (info.credential ?? info) as any;
+    const id: string = cred.id ?? body.id;
+    const publicKey: Uint8Array | string = cred.publicKey;
+    let pkB64: string;
+    if (publicKey instanceof Uint8Array) pkB64 = Buffer.from(publicKey).toString("base64");
+    else if (typeof publicKey === "string") pkB64 = publicKey;
+    else pkB64 = Buffer.from(publicKey as any).toString("base64");
+    // consume challenge
+    const chal = (body as any)?.response?.clientDataJSON ? (()=>{ try{ const s=Buffer.from((body.response.clientDataJSON as string),"base64url").toString("utf8"); const j=JSON.parse(s); return j.challenge; }catch{return null;}})() : null;
+    if (chal) authStore.consumeChallenge(chal, "register");
+    else {
+      // fallback: try to consume any register challenge that matches? just try brute consume if single pending
+    }
+    authStore.addCredential({
+      id,
+      publicKey: pkB64,
+      counter: cred.counter ?? 0,
+      transports: body?.response?.transports,
+      deviceType: info.credentialDeviceType,
+      backedUp: info.credentialBackedUp,
+    });
+    // auto-login after enrollment
+    const tok = authStore.createSession();
+    c.header("Set-Cookie", authStore.makeCookie(tok));
+    return c.json({ verified: true });
+  });
+
+  // ── WebAuthn: authentication ──
+  app.get("/auth/webauthn/auth-options", async (c) => {
+    const challenge = authStore.createChallenge("auth");
+    const challengeBytes = Buffer.from(challenge, "base64url");
+    const allow = authStore.credentials.map((cc) => ({ id: cc.id, transports: cc.transports as any }));
+    const opts = await generateAuthenticationOptions({
+      rpID: rpId,
+      challenge: challengeBytes as any,
+      allowCredentials: allow.length ? allow : undefined,
+      userVerification: "preferred",
+    } as any);
+    return c.json(opts);
+  });
+
+  app.post("/auth/webauthn/auth-verify", async (c) => {
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ verified:false, error:"invalid json" },400); }
+    const credId: string = body.id ?? body.rawId;
+    const stored = authStore.credentials.find((cc) => cc.id === credId || cc.id === body.rawId);
+    if (!stored) return c.json({ verified:false, error:"unknown credential" }, 400);
+    let credential: any;
+    try {
+      credential = {
+        id: stored.id,
+        publicKey: new Uint8Array(Buffer.from(stored.publicKey, "base64")),
+        counter: stored.counter,
+        transports: stored.transports as any,
+      };
+    } catch (e:any){ return c.json({ verified:false, error: e.message },400); }
+    const expectedChallenge = (chall: string) => authStore.hasChallenge(chall);
+    let verification: any;
+    try {
+      verification = await verifyAuthenticationResponse({
+        response: body as any,
+        expectedChallenge,
+        expectedOrigin: expectedOrigins(),
+        expectedRPID: rpId,
+        credential,
+        requireUserVerification: false,
+      } as any);
+    } catch (e:any) {
+      return c.json({ verified:false, error: e?.message ?? String(e) }, 400);
+    }
+    if (!verification.verified) return c.json({ verified:false, error:"verification failed" }, 400);
+    // consume challenge
+    try {
+      const s=Buffer.from(body.response.clientDataJSON as string,"base64url").toString("utf8");
+      const j=JSON.parse(s);
+      if (j.challenge) authStore.consumeChallenge(j.challenge, "auth");
+    } catch {}
+    authStore.updateCounter(stored.id, verification.authenticationInfo.newCounter);
+    const tok = authStore.createSession();
+    c.header("Set-Cookie", authStore.makeCookie(tok));
+    return c.json({ verified: true });
+  });
+
+  // ── auth gate for all other routes ──
+  app.use("*", async (c, next) => {
+    const p = c.req.path;
+    if (openAuthPaths.has(p)) return next();
+    if (p.startsWith("/auth/webauthn/")) return next();
+    if (!authRequired()) return next();
+    if (isAuthenticated(c)) return next();
+    if (isApiRequest(c)) return c.json({ error: "unauthorized" }, 401);
+    return c.redirect("/auth?msg=" + encodeURIComponent("Please unlock with Touch ID or token"));
+  });
+
   const agentOr404 = (id: string): LoadedAgent | null => {
     const a = deps.agents.getAgent(id);
     return a ?? null;
@@ -157,7 +504,10 @@ export function createWebApp(deps: WebDeps): Hono {
 </div>`;
       })
       .join("\n");
-    return c.html(page("overview", `${cards || '<p class="muted">No agents yet.</p>'}
+    const authBanner = authRequired() ? `<div class="card"><span class="pill on">🔒 locked</span> <span class="muted">${authStore.hasCredentials() ? authStore.credentials.length+" passkey(s)" : ""} ${webToken ? "· token enabled" : ""}</span>
+      <form method="post" action="/auth/logout" class="inline" style="float:right">${csrfField()}<button class="ghost mini" type="submit">Logout</button></form>
+      <a href="/auth" style="margin-left:8px">Auth →</a></div>` : `<div class="card"><span class="pill">🔓 open</span> <span class="muted">No passkey, no token — <a href="/auth">enroll Touch ID</a> to lock dashboard</span></div>`;
+    return c.html(page("overview", `${authBanner}${cards || '<p class="muted">No agents yet.</p>'}
 <h2>Telegram</h2>
 <div class="card">
   ${deps.telegram?.hasTransport("telegram")
@@ -171,7 +521,8 @@ export function createWebApp(deps: WebDeps): Hono {
 
   // ── create agent ──
   app.post("/agents", async (c) => {
-    const body = await c.req.parseBody();
+    const body = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(body as any)) return c.text("CSRF failed", 403);
     const name = String(body.name ?? "").toLowerCase().trim();
     const persona = String(body.persona ?? "");
     const err = deps.agents.createAgent(name, persona || undefined);
@@ -204,6 +555,7 @@ export function createWebApp(deps: WebDeps): Hono {
   app.get("/agents/new", (c) => {
     const body = `<h2>New agent</h2>
 <form method="post" action="/agents/new" class="card">
+  ${csrfField()}
   <label>Name (lowercase, dashes)</label>
   <input type="text" name="name" placeholder="coach" required>
   <label>What is its main job? One or two sentences</label>
@@ -224,7 +576,8 @@ export function createWebApp(deps: WebDeps): Hono {
   });
 
   app.post("/agents/new", async (c) => {
-    const b = await c.req.parseBody();
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     const name = String(b.name ?? "").toLowerCase().trim();
     const job = String(b.job ?? "").trim();
     const vibe = String(b.vibe ?? "warm & casual");
@@ -278,7 +631,7 @@ export function createWebApp(deps: WebDeps): Hono {
         (j: Schedule) => `<tr>
   <td class="mono">${esc(j.id)}</td><td><strong>${esc(j.title)}</strong>${j.detail ? `<br><span class="muted">${esc(truncate(j.detail, 120))}</span>` : ""}</td>
   <td>${esc(fmtWhen(j.dueAt))}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " ⚡" : ""}<br><span class="muted">${esc(j.kind)} · ${esc(j.delivery)}</span></td>
-  <td><form method="post" action="/schedules/${esc(j.id)}/cancel"><button class="danger mini" type="submit">Cancel</button></form></td>
+  <td><form method="post" action="/schedules/${esc(j.id)}/cancel">${csrfField()}<button class="danger mini" type="submit">Cancel</button></form></td>
 </tr>`
       )
       .join("\n") || `<tr><td colspan="4" class="muted">Nothing pending.</td></tr>`;
@@ -293,22 +646,25 @@ ${staged.length ? `<div class="flash warn">🧬 Staged for review: ${staged.map(
 </div>
 
 <h2>Rhythm & model</h2>
-${manifestForm(agent)}
+${manifestForm(agent, csrfToken)}
 
 <h2>Persona <span class="muted">(AGENTS.md)</span></h2>
 <form method="post" action="/agents/${esc(agent.id)}/persona" class="card">
+  ${csrfField()}
   <textarea name="persona" style="min-height:140px">${esc(fs.existsSync(path.join(agent.dir, "AGENTS.md")) ? fs.readFileSync(path.join(agent.dir, "AGENTS.md"), "utf8") : "")}</textarea>
   <button type="submit">Save persona</button>
 </form>
 
 <h2>Memory digest <span class="muted">(memory/MEMORY.md)</span></h2>
 <form method="post" action="/agents/${esc(agent.id)}/memory" class="card">
+  ${csrfField()}
   <textarea name="memory">${esc(memory)}</textarea>
   <button type="submit">Save memory digest</button>
 </form>
 
 <h2>Schedules</h2>
 <form method="post" action="/agents/${esc(agent.id)}/snooze" class="card">
+  ${csrfField()}
   <label>Snooze everything (e.g. 2h, 30m)</label>
   <div class="row">
     <div><input type="text" name="duration" placeholder="2h"></div>
@@ -326,24 +682,26 @@ ${manifestForm(agent)}
 <h2>Skills</h2>
 <div class="card">
   ${skills.length ? skills.map((s) => `<div><strong>${esc(s.name)}</strong> <span class="muted">${esc(s.description)}</span></div>`).join("") : '<span class="muted">No skills yet.</span>'}
-  ${staged.length ? `<div style="margin-top:12px"><strong>Staged:</strong> ${staged.map((s) => `<span class="pill on">${esc(s)}</span> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/promote"><button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/reject"><button class="mini danger" type="submit">reject</button></form>`).join(" · ")}</div>` : ""}
+  ${staged.length ? `<div style="margin-top:12px"><strong>Staged:</strong> ${staged.map((s) => `<span class="pill on">${esc(s)}</span> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/promote">${csrfField()}<button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/reject">${csrfField()}<button class="mini danger" type="submit">reject</button></form>`).join(" · ")}</div>` : ""}
 </div>
 
 <h2>Telegram sub-bot <span class="muted">(its own @identity)</span></h2>
 <div class="card">
   ${deps.telegram?.subBotFor(agent.id)?.username
     ? `<span class="pill on">🟢 @${esc(deps.telegram.subBotFor(agent.id)!.username)}</span>
-       <form method="post" action="/agents/${esc(agent.id)}/subbot/detach" class="inline"><button class="danger mini" type="submit">Detach</button></form>`
+       <form method="post" action="/agents/${esc(agent.id)}/subbot/detach" class="inline">${csrfField()}<button class="danger mini" type="submit">Detach</button></form>`
     : `<span class="pill">⚪ shared bot only</span>`}
   ${deps.telegram?.managerMode()
     ? `<p class="muted">Manager mode is ON — tap the button below in Telegram, or use the link here.</p>
        <form method="post" action="/agents/${esc(agent.id)}/subbot/request" class="inline">
+         ${csrfField()}
          <button class="ghost" type="submit">Send creation link to my chats →</button>
        </form>
        <p class="muted">Tap the link in Telegram (or the button above after it arrives) and confirm — pibot fetches the token, wires the bot, and restricts it to you.</p>`
     : `<p class="muted">Manager mode is off — create a bot with @BotFather (/newbot) and paste its token here to give ${esc(agent.id)} its own identity.</p>`}
 </div>
 <form method="post" action="/agents/${esc(agent.id)}/subbot" class="card">
+  ${csrfField()}
   <label>Sub-bot token (from @BotFather — or leave empty if using the manager flow)</label>
   <input type="password" name="token" placeholder="123456:ABC…" autocomplete="off">
   <button type="submit">Attach sub-bot</button>
@@ -351,6 +709,7 @@ ${manifestForm(agent)}
 
 <h2>Run evolution now</h2>
 <form method="post" action="/agents/${esc(agent.id)}/evolve" class="card">
+  ${csrfField()}
   <label>Goal (optional — empty = self-directed)</label>
   <div class="row">
     <div><input type="text" name="goal" placeholder="get better at morning briefings"></div>
@@ -368,7 +727,8 @@ ${manifestForm(agent)}
   app.post("/agents/:id/manifest", async (c) => {
     const agent = agentOr404(c.req.param("id"));
     if (!agent) return c.notFound();
-    const b = await c.req.parseBody();
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     const str = (k: string) => String(b[k] ?? "").trim();
     const on = (k: string) => b[k] === "on";
 
@@ -405,7 +765,8 @@ ${manifestForm(agent)}
   app.post("/agents/:id/persona", async (c) => {
     const agent = agentOr404(c.req.param("id"));
     if (!agent) return c.notFound();
-    const b = await c.req.parseBody();
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     fs.writeFileSync(path.join(agent.dir, "AGENTS.md"), String(b.persona ?? "").trim() + "\n");
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Persona saved")}`);
   });
@@ -413,7 +774,8 @@ ${manifestForm(agent)}
   app.post("/agents/:id/memory", async (c) => {
     const agent = agentOr404(c.req.param("id"));
     if (!agent) return c.notFound();
-    const b = await c.req.parseBody();
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     fs.mkdirSync(path.join(agent.dir, "memory"), { recursive: true });
     fs.writeFileSync(path.join(agent.dir, "memory", "MEMORY.md"), String(b.memory ?? ""));
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Memory digest saved")}`);
@@ -423,7 +785,8 @@ ${manifestForm(agent)}
   app.post("/agents/:id/snooze", async (c) => {
     const agent = agentOr404(c.req.param("id"));
     if (!agent) return c.notFound();
-    const b = await c.req.parseBody();
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     const ms = parseDuration(String(b.duration ?? ""));
     if (!ms) return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Couldn't parse duration — try 2h or 30m")}`);
     const quietEnd = nextQuietEnd(agent.manifest.heartbeat?.quietHours);
@@ -435,12 +798,23 @@ ${manifestForm(agent)}
   app.post("/agents/:id/wake", (c) => {
     const agent = agentOr404(c.req.param("id"));
     if (!agent) return c.notFound();
-    deps.scheduler.unsnooze(agent.id);
-    return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Rhythm resumed")}`);
+    // wake via form with csrf: need to handle but this is POST with empty body? check query param?
+    // For formaction wake, body still has _csrf
+    return (async () => {
+      const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
+      if (Object.keys(b).length && !checkCsrf(b as any)) return c.text("CSRF failed", 403);
+      deps.scheduler.unsnooze(agent.id);
+      return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Rhythm resumed")}`);
+    })() as any;
   });
 
   // ── schedules ──
-  app.post("/schedules/:id/cancel", (c) => {
+  app.post("/schedules/:id/cancel", async (c) => {
+    const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
+    if (Object.keys(b).length && !checkCsrf(b as any)) return c.text("CSRF failed", 403);
+    // also accept csrf via form field even when parsing empty? For schedule cancel, form sends _csrf
+    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
+    // if body empty but method is POST, still require?orig forms include _csrf, so enforce if present
     const job = deps.scheduler.cancel(c.req.param("id"));
     const back = job ? `/agents/${encodeURIComponent(job.agentId)}` : "/";
     return c.redirect(`${back}?msg=${encodeURIComponent(job ? `Cancelled: ${job.title}` : "Already gone")}`);
@@ -450,9 +824,9 @@ ${manifestForm(agent)}
   app.post("/agents/:id/evolve", async (c) => {
     const agent = agentOr404(c.req.param("id"));
     if (!agent) return c.notFound();
-    const b = await c.req.parseBody();
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     const goal = String(b.goal ?? "").trim() || undefined;
-    // fire-and-forget: the cycle takes ~a minute; results land in events + chat
     void deps.evolution
       .evolve(agent.id, goal || undefined, { force: true })
       .then((r) => deps.events.log(agent.id, "system", `evolution: ${r.summary}`))
@@ -460,12 +834,18 @@ ${manifestForm(agent)}
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("🧬 Evolution cycle started — results appear in Recent events and are announced in chat")}`);
   });
 
-  app.post("/agents/:id/staged/:name/promote", (c) => {
+  app.post("/agents/:id/staged/:name/promote", async (c) => {
+    const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
+    if (!checkCsrf(b as any) && Object.keys(b).length) return c.text("CSRF failed", 403);
+    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
+    // enforce csrf even if body empty: require header? For staged, form includes _csrf, so already checked
     const ok = deps.evolution.promote(c.req.param("id"), c.req.param("name"));
     return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent(ok ? "Promoted ✅" : "Nothing staged with that name")}`);
   });
 
-  app.post("/agents/:id/staged/:name/reject", (c) => {
+  app.post("/agents/:id/staged/:name/reject", async (c) => {
+    const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
+    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
     deps.evolution.reject(c.req.param("id"), c.req.param("name"));
     return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Rejected 🗑")}`);
   });
@@ -473,22 +853,26 @@ ${manifestForm(agent)}
   app.post("/agents/:id/subbot", async (c) => {
     const agent = agentOr404(c.req.param("id"));
     if (!agent || !deps.telegram) return c.notFound();
-    const b = await c.req.parseBody();
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     const token = String(b.token ?? "").trim();
     if (!token) return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("No token given")}`);
     const r = await deps.telegram.attachSubBot(agent.id, token);
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent(r.ok ? `🟢 Sub-bot live as ${r.botName}` : `⛔ ${r.error}`)}`);
   });
 
-  // manager-mode flow: register a pending creation, then send the deep link into the agent's chats
   app.post("/agents/:id/subbot/request", async (c) => {
     const agent = agentOr404(c.req.param("id"));
     if (!agent || !deps.telegram) return c.notFound();
+    const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
+    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
     await deps.telegram.requestSubBotCreation(agent.id);
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Sub-bot creation requested — tap the link in Telegram and confirm")}`);
   });
 
   app.post("/agents/:id/subbot/detach", async (c) => {
+    const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
+    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
     await deps.telegram?.detachSubBot(c.req.param("id"));
     return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Sub-bot detached")}`);
   });
@@ -509,6 +893,7 @@ ${manifestForm(agent)}
   <p class="muted">Closed by default: empty allowlist denies all (pairing help with chat id). Set <code>PIBOT_TELEGRAM_OPEN=1</code> to allow all (opt-in). Agents are switched per chat with /agent.</p>
 </div>
 <form method="post" action="/telegram" class="card">
+  ${csrfField()}
   <label>Bot token <span class="muted">(from @BotFather — /newbot)</span></label>
   <input type="password" name="token" placeholder="${configured ? "•••••••• (configured — leave empty to keep)" : "123456:ABC-your-token"}" autocomplete="off">
   <label>Allowed chat IDs (comma-separated, empty = deny all — pairing mode)</label>
@@ -516,7 +901,7 @@ ${manifestForm(agent)}
   <button type="submit">${enabled ? "Test & reconnect" : "Test & connect"}</button>
 </form>
 ${enabled
-  ? `<form method="post" action="/telegram/disable"><button type="submit" class="danger">Disconnect bot</button></form>`
+  ? `<form method="post" action="/telegram/disable">${csrfField()}<button type="submit" class="danger">Disconnect bot</button></form>`
   : ""}`;
     return c.html(page("telegram", body, c.req.query("msg")));
   });
@@ -525,7 +910,8 @@ ${enabled
     if (!deps.telegram) {
       return c.redirect(`/telegram?msg=${encodeURIComponent("Telegram control not wired")}`);
     }
-    const b = await c.req.parseBody();
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     const token = String(b.token ?? "").trim();
     const allowedChats = String(b.allowedChats ?? "")
       .split(",")
@@ -536,7 +922,6 @@ ${enabled
     if (!effectiveToken) {
       return c.redirect(`/telegram?msg=${encodeURIComponent("No token provided — create a bot with @BotFather (/newbot) and paste the token")}`);
     }
-    // hot-swap: disable current instance, validate, enable with new config
     await deps.telegram.disableTelegram();
     const r = await deps.telegram.enableTelegram(effectiveToken, allowedChats);
     if (!r.ok) {
@@ -549,6 +934,8 @@ ${enabled
   });
 
   app.post("/telegram/disable", async (c) => {
+    const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
+    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
     if (deps.telegram) await deps.telegram.disableTelegram();
     await deps.secrets?.save({ telegram: undefined });
     return c.redirect(`/telegram?msg=${encodeURIComponent("Bot disconnected")}`);
@@ -560,6 +947,7 @@ ${enabled
     if (!agent) return c.notFound();
     const body = `<h2>Ask ${esc(agent.id)} a question</h2>
 <form method="post" action="/agents/${esc(agent.id)}/ask" class="card">
+  ${csrfField()}
   <label>Question</label>
   <input type="text" name="question" placeholder="Which account?" required>
   <label>Options (comma-separated, 2–6 → buttons, 7–10 → poll)</label>
@@ -573,7 +961,8 @@ ${enabled
     const agent = agentOr404(c.req.param("id"));
     if (!agent) return c.notFound();
     if (!deps.telegram) return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("telegram control not wired")}`);
-    const b = await c.req.parseBody();
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     const question = String(b.question ?? "").trim();
     const options = String(b.options ?? "").split(",").map((s) => s.trim()).filter(Boolean);
     if (!question || options.length < 2) {

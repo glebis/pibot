@@ -15,6 +15,9 @@ export interface Config {
   allowedChats: string[];
   /** when true, empty allowlist means allow all (opt-in, insecure). Default closed. */
   telegramOpen: boolean;
+  webToken?: string;
+  webRpId?: string;
+  webPort?: number;
 }
 
 // ─── runtime-editable settings (web-configurable, survives restarts) ───────
@@ -73,5 +76,8 @@ export function loadConfig(): Config {
       .map((s) => s.trim())
       .filter(Boolean),
     telegramOpen: (() => { const v = (process.env.PIBOT_TELEGRAM_OPEN || "").trim().toLowerCase(); return v === "1" || v === "true" || v === "yes" || v === "on"; })(),
+    webToken: process.env.PIBOT_WEB_TOKEN?.trim() || undefined,
+    webRpId: (process.env.PIBOT_WEB_RP_ID || process.env.PIBOT_WEB_AUTH || "").trim() || undefined,
+    webPort: parseInt(process.env.PIBOT_WEB_PORT || "7860", 10),
   };
 }
