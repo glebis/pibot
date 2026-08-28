@@ -12,7 +12,7 @@ import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
 import { QuestionBus, type QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
-import { loadSettings, saveSettings, type Config } from "../config.js";
+import type { Config } from "../config.js";
 import type { Card, ChatRef, Schedule, Transport } from "./types.js";
 import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
@@ -76,7 +76,7 @@ export class PiBot implements HeartbeatHost {
     console.log(`[telegram] managed bot update: ${botName} (id ${info.botId}) by ${info.creatorId}`);
 
     // token rotation for an already-wired sub-bot: re-attach with the fresh token
-    for (const [agentId, sub] of Object.entries(loadSettings(this.deps.config.dataDir).telegram?.subBots ?? {})) {
+    for (const [agentId, sub] of Object.entries(this.deps.secrets.get().telegram?.subBots ?? {})) {
       if (sub.username && info.botUsername && sub.username.toLowerCase() === info.botUsername.toLowerCase()) {
         const token = await (t as import("../transports/telegram.js").TelegramTransport).getManagedBotToken(info.botId);
         const r = await this.attachSubBot(agentId, token);
@@ -152,11 +152,11 @@ export class PiBot implements HeartbeatHost {
     await this.deps.secrets.save({ telegram: { ...cur.telegram, subBots } });
   }
 
-  private removeSubBotFromSettings(agentId: string): void {
-    const cur = loadSettings(this.deps.config.dataDir);
+  private async removeSubBotFromSettings(agentId: string): Promise<void> {
+    const cur = this.deps.secrets.get();
     const subBots = { ...(cur.telegram?.subBots ?? {}) };
-    delete subBots[agentId];
-    saveSettings(this.deps.config.dataDir, { telegram: { ...cur.telegram, subBots } });
+    delete (subBots as Record<string, unknown>)[agentId];
+    await this.deps.secrets.save({ telegram: { ...cur.telegram, subBots } });
   }
 
   /** Wire a dedicated bot for one agent (token verified against Telegram first) */
@@ -191,10 +191,10 @@ export class PiBot implements HeartbeatHost {
     await t.stop().catch(() => {});
     this.transports.delete(`telegram:${agentId}`);
     this.persistSubBot; // keep the record removal explicit:
-    const cur = loadSettings(this.deps.config.dataDir);
+    const cur = this.deps.secrets.get();
     const subBots = { ...(cur.telegram?.subBots ?? {}) };
-    delete subBots[agentId];
-    saveSettings(this.deps.config.dataDir, { telegram: { ...cur.telegram, subBots } });
+    delete (subBots as Record<string, unknown>)[agentId];
+    await this.deps.secrets.save({ telegram: { ...cur.telegram, subBots } });
     this.deps.events.log("system", "system", `sub-bot detached for ${agentId}`);
     return true;
   }
