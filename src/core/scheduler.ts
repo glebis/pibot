@@ -192,14 +192,36 @@ export class Scheduler {
       const job = this.jobs.get(jid);
       if (!job || job.status !== "pending") continue;
       const delay = job.dueAt - Date.now();
-      if (delay <= 0) {
-        // due now (or overdue) — fire; fire() handles snooze/recurrence
-        const ms = Math.max(0, delay);
-        this.timers.set(jid, setTimeout(() => { this.timers.delete(jid); void this.fire(job); }, ms));
-      } else {
-        this.timers.set(jid, setTimeout(() => { this.timers.delete(jid); void this.fire(job); }, Math.min(delay, MAX_TIMEOUT)));
-      }
+      this.scheduleTimeout(jid, delay);
     }
+  }
+
+  private scheduleTimeout(id: string, delay: number): void {
+    if (delay <= 0) {
+      this.timers.set(id, setTimeout(() => {
+        this.timers.delete(id);
+        const job = this.jobs.get(id);
+        if (job) void this.fire(job);
+      }, Math.max(0, delay)));
+      return;
+    }
+    if (delay > MAX_TIMEOUT) {
+      this.timers.set(id, setTimeout(() => {
+        this.timers.delete(id);
+        if (this.stopped) return;
+        const job = this.jobs.get(id);
+        if (!job || job.status !== "pending") return;
+        const remaining = job.dueAt - Date.now();
+        if (remaining <= 0) void this.fire(job);
+        else this.scheduleTimeout(id, remaining);
+      }, MAX_TIMEOUT));
+      return;
+    }
+    this.timers.set(id, setTimeout(() => {
+      this.timers.delete(id);
+      const job = this.jobs.get(id);
+      if (job) void this.fire(job);
+    }, delay));
   }
 
   private async fire(job: Schedule): Promise<void> {

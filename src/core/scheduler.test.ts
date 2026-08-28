@@ -216,3 +216,62 @@ describe("Scheduler night-snooze capping", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe("Scheduler MAX_TIMEOUT chaining", () => {
+  const MAX_TIMEOUT = 2 ** 31 - 1;
+
+  it("chains timer for jobs beyond MAX_TIMEOUT and fires at correct time", async () => {
+    vi.useFakeTimers();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-max-"));
+    try {
+      const fired: string[] = [];
+      const s = new Scheduler(dir, (job) => void fired.push(job.id));
+      const now = Date.now();
+      const thirtyDays = 30 * 86400e3;
+      const job = s.create({ ...makeJob({ dueAt: now + thirtyDays }) });
+
+      expect(fired).toHaveLength(0);
+
+      // Timer should be set to MAX_TIMEOUT first, not full 30d — advancing just before cap must not fire
+      await vi.advanceTimersByTimeAsync(MAX_TIMEOUT - 1000);
+      expect(fired).toHaveLength(0);
+
+      // Crossing MAX_TIMEOUT boundary triggers chaining, still not due (remainder ≈5.2d)
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fired).toHaveLength(0);
+
+      // Advance remainder to reach 30d total
+      const remainder = thirtyDays - MAX_TIMEOUT;
+      await vi.advanceTimersByTimeAsync(remainder);
+      // flush any pending microtasks from fire()
+      await Promise.resolve();
+
+      expect(fired).toHaveLength(1);
+      expect(fired[0]).toBe(job.id);
+      expect(s.get(job.id)?.status).toBe("done");
+
+      s.stop();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears chained timer on cancel", async () => {
+    vi.useFakeTimers();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-max-cancel-"));
+    try {
+      const fired: string[] = [];
+      const s = new Scheduler(dir, (job) => void fired.push(job.id));
+      const now = Date.now();
+      const job = s.create({ ...makeJob({ dueAt: now + 30 * 86400e3 }) });
+      s.cancel(job.id);
+      await vi.advanceTimersByTimeAsync(30 * 86400e3);
+      expect(fired).toHaveLength(0);
+      s.stop();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      vi.useRealTimers();
+    }
+  });
+});
