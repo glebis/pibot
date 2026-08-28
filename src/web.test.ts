@@ -59,7 +59,7 @@ describe("web dashboard", () => {
       host: { announce: async () => {} },
       io,
     });
-    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir } satisfies WebDeps);
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, secrets: { get: () => ({}), save: async () => {} } } satisfies WebDeps);
   });
 
   afterEach(() => {
@@ -240,7 +240,7 @@ describe("web /telegram", () => {
       io: { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() },
     });
     control = fakeControl(over);
-    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, telegram: control } satisfies WebDeps);
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, telegram: control, secrets: { get: () => loadSettings(dir), save: async (p) => { await saveSettings(dir, p); } } } satisfies WebDeps);
   }
 
   let scheduler: Scheduler;
@@ -337,7 +337,7 @@ describe("web /agents/new", () => {
       host: { announce: async () => {} },
       io: { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() },
     });
-    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir } satisfies WebDeps);
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, secrets: { get: () => ({}), save: async () => {} } } satisfies WebDeps);
   });
 
   afterEach(() => {

@@ -104,7 +104,7 @@ function makeBot() {
   } as unknown as Scheduler;
 
   const transport = new MockTransport();
-  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport] });
+  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never });
   return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, dir };
 }
 
