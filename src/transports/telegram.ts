@@ -46,28 +46,31 @@ function keyboard(card: Card | undefined) {
 
 /**
  * Telegram transport via grammY long polling.
- * Any chat that can see the bot can talk (optionally locked to
- * TELEGRAM_ALLOWED_CHATS). Each chat picks its agent with /agent.
+ * Closed by default: empty allowlist denies all (pairing help);
+ * set PIBOT_TELEGRAM_OPEN=1 to restore open behavior (opt-in).
+ * Each chat picks its agent with /agent.
  */
 export class TelegramTransport implements Transport {
   readonly name: string;
   readonly boundAgentId?: string;
   private bot: Bot;
   private allowed: Set<string>;
+  private openWhenEmpty: boolean;
   private me?: { id: number; username?: string; first_name: string; can_manage_bots?: boolean };
   private lastCallbackQuery?: { id: string; data?: string };
   private onMessageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   private onPollAnswerCb: ((pollId: string, optionIndex: number, voterId: string) => Promise<void>) | null = null;
 
-  constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string } = {}) {
+  constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string; openWhenEmpty?: boolean } = {}) {
     this.bot = new Bot(token);
     this.allowed = new Set(allowedChats);
+    this.openWhenEmpty = opts.openWhenEmpty ?? false;
     this.name = opts.nameSuffix ? `telegram:${opts.nameSuffix}` : "telegram";
     this.boundAgentId = opts.boundAgentId;
 
     this.bot.on("message:text", (ctx: Context) => {
-      if (!this.check(ctx)) return;
+      if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
       const text = ctx.message?.text?.trim();
       if (!text || !this.onMessageCb) return;
       // fire-and-forget: agent turns can run long (ask_user blocks) — never stall polling
@@ -77,7 +80,7 @@ export class TelegramTransport implements Transport {
     this.bot.on("callback_query:data", async (ctx) => {
       console.log(`[telegram] callback received: ${ctx.callbackQuery?.data?.slice(0, 40)} at ${new Date().toISOString().slice(11, 19)}`);
       this.lastCallbackQuery = ctx.callbackQuery ?? undefined;
-      if (!this.check(ctx)) { await ctx.answerCallbackQuery().catch(() => {}); return; }
+      if (!this.check(ctx)) { void this.handleDenied(ctx); await ctx.answerCallbackQuery().catch(() => {}); return; }
       const action = ctx.callbackQuery?.data;
       if (!action || !this.onActionCb) { await ctx.answerCallbackQuery().catch(() => {}); return; }
       // remove the buttons from the tapped message first — no double-taps, no stale clicks
@@ -146,8 +149,20 @@ export class TelegramTransport implements Transport {
 
 
   private check(ctx: Context): boolean {
-    if (!this.allowed.size) return true;
+    if (!this.allowed.size) return this.openWhenEmpty;
     return this.allowed.has(String(ctx.chat?.id ?? ""));
+  }
+
+  private async handleDenied(ctx: Context): Promise<void> {
+    const chatId = String(ctx.chat?.id ?? ctx.from?.id ?? "unknown");
+    console.warn(`[telegram] blocked chat ${chatId} — not in allowlist (closed by default). Add TELEGRAM_ALLOWED_CHATS=${chatId} or set PIBOT_TELEGRAM_OPEN=1 to allow all.`);
+    const help = `⛔️ Bot not paired. Your chat id is \`${chatId}\`\n\nAdd \`TELEGRAM_ALLOWED_CHATS=${chatId}\` to your env (or set allowed chats in the dashboard) and restart.\n\nTo allow all chats (not recommended) set \`PIBOT_TELEGRAM_OPEN=1\`.`;
+    try {
+      const target = ctx.chat?.id ?? ctx.from?.id;
+      if (target) await this.bot.api.sendMessage(target, help, { parse_mode: "Markdown" }).catch(() => {});
+    } catch {
+      /* ignore */
+    }
   }
 
   onMessage(cb: (text: string, chatId: string) => Promise<void>): void {
@@ -210,8 +225,14 @@ export class TelegramTransport implements Transport {
       .setMyCommands(BOT_COMMANDS)
       .then(() => console.log("[telegram] command menu registered"))
       .catch((e) => console.error("[telegram] setMyCommands failed:", e.message));
+    if (!this.allowed.size && !this.openWhenEmpty) {
+      console.warn(`[telegram] no allowlist configured — closed by default (pairing mode). Set TELEGRAM_ALLOWED_CHATS=<chatId> or PIBOT_TELEGRAM_OPEN=1 to allow all.`);
+    }
     void this.bot.start({
-      onStart: (me) => console.log(`[telegram] polling as @${me.username} · allowed chats: ${this.allowed.size ? [...this.allowed].join(",") : "any"}`),
+      onStart: (me) => {
+        const allowInfo = this.allowed.size ? [...this.allowed].join(",") : this.openWhenEmpty ? "any (open)" : "none (pairing mode — closed)";
+        console.log(`[telegram] polling as @${me.username} · allowed chats: ${allowInfo}`);
+      },
     });
   }
 

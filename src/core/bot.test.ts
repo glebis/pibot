@@ -84,6 +84,7 @@ function makeBot() {
     vaultDir: path.join(dir, "vault"),
     defaultAgentId: "assistant",
     allowedChats: [],
+    telegramOpen: false,
   };
   const promptSpy = vi.fn();
   const agents = fakeAgentManager(promptSpy);

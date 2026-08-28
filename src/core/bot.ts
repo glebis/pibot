@@ -166,7 +166,7 @@ export class PiBot implements HeartbeatHost {
       await this.transports.get(existingName)?.stop().catch(() => {});
       this.transports.delete(existingName);
     }
-    const t = new TelegramTransport(token, [], { nameSuffix: agentId, boundAgentId: agentId });
+    const t = new TelegramTransport(token, [], { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen });
     let botName: string;
     try {
       botName = await t.verify();
@@ -235,7 +235,7 @@ export class PiBot implements HeartbeatHost {
     if (this.transports.has("telegram")) {
       return { ok: false, error: "Telegram is already enabled — disable it first." };
     }
-    const t = new TelegramTransport(token, allowedChats);
+    const t = new TelegramTransport(token, allowedChats, { openWhenEmpty: this.deps.config.telegramOpen });
     let botName: string;
     try {
       botName = await t.verify();
