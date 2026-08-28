@@ -7,7 +7,6 @@ import type { EventLog } from "./core/events.js";
 import type { EvolutionEngine } from "./core/evolution.js";
 import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
-import { loadSettings, saveSettings } from "./config.js";
 import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
 import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
 
@@ -32,6 +31,7 @@ export interface WebDeps {
   evolution: EvolutionEngine;
   dataDir: string;
   telegram?: TelegramControl;
+  secrets?: { get(): import("./config.js").Settings; save(patch: Partial<import("./config.js").Settings>): Promise<void> };
 }
 
 // ─── rendering helpers ──────────────────────────────────────────────────────
@@ -497,7 +497,7 @@ ${manifestForm(agent)}
   app.get("/telegram", (c) => {
     const enabled = deps.telegram?.hasTransport("telegram") ?? false;
     const username = deps.telegram?.telegramUsername();
-    const settings = loadSettings(deps.dataDir);
+    const settings = deps.secrets?.get() ?? {};
     const configured = Boolean(settings.telegram?.token);
     const body = `<h2>Telegram bot</h2>
 <div class="card">
@@ -531,7 +531,7 @@ ${enabled
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-    const settings = loadSettings(deps.dataDir);
+    const settings = deps.secrets?.get() ?? {};
     const effectiveToken = token || settings.telegram?.token || "";
     if (!effectiveToken) {
       return c.redirect(`/telegram?msg=${encodeURIComponent("No token provided — create a bot with @BotFather (/newbot) and paste the token")}`);
@@ -540,17 +540,17 @@ ${enabled
     await deps.telegram.disableTelegram();
     const r = await deps.telegram.enableTelegram(effectiveToken, allowedChats);
     if (!r.ok) {
-      saveSettings(deps.dataDir, { telegram: undefined });
+      await deps.secrets?.save({ telegram: undefined });
       return c.redirect(`/telegram?msg=${encodeURIComponent(`⛔ ${r.error}`)}`);
     }
-    saveSettings(deps.dataDir, { telegram: { token: effectiveToken, allowedChats } });
+    await deps.secrets?.save({ telegram: { token: effectiveToken, allowedChats } });
     deps.events.log("system", "system", `telegram connected as ${r.botName}`);
     return c.redirect(`/telegram?msg=${encodeURIComponent(`🟢 Connected as ${r.botName} — say hi in Telegram!`)}`);
   });
 
   app.post("/telegram/disable", async (c) => {
     if (deps.telegram) await deps.telegram.disableTelegram();
-    saveSettings(deps.dataDir, { telegram: undefined });
+    await deps.secrets?.save({ telegram: undefined });
     return c.redirect(`/telegram?msg=${encodeURIComponent("Bot disconnected")}`);
   });
 

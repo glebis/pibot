@@ -54,6 +54,7 @@ export class PiBot implements HeartbeatHost {
       transports: Transport[];
       evolution?: EvolutionEngine;
       modelRuntime?: import("@earendil-works/pi-coding-agent").ModelRuntime;
+      secrets: import("./secrets.js").SecretStore;
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
@@ -145,10 +146,10 @@ export class PiBot implements HeartbeatHost {
 
   // ── sub-bots (per-agent Telegram identities) ──────────────────────────────
 
-  private persistSubBot(agentId: string, token: string, username?: string): void {
-    const cur = loadSettings(this.deps.config.dataDir);
+  private async persistSubBot(agentId: string, token: string, username?: string): Promise<void> {
+    const cur = this.deps.secrets.get();
     const subBots = { ...(cur.telegram?.subBots ?? {}), [agentId]: { token, username } };
-    saveSettings(this.deps.config.dataDir, { telegram: { ...cur.telegram, subBots } });
+    await this.deps.secrets.save({ telegram: { ...cur.telegram, subBots } });
   }
 
   private removeSubBotFromSettings(agentId: string): void {
@@ -179,7 +180,7 @@ export class PiBot implements HeartbeatHost {
       this.transports.delete(existingName);
       return { ok: false, error: `Started but polling failed: ${errorMessage(e)}` };
     }
-    this.persistSubBot(agentId, token, botName.startsWith("@") ? botName.slice(1) : botName);
+    await this.persistSubBot(agentId, token, botName.startsWith("@") ? botName.slice(1) : botName);
     this.deps.events.log("system", "system", `sub-bot attached for ${agentId} as ${botName}`);
     return { ok: true, botName };
   }

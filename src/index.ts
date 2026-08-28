@@ -2,7 +2,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { serve } from "@hono/node-server";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { loadConfig, loadSettings } from "./config.js";
+import { loadConfig } from "./config.js";
+import { readJson } from "./core/util.js";
+import { SecretStore } from "./core/secrets.js";
 import { AgentManager } from "./core/agent-manager.js";
 import { PiBot } from "./core/bot.js";
 import { EventLog } from "./core/events.js";
@@ -17,6 +19,10 @@ import { TelegramTransport } from "./transports/telegram.js";
 async function main(): Promise<void> {
   const config = loadConfig();
   ensureDir(config.dataDir);
+
+  // encrypted settings (sops/age): decrypt-or-migrate at boot, fail closed
+  const secretStore = new SecretStore(config.dataDir);
+  await secretStore.init(readJson(config.dataDir + "/settings.json", {}));
 
   // single-instance guard: two processes would fight over the bot's getUpdates
   const lockFile = path.join(config.dataDir, "pibot.lock");
@@ -83,7 +89,7 @@ async function main(): Promise<void> {
     }),
   });
 
-  const settings = loadSettings(config.dataDir);
+  const settings = secretStore.get();
   const telegramToken = config.telegramToken ?? settings.telegram?.token;
   const allowedChats = config.allowedChats.length
     ? config.allowedChats
@@ -93,7 +99,7 @@ async function main(): Promise<void> {
       ? [new TelegramTransport(telegramToken, allowedChats)]
       : [new CliTransport()];
 
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore });
 
   await bot.start();
   scheduler.rearm();
@@ -101,24 +107,27 @@ async function main(): Promise<void> {
   // web dashboard (config CRUD) — always on unless disabled
   const webPort = parseInt(process.env.PIBOT_WEB_PORT || "7860", 10);
   if (process.env.PIBOT_WEB !== "0") {
-    const webApp = createWebApp({ agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot });
+    const webApp = createWebApp({ agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore });
     const server = serve({ fetch: webApp.fetch, port: webPort, hostname: "127.0.0.1" });
     console.log(`[pibot] dashboard → http://127.0.0.1:${webPort}`);
     server.addListener("error", (e) => console.error("[web]", e.message));
   }
 
   // telegram configured via web (settings.json) survives restarts
+  const liveSettings = secretStore.get();
   if (!bot.hasTransport("telegram")) {
-    if (settings.telegram?.token) {
-      const r = await bot.enableTelegram(settings.telegram.token, settings.telegram.allowedChats ?? []);
+    if (liveSettings.telegram?.token) {
+      const r = await bot.enableTelegram(liveSettings.telegram.token, liveSettings.telegram.allowedChats ?? []);
       console.log(r.ok ? `[pibot] telegram enabled (web config) as ${r.botName}` : `[pibot] telegram (web config) failed: ${r.error}`);
     }
   }
   // per-agent sub-bots attach INDEPENDENTLY of the main bot's transport source
-  for (const [agentId, sub] of Object.entries(settings.telegram?.subBots ?? {})) {
-    if (bot.hasTransport(`telegram:${agentId}`)) continue;
-    const r = await bot.attachSubBot(agentId, sub.token);
-    console.log(r.ok ? `[pibot] sub-bot for ${agentId} → ${r.botName}` : `[pibot] sub-bot for ${agentId} failed: ${r.error}`);
+  {
+    for (const [agentId, sub] of Object.entries(liveSettings.telegram?.subBots ?? {})) {
+      if (bot.hasTransport(`telegram:${agentId}`)) continue;
+      const r = await bot.attachSubBot(agentId, sub.token);
+      console.log(r.ok ? `[pibot] sub-bot for ${agentId} → ${r.botName}` : `[pibot] sub-bot for ${agentId} failed: ${r.error}`);
+    }
   }
 
   const shutdown = () => {
