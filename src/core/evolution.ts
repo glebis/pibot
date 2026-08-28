@@ -43,6 +43,26 @@ export function validateSkillFile(name: string, description: string, content: st
   return { ok: errors.length === 0, errors };
 }
 
+// ─── risky pattern gate (prompt-injection guard) ────────────────────────────
+
+export const RISKY_PATTERNS: RegExp[] = [
+  /\bexec\b/i,
+  /\bfetch\b/i,
+  /\bPOST\b/i,
+  /\beval\b/i,
+  /child_process/i,
+  /\bsops\b/i,
+  /rm\s+-rf/i,
+  /require\s*\(/i,
+  /import\s*\(/i,
+  /process\.env/i,
+  /ignore[\s\S]*previous[\s\S]*instructions/i,
+];
+
+export function containsRiskyPattern(content: string): boolean {
+  return RISKY_PATTERNS.some((re) => re.test(content));
+}
+
 /** Exact find/replace patching, reported honestly */
 export function applyPatch(raw: string, find: string, replace: string): { ok: boolean; result?: string; error?: string } {
   const idx = raw.indexOf(find);
@@ -230,7 +250,10 @@ export class EvolutionEngine {
     this.deps.events.log(agentId, "system", `evolution: ${proposal.mode} "${proposal.skillName}" staged, probes [${scores.join(", ")}]`);
 
     if (scores.length > 0 && avg >= 4) {
-      // 6a. auto-promote with git checkpoint
+      if (containsRiskyPattern(candidateContent)) {
+        this.deps.events.log(agentId, "system", `evolution: risky pattern detected in "${proposal.skillName}", requires manual promote`);
+      } else {
+        // 6a. auto-promote with git checkpoint
       const promoted = this.promoteCandidate(agent, proposal.skillName, candidateContent, proposal.rationale);
       return {
         agentId,
@@ -242,6 +265,7 @@ export class EvolutionEngine {
         scores,
         rationale: proposal.rationale,
       };
+      }
     }
 
     // 6b. stays staged for human review
