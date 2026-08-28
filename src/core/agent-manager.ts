@@ -186,6 +186,27 @@ export class AgentManager {
     return session;
   }
 
+  /** Start a fresh session for one agent+chat (the old file is kept on disk) */
+  async resetSession(agentId: string, chatKey: string, chat: ChatRef, scheduler: Scheduler): Promise<void> {
+    const key = `${agentId}::${chatKey}`;
+    const old = this.sessions.get(key);
+    if (old) {
+      try {
+        old.dispose();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.sessions.delete(key);
+    // drop the index entry so the next getOrCreateSession creates a new file
+    const sessionsDir = path.join(this.agentsDir, agentId, "sessions");
+    const indexPath = path.join(sessionsDir, "index.json");
+    const index = readJson<Record<string, string>>(indexPath, {});
+    delete index[chatKey];
+    writeJsonAtomic(indexPath, index);
+    void scheduler;
+  }
+
   resolveModel(modelSpec: string | undefined) {
     if (!modelSpec) return undefined;
     const r = resolveCliModel({ cliModel: modelSpec, modelRuntime: this.modelRuntime });

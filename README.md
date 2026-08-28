@@ -46,6 +46,8 @@ Ask naturally: *"remind me to stretch in 20 minutes"*, *"note to take: check the
 
 ## Heartbeat (economical aliveness)
 
+**Give each agent a checklist:** edit `agents/<name>/HEARTBEAT.md` — a tiny, user-editable list the agent follows on every tick (OpenClaw's most-loved pattern). Agents can also send images: include `MEDIA: <url>` in a reply.
+
 Every agent's manifest sets a rhythm (`interval`, cheap `model`, `quietHours`). Each tick spawns an **ephemeral cheap-model session** (never touching the main session's cache) with a compact digest: persona + memory + pending items + recent events. It decides via one tool call: `speak` (short proactive message), `escalate` (hand to the full agent brain), or nothing (a few hundred tokens).
 
 ## Self-evolution (Hermes-style, pibot-native)
