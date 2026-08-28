@@ -17,7 +17,7 @@ const HELP = [
   `**pibot** — your agents. Talk normally; ask to schedule anything ("remind me to stretch in 20m", "daily standup note at 9am").`,
   ``,
   `/agents — list agents  ·  /agent <name> — switch  ·  /newagent — guided wizard`,
-  `/schedules — pending items  ·  /cancel <id>`,
+  `/schedules — pending items  ·  /cancel <id>  ·  /new — fresh session`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
   `/status — what's running`,
 ].join("\n");

@@ -879,8 +879,19 @@ export class PiBot implements HeartbeatHost {
   /** Blocking inter-agent question — used by the agent_ask tool */
   async agentAsk(fromAgent: string, toAgent: string, question: string, timeoutMs?: number): Promise<string> {
     if (!this.deps.agents.getAgent(toAgent)) throw new Error(`unknown agent "${toAgent}"`);
+    // loop protection: identical asks within 5 minutes are rejected (OpenClaw-style bot loop guard)
+    const now = Date.now();
+    for (const [k, ts] of this.recentAsks) {
+      if (now - ts > 5 * 60e3) this.recentAsks.delete(k);
+    }
+    const dedupeKey = `${fromAgent}->${toAgent}:${truncate(question, 120)}`;
+    const hit = this.recentAsks.get(dedupeKey);
+    if (hit && now - hit < 5 * 60e3) throw new Error(`loop guard: the same question was sent to ${toAgent} recently`);
+    this.recentAsks.set(dedupeKey, now);
     return this.agentTurn(toAgent, fromAgent, question, timeoutMs);
   }
+
+  private recentAsks = new Map<string, number>(); // "from->to:text" → ts
 
   // ── HeartbeatHost ─────────────────────────────────────────────────────
 

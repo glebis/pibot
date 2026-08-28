@@ -77,6 +77,8 @@ export interface Transport {
   sendPoll?(chatId: string, question: string, options: string[]): Promise<{ pollId: string }>;
   /** Poll votes (optional) */
   onPollAnswer?(cb: (pollId: string, optionIndex: number, voterId: string) => Promise<void>): void;
+  /** Send an image/document by URL (optional; Telegram only) */
+  sendMedia?(chatId: string, url: string): Promise<void>;
   /** Manager-mode bots receive managed-bot creation/token updates (optional) */
   onManagedBot?(cb: (info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>): void;
 }
