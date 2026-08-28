@@ -96,7 +96,7 @@ async function main(): Promise<void> {
     : settings.telegram?.allowedChats ?? [];
   const transports =
     telegramToken && config.transport !== "cli"
-      ? [new TelegramTransport(telegramToken, allowedChats)]
+      ? [new TelegramTransport(telegramToken, allowedChats, { openWhenEmpty: config.telegramOpen })]
       : [new CliTransport()];
 
   bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore });

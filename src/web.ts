@@ -506,12 +506,12 @@ ${manifestForm(agent)}
     : configured
       ? `<span class="pill">⚪ configured but not running</span>`
       : `<span class="pill">⚪ not connected</span>`}
-  <p class="muted">Any chat that can see the bot can talk to it (allowlist below to restrict). Agents are switched per chat with /agent.</p>
+  <p class="muted">Closed by default: empty allowlist denies all (pairing help with chat id). Set <code>PIBOT_TELEGRAM_OPEN=1</code> to allow all (opt-in). Agents are switched per chat with /agent.</p>
 </div>
 <form method="post" action="/telegram" class="card">
   <label>Bot token <span class="muted">(from @BotFather — /newbot)</span></label>
   <input type="password" name="token" placeholder="${configured ? "•••••••• (configured — leave empty to keep)" : "123456:ABC-your-token"}" autocomplete="off">
-  <label>Allowed chat IDs (comma-separated, empty = anyone with access to the bot)</label>
+  <label>Allowed chat IDs (comma-separated, empty = deny all — pairing mode)</label>
   <input type="text" name="allowedChats" value="${esc((settings.telegram?.allowedChats ?? []).join(","))}" placeholder="123456789, 987654321">
   <button type="submit">${enabled ? "Test & reconnect" : "Test & connect"}</button>
 </form>
