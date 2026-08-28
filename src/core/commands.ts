@@ -18,6 +18,7 @@ const HELP = [
   ``,
   `/agents — list agents  ·  /agent <name> — switch  ·  /newagent — guided wizard`,
   `/schedules — pending items  ·  /cancel <id>  ·  /new — fresh session`,
+  `/handoff <agent> — move this conversation (with context) to another agent`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
   `/status — what's running`,
 ].join("\n");

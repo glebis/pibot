@@ -21,6 +21,7 @@ import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
 import { tgResponderPlugin } from "../plugins/tg-responder-plugin.js";
 import { knowledgePlugin } from "../plugins/knowledge-plugin.js";
 import { agentCommsPlugin, type CommsHooks } from "../plugins/agent-comms-plugin.js";
+import { delegatePlugin } from "../plugins/delegate-plugin.js";
 import { attendPlugin } from "../plugins/attend-plugin.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
