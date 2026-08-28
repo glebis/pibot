@@ -223,12 +223,12 @@ export function createWebApp(deps: WebDeps): Hono {
     <button id="btn-touch" class="btn" style="background:#1a7f37">👆 Unlock with Touch ID</button>
     <span id="wa-msg" class="muted" style="margin-left:10px"></span>
   </div>
-  ${hasCreds ? `<p class="muted">${authStore.credentials.length} passkey(s) enrolled. Use Touch ID above.</p>` : `<p class="muted">No passkey yet — you can enroll below once logged in with a token, or enroll immediately if dashboard is still open.</p>`}
+  ${hasCreds ? `<p class="muted">${authStore.credentials.length} passkey enrolled — this is the admin. Use Touch ID above to unlock.</p>` : `<p class="muted">No passkey yet — you can enroll below once logged in with a token, or enroll immediately if dashboard is still open.</p>`}
   ${!hasCreds && !hasToken ? `<div class="flash warn">Dashboard is open (no passkey, no PIBOT_WEB_TOKEN). Enroll a passkey now to lock it.</div>` : ""}
-  <div id="enroll" style="margin-top:14px">
+  ${!hasCreds ? `<div id="enroll" style="margin-top:14px">
     <button id="btn-enroll" class="btn ghost">➕ Enroll this Mac (Touch ID)</button>
     <span id="enroll-msg" class="muted" style="margin-left:10px"></span>
-  </div>
+  </div>` : `<div id="enroll" style="margin-top:14px" class="muted">Enrolled — single admin. To re-enroll, remove <span class="mono">data/web-auth.json</span> and restart.</div>`}
 </div>
 ${hasToken ? `<div class="card">
   <h2 style="margin-top:0">Token fallback</h2>
@@ -341,10 +341,9 @@ ${hasToken ? `<div class="card">
 
   // ── WebAuthn: registration ──
   app.get("/auth/webauthn/register-options", async (c) => {
-    const authed = isAuthenticated(c);
     const hasCreds = authStore.hasCredentials();
-    if (hasCreds && !authed) {
-      return c.json({ error: "authentication required to add more passkeys" }, 401);
+    if (hasCreds) {
+      return c.json({ error: "already enrolled — single admin, remove data/web-auth.json to reset" }, 403);
     }
     const challenge = authStore.createChallenge("register");
     // SimpleWebAuthn expects raw bytes — pass Uint8Array to avoid double-base64url encoding
@@ -365,9 +364,8 @@ ${hasToken ? `<div class="card">
   });
 
   app.post("/auth/webauthn/register-verify", async (c) => {
-    const authed = isAuthenticated(c);
     const hasCreds = authStore.hasCredentials();
-    if (hasCreds && !authed) return c.json({ verified: false, error: "auth required" }, 401);
+    if (hasCreds) return c.json({ verified: false, error: "already enrolled — single admin" }, 403);
     let body: any;
     try { body = await c.req.json(); } catch { return c.json({ verified:false, error:"invalid json" },400); }
     const expectedChallenge = (chall: string) => authStore.hasChallenge(chall);
