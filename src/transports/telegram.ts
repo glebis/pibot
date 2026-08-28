@@ -29,6 +29,15 @@ function toTelegramHtml(text: string): string {
   return out;
 }
 
+export function assertCallbackData(action: string): string {
+  if (action.length <= 64) return action;
+  if (process.env.NODE_ENV !== "production") {
+    throw new Error(`callback_data exceeds 64 bytes: ${action.length} chars — "${action.slice(0, 40)}…" (Telegram limit is 64 bytes; collisions on truncate)`);
+  }
+  console.warn(`[telegram] callback_data truncated: ${action.length} → 64 bytes — "${action.slice(0, 40)}…"`);
+  return action.slice(0, 64);
+}
+
 function keyboard(card: Card | undefined) {
   if (!card?.buttons.length) return undefined;
   const rows: InlineKeyboardButton[][] = [];
@@ -37,7 +46,7 @@ function keyboard(card: Card | undefined) {
       card.buttons.slice(i, i + 2).map((b): InlineKeyboardButton =>
         b.url
           ? { text: b.label, url: b.url }
-          : { text: b.label, callback_data: b.action.slice(0, 64) }
+          : { text: b.label, callback_data: assertCallbackData(b.action) }
       )
     );
   }
