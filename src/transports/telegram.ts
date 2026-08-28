@@ -111,15 +111,6 @@ export class TelegramTransport implements Transport {
       const pa = ctx.pollAnswer;
       if (this.onPollAnswerCb) void this.onPollAnswerCb(pa.poll_id, pa.option_ids[0] ?? -1, String(pa.user?.id ?? "")).catch(() => {});
     });
-
-    // raw middleware: managed-bot updates (Bot API 9.6) — not in grammy 1.46 types yet
-    this.bot.use((ctx, next) => {
-      const u = ctx.update as { managed_bot?: { user?: { id: number }; bot?: { id: number; username?: string; first_name?: string } } };
-      if (u.managed_bot && this.onManagedBotCb) {
-        void this.onManagedBotCb({ creatorId: String(u.managed_bot.user?.id ?? ""), botId: u.managed_bot.bot?.id ?? 0, botUsername: u.managed_bot.bot?.username });
-      }
-      return next();
-    });
   }
 
   private onManagedBotCb: ((info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>) | null = null;

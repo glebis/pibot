@@ -114,5 +114,4 @@ export function saveAmbiguityReport(agentDir: string, personaText: string, resul
     answers,
   };
   fs.writeFileSync(path.join(dir, "last-gate.json"), JSON.stringify(entry, null, 2) + "\n");
-  void personaText;
 }
