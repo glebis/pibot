@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Personal agent companion built on the pi SDK \u2014 chat with agents that have independent plugin systems, memory, and a scheduling heartbeat.",
+  "description": "Personal agent companion built on the pi SDK — chat with agents that have independent plugin systems, memory, and a scheduling heartbeat.",
   "engines": {
     "node": ">=22"
   },
@@ -22,7 +22,7 @@
     "@hono/node-server": "^2.1.1",
     "grammy": "^1.46.0",
     "hono": "^4.13.5",
-    "typebox": "^1.3.7"
+    "typebox": "^1.3.20"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
