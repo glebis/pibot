@@ -66,6 +66,17 @@ export class PiBot implements HeartbeatHost {
   private async handleManagedBot(t: Transport, info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }): Promise<void> {
     const botName = info.botUsername ?? info.firstName ?? `bot_${info.botId}`;
     console.log(`[telegram] managed bot update: ${botName} (id ${info.botId}) by ${info.creatorId}`);
+
+    // token rotation for an already-wired sub-bot: re-attach with the fresh token
+    for (const [agentId, sub] of Object.entries(loadSettings(this.deps.config.dataDir).telegram?.subBots ?? {})) {
+      if (sub.username && info.botUsername && sub.username.toLowerCase() === info.botUsername.toLowerCase()) {
+        const token = await (t as import("../transports/telegram.js").TelegramTransport).getManagedBotToken(info.botId);
+        const r = await this.attachSubBot(agentId, token);
+        this.deps.events.log(agentId, "system", `sub-bot token rotated → ${r.ok ? "re-attached" : r.error}`);
+        return;
+      }
+    }
+
     const agentId =
       this.pendingSubBots.get(botName) ??
       this.pendingSubBots.get(botName.replace(/_?bot$/, "")) ??

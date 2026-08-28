@@ -71,6 +71,8 @@ export interface ProposalContext {
   digest: string;
   existingSkills: Array<{ name: string; description: string; raw: string }>;
   goal?: string;
+  /** skills already proposed recently — the proposer must not repeat them */
+  recentProposals?: string[];
 }
 
 export interface EvolutionIO {
@@ -91,6 +93,16 @@ export interface EvolutionReport {
   scores?: number[];
   errors?: string[];
   rationale?: string;
+}
+
+/** Mine the event log for recently proposed skill titles (dedup signal) */
+export function extractRecentProposals(entries: Array<{ type: string; summary: string }>): string[] {
+  const out: string[] = [];
+  for (const e of entries) {
+    const m = e.summary.match(/evolution: (?:create|patch) ["\u201c]?([^"\u201c,]+)/);
+    if (m) out.push(m[1].trim());
+  }
+  return [...new Set(out)];
 }
 
 export class EvolutionEngine {
@@ -170,11 +182,12 @@ export class EvolutionEngine {
     const skillsDir = path.join(agent.dir, "skills");
     const existingSkills = this.readExistingSkills(skillsDir);
     const digest = buildHeartbeatDigest(agent, { list: () => [] }, this.deps.events);
+    const recentProposals = extractRecentProposals(this.deps.events.tail(agentId, 40));
 
     // 2. propose
     let proposal: EvolutionProposal;
     try {
-      proposal = await this.deps.io.propose({ agent, digest, existingSkills, goal });
+      proposal = await this.deps.io.propose({ agent, digest, existingSkills, goal, recentProposals });
     } catch (e) {
       this.deps.events.log(agentId, "system", `evolution propose failed: ${errorMessage(e)}`);
       return { agentId, ok: false, summary: `propose failed: ${errorMessage(e)}`, errors: [errorMessage(e)] };
