@@ -13,6 +13,8 @@ export interface Config {
   heartbeatModel?: string;
   telegramToken?: string;
   allowedChats: string[];
+  /** when true, empty allowlist means allow all (opt-in, insecure). Default closed. */
+  telegramOpen: boolean;
 }
 
 // ─── runtime-editable settings (web-configurable, survives restarts) ───────
@@ -70,5 +72,6 @@ export function loadConfig(): Config {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
+    telegramOpen: (() => { const v = (process.env.PIBOT_TELEGRAM_OPEN || "").trim().toLowerCase(); return v === "1" || v === "true" || v === "yes" || v === "on"; })(),
   };
 }
