@@ -54,3 +54,13 @@ describe("suggestedSubBotUsername", () => {
     expect(suggestedSubBotUsername("tax")).toBe("pimother_tax_bot");
   });
 });
+
+describe("computeAmbiguity", () => {
+  it("weights goal/constraints/success per the Ouroboros formula", async () => {
+    const { computeAmbiguity } = await import("../core/ambiguity.js");
+    expect(computeAmbiguity({ goal: 1, constraints: 1, success: 1 })).toBeCloseTo(0);
+    expect(computeAmbiguity({ goal: 0, constraints: 0, success: 0 })).toBeCloseTo(1);
+    // 0.9*0.4 + 0.8*0.3 + 0.7*0.3 = 0.81 → 0.19 (the Ouroboros example)
+    expect(computeAmbiguity({ goal: 0.9, constraints: 0.8, success: 0.7 })).toBeCloseTo(0.19);
+  });
+});

@@ -194,7 +194,7 @@ export class EvolutionEngine {
     }
 
     // 3. guardrails
-    const gates = this.gate(agent, proposal);
+    const gates = this.gate(agent, proposal, this.deps.events.tail(agentId, 40));
     if (!gates.ok) {
       this.deps.events.log(agentId, "system", `evolution gates rejected "${proposal.skillName}": ${gates.errors.join("; ")}`);
       return {
@@ -275,7 +275,7 @@ export class EvolutionEngine {
     return out;
   }
 
-  private gate(agent: LoadedAgent, p: EvolutionProposal): SkillGateResult {
+  private gate(agent: LoadedAgent, p: EvolutionProposal, recentEvents: Array<{ type: string; summary: string }> = []): SkillGateResult {
     const errors: string[] = [];
     const nameCheck = validateSkillFile(p.skillName, p.description, p.content ?? p.replace ?? "");
     errors.push(...nameCheck.errors);
@@ -287,6 +287,13 @@ export class EvolutionEngine {
       errors.push(`skill "${p.skillName}" already exists — use mode "patch"`);
     }
     if (!p.probes?.length) errors.push("no eval probes provided");
+    // stagnation guard (Ouroboros): same target proposed 3+ times recently = spinning
+    let spins = 0;
+    for (const e of recentEvents) {
+      const m = e.summary.match(/evolution: (?:create|patch) ["\u201c]?([^"\u201c,]+)/);
+      if (m && m[1].trim() === p.skillName) spins++;
+    }
+    if (spins >= 3) errors.push(`stagnation: "${p.skillName}" was proposed ${spins} times recently — try a different improvement`);
     return { ok: errors.length === 0, errors };
   }
 

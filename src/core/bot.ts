@@ -16,6 +16,7 @@ import { loadSettings, saveSettings, type Config } from "../config.js";
 import type { Card, ChatRef, Schedule, Transport } from "./types.js";
 import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
+import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 
 export class PiBot implements HeartbeatHost {
@@ -47,6 +48,7 @@ export class PiBot implements HeartbeatHost {
       events: EventLog;
       transports: Transport[];
       evolution?: EvolutionEngine;
+      modelRuntime?: import("@earendil-works/pi-coding-agent").ModelRuntime;
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
@@ -548,8 +550,29 @@ export class PiBot implements HeartbeatHost {
 
       // (sub-bot offer happens after creation below)
 
+      // 5. ambiguity gate (Ouroboros-style): score the draft, ask follow-ups if vague
+      let extraAnswers: string[] = [];
+      const draft0: AgentDraft = { name, job: job ?? "", vibe, proactivity };
+      try {
+        const gate = await scorePersonaAmbiguity(buildPersona(draft0), {
+          modelRuntime: this.deps.modelRuntime as never,
+          model: this.deps.agents.resolveModel(process.env.PIBOT_DEFAULT_MODEL),
+          cwd: process.cwd(),
+        });
+        if (gate.score > AMBIGUITY_THRESHOLD) {
+          await t.push(chatId, { text: `🧙 A couple of clarifying questions to make ${name} sharper:` });
+          for (const q of gate.questions.slice(0, 2)) {
+            const answer = await this.questions.ask("system", chat, { text: q, options: [], timeoutMs: 600e3 });
+            if (!answer || answer.replaced) break;
+            extraAnswers.push(`Q: ${q}\nA: ${answer.choice}`);
+          }
+        }
+      } catch {
+        /* gate failure = proceed with what we have */
+      }
+
       // build
-      const draft: AgentDraft = { name, job: job ?? "", vibe, proactivity };
+      const draft: AgentDraft = { name, job: [job ?? "", ...extraAnswers].filter(Boolean).join("\n"), vibe, proactivity };
       const err = this.deps.agents.createAgent(name, buildPersona(draft));
       if (err) { await t.push(chatId, { text: `Couldn't create: ${err}` }); return; }
       const agent = this.deps.agents.getAgent(name)!;
