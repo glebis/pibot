@@ -11,6 +11,7 @@ import {
   type StageLogEntry,
 } from "../core/dev-agent.js";
 import { errorMessage, truncate } from "../core/util.js";
+import { spawn } from "node:child_process";
 
 const runDefault = promisify(execFile);
 
@@ -31,6 +32,8 @@ export interface DevPluginDeps {
   /** injectable runner (unit tests); defaults to real execFile */
   exec?: ExecFn;
   now?: () => number;
+  /** optional disposable remote workshop (SSH alias defined in ~/.ssh/config) */
+  remote?: { alias: string; dir: string };
 }
 
 /** Run `npm run typecheck` in the repo */
@@ -98,6 +101,54 @@ export function devToolsPlugin(deps: DevPluginDeps): InlineExtension {
     const { stdout } = await exec("git", args, { cwd: deps.repoRoot, timeout });
     return stdout;
   }
+
+  /** Run a script on the remote workshop via `ssh <alias> bash -s` (script on stdin — no escaping games) */
+  function remoteRun(alias: string, cmd: string, timeoutMs: number): Promise<{ ok: boolean; out: string }> {
+    return new Promise((resolve) => {
+      let out = "";
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn("ssh", [alias, "bash -s"], { stdio: ["pipe", "pipe", "pipe"] });
+      } catch (e) {
+        resolve({ ok: false, out: "ssh spawn failed: " + errorMessage(e) });
+        return;
+      }
+      const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+      child.stdout?.on("data", (d) => (out += d));
+      child.stderr?.on("data", (d) => (out += d));
+      child.on("error", (e) => {
+        clearTimeout(timer);
+        resolve({ ok: false, out: "ssh failed: " + errorMessage(e) + " (is the box up? alias " + alias + " in ~/.ssh/config?)" });
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ ok: code === 0, out: truncate(out.trim() || "(no output)", 6000) });
+      });
+      child.stdin?.write(cmd + "\n");
+      child.stdin?.end();
+    });
+  }
+
+  const remoteSync = async (alias: string, dir: string): Promise<CheckResult> => {
+    try {
+      const { stdout } = await exec(
+        "rsync",
+        [
+          "-az", "--delete",
+          "--exclude", "node_modules", "--exclude", ".env", "--exclude", "data",
+          "--exclude", "agents", "--exclude", "coverage",
+          "src/", "package.json", "package-lock.json", "tsconfig.json", "vitest.config.ts",
+          `${alias}:${dir}/`,
+        ],
+        { cwd: deps.repoRoot, timeout: CHECK_TIMEOUT }
+      );
+      void stdout;
+      return { ok: true, summary: "source synced to " + alias + ":" + dir };
+    } catch (e) {
+      const err = e as { stderr?: string; message?: string };
+      return { ok: false, summary: truncate([err.stderr, err.message].filter(Boolean).join("\n"), 2000) };
+    }
+  };
 
   return {
     name: "dev-tools",
@@ -221,6 +272,59 @@ export function devToolsPlugin(deps: DevPluginDeps): InlineExtension {
           return { content: [{ type: "text", text }], details };
         },
       });
+
+      // ── remote workshop tools (only when the box exists) ──
+      if (deps.remote) {
+        const al = deps.remote.alias;
+        const rd = deps.remote.dir;
+        pi.registerTool({
+          name: "remote_sync",
+          label: "Sync to workshop",
+          description:
+            `rsync the local pibot source (src/ + configs, never secrets/data) to the disposable Linux workshop box (${al}:${rd}). Run before remote_test after local edits.`,
+          parameters: Type.Object({}),
+          async execute() {
+            const r = await remoteSync(al, rd);
+            return { content: [{ type: "text", text: (r.ok ? "✅ " : "❌ ") + r.summary }], details: { ok: r.ok } };
+          },
+        });
+
+        pi.registerTool({
+          name: "remote_exec",
+          label: "Run on workshop",
+          description:
+            `Run a shell command on the disposable Linux workshop box (${al}) and get stdout/stderr back. The box is ARM64 Ubuntu and disposable — never store secrets there. Long commands: prefer remote_test.`,
+          parameters: Type.Object({
+            cmd: Type.String({ description: "Shell command to run on the remote box" }),
+            timeoutSec: Type.Optional(Type.Number({ description: "Timeout in seconds (default 120)" })),
+          }),
+          async execute(_tcid, params) {
+            const r = await remoteRun(al, params.cmd, (params.timeoutSec ?? 120) * 1000);
+            const text = (r.ok ? "✅ done:\n" : "❌ exit ≠ 0:\n") + r.out;
+            return { content: [{ type: "text", text }], details: { ok: r.ok } };
+          },
+        });
+
+        pi.registerTool({
+          name: "remote_test",
+          label: "Verify on workshop",
+          description:
+            `Full Linux-parity check: rsync local source to the workshop box (${al}:${rd}), run typecheck + the WHOLE test suite on ARM64, report pass/fail. The remote gate before dev_stage when a change is Linux-sensitive.`,
+          parameters: Type.Object({}),
+          async execute() {
+            const sync = await remoteSync(al, rd);
+            if (!sync.ok) {
+              return { content: [{ type: "text", text: "❌ sync failed:\n" + sync.summary }], details: { ok: false } };
+            }
+            const test = await remoteRun(
+              al, `cd ${rd} && [ -d node_modules ] || npm ci --no-audit --no-fund; npm run typecheck 2>&1 | tail -5 && npm test 2>&1 | tail -6`,
+              CHECK_TIMEOUT
+            );
+            const text = (test.ok ? "✅ workshop verified (typecheck + tests on ARM):\n" : "❌ remote verification failed:\n") + test.out;
+            return { content: [{ type: "text", text }], details: { ok: test.ok } };
+          },
+        });
+      }
     },
   };
 }

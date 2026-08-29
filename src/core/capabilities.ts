@@ -14,7 +14,7 @@ import { questionPlugin } from "../plugins/question-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
 import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
 import { resolveResponderDb, tgResponderPlugin } from "../plugins/tg-responder-plugin.js";
-import { DEV_AGENT_ID, DEV_AGENT_TOOLS } from "./dev-agent.js";
+import { DEV_AGENT_ID, DEV_AGENT_TOOLS, readDevRemoteConfig } from "./dev-agent.js";
 import type { QuestionAnswer, QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import type { AgentManifest, ChatRef } from "./types.js";
@@ -126,9 +126,9 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
   },
   {
     id: "developer", defaultEnabled: false, tools: DEV_AGENT_TOOLS,
-    prompt: "dev_test validates the host and dev_stage records a checkpoint only after validation passes.",
-    available: (ctx) => ctx.agent.id === DEV_AGENT_ID,
-    create: (ctx) => devToolsPlugin({ repoRoot: ctx.workspace, agentDir: ctx.agent.dir }),
+    prompt: "dev_test validates the host and dev_stage records a checkpoint only after validation passes. The disposable Linux workshop (ssh oracle-pibot) is your remote parity gate: remote_sync mirrors the source there (never secrets), remote_test runs typecheck + the full suite on ARM64 before dev_stage when a change is Linux-sensitive, remote_exec runs anything else on it. The visual desktop on that box is for the owner to watch — you work over SSH and never store secrets on the box.",
+    available: (ctx) => ctx.agent.id === DEV_AGENT_ID && readDevRemoteConfig() !== undefined,
+    create: (ctx) => devToolsPlugin({ repoRoot: ctx.workspace, agentDir: ctx.agent.dir, remote: readDevRemoteConfig() }),
   },
 ] as const;
 

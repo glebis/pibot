@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_AGENT_TOOLS, type AgentManifest } from "./types.js";
 import { writeJsonAtomic } from "./util.js";
@@ -20,7 +21,26 @@ import { writeJsonAtomic } from "./util.js";
 export const DEV_AGENT_ID = "pibot-dev";
 
 /** Tool names registered by devPlugin — must stay in sync with src/plugins/dev-tools-plugin.ts */
-export const DEV_AGENT_TOOLS = ["dev_status", "dev_test", "dev_stage"] as const;
+export const DEV_AGENT_TOOLS = ["dev_status", "dev_test", "dev_stage", "remote_sync", "remote_exec", "remote_test"] as const;
+
+/** The disposable remote workshop reached via this ssh alias (see ~/.ssh/config) */
+export const DEV_REMOTE_ALIAS = "oracle-pibot";
+export const DEV_REMOTE_DIR = "~/pibot";
+
+/** Detect the remote workshop from the local ssh config (pure — injectable for tests) */
+export function devRemoteConfig(sshConfigText: string | undefined | null): { alias: string; dir: string } | undefined {
+  if (!sshConfigText) return undefined;
+  return sshConfigText.includes(DEV_REMOTE_ALIAS) ? { alias: DEV_REMOTE_ALIAS, dir: DEV_REMOTE_DIR } : undefined;
+}
+
+/** Read ~/.ssh/config and detect the workshop alias (undefined when absent) */
+export function readDevRemoteConfig(): { alias: string; dir: string } | undefined {
+  try {
+    return devRemoteConfig(fs.readFileSync(path.join(os.homedir(), ".ssh", "config"), "utf8"));
+  } catch {
+    return undefined;
+  }
+}
 
 /** Parse the opt-in flag the same way other boolean envs are parsed in this codebase */
 export function devAgentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -58,7 +78,14 @@ export const DEV_PERSONA = `You are pibot-dev, the resident developer of the bot
 - If the repo contains uncommitted changes you did not make (check dev_status first), say so and ask before staging.
 - Prefer tests: when fixing a bug, add/adjust a test that would have caught it.
 - When a change alters behavior visible to the owner (commands, dashboard, messages), mention in one line what changed for them.
-- You are a companion too: keep replies human and short. No report dumps — a two-line summary beats a wall of diffs.`;
+- You are a companion too: keep replies human and short. No report dumps — a two-line summary beats a wall of diffs.
+
+# Remote workshop (disposable Linux box)
+
+- A disposable ARM Linux workshop lives at "ssh oracle-pibot" (Oracle Always Free, rebuildable — it holds NOTHING valuable; treat it as fire-and-forget compute).
+- "~/pibot" on the box is your Linux checkout: run remote_sync (rsyncs your local tree there — never secrets/data), then remote_test for Linux-parity verification (typecheck + full suite on ARM). remote_exec for anything else.
+- The box also runs a visual desktop (reachable by the owner in a browser via the ssh tunnel) — that is for the OWNER to watch. You work over SSH; never try to drive pixels.
+- Never store secrets on the box. If it acts weird, say it's disposable and rebuild on request.`;
 
 export interface ScaffoldResult {
   created: boolean;
