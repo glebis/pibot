@@ -16,6 +16,7 @@ import { ensureDir } from "./core/util.js";
 import { createWebApp } from "./web.js";
 import { CliTransport } from "./transports/cli.js";
 import { TelegramTransport } from "./transports/telegram.js";
+import { ProviderManager } from "./core/providers.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -123,7 +124,8 @@ async function main(): Promise<void> {
       ? [new TelegramTransport(telegramToken, allowedChats, { openWhenEmpty: config.telegramOpen })]
       : [new CliTransport()];
 
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore, cascade });
+  const providerManager = new ProviderManager(modelRuntime);
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore, cascade, providers: providerManager });
 
   await bot.start();
   scheduler.rearm();
@@ -134,6 +136,7 @@ async function main(): Promise<void> {
     const webApp = createWebApp({
       agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
       webToken: config.webToken, webRpId: config.webRpId, webPort,
+      providers: providerManager,
     });
     const server = serve({ fetch: webApp.fetch, port: webPort, hostname: "127.0.0.1" });
     console.log(`[pibot] dashboard → http://127.0.0.1:${webPort}${config.webToken ? " 🔒 token" : ""}${config.webRpId ? ` (rpId=${config.webRpId})` : ""}`);

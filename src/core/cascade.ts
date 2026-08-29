@@ -278,6 +278,7 @@ export class ModelCascade {
         continue;
       }
       try {
+        console.log(`[cascade] probe ${spec} → provider=${model.provider} baseUrl=${(model as unknown as { baseUrl?: string }).baseUrl ?? "(default)"}`);
         const msg = await this.deps.modelRuntime.complete(
           model,
           { messages: [{ role: "user", content: "ping", timestamp: Date.now() }] },

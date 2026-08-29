@@ -23,6 +23,8 @@ import { knowledgePlugin } from "../plugins/knowledge-plugin.js";
 import { agentCommsPlugin, type CommsHooks } from "../plugins/agent-comms-plugin.js";
 import { delegatePlugin } from "../plugins/delegate-plugin.js";
 import { attendPlugin } from "../plugins/attend-plugin.js";
+import { devToolsPlugin } from "../plugins/dev-tools-plugin.js";
+import { DEV_AGENT_ID, DEV_AGENT_TOOLS } from "./dev-agent.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
 import { ensureDir, errorMessage, readJson, truncate, writeJsonAtomic } from "./util.js";
@@ -48,6 +50,16 @@ export class AgentManager {
 
   get vault(): string {
     return this.vaultDir;
+  }
+
+  /** directory agents are discovered from (**repo root sibling** of pibot itself) */
+  get agentsRoot(): string {
+    return this.agentsDir;
+  }
+
+  /** session working directory for an agent: its own dir, or the repo root when it develops the host (workspace: "repo") */
+  workspaceFor(agent: { dir: string; manifest: { workspace?: "agent-dir" | "repo" } }): string {
+    return agent.manifest.workspace === "repo" ? path.resolve(this.agentsDir, "..") : agent.dir;
   }
 
   // ── discovery & scaffolding ───────────────────────────────────────────────
@@ -132,8 +144,12 @@ export class AgentManager {
         ? SessionManager.open(index[chatKey])
         : SessionManager.create(agent.dir, sessionsDir);
 
+    // pibot-dev works on the host repo; everyone else lives inside their own dir
+    const sessionCwd = this.workspaceFor(agent);
+    const isDevAgent = agent.id === DEV_AGENT_ID;
+
     const loader = new DefaultResourceLoader({
-      cwd: agent.dir,
+      cwd: sessionCwd,
       agentDir: getAgentDir(),
       systemPromptOverride: () => systemPromptFor(agent, this.vaultDir),
       // per-agent private plugins
@@ -148,6 +164,7 @@ export class AgentManager {
           gmailPlugin(),
           linearPlugin(),
           skillManagePlugin({ agentDir: agent.dir, agentId }),
+          ...(isDevAgent ? [devToolsPlugin({ repoRoot: sessionCwd, agentDir: agent.dir })] : []),
           ...(ask ? [questionPlugin({ chat, ask })] : []),
         ],
       });
@@ -162,7 +179,7 @@ export class AgentManager {
         model = undefined;
       }
       const { session, modelFallbackMessage } = await createAgentSession({
-        cwd: agent.dir,
+        cwd: sessionCwd,
         agentDir: getAgentDir(),
         modelRuntime: this.modelRuntime,
         model,
@@ -175,6 +192,7 @@ export class AgentManager {
           "linear_list", "linear_create", "linear_update",
           "memory_save", "memory_recall",
           "skill_save", "skill_patch", "skill_list",
+          ...(isDevAgent ? [...DEV_AGENT_TOOLS] : []),
           ...(ask ? ["ask_user"] : []),
         ],
         resourceLoader: loader,
@@ -269,6 +287,7 @@ export function commonKnowledge(vaultDir: string): string {
 
 function systemPromptFor(agent: LoadedAgent, vaultDir: string): string {
   const hb = agent.manifest.heartbeat;
+  const isDevAgent = agent.manifest.workspace === "repo";
   return [
     `You are "${agent.manifest.name}", a personal agent companion living inside pibot.`,
     `You are talking with your owner through a chat interface. Keep replies short and natural — you are a companion, not a report generator. Light markdown is fine.`,
@@ -286,6 +305,13 @@ function systemPromptFor(agent: LoadedAgent, vaultDir: string): string {
     `- attend_enqueue / attend_list / attend_mark: the owner's attention queue — adaptive question surfacing (max 1/day, active hours).`,
     `- inbox_pending / followups_open / draft_reply: the owner's Telegram comms inbox (who is waiting, follow-ups). Never send directly — draft only, the user approves.`,
     `- The owner's Obsidian vault lives at ${vaultDir} — READ it freely (grep/find are your friends); it is the ground truth. Write only inside your own directory.`,
+    ...(isDevAgent
+      ? [
+          `- You are the RESIDENT DEVELOPER of this bot: your workspace is the pibot source tree itself (repo root), not just your agent dir.`,
+          `- Follow the loop from your persona: understand → implement → dev_test (typecheck + tests must pass) → dev_stage (lands a git checkpoint; refuses when red).`,
+          `- Never touch .env, data/, node_modules, other agents' sessions/ or memory/, and never push/force git.`,
+        ]
+      : []),
     ``,
     `# Schedule tool semantics`,
     `- "when" strings: "in 20m", "tomorrow 9am", "daily at 08:00", "every 2h", "friday 18:00", "every day at 9am".`,

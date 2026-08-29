@@ -21,6 +21,7 @@ const HELP = [
   `/handoff <agent> — move this conversation (with context) to another agent`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
   `/cascade — model fallback health  ·  /cascade probe|retry|clear`,
+  `/providers — cloud providers, keys & subscription logins`,
   `/status — what's running`,
 ].join("\n");
 
@@ -57,6 +58,9 @@ export interface CommandContext {
     probe(): Promise<string>;
     retry(): Promise<string>;
     clear(): string;
+  };
+  providers?: {
+    statusText(): Promise<string>;
   };
 }
 
@@ -273,6 +277,15 @@ export function createCommandHandler(ctx: CommandContext) {
         } else {
           await reply(cascade.status(agentId));
         }
+        return;
+      }
+
+      case "providers": {
+        if (!deps.providers) {
+          await reply("Providers view is not wired in this build.");
+          return;
+        }
+        await reply(await deps.providers.statusText());
         return;
       }
 

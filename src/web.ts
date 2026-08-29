@@ -10,6 +10,7 @@ import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
 import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
 import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
+import { providerRowHtml } from "./core/providers.js";
 import { WebAuthStore } from "./web-auth.js";
 import {
   generateRegistrationOptions,
@@ -40,6 +41,16 @@ export interface WebDeps {
   dataDir: string;
   telegram?: TelegramControl;
   secrets?: { get(): import("./config.js").Settings; save(patch: Partial<import("./config.js").Settings>): Promise<void> };
+  /** cloud provider status + subscription/API-key logins (subscription providers, like pi) */
+  providers?: {
+    statusText?(): Promise<string>;
+    status(): Promise<import("./core/providers.js").ProviderStatus[]>;
+    loginState(providerId: string): import("./core/providers.js").LoginState | undefined;
+    startLogin(providerId: string, type: "oauth" | "api_key"): { ok: boolean; error?: string };
+    answer(providerId: string, value: string): boolean;
+    cancel(providerId: string): void;
+    logout(providerId: string): Promise<void>;
+  };
   webToken?: string;
   webRpId?: string;
   webPort?: number;
@@ -515,6 +526,11 @@ ${hasToken ? `<div class="card">
     : `<span class="pill">⚪ not connected</span>`}
   <a href="/telegram">Configure →</a>
 </div>
+<h2>Cloud providers</h2>
+<div class="card">
+  <span class="muted">Keys & subscription logins (Claude Pro/Max, SuperGrok, …) — models join the cascade automatically.</span>
+  <a href="/providers">Manage →</a>
+</div>
 <h2>New agent</h2>
 <div class="card"><a href="/agents/new">Create a new agent →</a> <span class="muted">guided form — or /newagent in chat for the interview wizard</span></div>`));
   });
@@ -939,6 +955,56 @@ ${enabled
     if (deps.telegram) await deps.telegram.disableTelegram();
     await deps.secrets?.save({ telegram: undefined });
     return c.redirect(`/telegram?msg=${encodeURIComponent("Bot disconnected")}`);
+  });
+
+  // ── cloud providers: status + subscription/OAuth/API-key logins ──
+  app.get("/providers", async (c) => {
+    if (!deps.providers) return c.html(page("providers", "<h2>Cloud providers</h2><p class=\"muted\">Not wired in this build.</p>"));
+    let list: import("./core/providers.js").ProviderStatus[] = [];
+    try { list = await deps.providers.status(); } catch { list = []; }
+    const rows = list.map((p) => providerRowHtml(p, deps.providers!.loginState(p.id), csrfToken)).join("\n");
+    const body = `<h2>Cloud providers</h2>
+<p class="muted">Subscription sign-ins (Claude Pro/Max, SuperGrok / X Premium, …) are stored in the shared pi credentials — the same login pi uses. New models join every agent's cascade automatically, no restart.</p>
+${rows || `<p class="muted">No providers discovered.</p>`}`;
+    return c.html(page("providers", body, c.req.query("msg")));
+  });
+
+  app.post("/providers/:id/login", async (c) => {
+    if (!deps.providers) return c.text("Not wired", 404);
+    const b = await c.req.parseBody().catch(() => ({})) as Record<string, string>;
+    if (!checkCsrf(b as never)) return c.text("CSRF failed", 403);
+    const id = c.req.param("id");
+    const type = b.type === "api_key" ? "api_key" : "oauth";
+    // api_key flows take the key directly via the form; oauth flows go through the prompt loop
+    const r = deps.providers.startLogin(id, type);
+    if (!r.ok) return c.redirect(`/providers?msg=${encodeURIComponent(r.error ?? "could not start login")}`);
+    if (type === "api_key" && b.value?.trim()) deps.providers.answer(id, b.value.trim());
+    return c.redirect("/providers");
+  });
+
+  app.post("/providers/:id/answer", async (c) => {
+    if (!deps.providers) return c.text("Not wired", 404);
+    const b = await c.req.parseBody().catch(() => ({})) as Record<string, string>;
+    if (!checkCsrf(b as never)) return c.text("CSRF failed", 403);
+    const ok = deps.providers.answer(c.req.param("id"), String(b.value ?? ""));
+    return c.redirect(`/providers${ok ? "" : `?msg=${encodeURIComponent("No active login prompt for this provider")}`}`);
+  });
+
+  app.post("/providers/:id/cancel", async (c) => {
+    if (!deps.providers) return c.text("Not wired", 404);
+    const b = await c.req.parseBody().catch(() => ({})) as Record<string, string>;
+    if (!checkCsrf(b as never)) return c.text("CSRF failed", 403);
+    deps.providers.cancel(c.req.param("id"));
+    return c.redirect("/providers");
+  });
+
+  app.post("/providers/:id/logout", async (c) => {
+    if (!deps.providers) return c.text("Not wired", 404);
+    const b = await c.req.parseBody().catch(() => ({})) as Record<string, string>;
+    if (!checkCsrf(b as never)) return c.text("CSRF failed", 403);
+    await deps.providers.logout(c.req.param("id"));
+    deps.events.log("system", "system", `provider ${c.req.param("id")} disconnected`);
+    return c.redirect(`/providers?msg=${encodeURIComponent("Provider disconnected")}`);
   });
 
   // ── manual structured question (also the live test surface) ──

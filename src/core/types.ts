@@ -108,6 +108,9 @@ export interface AgentManifest {
   heartbeat?: HeartbeatConfig;
   /** goal-driven skill self-evolution (Hermes-style propose → gate → eval → apply) */
   evolution?: { enabled?: boolean; interval?: string; model?: string };
+  /** "repo": this agent develops the pibot source itself — its session cwd is the
+   *  repo root instead of its own agent dir (used by the built-in pibot-dev agent). */
+  workspace?: "agent-dir" | "repo";
 }
 
 export const DEFAULT_AGENT_TOOLS = ["read", "write", "edit", "grep", "find", "ls"];

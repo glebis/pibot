@@ -363,3 +363,55 @@ describe("PiBot /newagent wizard", () => {
     expect(t.transport.pushed.some((p) => p.opts.text.includes("Born: **fitness**"))).toBe(true);
   });
 });
+
+// ─── cascade dead-letter loop guards (Aug 2026 incident regression) ─────────
+
+describe("cascade dead-letter loop guards", () => {
+  let t: ReturnType<typeof makeBot>;
+
+  beforeEach(() => {
+    t = makeBot();
+    t.promptSpy.mockRejectedValue(new Error("402 payment required"));
+  });
+  afterEach(() => {
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("queues genuine user messages on cascade exhaustion and notifies the chat", async () => {
+    await t.transport.say("hello there");
+    expect(t.cascade.queueDead).toHaveBeenCalledTimes(1);
+    expect(t.cascade.queueDead).toHaveBeenCalledWith(expect.objectContaining({ text: "hello there", agentId: "assistant" }));
+    expect(t.transport.lastText()).toContain("couldn't reach any model");
+  });
+
+  it("never queues host-generated prompts — they re-fire instead of compounding", async () => {
+    await t.transport.say("[scheduler] It's time for “stretch”");
+    expect(t.cascade.queueDead).not.toHaveBeenCalled();
+    expect(t.transport.pushed.filter((p) => p.opts.text.startsWith("⚠︎"))).toHaveLength(0);
+  });
+
+  it("flushDeadLetters replays raw text — no synthetic wrapper", async () => {
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({ id: "dl2", agentId: "assistant", transport: "mock", chatId: "42", text: "stretch in 20m", createdAt: Date.now(), attempts: [], lastError: "x" })
+      .mockReturnValue(undefined);
+    const n = await t.bot.flushDeadLetters();
+    expect(n).toBe(1);
+    expect(t.promptSpy).toHaveBeenCalledTimes(1);
+    const prompted = t.promptSpy.mock.calls[0][0] as string;
+    expect(prompted).toContain("stretch in 20m");
+    expect(prompted).not.toContain("[cascade-recover]");
+  });
+
+  it("flushDeadLetters drops legacy wrapped meta-entries (loop guard)", async () => {
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({
+        id: "dl1", agentId: "focuscoach", transport: "mock", chatId: "42", createdAt: Date.now(), attempts: [], lastError: "x",
+        text: "[cascade-recover] (queued while all models were down, 11:06 PM): [cascade-recover] (queued while all models were down, 11:06 PM): [cascade-recover] (que",
+      })
+      .mockReturnValue(undefined);
+    const n = await t.bot.flushDeadLetters();
+    expect(n).toBe(0);
+    expect(t.promptSpy).not.toHaveBeenCalled();
+    expect(t.events.log).toHaveBeenCalledWith("focuscoach", "system", expect.stringContaining("loop guard"));
+  });
+});

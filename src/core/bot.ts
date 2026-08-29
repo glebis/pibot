@@ -19,6 +19,7 @@ import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBo
 import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { classifyModelError, ModelCascade } from "./cascade.js";
+import { devAgentEnabled, DEV_AGENT_ID, scaffoldDevAgent } from "./dev-agent.js";
 
 export class PiBot implements HeartbeatHost {
   private transports = new Map<string, Transport>();
@@ -61,6 +62,8 @@ export class PiBot implements HeartbeatHost {
       secrets: import("./secrets.js").SecretStore;
       /** model cascade / triage: primary → fallbacks → deterministic */
       cascade?: ModelCascade;
+      /** cloud provider status + subscription/API-key login flows */
+      providers?: import("./providers.js").ProviderManager;
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
@@ -122,6 +125,14 @@ export class PiBot implements HeartbeatHost {
     if (!this.deps.agents.list().length) {
       this.deps.agents.createAgent("assistant");
       console.log("[pibot] scaffolded default agent 'assistant'");
+    }
+    // optional built-in developer agent (PIBOT_DEV_AGENT=1): develops, tests, stages the bot itself
+    if (devAgentEnabled()) {
+      const r = scaffoldDevAgent(this.deps.agents.agentsRoot);
+      if (r.created) {
+        await this.deps.agents.discover();
+        console.log(`[pibot] scaffolded dev agent '${DEV_AGENT_ID}' — code with it via /agent ${DEV_AGENT_ID}`);
+      }
     }
     for (const agent of this.deps.agents.list()) {
       this.ensureHeartbeatJob(agent);
@@ -491,16 +502,22 @@ export class PiBot implements HeartbeatHost {
       }
     }
 
-    // deterministic fallback: queue the message, tell the user honestly
+    // deterministic fallback: queue genuine user messages, tell the user honestly.
+    // Host-generated prompts ([scheduler]/[heartbeat]/[cascade-recover]/[handoff from])
+    // are NEVER queued: they re-fire on their own schedule, and re-queueing them
+    // compounded the dead-letter queue into a self-feeding loop (each failed
+    // replay got re-queued wrapped in another [cascade-recover] layer — Aug 2026 incident).
+    const internal = INTERNAL_PROMPT_PREFIXES.some((p) => text.startsWith(p));
+    if (internal) {
+      this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — internal prompt dropped, will re-fire: ${truncate(text, 120)}`);
+      return;
+    }
     const dl = cascade.queueDead({ agentId, transport: t.name, chatId, text, createdAt: Date.now(), attempts, lastError });
     this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — queued ${dl.id} (${cascade.deadLetterCount()} pending)`);
-    const internal = INTERNAL_PROMPT_PREFIXES.some((p) => text.startsWith(p));
-    if (!internal) {
-      await t.notifyError(
-        chatId,
-        `🪫 **${agentId}** couldn't reach any model just now (${attempts.join(" → ")}).\nYour message is saved — I'll process it automatically once a provider recovers. /cascade for details.`
-      );
-    }
+    await t.notifyError(
+      chatId,
+      `🪫 **${agentId}** couldn't reach any model just now (${attempts.join(" → ")}).\nYour message is saved — I'll process it automatically once a provider recovers. /cascade for details.`
+    );
   }
 
   /** Periodic probe (scheduler job): when a model recovers, flush the dead-letter queue. */
@@ -539,10 +556,16 @@ export class PiBot implements HeartbeatHost {
     for (let i = 0; i < 25; i++) {
       const dl = cascade.takeOneDead();
       if (!dl) break;
+      // loop guard: entries produced by the old recover-wrapper (meta-prompt soup,
+      // no user content) are dropped rather than fed back into a session
+      if (dl.text.startsWith("[cascade-recover]")) {
+        this.deps.events.log(dl.agentId, "system", "cascade recovery: dropped wrapped meta-entry (dead-letter loop guard)");
+        continue;
+      }
       const t = this.transports.get(dl.transport);
       if (!t) continue; // transport gone (sub-bot detached) — drop
       try {
-        await this.promptAgent(t, dl.chatId, dl.agentId, `[cascade-recover] (queued while all models were down, ${new Date(dl.createdAt).toLocaleTimeString()}):\n${dl.text}`);
+        await this.promptAgent(t, dl.chatId, dl.agentId, dl.text);
         flushed++;
       } catch (e) {
         cascade.unshiftDead(dl); // delivery failed — stop, retry on next probe
@@ -716,6 +739,7 @@ export class PiBot implements HeartbeatHost {
           return n ? `Reopened ${n} model(s) — they'll be tried again immediately.` : "No models are marked down.";
         },
       },
+      providers: this.deps.providers,
     };
   }
 
@@ -1242,7 +1266,7 @@ export class PiBot implements HeartbeatHost {
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /** Per-turn bound: primary + at most this many fallback models try one user turn */
-const MAX_TURN_MODELS = 3;
+const MAX_TURN_MODELS = 5;
 
 /** Prompts issued by the host itself — deterministic fallback for these stays quiet (no toast) */
 const INTERNAL_PROMPT_PREFIXES = ["[scheduler]", "[heartbeat]", "[cascade-recover]", "[handoff from"];

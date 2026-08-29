@@ -91,10 +91,26 @@ src/
     cli.ts                terminal chat with numbered cards
 ```
 
+## Developer agent (off by default)
+
+Set `PIBOT_DEV_AGENT=1` to scaffold the built-in **`pibot-dev`** agent: it develops, tests, and stages the bot's own source.
+
+- React-only (no heartbeat, no evolution) — it never self-initiates; you talk to it (`/agent pibot-dev`, or hand a task off via `agent_message`).
+- Its session runs with `workspace: "repo"` — the pibot repo root is its cwd, and it gets `bash` plus three tools:
+  - `dev_status` — branch / git status / diffstat / recent commits
+  - `dev_test` — runs `tsc --noEmit` + the vitest suite (optionally scoped)
+  - `dev_stage` — lands the change as a git checkpoint commit, but **only** after re-running the full gate (typecheck + tests). Refuses on red or when forbidden paths changed (`.env`, `data/`, sessions, node_modules).
+- You review in git history (`git log`, `git revert`); every staged change is also logged to `agents/pibot-dev/staging/log.jsonl`.
+
+```bash
+echo 'PIBOT_DEV_AGENT=1' >> .env   # enable at next restart
+git revert <commit>                # rollback any staged change
+```
+
 ## Testing
 
 ```bash
-npm test              # vitest, 87 tests
+npm test              # vitest, 216 tests
 npm run test:coverage
 npm run evolve -- assistant "goal text"   # CLI evolution cycle
 ```
