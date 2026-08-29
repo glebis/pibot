@@ -65,10 +65,11 @@ export function loadConfig(): Config {
   loadDotEnv();
   const token = process.env.TELEGRAM_BOT_TOKEN || undefined;
   const transport = (process.env.PIBOT_TRANSPORT as Config["transport"]) || (token ? "telegram" : "cli");
+  const privateAgentsDir = path.join(os.homedir(), ".local", "share", "pibot", "agents");
   return {
     transport,
     dataDir: path.resolve(process.env.PIBOT_DATA_DIR || "./data"),
-    agentsDir: path.resolve(process.env.PIBOT_AGENTS_DIR || "./agents"),
+    agentsDir: path.resolve(process.env.PIBOT_AGENTS_DIR || privateAgentsDir),
     vaultDir: path.resolve((process.env.PIBOT_VAULT_DIR || "~/Brains/brain").replace("~", os.homedir())),
     defaultAgentId: process.env.PIBOT_DEFAULT_AGENT || undefined,
     heartbeatModel: process.env.PIBOT_HEARTBEAT_MODEL && process.env.PIBOT_HEARTBEAT_MODEL !== "same"

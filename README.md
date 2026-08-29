@@ -4,10 +4,10 @@ Personal agent companions built on the [pi SDK](https://github.com/badlogic/pi-m
 
 ## Design in one paragraph
 
-**Every agent is a directory** under `agents/`:
+**Every agent is a private runtime directory** under `~/.local/share/pibot/agents/` by default (`PIBOT_AGENTS_DIR` overrides it). Only the generic scaffold in `agents/_template/` belongs in source control:
 
 ```
-agents/<name>/
+~/.local/share/pibot/agents/<name>/
   agent.json      # manifest: model, heartbeat rhythm, evolution config
   AGENTS.md       # persona (loaded as context by pi)
   memory/         # long-term memory, owned by the agent
@@ -58,7 +58,7 @@ Ask naturally: *"remind me to stretch in 20 minutes"*, *"note to take: check the
 
 ## Heartbeat (economical aliveness)
 
-**Give each agent a checklist:** edit `agents/<name>/HEARTBEAT.md` — a tiny, user-editable list the agent follows on every tick (OpenClaw's most-loved pattern). Agents can also send images: include `MEDIA: <url>` in a reply.
+**Give each agent a checklist:** edit `~/.local/share/pibot/agents/<name>/HEARTBEAT.md` — a tiny, user-editable list the agent follows on every tick (OpenClaw's most-loved pattern). Agents can also send images: include `MEDIA: <url>` in a reply.
 
 Every agent's manifest sets a rhythm (`interval`, cheap `model`, `quietHours`). Each tick spawns an **ephemeral cheap-model session** (never touching the main session's cache) with a compact digest: persona + memory + pending items + recent events. It decides via one tool call: `speak` (short proactive message), `escalate` (hand to the full agent brain), or nothing (a few hundred tokens).
 
@@ -112,7 +112,7 @@ Set `PIBOT_DEV_AGENT=1` to scaffold the built-in **`pibot-dev`** agent: it devel
   - `dev_status` — branch / git status / diffstat / recent commits
   - `dev_test` — runs `tsc --noEmit` + the vitest suite (optionally scoped)
   - `dev_stage` — lands the change as a git checkpoint commit, but **only** after re-running the full gate (typecheck + tests). Refuses on red or when forbidden paths changed (`.env`, `data/`, sessions, node_modules).
-- You review in git history (`git log`, `git revert`); every staged change is also logged to `agents/pibot-dev/staging/log.jsonl`.
+- You review source changes in git history (`git log`, `git revert`); runtime staging logs stay private under the configured agent directory.
 
 ```bash
 echo 'PIBOT_DEV_AGENT=1' >> .env   # enable at next restart

@@ -1,4 +1,6 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "./config.js";
 
@@ -17,6 +19,11 @@ describe("loadConfig", () => {
     const c = loadConfig();
     expect(c.transport).toBe("cli");
     expect(c.allowedChats).toEqual([]);
+  });
+
+  it("keeps runtime agent personas and memory outside the source checkout by default", () => {
+    clearEnv();
+    expect(loadConfig().agentsDir).toBe(path.join(os.homedir(), ".local", "share", "pibot", "agents"));
   });
 
   it("defaults to telegram when a token is present", () => {

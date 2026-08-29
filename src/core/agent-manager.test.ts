@@ -57,6 +57,13 @@ describe("AgentManager scaffolding", () => {
     expect(mgr.resolveModel(undefined)).toBeUndefined();
     expect(() => mgr.resolveModel("no-such-provider/no-such-model")).toThrow(/not available/);
   });
+
+  it("keeps repo-scoped developer agents in the source checkout when runtime agents are external", () => {
+    const repo = path.join(dir, "source-checkout");
+    const externalAgent = path.join(os.homedir(), ".local", "share", "pibot", "agents", "pibot-dev");
+    const externalMgr = new AgentManager(dir, { getModels: () => [] } as never, undefined, repo);
+    expect(externalMgr.workspaceFor({ dir: externalAgent, manifest: { workspace: "repo" } })).toBe(repo);
+  });
 });
 
 describe("buildHeartbeatDigest", () => {

@@ -9,3 +9,6 @@ agents/*/state/
 !agents/_template/state/
 agents/*/state/.staging/
 agents/system/state/
+agents/*
+!agents/_template/
+!agents/_template/**

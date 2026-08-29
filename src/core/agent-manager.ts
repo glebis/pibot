@@ -28,11 +28,13 @@ export class AgentManager {
   private sessions = new Map<string, AgentSession>(); // `${agentId}::${chatKey}` → session
   private agentsDir: string;
   private vaultDir: string;
+  private repoRoot: string;
   private modelRuntime: ModelRuntime;
 
-  constructor(agentsDir: string, modelRuntime: ModelRuntime, vaultDir?: string) {
+  constructor(agentsDir: string, modelRuntime: ModelRuntime, vaultDir?: string, repoRoot = process.cwd()) {
     this.agentsDir = path.resolve(agentsDir);
     this.vaultDir = vaultDir ?? path.join(os.homedir(), "Brains", "brain");
+    this.repoRoot = path.resolve(repoRoot);
     this.modelRuntime = modelRuntime;
   }
 
@@ -47,7 +49,7 @@ export class AgentManager {
 
   /** session working directory for an agent: its own dir, or the repo root when it develops the host (workspace: "repo") */
   workspaceFor(agent: { dir: string; manifest: { workspace?: "agent-dir" | "repo" } }): string {
-    return agent.manifest.workspace === "repo" ? path.resolve(this.agentsDir, "..") : agent.dir;
+    return agent.manifest.workspace === "repo" ? this.repoRoot : agent.dir;
   }
 
   // ── discovery & scaffolding ───────────────────────────────────────────────
