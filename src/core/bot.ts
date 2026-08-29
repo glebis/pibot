@@ -18,6 +18,7 @@ import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
+import { classifyModelError, ModelCascade } from "./cascade.js";
 
 export class PiBot implements HeartbeatHost {
   private transports = new Map<string, Transport>();
@@ -29,6 +30,9 @@ export class PiBot implements HeartbeatHost {
   private pendingSubBots = new Map<string, string>(); // chatKey → agentId awaiting its sub-bot creation
   private lastUserMessage = new Map<string, number>(); // agentId → last real user message
   private subBots = new Map<string, { token: string; username?: string }>(); // agentId → token
+  /** model spec currently bound to each persistent session ("" = not yet bound) */
+  private sessionSpec = new Map<string, string>();
+  private probing = false; // one recovery probe at a time
 
   /** @internal session cache access for handoff context extraction */
   private get cachedSessions(): Map<string, AgentSession> {
@@ -55,6 +59,8 @@ export class PiBot implements HeartbeatHost {
       evolution?: EvolutionEngine;
       modelRuntime?: import("@earendil-works/pi-coding-agent").ModelRuntime;
       secrets: import("./secrets.js").SecretStore;
+      /** model cascade / triage: primary → fallbacks → deterministic */
+      cascade?: ModelCascade;
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
@@ -122,6 +128,7 @@ export class PiBot implements HeartbeatHost {
       this.ensureMorningBriefJob(agent);
       if (agent.manifest.evolution?.enabled) this.ensureEvolutionJob(agent);
     }
+    this.ensureCascadeProbeJob();
     // attend surfacing: one pass/day within its active hours, on the default agent
     const defaultAgent = this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId();
     if (defaultAgent) this.ensureAttendPassJob(defaultAgent);
@@ -317,9 +324,9 @@ export class PiBot implements HeartbeatHost {
         void t.push(chatId, { text }).catch((e) => console.error("[bot] push failed:", e));
         this.deps.events.log(agentId, "message", truncate(text, 200));
       } else {
-        // failed turn (e.g. model auth) — tell the user instead of silence
+        // failed turn — logged here; user-facing triage lives in the cascade layer
         const err = lastAssistantError((ev as { messages?: unknown[] }).messages ?? []);
-        if (err) void t.notifyError(chatId, `model error: ${err}`).catch(() => {});
+        if (err) this.deps.events.log(agentId, "system", `failed turn: ${truncate(err, 200)}`);
       }
     }
   }
@@ -371,15 +378,205 @@ export class PiBot implements HeartbeatHost {
     t.setTyping?.(chatId, true);
     try {
       // followUp: concurrent messages queue behind the running turn instead of erroring
-      await session.prompt(envelope(text), { streamingBehavior: "followUp" });
-    } catch (e) {
-      this.deps.events.log(agentId, "system", `prompt error: ${errorMessage(e)}`);
-      await t.notifyError(chatId, errorMessage(e));
-      return;
+      await this.turnWithCascade(t, chatId, agentId, session, ck, text);
     } finally {
       t.setTyping?.(chatId, false);
     }
     await this.flushCards(t, chatId, agentId);
+  }
+
+  /**
+   * One full turn with model cascade triage: try the session's model; on a
+   * switchable model error classify it (auth/credits → long cooldown, 429 →
+   * short, transient → brief), open a breaker on that model and retry the turn
+   * on the next model in the chain within the SAME session (history kept).
+   * When every model is down the message is queued (dead letter) and the user
+   * gets an honest notice; a periodic probe replays queued messages on recovery.
+   */
+  private async turnWithCascade(
+    t: Transport,
+    chatId: string,
+    agentId: string,
+    session: AgentSession,
+    ck: string,
+    text: string
+  ): Promise<void> {
+    const cascade = this.deps.cascade;
+    const attempts: string[] = [];
+    if (!cascade) {
+      await session.prompt(envelope(text), { streamingBehavior: "followUp" });
+      return;
+    }
+
+    const agent = this.deps.agents.getAgent(agentId);
+    const chain = cascade.chainFor(agent?.manifest ?? {});
+    const wkey = `${agentId}::${ck}`;
+    let spec = this.sessionSpec.get(wkey) ?? ""; // "" = not yet bound
+
+    // first turn on this session: bind the first healthy model (skips open breakers)
+    if (!spec) {
+      const wanted = agent?.manifest.model ?? "";
+      const healthy = cascade.firstHealthy(chain) ?? wanted;
+      let bound = wanted;
+      if (healthy && healthy !== wanted) {
+        const m = cascade.resolveModel(healthy);
+        if (m) {
+          try {
+            await session.setModel(m);
+            bound = healthy;
+          } catch {
+            /* can't bind — fall through, the prompt will triage */
+          }
+        }
+      }
+      spec = bound;
+      this.sessionSpec.set(wkey, spec);
+    } else if (cascade.isOpen(spec)) {
+      // previously-bound model has an open breaker (e.g. a failure elsewhere opened it) → pre-switch
+      const next = cascade.nextCandidate(chain, spec);
+      if (next) {
+        const m = cascade.resolveModel(next);
+        if (m) {
+          try {
+            await session.setModel(m);
+            spec = next;
+            this.sessionSpec.set(wkey, next);
+          } catch {
+            /* prompt will fail and triage */
+          }
+        }
+      }
+    }
+
+    let landed = false; // has the user's text entered the session history?
+    let lastError = "";
+    for (let step = 0; step < MAX_TURN_MODELS; step++) {
+      let thrown: string | null = null;
+      const body = !landed
+        ? text
+        : `[cascade] The previous attempt failed with a model error${spec ? ` on ${spec}` : ""}. A different model is now active — respond to the user's last message now.`;
+      try {
+        await session.prompt(envelope(body), { streamingBehavior: "followUp" });
+      } catch (e) {
+        thrown = errorMessage(e);
+      }
+      const err = thrown ?? lastAssistantError(((session as { agent?: { state?: { messages?: unknown[] } } }).agent?.state?.messages) ?? []);
+      if (!err) {
+        if (spec) cascade.noteSuccess(spec);
+        return;
+      }
+      landed = thrown === null; // prompt resolved → the user msg is in history; retries use the note
+      lastError = err;
+      attempts.push(spec || "(auto)");
+      if (spec) cascade.noteFailure(spec, err);
+      this.deps.events.log(agentId, "system", `model error on ${spec || "(auto)"} [${classifyModelError(err)}]: ${truncate(err, 160)}`);
+
+      const next = cascade.nextCandidate(chain, spec || undefined);
+      if (!next) break; // whole chain exhausted → deterministic fallback
+      const model = cascade.resolveModel(next);
+      if (!model) break;
+      try {
+        await session.setModel(model);
+        spec = next;
+        this.sessionSpec.set(wkey, next);
+      } catch (e) {
+        cascade.noteFailure(next, `cannot bind model: ${errorMessage(e)}`);
+        continue;
+      }
+    }
+
+    // deterministic fallback: queue the message, tell the user honestly
+    const dl = cascade.queueDead({ agentId, transport: t.name, chatId, text, createdAt: Date.now(), attempts, lastError });
+    this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — queued ${dl.id} (${cascade.deadLetterCount()} pending)`);
+    const internal = INTERNAL_PROMPT_PREFIXES.some((p) => text.startsWith(p));
+    if (!internal) {
+      await t.notifyError(
+        chatId,
+        `🪫 **${agentId}** couldn't reach any model just now (${attempts.join(" → ")}).\nYour message is saved — I'll process it automatically once a provider recovers. /cascade for details.`
+      );
+    }
+  }
+
+  /** Periodic probe (scheduler job): when a model recovers, flush the dead-letter queue. */
+  private async runCascadeRecovery(): Promise<void> {
+    if (this.probing) return;
+    const cascade = this.deps.cascade;
+    if (!cascade || !cascade.needsRecoveryProbe()) return;
+    this.probing = true;
+    try {
+      // probe each dead-letter agent's first healthy candidate (capped)
+      const specs = new Set<string>();
+      const dls = cascade.deadLetters();
+      if (dls.length) {
+        for (const dl of dls.slice(-3)) {
+          const chain = cascade.chainFor(this.deps.agents.getAgent(dl.agentId)?.manifest ?? {});
+          const head = cascade.firstHealthy(chain) ?? chain[0];
+          if (head) specs.add(head);
+        }
+      } else {
+        const chain = cascade.chainFor(this.deps.agents.list()[0]?.manifest ?? {});
+        const head = chain.find((s) => cascade.isOpen(s)) ?? cascade.firstHealthy(chain);
+        if (head) specs.add(head);
+      }
+      const results = await cascade.probeAlive([...specs]);
+      if (results.some((r) => r.ok)) await this.flushDeadLetters();
+    } finally {
+      this.probing = false;
+    }
+  }
+
+  /** Replay queued messages into their agent sessions (oldest first). */
+  async flushDeadLetters(): Promise<number> {
+    const cascade = this.deps.cascade;
+    if (!cascade) return 0;
+    let flushed = 0;
+    for (let i = 0; i < 25; i++) {
+      const dl = cascade.takeOneDead();
+      if (!dl) break;
+      const t = this.transports.get(dl.transport);
+      if (!t) continue; // transport gone (sub-bot detached) — drop
+      try {
+        await this.promptAgent(t, dl.chatId, dl.agentId, `[cascade-recover] (queued while all models were down, ${new Date(dl.createdAt).toLocaleTimeString()}):\n${dl.text}`);
+        flushed++;
+      } catch (e) {
+        cascade.unshiftDead(dl); // delivery failed — stop, retry on next probe
+        console.error("[cascade] flush failed:", errorMessage(e));
+        break;
+      }
+    }
+    if (flushed) this.deps.events.log("system", "system", `cascade recovered — flushed ${flushed} queued message(s)`);
+    return flushed;
+  }
+
+  /** One recovery probe now, with results as text (used by /cascade probe & retry) */
+  async cascadeProbe(): Promise<string> {
+    const cascade = this.deps.cascade;
+    if (!cascade) return "Cascade is not wired in this build.";
+    const agentLike = this.deps.agents.getAgent(this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId() ?? "") ?? this.deps.agents.list()[0];
+    const chain = cascade.chainFor(agentLike?.manifest ?? {});
+    const specs = [cascade.firstHealthy(chain) ?? chain[0]].filter(Boolean) as string[];
+    for (const s of chain) if (cascade.isOpen(s) && !specs.includes(s) && specs.length < 3) specs.push(s);
+    const results = await cascade.probeAlive(specs);
+    const lines = results.map((r) => `${r.ok ? "✓" : "✕"} ${r.spec}${r.ok ? " — alive" : ` — ${truncate(r.error ?? "unreachable", 100)}`}`);
+    if (results.some((r) => r.ok)) {
+      const n = await this.flushDeadLetters();
+      if (n) lines.push(`flushed ${n} queued message(s).`);
+    }
+    return lines.join("\n");
+  }
+
+  /** Human-readable cascade health for an agent's chain (+ queue size) */
+  cascadeStatusText(agentId?: string): string {
+    const cascade = this.deps.cascade;
+    if (!cascade) return "Cascade is not wired in this build.";
+    const agent = this.deps.agents.getAgent(agentId ?? "") ?? this.deps.agents.list()[0];
+    const chain = cascade.chainFor(agent?.manifest ?? {});
+    const lines = [`model cascade for **${agent?.manifest.name ?? "(no agents)"}**:`];
+    lines.push(...(chain.length ? cascade.statusLines(chain) : ["(no configured models)"]));
+    const queued = cascade.deadLetterCount();
+    lines.push(`queued messages: ${queued || "none"}`);
+    lines.push("_primary → manifest cascade → PIBOT_MODEL_CASCADE → every authenticated model; breakers auto-expire._");
+    return lines.join("\n");
   }
 
   private async flushCards(t: Transport, chatId: string, agentId: string): Promise<void> {
@@ -498,6 +695,21 @@ export class PiBot implements HeartbeatHost {
       deliverToAgent: (id, text) => this.deliverToAgent(id, text),
       questions: this.questions,
       wizard: this,
+      cascade: {
+        status: (agentId) => this.cascadeStatusText(agentId),
+        probe: () => this.cascadeProbe(),
+        retry: async () => {
+          const cascade = this.deps.cascade;
+          if (!cascade) return "Cascade is not wired in this build.";
+          if (!cascade.deadLetterCount()) return "Nothing queued.";
+          const probe = await this.cascadeProbe();
+          return `probe:\n${probe}`;
+        },
+        clear: () => {
+          const n = this.deps.cascade?.clearBreakers() ?? 0;
+          return n ? `Reopened ${n} model(s) — they'll be tried again immediately.` : "No models are marked down.";
+        },
+      },
     };
   }
 
@@ -781,6 +993,26 @@ export class PiBot implements HeartbeatHost {
     });
   }
 
+  /** Cheap periodic probe: retries downed providers + replays queued messages */
+  private ensureCascadeProbeJob(): void {
+    if (!this.deps.cascade) return;
+    this.deps.scheduler.ensure({
+      id: "cascade:probe",
+      agentId: "system",
+      chat: { transport: "internal", chatId: "cascade" },
+      title: "cascade probe",
+      kind: "cascade-probe",
+      dueAt: Date.now() + 5 * 60e3,
+      repeat: { everyMs: 5 * 60e3 },
+      wake: "normal",
+      delivery: "direct",
+      status: "pending",
+      createdAt: Date.now(),
+      firedCount: 0,
+      internal: true,
+    });
+  }
+
   private ensureHeartbeatJob(agent: LoadedAgent): void {
     const hb = agent.manifest.heartbeat;
     if (!hb?.enabled) return;
@@ -805,6 +1037,10 @@ export class PiBot implements HeartbeatHost {
   async deliverFire(job: Schedule, snoozed: boolean): Promise<void> {
     if (job.kind === "heartbeat") {
       await this.deps.heartbeat.tick(job.agentId);
+      return;
+    }
+    if (job.kind === "cascade-probe") {
+      await this.runCascadeRecovery();
       return;
     }
     if (job.kind === "attend-pass") {
@@ -998,6 +1234,12 @@ export class PiBot implements HeartbeatHost {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/** Per-turn bound: primary + at most this many fallback models try one user turn */
+const MAX_TURN_MODELS = 3;
+
+/** Prompts issued by the host itself — deterministic fallback for these stays quiet (no toast) */
+const INTERNAL_PROMPT_PREFIXES = ["[scheduler]", "[heartbeat]", "[cascade-recover]", "[handoff from"];
 
 /** Time envelope so the agent always knows the moment */
 function envelope(text: string): string {

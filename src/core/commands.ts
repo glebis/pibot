@@ -20,6 +20,7 @@ const HELP = [
   `/schedules — pending items  ·  /cancel <id>  ·  /new — fresh session`,
   `/handoff <agent> — move this conversation (with context) to another agent`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
+  `/cascade — model fallback health  ·  /cascade probe|retry|clear`,
   `/status — what's running`,
 ].join("\n");
 
@@ -51,6 +52,12 @@ export interface CommandContext {
   deliverToAgent(agentId: string, text: string): Promise<void>;
   questions: Pick<QuestionBus, "cancelPending">;
   wizard: { runNewAgentWizard(t: Transport, chatId: string): Promise<void> };
+  cascade?: {
+    status(agentId?: string): string;
+    probe(): Promise<string>;
+    retry(): Promise<string>;
+    clear(): string;
+  };
 }
 
 export function createCommandHandler(ctx: CommandContext) {
@@ -247,6 +254,25 @@ export function createCommandHandler(ctx: CommandContext) {
             `pending: ${pending.filter((j) => !j.internal).length}${next && !next.internal ? ` · next: “${next.title}” ${fmtWhen(next.dueAt)}` : ""}`,
           ].join("\n")
         );
+        return;
+      }
+
+      case "cascade": {
+        const cascade = deps.cascade;
+        if (!cascade) {
+          await reply("Cascade is not wired in this build.");
+          return;
+        }
+        const sub = (rest[0] ?? "").toLowerCase();
+        if (sub === "probe") {
+          await reply(`Probing models…\n${await cascade.probe()}`);
+        } else if (sub === "retry" || sub === "flush") {
+          await reply(await cascade.retry());
+        } else if (sub === "clear") {
+          await reply(cascade.clear());
+        } else {
+          await reply(cascade.status(agentId));
+        }
         return;
       }
 

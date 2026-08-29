@@ -8,10 +8,12 @@ import {
   SessionManager,
   SettingsManager,
   type AgentSession,
+  type CreateAgentSessionOptions,
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
+import type { ModelCascade } from "./cascade.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
@@ -90,6 +92,8 @@ export class HeartbeatEngine {
       events: EventLog;
       vaultDir: string;
       host: HeartbeatHost;
+      /** optional model cascade — breakers + fallback selection for tick models */
+      cascade?: ModelCascade;
     }
   ) {}
 
@@ -151,13 +155,15 @@ export class HeartbeatEngine {
     await loader.reload();
 
     let session: AgentSession;
+    let choice: { model?: CreateAgentSessionOptions["model"]; spec?: string } = {};
     try {
+      choice = this.heartbeatModelWithFallback(agent);
       session = (
         await createAgentSession({
           cwd: agent.dir,
           agentDir: getAgentDir(),
           modelRuntime: this.deps.modelRuntime,
-          model: this.heartbeatModelWithFallback(agent),
+          model: choice.model,
           thinkingLevel: "off",
           tools: opts.brief ? ["heartbeat_act", "calendar_today"] : ["heartbeat_act"],
           customTools: [actTool],
@@ -167,6 +173,7 @@ export class HeartbeatEngine {
         })
       ).session;
     } catch (e) {
+      if (choice.spec) this.deps.cascade?.noteFailure(choice.spec, errorMessage(e));
       this.deps.events.log(agent.id, "system", `heartbeat session error: ${errorMessage(e)}`);
       return null;
     }
@@ -178,7 +185,9 @@ export class HeartbeatEngine {
           : `HEARTBEAT TICK — ${new Date().toLocaleString([], { weekday: "long", hour: "2-digit", minute: "2-digit" })}\n\n${digest}\n\nDecide. Call heartbeat_act exactly once.`,
         {}
       );
+      if (choice.spec) this.deps.cascade?.noteSuccess(choice.spec);
     } catch (e) {
+      if (choice.spec) this.deps.cascade?.noteFailure(choice.spec, errorMessage(e));
       this.deps.events.log(agent.id, "system", `heartbeat prompt error: ${errorMessage(e)}`);
       return null;
     } finally {
@@ -209,14 +218,29 @@ export class HeartbeatEngine {
     }
   }
 
-  /** Configured cheap heartbeat model; falls back to the agent's main model if unavailable */
-  private heartbeatModelWithFallback(agent: LoadedAgent) {
-    try {
-      return this.deps.agents.heartbeatModel(agent) ?? this.deps.agents.resolveModel(agent.manifest.model);
-    } catch {
-      this.deps.events.log(agent.id, "system", "heartbeat model unavailable — using agent default");
-      return undefined;
+  /**
+   * Cheap model for this tick, cascade-aware: skip breaker-open models and
+   * fall down the agent's chain. Falls back to the agent's main model.
+   */
+  private heartbeatModelWithFallback(agent: LoadedAgent): {
+    model?: CreateAgentSessionOptions["model"];
+    spec?: string;
+  } {
+    const hb = agent.manifest.heartbeat;
+    const wanted = hb?.model && hb.model !== "same" ? hb.model : agent.manifest.model;
+    const cascade = this.deps.cascade;
+    if (!cascade) {
+      try {
+        return { model: this.deps.agents.heartbeatModel(agent) ?? this.deps.agents.resolveModel(agent.manifest.model) };
+      } catch {
+        return {};
+      }
     }
+    const chain = cascade.chainFor({ model: wanted, cascade: agent.manifest.cascade });
+    const healthy = cascade.firstHealthy(chain) ?? wanted ?? "";
+    if (!healthy) return {};
+    const model = cascade.resolveModel(healthy);
+    return model ? { model, spec: healthy } : {};
   }
 
   private buildDigest(agent: LoadedAgent): string {

@@ -5,7 +5,7 @@ export interface ChatRef {
   chatId: string;
 }
 
-export type ScheduleKind = "reminder" | "task" | "note" | "subject" | "heartbeat" | "morning-brief" | "attend-pass" | "promise" | "evolution" | "custom";
+export type ScheduleKind = "reminder" | "task" | "note" | "subject" | "heartbeat" | "morning-brief" | "attend-pass" | "promise" | "evolution" | "cascade-probe" | "custom";
 
 export interface ScheduleRepeat {
   /** Fire again this many ms after each fire */
@@ -99,6 +99,9 @@ export interface AgentManifest {
   description?: string;
   /** pi model shorthand: "sonnet:medium", "anthropic/claude-…", or omit for first available */
   model?: string;
+  /** ordered model fallbacks used when `model` errors (auth/credits/rate-limit/transient).
+   *  After these, PIBOT_MODEL_CASCADE env applies, then every authenticated model. */
+  cascade?: string[];
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   /** built-in + custom tool names; default excludes bash (safer for remote chats) */
   tools?: string[];

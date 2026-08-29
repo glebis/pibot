@@ -8,6 +8,7 @@ import { SecretStore } from "./core/secrets.js";
 import { AgentManager } from "./core/agent-manager.js";
 import { PiBot } from "./core/bot.js";
 import { EventLog } from "./core/events.js";
+import { ModelCascade } from "./core/cascade.js";
 import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
 import { HeartbeatEngine } from "./core/heartbeat.js";
 import { Scheduler } from "./core/scheduler.js";
@@ -19,6 +20,17 @@ import { TelegramTransport } from "./transports/telegram.js";
 async function main(): Promise<void> {
   const config = loadConfig();
   ensureDir(config.dataDir);
+
+  // rotate the daemon log if it grows past 5 MB
+  const daemonLog = path.join(config.dataDir, "daemon.log");
+  try {
+    const st = fs.statSync(daemonLog);
+    if (st.size > 5 * 1024 * 1024) {
+      fs.renameSync(daemonLog, daemonLog + ".old");
+    }
+  } catch {
+    /* fresh install */
+  }
 
   // encrypted settings (sops/age): decrypt-or-migrate at boot, fail closed
   const secretStore = new SecretStore(config.dataDir);
@@ -51,6 +63,17 @@ async function main(): Promise<void> {
   const agents = new AgentManager(config.agentsDir, modelRuntime, config.vaultDir);
   const events = new EventLog(config.agentsDir);
 
+  // model cascade: primary → manifest fallbacks → PIBOT_MODEL_CASCADE → authenticated models → queue
+  const cascade = new ModelCascade({
+    modelRuntime,
+    statePath: path.join(config.dataDir, "cascade-state.json"),
+    globalTail: (process.env.PIBOT_MODEL_CASCADE || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+    log: (m) => console.log(m),
+  });
+
   // bot is created after its collaborators; they reach it through this ref
   let bot!: PiBot;
 
@@ -67,6 +90,7 @@ async function main(): Promise<void> {
       escalateToAgent: (agentId, instruction) => bot.escalateToAgent(agentId, instruction),
       lastUserMessageAt: (agentId) => bot.lastUserMessageAt(agentId),
     },
+    cascade,
   });
 
   const evolution = new EvolutionEngine({
@@ -99,7 +123,7 @@ async function main(): Promise<void> {
       ? [new TelegramTransport(telegramToken, allowedChats, { openWhenEmpty: config.telegramOpen })]
       : [new CliTransport()];
 
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore, cascade });
 
   await bot.start();
   scheduler.rearm();

@@ -25,7 +25,7 @@ import { delegatePlugin } from "../plugins/delegate-plugin.js";
 import { attendPlugin } from "../plugins/attend-plugin.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
-import { ensureDir, readJson, truncate, writeJsonAtomic } from "./util.js";
+import { ensureDir, errorMessage, readJson, truncate, writeJsonAtomic } from "./util.js";
 
 export interface LoadedAgent {
   id: string;
@@ -153,7 +153,14 @@ export class AgentManager {
       });
       await loader.reload();
 
-      const model = this.resolveModel(agent.manifest.model);
+      // manifest model may be missing/renamed — degrade to pi's auto-pick rather than dying
+      let model: ReturnType<AgentManager["resolveModel"]>;
+      try {
+        model = this.resolveModel(agent.manifest.model);
+      } catch (e) {
+        console.warn(`[${agentId}] model "${agent.manifest.model}" unavailable: ${errorMessage(e)} — auto-picking`);
+        model = undefined;
+      }
       const { session, modelFallbackMessage } = await createAgentSession({
         cwd: agent.dir,
         agentDir: getAgentDir(),

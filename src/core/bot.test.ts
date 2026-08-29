@@ -9,7 +9,30 @@ import type { EventLog } from "./events.js";
 import type { HeartbeatEngine } from "./heartbeat.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
+import type { ModelCascade } from "./cascade.js";
 import type { PushOptions, Schedule, Transport } from "./types.js";
+
+// model cascade stub — chain empty, everything healthy
+function makeCascadeStub() {
+  return {
+    chainFor: vi.fn(() => [] as string[]),
+    firstHealthy: vi.fn(() => undefined),
+    nextCandidate: vi.fn(() => undefined),
+    resolveModel: vi.fn(() => undefined),
+    isOpen: vi.fn(() => false),
+    noteFailure: vi.fn(() => "unknown" as const),
+    noteSuccess: vi.fn(),
+    queueDead: vi.fn((dl: Record<string, unknown>) => ({ id: "dl_test", ...dl })),
+    deadLetterCount: vi.fn(() => 0),
+    deadLetters: vi.fn(() => [] as never[]),
+    takeOneDead: vi.fn(() => undefined),
+    unshiftDead: vi.fn(),
+    clearBreakers: vi.fn(() => 0),
+    needsRecoveryProbe: vi.fn(() => false),
+    probeAlive: vi.fn(async () => []),
+    statusLines: vi.fn(() => [] as string[]),
+  } as unknown as ModelCascade;
+}
 
 // ─── fakes ──────────────────────────────────────────────────────────────────
 
@@ -105,8 +128,9 @@ function makeBot() {
   } as unknown as Scheduler;
 
   const transport = new MockTransport();
-  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never });
-  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, dir };
+  const cascade = makeCascadeStub();
+  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade });
+  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir };
 }
 
 describe("PiBot commands", () => {
