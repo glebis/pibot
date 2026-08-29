@@ -190,6 +190,17 @@ describe("PiBot commands", () => {
     expect(arg).toContain("hello there");
   });
 
+  it("passes inter-agent communication hooks into chat sessions", async () => {
+    await t.transport.say("hello");
+    const hooks = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls[0][5];
+    expect(hooks).toMatchObject({
+      askAgent: expect.any(Function),
+      handoffContext: expect.any(Function),
+      listAgents: expect.any(Function),
+    });
+    expect(hooks.listAgents()).toEqual([{ id: "assistant", description: undefined }]);
+  });
+
   it("switches agents with /agent", async () => {
     (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
       id === "coach" ? { id: "coach", dir: "/y", manifest: { name: "coach" } } : undefined

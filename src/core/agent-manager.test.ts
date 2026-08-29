@@ -2,7 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentManager } from "./agent-manager.js";
+import { AgentManager, resolveAgentCapabilitySet } from "./agent-manager.js";
+import type { CapabilityContext, CapabilityDefinition } from "./capabilities.js";
 import { buildHeartbeatDigest } from "./heartbeat.js";
 import type { LoadedAgent } from "./agent-manager.js";
 import type { Schedule } from "./types.js";
@@ -113,5 +114,41 @@ describe("common knowledge", () => {
     expect(ck).toContain("Gleb, Berlin");
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(vault, { recursive: true, force: true });
+  });
+});
+
+describe("agent capability integration", () => {
+  it("derives loaded tools and prompt text from the same available registry set", () => {
+    const available: CapabilityDefinition = {
+      id: "available", defaultEnabled: false, tools: ["available_tool"], prompt: "available_tool is usable.",
+      create: () => ({ name: "available", factory: vi.fn() }),
+    };
+    const unavailable: CapabilityDefinition = {
+      id: "unavailable", defaultEnabled: false, tools: ["missing_tool"], prompt: "missing_tool is usable.",
+      available: () => false, create: () => ({ name: "missing", factory: vi.fn() }),
+    };
+    const context = {
+      agent: { id: "a1", dir: "/tmp/a1", manifest: { name: "a1", tools: ["read"], capabilities: ["available", "unavailable"] } },
+      workspace: "/tmp/a1", vaultDir: "/tmp/vault", scheduler: {}, chat: { transport: "test", chatId: "1" },
+    } as unknown as CapabilityContext;
+    const set = resolveAgentCapabilitySet(context, [available, unavailable]);
+    expect(set.sessionTools).toEqual(["read", "available_tool"]);
+    expect(set.systemPrompt).toContain("available_tool is usable");
+    expect(set.systemPrompt).not.toContain("missing_tool is usable");
+    expect(set.unavailable).toEqual(["unavailable"]);
+  });
+
+  it("does not pass a capability tool named in the legacy SDK tools list without selecting its capability", () => {
+    const definition: CapabilityDefinition = {
+      id: "mail", defaultEnabled: false, tools: ["mail_read"], prompt: "mail_read is usable.",
+      create: () => ({ name: "mail", factory: vi.fn() }),
+    };
+    const context = {
+      agent: { id: "a1", dir: "/tmp/a1", manifest: { name: "a1", tools: ["read", "mail_read"], capabilities: [] } },
+      workspace: "/tmp/a1", vaultDir: "/tmp/vault", scheduler: {}, chat: { transport: "test", chatId: "1" },
+    } as unknown as CapabilityContext;
+    const set = resolveAgentCapabilitySet(context, [definition]);
+    expect(set.sessionTools).toEqual(["read"]);
+    expect(set.systemPrompt).not.toContain("mail_read is usable");
   });
 });
