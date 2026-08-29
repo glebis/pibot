@@ -12,7 +12,7 @@ export const CATEGORIES = [
 
 export type Category = (typeof CATEGORIES)[number];
 
-const CLI = "/opt/homebrew/bin/attend";
+export const ATTEND_CLI = "/opt/homebrew/bin/attend";
 
 export interface AttendItem {
   id: string;
@@ -25,7 +25,11 @@ export interface AttendItem {
 }
 
 async function attendCli(args: string[]): Promise<string> {
-  const { stdout } = await run(CLI, args, { timeout: 15_000, cwd: "/Users/glebkalinin/ai_projects/attend" });
+  return attendCliAt(ATTEND_CLI, args);
+}
+
+async function attendCliAt(cli: string, args: string[]): Promise<string> {
+  const { stdout } = await run(cli, args, { timeout: 15_000, cwd: "/Users/glebkalinin/ai_projects/attend" });
   return stdout.trim();
 }
 
@@ -44,7 +48,7 @@ async function attendJson(args: string[]): Promise<Array<Record<string, unknown>
  * surfacing policy (max/day, active hours) stays in attend.
  */
 export function attendPlugin(deps: { cliPath?: string } = {}): InlineExtension {
-  const cli = deps.cliPath ?? CLI;
+  const cli = deps.cliPath ?? ATTEND_CLI;
 
   return {
     name: "attend",
@@ -59,7 +63,8 @@ export function attendPlugin(deps: { cliPath?: string } = {}): InlineExtension {
         async execute(_tcid, params) {
           const status = params.status ?? "pending,surfaced";
           try {
-            const items = await attendJson(["list", "--status", status]);
+            const out = await attendCliAt(cli, ["list", "--status", status]);
+            const items = (() => { try { return JSON.parse(out) as Array<Record<string, unknown>>; } catch { return []; } })();
             if (!items.length) return { content: [{ type: "text", text: "Attention queue is empty." }], details: { count: 0 } };
             const lines = items.map((i) => `- [${String(i.id).slice(0, 8)}] (${i.category}, ${i.status}) ${String(i.title)}${i.body ? ` — ${String(i.body).slice(0, 100)}` : ""}`);
             return { content: [{ type: "text", text: lines.join("\n") }], details: { count: items.length } };
@@ -92,7 +97,7 @@ export function attendPlugin(deps: { cliPath?: string } = {}): InlineExtension {
               if (params.body) args.push("--body", params.body);
               if (params.due) args.push("--due", params.due);
               if (params.urgency) args.push("--urgency", params.urgency);
-              const out = await attendCli(args);
+              const out = await attendCliAt(cli, args);
               const item = JSON.parse(out) as { id: string; category?: string };
               text = `Enqueued (${item.category ?? params.category}) — will surface adaptively.`;
               details = { id: item.id, ok: true };
@@ -115,7 +120,7 @@ export function attendPlugin(deps: { cliPath?: string } = {}): InlineExtension {
         }),
         async execute(_tcid, params) {
           try {
-            await attendCli(["mark", "--id", params.id, "--status", params.status]);
+            await attendCliAt(cli, ["mark", "--id", params.id, "--status", params.status]);
             return { content: [{ type: "text", text: `Marked ${params.status}.` }], details: { ok: true } };
           } catch (e) {
             return { content: [{ type: "text", text: `mark failed: ${String(e)}` }], details: { ok: false } };

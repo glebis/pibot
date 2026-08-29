@@ -321,7 +321,8 @@ export class PiBot implements HeartbeatHost {
       ck,
       { transport: t.name, chatId },
       this.deps.scheduler,
-      (spec: QuestionSpec) => this.questions.ask(agentId, { transport: t.name, chatId }, spec)
+      (spec: QuestionSpec) => this.questions.ask(agentId, { transport: t.name, chatId }, spec),
+      this.commsHooks()
     );
     const wkey = `${agentId}::${ck}`;
     if (!this.wired.has(wkey)) {
@@ -1183,12 +1184,22 @@ export class PiBot implements HeartbeatHost {
   // ── agent-to-agent messaging ─────────────────────────────────────────────
 
   /** Run one turn in an agent's inter-agent session and return the reply text */
+  private commsHooks() {
+    return {
+      askAgent: (fromAgentId: string, toAgentId: string, text: string, timeoutMs?: number) =>
+        this.agentAsk(fromAgentId, toAgentId, text, timeoutMs),
+      handoffContext: (fromAgentId: string, toAgentId: string, note?: string) =>
+        this.handoffContext(fromAgentId, toAgentId, note),
+      listAgents: () => this.deps.agents.list().map((agent) => ({ id: agent.id, description: agent.manifest.description })),
+    };
+  }
+
   private async agentTurn(agentId: string, fromAgent: string, text: string, timeoutMs?: number): Promise<string> {
     const target = this.deps.agents.getAgent(agentId);
     if (!target) throw new Error(`unknown agent "${agentId}"`);
     const ck = `agent::${agentId}::from-${fromAgent}`;
     const session = await this.deps.agents.getOrCreateSession(
-      agentId, ck, { transport: "agent", chatId: fromAgent }, this.deps.scheduler
+      agentId, ck, { transport: "agent", chatId: fromAgent }, this.deps.scheduler, undefined, this.commsHooks()
     );
     if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("target agent is busy");
     const run = session.prompt(envelope(`[agent-message from "${fromAgent}"]\n\n${text}`));

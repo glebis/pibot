@@ -17,7 +17,19 @@ agents/<name>/
   state/events.jsonl  # event log — feeds heartbeat + evolution
 ```
 
-The host process (`src/`) runs a **scheduler** (JSON-backed timer wheel with snooze semantics), a **heartbeat engine** (economical ephemeral cheap-model ticks that decide whether anything is worth saying), and pluggable **transports** (Telegram, CLI). Shared plugins give every agent scheduling, promises, memory, and calendar tools; each agent additionally loads its own private extensions and skills.
+The host process (`src/`) runs a **scheduler** (JSON-backed timer wheel with snooze semantics), a **heartbeat engine** (economical ephemeral cheap-model ticks that decide whether anything is worth saying), and pluggable **transports** (Telegram, CLI). One capability registry binds each host plugin's factory, tool allowlist, dependency check, and prompt description so agents are never told about unavailable tools. Each agent additionally loads its own private extensions and skills.
+
+### Per-agent capabilities
+
+`agent.json` may set `capabilities` to an explicit list. Omitting it uses the conservative default: `scheduler`, `memory`, `calendar-read`, `skills`, `agent-comms`, and `questions` (the last two only when their host hooks exist). External-data or mutation capabilities are opt-in:
+
+```json
+{
+  "capabilities": ["scheduler", "memory", "calendar-read", "skills", "agent-comms", "questions", "gmail-read", "knowledge"]
+}
+```
+
+Available ids are `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `attend`, `telegram-responder`, `delegate`, and `developer`. Attend, Telegram responder, and delegation are loaded and advertised only when their required local executable or data store exists. `tools` remains the SDK/custom-tool allowlist; use `capabilities` for host plugins.
 
 ## Run
 

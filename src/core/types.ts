@@ -105,6 +105,9 @@ export interface AgentManifest {
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   /** built-in + custom tool names; default excludes bash (safer for remote chats) */
   tools?: string[];
+  /** Host capability ids. Omit for the conservative default set; opt in to
+   * external-data or mutation capabilities explicitly per agent. */
+  capabilities?: string[];
   heartbeat?: HeartbeatConfig;
   /** goal-driven skill self-evolution (Hermes-style propose → gate → eval → apply) */
   evolution?: { enabled?: boolean; interval?: string; model?: string };

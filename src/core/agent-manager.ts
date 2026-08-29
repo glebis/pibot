@@ -11,20 +11,8 @@ import {
   type AgentSession,
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
-import { calendarPlugin } from "../plugins/calendar-plugin.js";
-import { gmailPlugin } from "../plugins/gmail-plugin.js";
-import { linearPlugin } from "../plugins/linear-plugin.js";
-import { memoryPlugin } from "../plugins/memory-plugin.js";
-import { questionPlugin } from "../plugins/question-plugin.js";
-import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
-import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
-import { tgResponderPlugin } from "../plugins/tg-responder-plugin.js";
-import { knowledgePlugin } from "../plugins/knowledge-plugin.js";
-import { agentCommsPlugin, type CommsHooks } from "../plugins/agent-comms-plugin.js";
-import { delegatePlugin } from "../plugins/delegate-plugin.js";
-import { attendPlugin } from "../plugins/attend-plugin.js";
-import { devToolsPlugin } from "../plugins/dev-tools-plugin.js";
-import { DEV_AGENT_ID, DEV_AGENT_TOOLS } from "./dev-agent.js";
+import type { CommsHooks } from "../plugins/agent-comms-plugin.js";
+import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext, type CapabilityDefinition } from "./capabilities.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
 import { ensureDir, errorMessage, readJson, truncate, writeJsonAtomic } from "./util.js";
@@ -146,27 +134,29 @@ export class AgentManager {
 
     // pibot-dev works on the host repo; everyone else lives inside their own dir
     const sessionCwd = this.workspaceFor(agent);
-    const isDevAgent = agent.id === DEV_AGENT_ID;
+    const capabilitySet = resolveAgentCapabilitySet({
+      agent,
+      workspace: sessionCwd,
+      vaultDir: this.vaultDir,
+      scheduler,
+      chat,
+      ask,
+      comms,
+    });
+    if (capabilitySet.unavailable.length) {
+      console.warn(`[${agentId}] unavailable capabilities skipped: ${capabilitySet.unavailable.join(", ")}`);
+    }
 
     const loader = new DefaultResourceLoader({
       cwd: sessionCwd,
       agentDir: getAgentDir(),
-      systemPromptOverride: () => systemPromptFor(agent, this.vaultDir),
+      systemPromptOverride: () => capabilitySet.systemPrompt,
       // per-agent private plugins
       additionalExtensionPaths: listTsFiles(path.join(agent.dir, "extensions")),
       // per-agent evolved skills (+ staging during evolution)
       additionalSkillPaths: listSkillDirs(path.join(agent.dir, "skills")).map((s) => path.dirname(s.filePath)),
       // shared plugins bound to this agent + chat
-        extensionFactories: [
-          schedulerPlugin({ scheduler, agentId, chat, getQuietHours: () => agent.manifest.heartbeat?.quietHours }),
-          memoryPlugin({ agentDir: agent.dir }),
-          calendarPlugin(),
-          gmailPlugin(),
-          linearPlugin(),
-          skillManagePlugin({ agentDir: agent.dir, agentId }),
-          ...(isDevAgent ? [devToolsPlugin({ repoRoot: sessionCwd, agentDir: agent.dir })] : []),
-          ...(ask ? [questionPlugin({ chat, ask })] : []),
-        ],
+        extensionFactories: capabilitySet.extensions,
       });
       await loader.reload();
 
@@ -185,15 +175,7 @@ export class AgentManager {
         model,
         thinkingLevel: agent.manifest.thinking ?? "off",
         tools: [
-          ...(agent.manifest.tools ?? DEFAULT_AGENT_TOOLS),
-          "schedule_create", "schedule_list", "schedule_cancel", "snooze",
-          "promise_make", "promise_keep", "calendar_today", "calendar_create_event", "calendar_delete_event", "calendar_move_event",
-          "gmail_list", "gmail_read",
-          "linear_list", "linear_create", "linear_update",
-          "memory_save", "memory_recall",
-          "skill_save", "skill_patch", "skill_list",
-          ...(isDevAgent ? [...DEV_AGENT_TOOLS] : []),
-          ...(ask ? ["ask_user"] : []),
+          ...capabilitySet.sessionTools,
         ],
         resourceLoader: loader,
         sessionManager: manager,
@@ -285,7 +267,19 @@ export function commonKnowledge(vaultDir: string): string {
   }
 }
 
-function systemPromptFor(agent: LoadedAgent, vaultDir: string): string {
+/** Resolve factories, allowed tools and prompt text together so they cannot drift. */
+export function resolveAgentCapabilitySet(ctx: CapabilityContext, registry: readonly CapabilityDefinition[] = CAPABILITY_REGISTRY) {
+  const resolved = resolveCapabilities(ctx, registry, ctx.agent.manifest.capabilities);
+  const capabilityTools = new Set(registry.flatMap((entry) => [...entry.tools]));
+  const sdkAndCustomTools = (ctx.agent.manifest.tools ?? DEFAULT_AGENT_TOOLS).filter((tool) => !capabilityTools.has(tool));
+  return {
+    ...resolved,
+    sessionTools: [...new Set([...sdkAndCustomTools, ...resolved.tools])],
+    systemPrompt: systemPromptFor(ctx.agent, ctx.vaultDir, resolved.prompt),
+  };
+}
+
+export function systemPromptFor(agent: LoadedAgent, vaultDir: string, capabilityPrompt = ""): string {
   const hb = agent.manifest.heartbeat;
   const isDevAgent = agent.manifest.workspace === "repo";
   return [
@@ -293,17 +287,9 @@ function systemPromptFor(agent: LoadedAgent, vaultDir: string): string {
     `You are talking with your owner through a chat interface. Keep replies short and natural — you are a companion, not a report generator. Light markdown is fine.`,
     ``,
     `# Operating manual`,
-    `- REMINDERS ARE NEVER DISCUSSIONS: if the user asks to be reminded of anything ("remind me to stretch in 1m", "nudge me about X at 5pm"), call schedule_create IMMEDIATELY with exactly what they said, then confirm in one line. Never look up context, never reinterpret, never answer instead of scheduling.`,
-    `- Time-sensitive requests: use the schedule_create tool. It is instant — no confirmation ritual needed. Confirm briefly in your reply.`,
-    `- Things worth remembering: memory_save (or write files directly into memory/ — that directory is yours).`,
-    `- The user may say "snooze" — use the snooze tool. Important items still fire through snooze.`,
-    `- Decisions with clear options: use the ask_user tool — it renders tappable buttons (2–6 options) or a poll (7–10) in the chat and returns the user's choice. Always include an "unsure" option when the user might not know.`,
     `- You have a heartbeat that wakes you periodically${hb?.enabled ? ` (every ${hb.interval})` : ""}. Between chats it is your chance to be proactive; the heartbeat decides whether anything is worth saying. Your HEARTBEAT.md checklist steers what to check.`,
     `- MEDIA: include a line "MEDIA: <url>" in your reply to send an image or file via Telegram.`,
-    `- Sibling agents: agent_message (fire-and-forget), agent_ask (blocking question → reply), agent_list, handoff (move a conversation with context to a sibling). [agent-message from "..."] messages come from a sibling — reply naturally.`,
-    `- knowledge_share: contribute a durable fact to the COMMON knowledge layer (all agents see it). knowledge_read: read the full layer.`,
-    `- attend_enqueue / attend_list / attend_mark: the owner's attention queue — adaptive question surfacing (max 1/day, active hours).`,
-    `- inbox_pending / followups_open / draft_reply: the owner's Telegram comms inbox (who is waiting, follow-ups). Never send directly — draft only, the user approves.`,
+    ...(capabilityPrompt ? [``, `# Available host capabilities`, capabilityPrompt] : []),
     `- The owner's Obsidian vault lives at ${vaultDir} — READ it freely (grep/find are your friends); it is the ground truth. Write only inside your own directory.`,
     ...(isDevAgent
       ? [
@@ -312,11 +298,5 @@ function systemPromptFor(agent: LoadedAgent, vaultDir: string): string {
           `- Never touch .env, data/, node_modules, other agents' sessions/ or memory/, and never push/force git.`,
         ]
       : []),
-    ``,
-    `# Schedule tool semantics`,
-    `- "when" strings: "in 20m", "tomorrow 9am", "daily at 08:00", "every 2h", "friday 18:00", "every day at 9am".`,
-    `- kind: reminder | task | note | subject | custom.`,
-    `- delivery "direct" sends a quick formatted ping when due; "agent" wakes you to compose the message yourself (more personal, more tokens).`,
-    `- wake "important" — reserve it for hard commitments (deadlines, meds).`,
   ].join("\n") + commonKnowledge(vaultDir);
 }
