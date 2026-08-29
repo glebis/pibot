@@ -41,6 +41,7 @@ cat > "$PLIST" <<PLIST
   <dict>
     <key>PIBOT_TRANSPORT</key><string>telegram</string>
     <key>PIBOT_DEFAULT_MODEL</key><string>xai/grok-4.6</string>
+    <key>TELEGRAM_ALLOWED_CHATS</key><string>${TELEGRAM_ALLOWED_CHATS:-161427550}</string>
     <key>PIBOT_WEB</key><string>1</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>

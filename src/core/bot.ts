@@ -177,6 +177,8 @@ export class PiBot implements HeartbeatHost {
     const secrets = this.deps.secrets.get();
     const persisted = secrets.telegram?.subBots?.[agentId];
     const allow = allowedChats ?? persisted?.allowedChats ?? secrets.telegram?.allowedChats ?? [];
+    // persist only an explicit/persisted choice — inheritance stays live so main-allowlist edits propagate
+    const pinned = allowedChats ?? persisted?.allowedChats;
     const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen });
     let botName: string;
     try {
@@ -191,7 +193,7 @@ export class PiBot implements HeartbeatHost {
       this.transports.delete(existingName);
       return { ok: false, error: `Started but polling failed: ${errorMessage(e)}` };
     }
-    await this.persistSubBot(agentId, token, botName.startsWith("@") ? botName.slice(1) : botName, allow);
+    await this.persistSubBot(agentId, token, botName.startsWith("@") ? botName.slice(1) : botName, pinned);
     this.deps.events.log("system", "system", `sub-bot attached for ${agentId} as ${botName}`);
     return { ok: true, botName };
   }
