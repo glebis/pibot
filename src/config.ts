@@ -26,10 +26,14 @@ export interface Settings {
   telegram?: {
     token?: string;
     allowedChats?: string[];
-    /** per-agent dedicated bots (sub-bots) */
-    subBots?: Record<string, { token: string; username?: string }>;
+    /** per-agent dedicated bots (sub-bots). allowedChats defaults to the main bot's
+     *  allowlist (owner pairing) when not set per-agent. */
+    subBots?: Record<string, { token: string; username?: string; allowedChats?: string[] }>;
   };
 }
+
+// NOTE: SecretStore.save (core/secrets.ts) deep-merges the `telegram` level, so
+// sub-bot entries — including per-agent allowedChats — survive dashboard saves.
 
 export function loadSettings(dataDir: string): Settings {
   return readJson<Settings>(path.join(dataDir, "settings.json"), {});

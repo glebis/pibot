@@ -153,9 +153,9 @@ export class PiBot implements HeartbeatHost {
 
   // ── sub-bots (per-agent Telegram identities) ──────────────────────────────
 
-  private async persistSubBot(agentId: string, token: string, username?: string): Promise<void> {
+  private async persistSubBot(agentId: string, token: string, username?: string, allowedChats?: string[]): Promise<void> {
     const cur = this.deps.secrets.get();
-    const subBots = { ...(cur.telegram?.subBots ?? {}), [agentId]: { token, username } };
+    const subBots = { ...(cur.telegram?.subBots ?? {}), [agentId]: { token, username, allowedChats } };
     await this.deps.secrets.save({ telegram: { ...cur.telegram, subBots } });
   }
 
@@ -166,14 +166,18 @@ export class PiBot implements HeartbeatHost {
     await this.deps.secrets.save({ telegram: { ...cur.telegram, subBots } });
   }
 
-  /** Wire a dedicated bot for one agent (token verified against Telegram first) */
-  async attachSubBot(agentId: string, token: string): Promise<{ ok: boolean; botName?: string; error?: string }> {
+  /** Wire a dedicated bot for one agent (token verified against Telegram first).
+   *  Allowlist resolution: explicit argument → per-agent entry in settings → main bot's allowlist. */
+  async attachSubBot(agentId: string, token: string, allowedChats?: string[]): Promise<{ ok: boolean; botName?: string; error?: string }> {
     const existingName = `telegram:${agentId}`;
     if (this.transports.has(existingName)) {
       await this.transports.get(existingName)?.stop().catch(() => {});
       this.transports.delete(existingName);
     }
-    const t = new TelegramTransport(token, [], { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen });
+    const secrets = this.deps.secrets.get();
+    const persisted = secrets.telegram?.subBots?.[agentId];
+    const allow = allowedChats ?? persisted?.allowedChats ?? secrets.telegram?.allowedChats ?? [];
+    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen });
     let botName: string;
     try {
       botName = await t.verify();
@@ -187,7 +191,7 @@ export class PiBot implements HeartbeatHost {
       this.transports.delete(existingName);
       return { ok: false, error: `Started but polling failed: ${errorMessage(e)}` };
     }
-    await this.persistSubBot(agentId, token, botName.startsWith("@") ? botName.slice(1) : botName);
+    await this.persistSubBot(agentId, token, botName.startsWith("@") ? botName.slice(1) : botName, allow);
     this.deps.events.log("system", "system", `sub-bot attached for ${agentId} as ${botName}`);
     return { ok: true, botName };
   }

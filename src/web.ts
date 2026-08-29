@@ -27,7 +27,7 @@ export interface TelegramControl {
   managerMode(): boolean;
   managerUsername(): string | undefined;
   subBotFor(agentId: string): { username?: string } | undefined;
-  attachSubBot(agentId: string, token: string): Promise<{ ok: boolean; botName?: string; error?: string }>;
+  attachSubBot(agentId: string, token: string, allowedChats?: string[]): Promise<{ ok: boolean; botName?: string; error?: string }>;
   detachSubBot(agentId: string): Promise<boolean>;
   requestSubBotCreation(agentId: string): Promise<void>;
 }

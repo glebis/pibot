@@ -155,7 +155,11 @@ export class TelegramTransport implements Transport {
 
   private async handleDenied(ctx: Context): Promise<void> {
     const chatId = String(ctx.chat?.id ?? ctx.from?.id ?? "unknown");
-    console.warn(`[telegram] blocked chat ${chatId} — not in allowlist (closed by default). Add TELEGRAM_ALLOWED_CHATS=${chatId} or set PIBOT_TELEGRAM_OPEN=1 to allow all.`);
+    if (this.boundAgentId) {
+      console.warn(`[telegram:${this.boundAgentId}] blocked chat ${chatId} — sub-bot allowlist empty/closed (pairing mode). Sub-bots inherit the main bot's allowlist unless a per-agent allowedChats is set.`);
+    } else {
+      console.warn(`[telegram] blocked chat ${chatId} — not in allowlist (closed by default). Add TELEGRAM_ALLOWED_CHATS=${chatId} or set PIBOT_TELEGRAM_OPEN=1 to allow all.`);
+    }
     const help = `⛔️ Bot not paired. Your chat id is \`${chatId}\`\n\nAdd \`TELEGRAM_ALLOWED_CHATS=${chatId}\` to your env (or set allowed chats in the dashboard) and restart.\n\nTo allow all chats (not recommended) set \`PIBOT_TELEGRAM_OPEN=1\`.`;
     try {
       const target = ctx.chat?.id ?? ctx.from?.id;
