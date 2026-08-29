@@ -13,6 +13,7 @@ describe("loadConfig", () => {
 
   it("defaults to cli transport without a token", () => {
     clearEnv();
+    delete process.env.TELEGRAM_ALLOWED_CHATS; // a real .env from other tests may linger
     const c = loadConfig();
     expect(c.transport).toBe("cli");
     expect(c.allowedChats).toEqual([]);
