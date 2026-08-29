@@ -20,8 +20,12 @@ import { writeJsonAtomic } from "./util.js";
 
 export const DEV_AGENT_ID = "pibot-dev";
 
-/** Tool names registered by devPlugin — must stay in sync with src/plugins/dev-tools-plugin.ts */
-export const DEV_AGENT_TOOLS = ["dev_status", "dev_test", "dev_stage", "remote_sync", "remote_exec", "remote_test"] as const;
+/** Tool names for locally-hosted development (the pibot dev agent's own loop) */
+export const DEV_TOOLS = ["dev_status", "dev_test", "dev_stage"] as const;
+/** Tool names for the shared remote workshop — any agent may opt in via manifest.capabilities */
+export const WORKSHOP_TOOLS = ["remote_sync", "remote_exec", "remote_test"] as const;
+/** Legacy union (kept for convenience/compat) */
+export const DEV_AGENT_TOOLS = [...DEV_TOOLS, ...WORKSHOP_TOOLS] as const;
 
 /** The disposable remote workshop reached via this ssh alias (see ~/.ssh/config) */
 export const DEV_REMOTE_ALIAS = "oracle-pibot";

@@ -14,7 +14,7 @@ import { questionPlugin } from "../plugins/question-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
 import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
 import { resolveResponderDb, tgResponderPlugin } from "../plugins/tg-responder-plugin.js";
-import { DEV_AGENT_ID, DEV_AGENT_TOOLS, readDevRemoteConfig } from "./dev-agent.js";
+import { DEV_AGENT_ID, DEV_TOOLS, WORKSHOP_TOOLS, readDevRemoteConfig } from "./dev-agent.js";
 import type { QuestionAnswer, QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import type { AgentManifest, ChatRef } from "./types.js";
@@ -125,10 +125,16 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     create: (ctx) => delegatePlugin({ allowed: installedDelegateClis(), cwd: ctx.workspace, agentId: ctx.agent.id }),
   },
   {
-    id: "developer", defaultEnabled: false, tools: DEV_AGENT_TOOLS,
-    prompt: "dev_test validates the host and dev_stage records a checkpoint only after validation passes. The disposable Linux workshop (ssh oracle-pibot) is your remote parity gate: remote_sync mirrors the source there (never secrets), remote_test runs typecheck + the full suite on ARM64 before dev_stage when a change is Linux-sensitive, remote_exec runs anything else on it. The visual desktop on that box is for the owner to watch — you work over SSH and never store secrets on the box.",
-    available: (ctx) => ctx.agent.id === DEV_AGENT_ID && readDevRemoteConfig() !== undefined,
-    create: (ctx) => devToolsPlugin({ repoRoot: ctx.workspace, agentDir: ctx.agent.dir, remote: readDevRemoteConfig() }),
+    id: "developer", defaultEnabled: false, tools: DEV_TOOLS,
+    prompt: "dev_test validates the host and dev_stage records a checkpoint only after validation passes — prefer it over raw git for landing changes.",
+    available: (ctx) => ctx.agent.id === DEV_AGENT_ID,
+    create: (ctx) => devToolsPlugin({ repoRoot: ctx.workspace, agentDir: ctx.agent.dir }),
+  },
+  {
+    id: "remote-workshop", defaultEnabled: false, tools: WORKSHOP_TOOLS,
+    prompt: "The disposable Linux workshop (ssh oracle-pibot) is shared compute: your isolated workspace is ~/agents/<your-id> — keep everything inside it; it holds nothing valuable and is rebuildable, never store secrets there. remote_sync mirrors your local source there, remote_test runs typecheck + the full suite on ARM64 Linux (call before claiming Linux parity), remote_exec runs anything else. The visual desktop on the box belongs to the owner — work over SSH, never drive pixels.",
+    available: () => readDevRemoteConfig() !== undefined,
+    create: (ctx) => devToolsPlugin({ repoRoot: ctx.workspace, agentDir: ctx.agent.dir, remote: { ...readDevRemoteConfig()!, dir: `~/agents/${ctx.agent.id}` } }),
   },
 ] as const;
 
@@ -139,7 +145,10 @@ export function capabilityIdsForTools(tools: readonly string[], registry: readon
 
 export function resolveCapabilities(ctx: CapabilityContext, registry: readonly CapabilityDefinition[] = CAPABILITY_REGISTRY, selectedIds?: readonly string[]): ResolvedCapabilities {
   const wanted = selectedIds ? [...selectedIds] : registry.filter((entry) => entry.defaultEnabled).map((entry) => entry.id);
-  if (ctx.agent.id === DEV_AGENT_ID && !wanted.includes("developer")) wanted.push("developer");
+  if (ctx.agent.id === DEV_AGENT_ID) {
+    if (!wanted.includes("developer")) wanted.push("developer");
+    if (!wanted.includes("remote-workshop")) wanted.push("remote-workshop");
+  }
   const known = new Map(registry.map((entry) => [entry.id, entry]));
   const unknown = wanted.find((id) => !known.has(id));
   if (unknown) throw new Error(`Unknown capability "${unknown}"`);
