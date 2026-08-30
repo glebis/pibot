@@ -35,6 +35,7 @@ export class PiBot implements HeartbeatHost {
   /** model spec currently bound to each persistent session ("" = not yet bound) */
   private sessionSpec = new Map<string, string>();
   private pendingPushes = new Map<string, Promise<void>>();
+  private sessionTurnFailures = new Map<string, { error: string; hadPartialText: boolean }>();
   private probing = false; // one recovery probe at a time
 
   /** @internal session cache access for handoff context extraction */
@@ -345,17 +346,22 @@ export class PiBot implements HeartbeatHost {
       t.setTyping?.(chatId, true);
     } else if (ev.type === "agent_end") {
       t.setTyping?.(chatId, false);
-      const text = extractAssistantText((ev as { messages?: unknown[] }).messages ?? []);
-      if (text) {
-        const key = `${agentId}::${this.chatKey(t, chatId)}`;
-        const delivery = t.push(chatId, { text });
-        this.pendingPushes.set(key, delivery);
-        void delivery.catch((e) => console.error("[bot] push failed:", e));
-        this.deps.events.log(agentId, "message", truncate(text, 200));
+      const messages = (ev as { messages?: unknown[] }).messages ?? [];
+      const key = `${agentId}::${this.chatKey(t, chatId)}`;
+      const terminalAssistant = lastAssistantMessage(messages);
+      const text = terminalAssistant ? extractAssistantText([terminalAssistant]) : null;
+      const err = terminalAssistant ? lastAssistantError([terminalAssistant]) : null;
+      if (err) {
+        this.sessionTurnFailures.set(key, { error: err, hadPartialText: Boolean(text) });
+        this.deps.events.log(agentId, "system", `failed turn: ${truncate(err, 200)}`);
       } else {
-        // failed turn — logged here; user-facing triage lives in the cascade layer
-        const err = lastAssistantError((ev as { messages?: unknown[] }).messages ?? []);
-        if (err) this.deps.events.log(agentId, "system", `failed turn: ${truncate(err, 200)}`);
+        this.sessionTurnFailures.delete(key);
+        if (text) {
+          const delivery = t.push(chatId, { text });
+          this.pendingPushes.set(key, delivery);
+          void delivery.catch((e) => console.error("[bot] push failed:", e));
+          this.deps.events.log(agentId, "message", truncate(text, 200));
+        }
       }
     }
   }
@@ -449,6 +455,7 @@ export class PiBot implements HeartbeatHost {
 
     t.setTyping?.(chatId, true);
     try {
+      this.pendingPushes.delete(`${agentId}::${ck}`);
       // followUp: concurrent messages queue behind the running turn instead of erroring
       await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, text), opts.recoveringDeadLetter ?? false);
       await Promise.resolve();
@@ -534,21 +541,25 @@ export class PiBot implements HeartbeatHost {
 
     let landed = false; // has the user's text entered the session history?
     let lastError = "";
+    let ambiguousPartialFailure = false;
     for (let step = 0; canPrompt && step < MAX_TURN_MODELS; step++) {
       let thrown: string | null = null;
       const body = !landed
         ? text
         : `[cascade] Internal: the previous attempt hit a provider error${spec ? ` on ${spec}` : ""} — the model was switched. Answer the user's last message directly and naturally; do not mention models, errors, or failover.`;
       try {
+        this.sessionTurnFailures.delete(wkey);
         await session.prompt(envelope(body), { streamingBehavior: "followUp" });
       } catch (e) {
         thrown = errorMessage(e);
       }
-      const err = thrown ?? lastAssistantError(((session as { agent?: { state?: { messages?: unknown[] } } }).agent?.state?.messages) ?? []);
+      const eventFailure = this.sessionTurnFailures.get(wkey);
+      const err = thrown ?? eventFailure?.error ?? lastAssistantError(((session as { agent?: { state?: { messages?: unknown[] } } }).agent?.state?.messages) ?? []);
       if (!err) {
         if (spec) cascade.noteSuccess(spec);
         return;
       }
+      ambiguousPartialFailure ||= Boolean(eventFailure?.hadPartialText);
       landed = thrown === null; // prompt resolved → the user msg is in history; retries use the note
       lastError = err;
       attempts.push(spec || "(auto)");
@@ -580,6 +591,9 @@ export class PiBot implements HeartbeatHost {
         ? "dead-letter replay failed; retained for a later retry"
         : "internal prompt dropped, will re-fire";
       this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — ${disposition}: ${truncate(text, 120)}`);
+      if (recoveringDeadLetter && ambiguousPartialFailure) {
+        throw new AmbiguousReplayError(`no permitted model available for ${agentId}`);
+      }
       throw new Error(`no permitted model available for ${agentId}`);
     }
     const dl = cascade.queueDead({ agentId, transport: t.name, chatId, text, createdAt: Date.now(), attempts, lastError });
@@ -622,6 +636,8 @@ export class PiBot implements HeartbeatHost {
   async flushDeadLetters(): Promise<number> {
     const cascade = this.deps.cascade;
     if (!cascade) return 0;
+    const head = cascade.deadLetters()[0];
+    if (head?.automaticReplayBlocked) return 0;
     let flushed = 0;
     for (let i = 0; i < 25; i++) {
       const dl = cascade.takeOneDead();
@@ -632,12 +648,29 @@ export class PiBot implements HeartbeatHost {
         this.deps.events.log(dl.agentId, "system", "cascade recovery: dropped wrapped meta-entry (dead-letter loop guard)");
         continue;
       }
+      const registered = [...(this.agentChats.get(dl.agentId) ?? [])];
+      const dedicated = registered.filter((ck) => {
+        const { transport } = this.splitChatKey(ck);
+        return this.transports.get(transport)?.boundAgentId === dl.agentId;
+      });
+      const preferred = dedicated.length ? dedicated : registered;
+      const deadLetterChat = `${dl.transport}:${dl.chatId}`;
+      if (preferred.length && !preferred.includes(deadLetterChat)) {
+        cascade.unshiftDead(dl);
+        break;
+      }
       const t = this.transports.get(dl.transport);
-      if (!t) continue; // transport gone (sub-bot detached) — drop
+      if (!t) {
+        cascade.unshiftDead(dl);
+        break;
+      }
       try {
         await this.promptAgent(t, dl.chatId, dl.agentId, dl.text, { recoveringDeadLetter: true });
         flushed++;
       } catch (e) {
+        if (e instanceof AmbiguousReplayError) {
+          dl.automaticReplayBlocked = true;
+        }
         cascade.unshiftDead(dl); // delivery failed — stop, retry on next probe
         console.error("[cascade] flush failed:", errorMessage(e));
         break;
@@ -1380,6 +1413,8 @@ function mediaPromptText(media: IncomingMedia): string {
 /** Per-turn bound: primary + at most this many fallback models try one user turn */
 const MAX_TURN_MODELS = 5;
 
+class AmbiguousReplayError extends Error {}
+
 /** Prompts issued by the host itself — deterministic fallback for these stays quiet (no toast) */
 const INTERNAL_PROMPT_PREFIXES = ["[scheduler]", "[heartbeat]", "[cascade-recover]", "[handoff from"];
 
@@ -1400,10 +1435,20 @@ function extractAssistantTextFromSession(session: AgentSession): string | null {
   return extractAssistantText((session.agent.state.messages ?? []) as unknown[]);
 }
 
+function lastAssistantMessage(messages: unknown[]): unknown | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if ((messages[i] as { role?: string })?.role === "assistant") return messages[i];
+  }
+  return undefined;
+}
+
 function lastAssistantError(messages: unknown[]): string | null {
   for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i] as { role?: string; errorMessage?: string };
-    if (m?.role === "assistant" && m.errorMessage) return m.errorMessage;
+    const m = messages[i] as { role?: string; errorMessage?: string; stopReason?: string };
+    if (m?.role !== "assistant") continue;
+    if (m.errorMessage) return m.errorMessage;
+    if (m.stopReason === "error" || m.stopReason === "aborted") return `assistant stopped with ${m.stopReason}`;
+    return null;
   }
   return null;
 }

@@ -56,13 +56,20 @@ function tmpAgentDir(): string {
 function makeAgent(dir: string, over: Partial<LoadedAgent["manifest"]> = {}): LoadedAgent {
   return { id: "assistant", dir, manifest: { name: "assistant", heartbeat: { enabled: true, interval: "45m" }, ...over } };
 }
-function makeEngine(agent: LoadedAgent, dir: string, over: Partial<HeartbeatHost> = {}, cascade?: import("./cascade.js").ModelCascade) {
+function makeEngine(
+  agent: LoadedAgent,
+  dir: string,
+  over: Partial<HeartbeatHost> = {},
+  cascade?: import("./cascade.js").ModelCascade,
+  statePath?: string,
+) {
   const agents = { getAgent: vi.fn((id: string) => (id === agent.id ? agent : undefined)), heartbeatModel: vi.fn(() => undefined), resolveModel: vi.fn(() => undefined) } as unknown as import("./agent-manager.js").AgentManager;
   const scheduler = { snoozeState: vi.fn(() => null), list: vi.fn(() => []) } as unknown as import("./scheduler.js").Scheduler;
   const events = { log: vi.fn(), tail: vi.fn(() => []) } as unknown as import("./events.js").EventLog;
   const host: HeartbeatHost = { deliverToAgent: vi.fn(async () => {}), escalateToAgent: vi.fn(async () => {}), lastUserMessageAt: vi.fn(() => 0), ...over };
   const modelRuntime = {} as PiAgent.ModelRuntime;
-  const engine = new HeartbeatEngine({ agents, scheduler, modelRuntime, events, vaultDir: dir, host, cascade });
+  const engineOptions = { agents, scheduler, modelRuntime, events, vaultDir: dir, host, cascade, statePath };
+  const engine = new HeartbeatEngine(engineOptions as ConstructorParameters<typeof HeartbeatEngine>[0]);
   return { engine, agents, scheduler, events, host };
 }
 
@@ -132,6 +139,73 @@ describe("HeartbeatEngine backoff", () => {
     });
   });
   describe("tick integration (stubbed ModelRuntime / ephemeral session)", () => {
+    it("suppresses an identical repeated speak but delivers a materially changed actionable speak", async () => {
+      const agent = makeAgent(dir);
+      const { engine, host } = makeEngine(agent, dir);
+      const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+
+      queueActs([
+        { speak: "Your appointment is tomorrow at 09:00." },
+        { speak: "Your appointment is tomorrow at 09:00." },
+        { speak: "Your appointment moved to tomorrow at 10:30." },
+      ]);
+
+      await engine.tick(agent.id);
+      await engine.tick(agent.id);
+      await engine.tick(agent.id);
+
+      expect(deliver.mock.calls.map((call: unknown[]) => call[1])).toEqual([
+        "Your appointment is tomorrow at 09:00.",
+        "Your appointment moved to tomorrow at 10:30.",
+      ]);
+    });
+
+    it("resets fatigue after user activity without forgetting duplicate suppression", async () => {
+      const agent = makeAgent(dir);
+      const { engine, host } = makeEngine(agent, dir);
+      const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+
+      queueActs([{ speak: "Your appointment is tomorrow at 09:00." }]);
+      await engine.tick(agent.id);
+      engine.noteUserMessage(agent.id);
+      queueActs([{ speak: "Your appointment is tomorrow at 09:00." }]);
+      await engine.tick(agent.id);
+
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect((engine as unknown as { unansweredSpeaks: Map<string, number> }).unansweredSpeaks.get(agent.id)).toBeUndefined();
+    });
+
+    it("persists anti-repeat state owner-only across engine recreation without surfacing silent or note-only acts", async () => {
+      const agent = makeAgent(dir);
+      const statePath = path.join(dir, "private", "heartbeat-state.json");
+      const deliver = vi.fn(async () => {});
+      const host = { deliverToAgent: deliver };
+
+      queueActs([{ speak: "Submit the signed form today." }]);
+      const first = makeEngine(agent, dir, host, undefined, statePath);
+      await first.engine.tick(agent.id);
+
+      expect(fs.existsSync(statePath)).toBe(true);
+      expect(fs.statSync(statePath).mode & 0o777).toBe(0o600);
+
+      queueActs([
+        { speak: "Submit the signed form today." },
+        null,
+        { note: "Keep the form deadline in private context." },
+        { speak: "The signed form deadline moved to tomorrow." },
+      ]);
+      const recreated = makeEngine(agent, dir, host, undefined, statePath);
+      await recreated.engine.tick(agent.id);
+      await recreated.engine.tick(agent.id);
+      await recreated.engine.tick(agent.id);
+      await recreated.engine.tick(agent.id);
+
+      expect(deliver.mock.calls.map((call: unknown[]) => call[1])).toEqual([
+        "Submit the signed form today.",
+        "The signed form deadline moved to tomorrow.",
+      ]);
+    });
+
     it("increments unansweredSpeaks on each speak and skips the third tick", async () => {
       const agent = makeAgent(dir);
       const { engine, host, events } = makeEngine(agent, dir);

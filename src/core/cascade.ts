@@ -73,6 +73,8 @@ export interface DeadLetter {
   createdAt: number;
   attempts: string[];
   lastError?: string;
+  /** A replay produced partial output before failing; automatic retries risk duplicate side effects. */
+  automaticReplayBlocked?: boolean;
 }
 
 export interface CascadeState {

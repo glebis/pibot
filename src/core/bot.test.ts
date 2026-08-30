@@ -95,12 +95,16 @@ class MockTransport implements Transport {
 }
 
 function fakeAgentManager(promptSpy = vi.fn()) {
+  const sessionListeners: Array<(event: unknown) => void> = [];
   const fakeSession = {
     prompt: promptSpy.mockResolvedValue(undefined),
     setModel: vi.fn(async () => {}),
-    subscribe: vi.fn(),
+    subscribe: vi.fn((listener: (event: unknown) => void) => {
+      sessionListeners.push(listener);
+      return () => {};
+    }),
   } as unknown as AgentSession;
-  return {
+  const agents = {
     createAgent: vi.fn(() => undefined),
     discover: vi.fn(async () => {}),
     getOrCreateSession: vi.fn(async () => fakeSession),
@@ -112,6 +116,7 @@ function fakeAgentManager(promptSpy = vi.fn()) {
     list: vi.fn(() => [{ id: "assistant", dir: "/x", manifest: { name: "assistant" } }]),
     defaultAgentId: () => "assistant",
   } as unknown as AgentManager;
+  return { agents, emitSessionEvent: (event: unknown) => sessionListeners.forEach((listener) => listener(event)) };
 }
 
 function makeBot() {
@@ -126,7 +131,7 @@ function makeBot() {
     telegramOpen: false,
   };
   const promptSpy = vi.fn();
-  const agents = fakeAgentManager(promptSpy);
+  const { agents, emitSessionEvent } = fakeAgentManager(promptSpy);
   const heartbeat = { tick: vi.fn(async () => {}) } as unknown as HeartbeatEngine;
   const events = { log: vi.fn(), tail: vi.fn(() => []) } as unknown as EventLog;
   const scheduler = {
@@ -150,7 +155,7 @@ function makeBot() {
     transcribe: vi.fn(async () => ({ ok: true, text: "spoken words", provider: "groq" })),
   };
   const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never });
-  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt };
+  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt, emitSessionEvent };
 }
 
 describe("PiBot commands", () => {
@@ -517,6 +522,197 @@ describe("cascade dead-letter loop guards", () => {
     const prompted = t.promptSpy.mock.calls[0][0] as string;
     expect(prompted).toContain("stretch in 20m");
     expect(prompted).not.toContain("[cascade-recover]");
+  });
+
+  it("keeps a provider-error replay queued without delivering partial assistant text or auto-retrying it", async () => {
+    const original = {
+      id: "dl-provider-error", agentId: "assistant", transport: "mock", chatId: "42",
+      text: "book the train", createdAt: Date.now(), attempts: ["ollama/test"], lastError: "provider unavailable",
+    };
+    const queue = [original];
+    const failedAssistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "I booked the train" }],
+      api: "openai-completions",
+      provider: "ollama",
+      model: "test",
+      usage: { input: 1, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "error",
+      errorMessage: "connection reset after partial response",
+      timestamp: Date.now(),
+    };
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>).mockImplementation(() => queue.shift());
+    (t.cascade.unshiftDead as ReturnType<typeof vi.fn>).mockImplementation((dead) => { queue.unshift(dead); });
+    (t.cascade.deadLetters as ReturnType<typeof vi.fn>).mockImplementation(() => queue);
+    t.promptSpy.mockImplementation(async () => {
+      t.emitSessionEvent({ type: "message_end", message: failedAssistant });
+      t.emitSessionEvent({ type: "turn_end", message: failedAssistant, toolResults: [] });
+      t.emitSessionEvent({ type: "agent_end", messages: [failedAssistant], willRetry: false });
+    });
+
+    const first = await t.bot.flushDeadLetters();
+    const second = await t.bot.flushDeadLetters();
+
+    expect({
+      recovered: [first, second],
+      promptCalls: t.promptSpy.mock.calls.length,
+      pushedTexts: t.transport.pushed.map((push) => push.opts.text),
+      requeued: (t.cascade.unshiftDead as ReturnType<typeof vi.fn>).mock.calls.length,
+      queue,
+    }).toEqual({
+      recovered: [0, 0],
+      promptCalls: 1,
+      pushedTexts: [],
+      requeued: 1,
+      queue: [original],
+    });
+  });
+
+  it("does not let a removed blocked replay suppress an unrelated later queue head", async () => {
+    const blocked = {
+      id: "dl-blocked", agentId: "assistant", transport: "mock", chatId: "42",
+      text: "book the train", createdAt: Date.now(), attempts: [], lastError: "provider unavailable",
+      automaticReplayBlocked: undefined as boolean | undefined,
+    };
+    const later = {
+      id: "dl-later", agentId: "assistant", transport: "mock", chatId: "42",
+      text: "tell me the weather", createdAt: Date.now() + 1, attempts: [], lastError: "provider unavailable",
+      automaticReplayBlocked: undefined as boolean | undefined,
+    };
+    const queue = [blocked];
+    const failedAssistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "I booked the train" }],
+      stopReason: "aborted",
+      timestamp: Date.now(),
+    };
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>).mockImplementation(() => queue.shift());
+    (t.cascade.unshiftDead as ReturnType<typeof vi.fn>).mockImplementation((dead) => { queue.unshift(dead); });
+    (t.cascade.deadLetters as ReturnType<typeof vi.fn>).mockImplementation(() => queue);
+    t.promptSpy.mockImplementationOnce(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [failedAssistant], willRetry: false });
+    });
+
+    expect(await t.bot.flushDeadLetters()).toBe(0);
+    expect(blocked.automaticReplayBlocked).toBe(true);
+
+    queue.shift();
+    queue.push(later);
+    t.promptSpy.mockResolvedValueOnce(undefined);
+
+    expect(await t.bot.flushDeadLetters()).toBe(1);
+    expect(t.promptSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("delivers a successful terminal assistant output after an earlier failed attempt", async () => {
+    const failedAssistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "partial answer" }],
+      stopReason: "error",
+      errorMessage: "temporary provider failure",
+      timestamp: Date.now(),
+    };
+    const successfulAssistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "complete fallback answer" }],
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementationOnce(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [failedAssistant], willRetry: true });
+      t.emitSessionEvent({ type: "agent_end", messages: [successfulAssistant], willRetry: false });
+    });
+
+    await expect(t.bot.promptAgent(t.transport, "42", "assistant", "answer this")).resolves.toBeUndefined();
+
+    expect(t.transport.pushed.map((push) => push.opts.text)).toEqual(["complete fallback answer"]);
+    expect(t.cascade.queueDead).not.toHaveBeenCalled();
+    expect(t.cascade.noteSuccess).toHaveBeenCalledWith("ollama/test");
+  });
+
+  it("does not mistake historical assistant text for partial output on a terminal error", async () => {
+    const original = {
+      id: "dl-history", agentId: "assistant", transport: "mock", chatId: "42",
+      text: "check the booking", createdAt: Date.now(), attempts: [], lastError: "provider unavailable",
+      automaticReplayBlocked: undefined as boolean | undefined,
+    };
+    const priorAssistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "an answer from the previous turn" }],
+      stopReason: "stop",
+      timestamp: Date.now() - 1,
+    };
+    const failedAssistant = {
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: "provider unavailable",
+      timestamp: Date.now(),
+    };
+    const queue = [original];
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>).mockImplementation(() => queue.shift());
+    (t.cascade.unshiftDead as ReturnType<typeof vi.fn>).mockImplementation((dead) => { queue.unshift(dead); });
+    (t.cascade.deadLetters as ReturnType<typeof vi.fn>).mockImplementation(() => queue);
+    t.promptSpy.mockImplementationOnce(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [priorAssistant, failedAssistant], willRetry: false });
+    });
+
+    expect(await t.bot.flushDeadLetters()).toBe(0);
+    expect(original.automaticReplayBlocked).toBeUndefined();
+    expect(t.transport.pushed).toEqual([]);
+    expect(queue).toEqual([original]);
+  });
+
+  it("leaves a stale-route dead letter queued when the agent now prefers a dedicated route", async () => {
+    const dedicated = new MockTransport("telegram:assistant", "assistant");
+    t.bot.addTransport(dedicated);
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockResolvedValue(undefined);
+    await dedicated.say("register the current dedicated route");
+    t.promptSpy.mockClear();
+    t.transport.pushed = [];
+    dedicated.pushed = [];
+
+    const stale = {
+      id: "dl-stale-route", agentId: "assistant", transport: "mock", chatId: "42",
+      text: "stale route message", createdAt: Date.now(), attempts: [], lastError: "models unavailable",
+    };
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>).mockReturnValueOnce(stale).mockReturnValueOnce(undefined);
+
+    expect(await t.bot.flushDeadLetters()).toBe(0);
+    expect(t.promptSpy).not.toHaveBeenCalled();
+    expect(t.cascade.unshiftDead).toHaveBeenCalledWith(stale);
+  });
+
+  it("still replays a dead letter addressed to the agent's current dedicated route", async () => {
+    const dedicated = new MockTransport("telegram:assistant", "assistant");
+    t.bot.addTransport(dedicated);
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockResolvedValue(undefined);
+    await dedicated.say("register the current dedicated route");
+    t.promptSpy.mockClear();
+    dedicated.pushed = [];
+
+    const current = {
+      id: "dl-current-route", agentId: "assistant", transport: "telegram:assistant", chatId: "42",
+      text: "current route message", createdAt: Date.now(), attempts: [], lastError: "models unavailable",
+    };
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>).mockReturnValueOnce(current).mockReturnValueOnce(undefined);
+
+    expect(await t.bot.flushDeadLetters()).toBe(1);
+    expect(t.promptSpy).toHaveBeenCalledTimes(1);
+    expect(t.promptSpy.mock.calls[0][0]).toContain("current route message");
+    expect(t.cascade.unshiftDead).not.toHaveBeenCalled();
   });
 
   it("failed dead-letter recovery retains one item without notifying or re-queueing copies", async () => {

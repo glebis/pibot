@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -17,7 +18,7 @@ import type { ModelCascade } from "./cascade.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
-import { errorMessage, fmtWhen, inQuietHours, truncate } from "./util.js";
+import { errorMessage, fmtWhen, inQuietHours, readJson, truncate, writeJsonAtomic } from "./util.js";
 
 export interface HeartbeatHost {
   /** Heartbeat wants to say something short to the user */
@@ -53,14 +54,32 @@ interface HeartbeatAct {
   note?: string;
 }
 
+interface PersistedHeartbeatAgentState {
+  lastSpeakFingerprint?: string;
+  unansweredSpeaks?: number;
+}
+
+interface PersistedHeartbeatState {
+  agents: Record<string, PersistedHeartbeatAgentState>;
+}
+
+function fingerprint(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 export class HeartbeatEngine {
   private inflight = new Set<string>();
   /** proactive speaks that got no user reaction — 2 in a row = back off */
   private unansweredSpeaks = new Map<string, number>();
+  private lastSpeakFingerprint = new Map<string, string>();
+  private hydratedAgents = new Set<string>();
+  private persistedState: PersistedHeartbeatState;
 
   /** the user just talked to this agent — reset the backoff */
   noteUserMessage(agentId: string): void {
+    this.hydrateAgent(agentId);
     this.unansweredSpeaks.delete(agentId);
+    this.persistAgent(agentId);
   }
 
   /** Should a heartbeat tick run at all? (economics guards, pure) */
@@ -68,6 +87,7 @@ export class HeartbeatEngine {
     agent: LoadedAgent,
     opts: { snoozed: boolean; lastUserMessageAt: number; now?: number }
   ): { ok: boolean; reason?: string } {
+    this.hydrateAgent(agent.id);
     const now = opts.now ?? Date.now();
     const hb = agent.manifest.heartbeat;
     if (!hb?.enabled) return { ok: false, reason: "disabled" };
@@ -94,8 +114,15 @@ export class HeartbeatEngine {
       host: HeartbeatHost;
       /** optional model cascade — breakers + fallback selection for tick models */
       cascade?: ModelCascade;
+      /** private fingerprint/counter state; omitted for in-memory-only operation */
+      statePath?: string;
     }
-  ) {}
+  ) {
+    this.persistedState = deps.statePath
+      ? readJson<PersistedHeartbeatState>(deps.statePath, { agents: {} })
+      : { agents: {} };
+    if (!this.persistedState.agents) this.persistedState.agents = {};
+  }
 
   async tick(agentId: string, opts: { brief?: boolean } = {}): Promise<void> {
     const agent = this.deps.agents.getAgent(agentId);
@@ -215,11 +242,32 @@ export class HeartbeatEngine {
     if (act.escalate) {
       await this.deps.host.escalateToAgent(agent.id, act.escalate);
     } else if (act.speak) {
+      const speakFingerprint = fingerprint(act.speak);
+      if (this.lastSpeakFingerprint.get(agent.id) === speakFingerprint) return;
       // backoff: proactive speaks that go unanswered make the heartbeat quieter
       const n = (this.unansweredSpeaks.get(agent.id) ?? 0) + 1;
-      this.unansweredSpeaks.set(agent.id, n);
       await this.deps.host.deliverToAgent(agent.id, act.speak);
+      this.unansweredSpeaks.set(agent.id, n);
+      this.lastSpeakFingerprint.set(agent.id, speakFingerprint);
+      this.persistAgent(agent.id);
     }
+  }
+
+  private hydrateAgent(agentId: string): void {
+    if (this.hydratedAgents.has(agentId)) return;
+    this.hydratedAgents.add(agentId);
+    const saved = this.persistedState.agents[fingerprint(agentId)];
+    if (saved?.lastSpeakFingerprint) this.lastSpeakFingerprint.set(agentId, saved.lastSpeakFingerprint);
+    if (saved?.unansweredSpeaks) this.unansweredSpeaks.set(agentId, saved.unansweredSpeaks);
+  }
+
+  private persistAgent(agentId: string): void {
+    if (!this.deps.statePath) return;
+    const key = fingerprint(agentId);
+    const lastSpeakFingerprint = this.lastSpeakFingerprint.get(agentId);
+    const unansweredSpeaks = this.unansweredSpeaks.get(agentId) ?? 0;
+    this.persistedState.agents[key] = { lastSpeakFingerprint, unansweredSpeaks };
+    writeJsonAtomic(this.deps.statePath, this.persistedState, 0o600);
   }
 
   /**

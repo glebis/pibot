@@ -102,6 +102,7 @@ async function main(): Promise<void> {
       lastUserMessageAt: (agentId) => bot.lastUserMessageAt(agentId),
     },
     cascade,
+    statePath: path.join(config.dataDir, "heartbeat-state.json"),
   });
 
   const evolution = new EvolutionEngine({
