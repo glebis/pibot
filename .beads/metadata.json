@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "pibot",
+  "project_id": "7d12fabe-7aa2-498b-ada5-3d52aecfc84b"
+}

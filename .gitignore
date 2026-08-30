@@ -12,3 +12,9 @@ agents/system/state/
 agents/*
 !agents/_template/
 !agents/_template/**
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
