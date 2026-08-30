@@ -52,6 +52,8 @@ describe("ProviderManager.status", () => {
     expect(text).toContain("subscription");
     expect(text).toContain("· **groq** not configured — login:");
     expect(text).toContain("dashboard → Providers");
+    expect(text).toContain("explicitly allow the provider");
+    expect(text).not.toContain("enter the cascade automatically");
   });
 
   it("providerRowHtml renders subscription login button and pending prompt form", () => {

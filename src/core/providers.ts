@@ -7,8 +7,8 @@
 //   - login: OAuth subscription flows and API-key flows are bridged to the
 //     dashboard as a small prompt/event state machine. Credentials land in the
 //     shared pi auth store (~/.pi/agent/auth.json), so pi and pibot see the
-//     same logins — no restart needed for the cascade (chainFor auto-tail
-//     re-reads configured auth on every turn).
+//     same logins. Provider credentials never change an agent's model policy:
+//     the agent must explicitly allow that provider in its manifest.
 
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AuthEvent, AuthInteraction, AuthPrompt, AuthType } from "@earendil-works/pi-ai";
@@ -125,7 +125,7 @@ export class ProviderManager {
       return `${mark} **${p.id}** ${kind}${models}${login}`;
     });
     if (!lines.length) return "No cloud providers visible.";
-    lines.push("_Subscription sign-ins (Claude Pro/Max, SuperGrok / X Premium, …) live in the shared pi credentials — login in the dashboard → Providers. New logins enter the cascade automatically._");
+    lines.push("_Subscription sign-ins (Claude Pro/Max, SuperGrok / X Premium, …) live in the shared pi credentials. Login in the dashboard → Providers, then explicitly allow the provider in each agent that may use it._");
     return lines.join("\n");
   }
 
@@ -207,7 +207,7 @@ export class LoginFlow {
     };
     void (this.runPromise = this.run(interaction)
       .then((credential) => {
-        this._state = { phase: "done", message: "credential stored — models join the cascade automatically" };
+        this._state = { phase: "done", message: "credential stored — explicitly allow this provider in each agent that may use it" };
         return credential;
       })
       .catch((e: unknown) => {
