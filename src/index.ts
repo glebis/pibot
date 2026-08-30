@@ -104,12 +104,14 @@ async function main(): Promise<void> {
       agents,
       modelRuntime,
       modelFor: (agent) => {
-        const spec = agent.manifest.evolution?.model ?? config.heartbeatModel;
-        try {
-          return agents.resolveModel(spec) ?? agents.resolveModel(agent.manifest.model);
-        } catch {
-          return undefined;
-        }
+        const configured = agent.manifest.evolution?.model ?? config.heartbeatModel;
+        const wanted = configured && configured !== "same" ? configured : agent.manifest.model;
+        const chain = cascade.chainFor({ model: wanted, cascade: agent.manifest.cascade, providers: agent.manifest.providers });
+        const spec = cascade.firstHealthy(chain);
+        if (!spec) throw new Error(`no permitted evolution model available for ${agent.id}`);
+        const model = agents.resolveModel(spec);
+        if (!model) throw new Error(`permitted evolution model unavailable: ${spec}`);
+        return model;
       },
     }),
   });

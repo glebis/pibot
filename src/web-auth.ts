@@ -71,13 +71,13 @@ export class WebAuthStore {
   }
 
   private save() {
-    writeJsonAtomic(this.file, { credentials: this.creds });
+    writeJsonAtomic(this.file, { credentials: this.creds }, 0o600);
   }
 
   private persistSessions() {
     const sf = path.join(this.dataDir, "web-sessions.json");
     const arr = [...this.sessions.entries()].map(([token, expires]) => ({ token, expires }));
-    writeJsonAtomic(sf, { sessions: arr });
+    writeJsonAtomic(sf, { sessions: arr }, 0o600);
   }
 
   private purge() {
@@ -137,7 +137,7 @@ export class WebAuthStore {
   // session tokens
   createSession(): string {
     const token = crypto.randomBytes(32).toString("hex");
-    const expires = Date.now() + 30 * 24 * 3600_1000;
+    const expires = Date.now() + 12 * 3600_1000;
     this.sessions.set(token, expires);
     this.persistSessions();
     return token;
@@ -167,15 +167,16 @@ export class WebAuthStore {
     const token = signed.slice(0, idx);
     const sig = signed.slice(idx + 1);
     const expected = crypto.createHmac("sha256", this.sessionSecret).update(token).digest("base64url");
-    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+    const actualBytes = Buffer.from(sig);
+    const expectedBytes = Buffer.from(expected);
+    if (actualBytes.length !== expectedBytes.length || !crypto.timingSafeEqual(actualBytes, expectedBytes)) return null;
     if (!this.validateSession(token)) return null;
     return token;
   }
 
   makeCookie(token: string): string {
     const signed = this.signSessionToken(token);
-    // 30d
-    return `pibot_session=${signed}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 3600}`;
+    return `pibot_session=${signed}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${12 * 3600}`;
   }
 
   clearCookie(): string {

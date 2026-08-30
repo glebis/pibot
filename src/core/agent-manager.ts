@@ -57,6 +57,7 @@ export class AgentManager {
   async discover(): Promise<void> {
     this.agents.clear();
     ensureDir(this.agentsDir);
+    fs.chmodSync(this.agentsDir, 0o700);
     for (const e of fs.readdirSync(this.agentsDir, { withFileTypes: true })) {
       if (!e.isDirectory() || e.name.startsWith("_") || e.name.startsWith(".")) continue;
       const dir = path.join(this.agentsDir, e.name);
@@ -88,6 +89,7 @@ export class AgentManager {
     const templateDir = path.join(this.agentsDir, "_template");
     const dir = path.join(this.agentsDir, name);
     ensureDir(dir);
+    fs.chmodSync(dir, 0o700);
     if (fs.existsSync(templateDir)) {
       fs.cpSync(templateDir, dir, { recursive: true });
     } else {

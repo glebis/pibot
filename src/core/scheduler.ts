@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Schedule, ScheduleRepeat } from "./types.js";
-import { ensureDir, nextRepeatAt, readJson, uid, writeJsonAtomic } from "./util.js";
+import { ensureDir, errorMessage, nextRepeatAt, readJson, uid, writeJsonAtomic } from "./util.js";
 
 interface SnoozeState {
   until: number;
@@ -125,8 +125,11 @@ export class Scheduler {
 
   /** Jobs the bot owes an inline adjustment card for (drains the pending set) */
   takePendingCards(agentId: string, chatKey: string): Schedule[] {
+    const separator = chatKey.lastIndexOf(":");
+    const transport = chatKey.slice(0, separator);
+    const chatId = chatKey.slice(separator + 1);
     const out = [...this.jobs.values()].filter(
-      (j) => j.cardPending && j.agentId === agentId && j.chat.transport === chatKey.split(":")[0] && j.chat.chatId === chatKey.split(":")[1]
+      (j) => j.cardPending && j.agentId === agentId && j.chat.transport === transport && j.chat.chatId === chatId
     );
     for (const j of out) j.cardPending = false;
     if (out.length) this.save();
@@ -248,8 +251,22 @@ export class Scheduler {
       // important: fire despite snooze
     }
 
-    job.firedCount += 1;
+    try {
+      await this.fireCb(job, Boolean(sn && now < sn.until && job.wake === "important"));
+    } catch (e) {
+      console.error("[scheduler] fire handler error:", e);
+      job.deliveryAttempts = (job.deliveryAttempts ?? 0) + 1;
+      job.lastDeliveryError = errorMessage(e).slice(0, 300);
+      job.dueAt = Date.now() + Math.min(5 * 60_000, 10_000 * 2 ** Math.min(job.deliveryAttempts - 1, 5));
+      job.status = "pending";
+      this.save();
+      this.rearm(job.id);
+      return;
+    }
 
+    job.firedCount += 1;
+    job.deliveryAttempts = 0;
+    delete job.lastDeliveryError;
     if (job.repeat) {
       const next = this.nextFire(job, now);
       if (next != null && next > now) {
@@ -263,12 +280,6 @@ export class Scheduler {
     } else {
       job.status = "done";
       this.save();
-    }
-
-    try {
-      await this.fireCb(job, Boolean(sn && now < sn.until && job.wake === "important"));
-    } catch (e) {
-      console.error("[scheduler] fire handler error:", e);
     }
   }
 

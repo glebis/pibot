@@ -59,6 +59,12 @@ export function executableAvailable(command: string): boolean {
 
 const installedDelegateClis = () => Object.keys(DELEGATE_CLIS).filter(executableAvailable);
 
+const confirmMutation = (ctx: CapabilityContext) => async (description: string): Promise<boolean> => {
+  if (!ctx.ask) return false;
+  const answer = await ctx.ask({ text: description, options: ["Confirm", "Cancel"], timeoutMs: 5 * 60_000 });
+  return answer?.index === 0 && !answer.timedOut && !answer.replaced;
+};
+
 export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
   {
     id: "scheduler", defaultEnabled: true,
@@ -73,12 +79,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
   },
   {
     id: "calendar-read", defaultEnabled: true, tools: ["calendar_today"],
-    prompt: "calendar_today provides read-only calendar context.", create: () => calendarPlugin(),
+    prompt: "calendar_today provides read-only calendar context.", create: (ctx) => calendarPlugin(confirmMutation(ctx)),
   },
   {
     id: "calendar-write", defaultEnabled: false,
     tools: ["calendar_create_event", "calendar_delete_event", "calendar_move_event"],
-    prompt: "calendar_create_event, calendar_delete_event and calendar_move_event change the owner's calendar.", create: () => calendarPlugin(),
+    prompt: "calendar_create_event, calendar_delete_event and calendar_move_event require owner confirmation before changing the calendar.", create: (ctx) => calendarPlugin(confirmMutation(ctx)),
   },
   {
     id: "gmail-read", defaultEnabled: false, tools: ["gmail_list", "gmail_read"],
@@ -86,7 +92,7 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
   },
   {
     id: "linear", defaultEnabled: false, tools: ["linear_list", "linear_create", "linear_update"],
-    prompt: "linear_list reads Linear; linear_create and linear_update change issues.", create: () => linearPlugin(),
+    prompt: "linear_list reads Linear; linear_create and linear_update require owner confirmation.", create: (ctx) => linearPlugin(confirmMutation(ctx)),
   },
   {
     id: "skills", defaultEnabled: true, tools: ["skill_save", "skill_patch", "skill_list"],

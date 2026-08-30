@@ -29,7 +29,9 @@ The host process (`src/`) runs a **scheduler** (JSON-backed timer wheel with sno
 }
 ```
 
-Available ids are `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `attend`, `telegram-responder`, `delegate`, and `developer`. Attend, Telegram responder, and delegation are loaded and advertised only when their required local executable or data store exists. `tools` remains the SDK/custom-tool allowlist; use `capabilities` for host plugins.
+Available ids are `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `attend`, `telegram-responder`, `delegate`, `developer`, and `remote-workshop`. Calendar and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
+
+`providers` is a per-agent model-provider allowlist. Without it, only models named directly in `model`/`cascade` are used; global and authenticated-provider fallback discovery is disabled.
 
 ## Run
 
@@ -40,7 +42,9 @@ cp .env.example .env             # add TELEGRAM_BOT_TOKEN for the real thing
 npm start                        # telegram bot
 ```
 
-The **web dashboard** runs at `http://127.0.0.1:7860` (disable: `PIBOT_WEB=0`, port: `PIBOT_WEB_PORT`):
+The **web dashboard** runs at `http://127.0.0.1:7860` (disable: `PIBOT_WEB=0`, port: `PIBOT_WEB_PORT`). It is always locked: set `PIBOT_WEB_TOKEN` for the first login, then enrol a passkey. First-passkey enrolment requires that token-authenticated session.
+
+The dashboard provides:
 agent CRUD, manifest editor (model/heartbeat/evolution/quiet hours), persona + memory editors,
 schedule table with cancel, snooze/wake, staged-skill review (promote/reject), run-evolution, event tail.
 
@@ -122,7 +126,7 @@ git revert <commit>                # rollback any staged change
 ## Testing
 
 ```bash
-npm test              # vitest, 216 tests
+npm test              # full Vitest suite
 npm run test:coverage
 npm run evolve -- assistant "goal text"   # CLI evolution cycle
 ```
@@ -131,11 +135,10 @@ npm run evolve -- assistant "goal text"   # CLI evolution cycle
 
 ## Roadmap
 
-- Web dashboard (config CRUD over Hono) for agents, schedules, rhythm
 - Skill Forge pattern-mining from event/session history (from `pi-skill-evolution`)
 - Multi-strategy mutation archive (compress/quality/radical, from `@artale/pi-evolve`)
-- Linear plugin (task creation + scheduled sync), image plugin
-- Per-agent Telegram bot tokens (one agent = one bot identity)
+- Image capability
+- Stronger process-level sandboxing for agent-private extensions
 ## License
 
 MIT — see [LICENSE](LICENSE).

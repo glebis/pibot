@@ -53,6 +53,30 @@ describe("Scheduler", () => {
     s.stop();
   });
 
+  it("persists a failed delivery as pending and retries it later", async () => {
+    const s = new Scheduler(dataDir, async () => { throw new Error("transport offline"); });
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000 }) });
+    await (s as unknown as { fire: (job: Schedule) => Promise<void> }).fire(job);
+    const retry = s.get(job.id)! as Schedule & { deliveryAttempts?: number; lastDeliveryError?: string };
+    expect(retry.status).toBe("pending");
+    expect(retry.deliveryAttempts).toBe(1);
+    expect(retry.lastDeliveryError).toContain("transport offline");
+    expect(retry.dueAt).toBeGreaterThan(Date.now());
+    s.flush();
+    s.stop();
+
+    let delivered = 0;
+    const restartedScheduler = new Scheduler(dataDir, () => { delivered += 1; });
+    const restored = restartedScheduler.get(job.id) as Schedule & { deliveryAttempts?: number };
+    expect(restored.status).toBe("pending");
+    expect(restored.deliveryAttempts).toBe(1);
+    restored.dueAt = Date.now();
+    restartedScheduler.rearm(restored.id);
+    await waitFor(() => delivered === 1);
+    expect(restartedScheduler.get(job.id)?.status).toBe("done");
+    restartedScheduler.stop();
+  });
+
   it("cancels pending jobs", async () => {
     const s = new Scheduler(dataDir, () => {});
     const job = s.create({ ...makeJob() });
@@ -174,6 +198,13 @@ describe("Scheduler", () => {
     const drained = s.takePendingCards("a1", "test:c1");
     expect(drained.map((j) => j.id)).toEqual([mine.id]);
     expect(s.takePendingCards("a1", "test:c1")).toHaveLength(0);
+    s.stop();
+  });
+
+  it("matches pending cards for sub-bot transport names containing colons", () => {
+    const s = new Scheduler(dataDir, () => {});
+    const mine = s.create({ ...makeJob({ cardPending: true, chat: { transport: "telegram:assistant", chatId: "123" } }) });
+    expect(s.takePendingCards("a1", "telegram:assistant:123").map((job) => job.id)).toEqual([mine.id]);
     s.stop();
   });
 

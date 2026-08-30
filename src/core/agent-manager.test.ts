@@ -45,6 +45,8 @@ describe("AgentManager scaffolding", () => {
     expect(fs.readFileSync(path.join(dir, "coach", "AGENTS.md"), "utf8")).toContain("strict but kind");
     expect(JSON.parse(fs.readFileSync(path.join(dir, "coach", "agent.json"), "utf8"))).toMatchObject({ name: "coach", heartbeat: { enabled: true } });
     expect(fs.existsSync(path.join(dir, "coach", "extensions"))).toBe(true);
+    expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(path.join(dir, "coach")).mode & 0o777).toBe(0o700);
   });
 
   it("rejects invalid and duplicate names", () => {
@@ -125,6 +127,14 @@ describe("common knowledge", () => {
 });
 
 describe("agent capability integration", () => {
+  it("does not grant generic filesystem tools to ordinary agents by default", () => {
+    const context = {
+      agent: { id: "a1", dir: "/tmp/a1", manifest: { name: "a1" } },
+      workspace: "/tmp/a1", vaultDir: "/tmp/vault", scheduler: {}, chat: { transport: "test", chatId: "1" },
+    } as unknown as CapabilityContext;
+    expect(resolveAgentCapabilitySet(context, []).sessionTools).toEqual([]);
+  });
+
   it("derives loaded tools and prompt text from the same available registry set", () => {
     const available: CapabilityDefinition = {
       id: "available", defaultEnabled: false, tools: ["available_tool"], prompt: "available_tool is usable.",

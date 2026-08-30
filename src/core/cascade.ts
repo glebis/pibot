@@ -3,8 +3,8 @@
 // Every agent gets an ordered chain of model specs:
 //   1. agent manifest `model` (primary)
 //   2. agent manifest `cascade` (ordered fallback list)   — new optional field
-//   3. PIBOT_MODEL_CASCADE env (comma-separated, global fallback list)
-//   4. auto tail: every model whose provider has configured auth (catalog order)
+//   3. allowed entries from PIBOT_MODEL_CASCADE
+//   4. authenticated models from providers explicitly allowed by the manifest
 //
 // When a turn fails with a model error, the error is classified
 // (auth / rate-limit / transient / context / unknown), the failing model gets
@@ -90,6 +90,7 @@ export interface ModelSpec {
 export interface CascadeManifestLike {
   model?: string;
   cascade?: string[];
+  providers?: string[];
 }
 
 export interface ModelCascadeDeps {
@@ -115,21 +116,29 @@ export class ModelCascade {
   /** Ordered, deduplicated chain of model specs for an agent. */
   chainFor(manifest: CascadeManifestLike): string[] {
     const specs: string[] = [];
-    const push = (s?: string | string[]) => {
+    const configuredProviders = manifest.providers?.map((provider) => provider.trim()).filter(Boolean);
+    const allowedProviders = new Set(configuredProviders ?? []);
+    const providerAllowed = (spec: string) => {
+      const slash = spec.indexOf("/");
+      return slash > 0 && allowedProviders.has(spec.slice(0, slash));
+    };
+    const push = (s?: string | string[], enforcePolicy = false) => {
       for (const item of Array.isArray(s) ? s : s ? [s] : []) {
         const v = item.trim();
         if (!v || v === "same") continue;
+        if (enforcePolicy && !providerAllowed(v)) continue;
         if (!specs.includes(v)) specs.push(v);
       }
     };
-    push(manifest.model);
-    push(manifest.cascade);
-    push(this.deps.globalTail ?? []);
-    // auto tail: every remaining model whose provider has auth configured
+    push(manifest.model, configuredProviders !== undefined);
+    push(manifest.cascade, configuredProviders !== undefined);
+    push(this.deps.globalTail ?? [], true);
+    // Authenticated-provider discovery is opt-in through manifest.providers.
     try {
       for (const m of this.deps.modelRuntime.getModels()) {
         const spec = `${m.provider}/${m.id}`;
         if (specs.includes(spec)) continue;
+        if (!allowedProviders.has(m.provider)) continue;
         if (!this.deps.modelRuntime.hasConfiguredAuth(m.provider)) continue;
         specs.push(spec);
       }

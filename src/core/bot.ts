@@ -33,6 +33,7 @@ export class PiBot implements HeartbeatHost {
   private subBots = new Map<string, { token: string; username?: string }>(); // agentId → token
   /** model spec currently bound to each persistent session ("" = not yet bound) */
   private sessionSpec = new Map<string, string>();
+  private pendingPushes = new Map<string, Promise<void>>();
   private probing = false; // one recovery probe at a time
 
   /** @internal session cache access for handoff context extraction */
@@ -42,9 +43,9 @@ export class PiBot implements HeartbeatHost {
   private questions = new QuestionBus({
     getTransport: (name) => this.transports.get(name),
     notify: (chatKey, text) => {
-      const idx = chatKey.indexOf(":");
-      const t = this.transports.get(chatKey.slice(0, idx));
-      if (t) void t.push(chatKey.slice(idx + 1), { text }).catch(() => {});
+      const { transport, chatId } = this.splitChatKey(chatKey);
+      const t = this.transports.get(transport);
+      if (t) void t.push(chatId, { text }).catch(() => {});
     },
   });
   private statePath: string;
@@ -339,7 +340,10 @@ export class PiBot implements HeartbeatHost {
       t.setTyping?.(chatId, false);
       const text = extractAssistantText((ev as { messages?: unknown[] }).messages ?? []);
       if (text) {
-        void t.push(chatId, { text }).catch((e) => console.error("[bot] push failed:", e));
+        const key = `${agentId}::${this.chatKey(t, chatId)}`;
+        const delivery = t.push(chatId, { text });
+        this.pendingPushes.set(key, delivery);
+        void delivery.catch((e) => console.error("[bot] push failed:", e));
         this.deps.events.log(agentId, "message", truncate(text, 200));
       } else {
         // failed turn — logged here; user-facing triage lives in the cascade layer
@@ -390,13 +394,19 @@ export class PiBot implements HeartbeatHost {
       session = await this.sessionFor(t, chatId, agentId, ck);
     } catch (e) {
       await t.notifyError(chatId, `Agent "${agentId}" failed to start: ${errorMessage(e)}`);
-      return;
+      throw e;
     }
 
     t.setTyping?.(chatId, true);
     try {
       // followUp: concurrent messages queue behind the running turn instead of erroring
       await this.turnWithCascade(t, chatId, agentId, session, ck, text);
+      await Promise.resolve();
+      const delivery = this.pendingPushes.get(`${agentId}::${ck}`);
+      if (delivery) {
+        this.pendingPushes.delete(`${agentId}::${ck}`);
+        await delivery;
+      }
     } finally {
       t.setTyping?.(chatId, false);
     }
@@ -430,12 +440,17 @@ export class PiBot implements HeartbeatHost {
     const chain = cascade.chainFor(agent?.manifest ?? {});
     const wkey = `${agentId}::${ck}`;
     let spec = this.sessionSpec.get(wkey) ?? ""; // "" = not yet bound
+    if (spec && !chain.includes(spec)) spec = "";
+    let canPrompt = true;
 
     // first turn on this session: bind the first healthy model (skips open breakers)
     if (!spec) {
+      const healthy = cascade.firstHealthy(chain);
+      if (!healthy) {
+        canPrompt = false;
+      }
+      let bound = healthy ?? "";
       const wanted = agent?.manifest.model ?? "";
-      const healthy = cascade.firstHealthy(chain) ?? wanted;
-      let bound = wanted;
       if (healthy && healthy !== wanted) {
         const m = cascade.resolveModel(healthy);
         if (m) {
@@ -468,7 +483,7 @@ export class PiBot implements HeartbeatHost {
 
     let landed = false; // has the user's text entered the session history?
     let lastError = "";
-    for (let step = 0; step < MAX_TURN_MODELS; step++) {
+    for (let step = 0; canPrompt && step < MAX_TURN_MODELS; step++) {
       let thrown: string | null = null;
       const body = !landed
         ? text
@@ -511,7 +526,7 @@ export class PiBot implements HeartbeatHost {
     const internal = INTERNAL_PROMPT_PREFIXES.some((p) => text.startsWith(p));
     if (internal) {
       this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — internal prompt dropped, will re-fire: ${truncate(text, 120)}`);
-      return;
+      throw new Error(`no permitted model available for ${agentId}`);
     }
     const dl = cascade.queueDead({ agentId, transport: t.name, chatId, text, createdAt: Date.now(), attempts, lastError });
     this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — queued ${dl.id} (${cascade.deadLetterCount()} pending)`);
@@ -839,7 +854,7 @@ export class PiBot implements HeartbeatHost {
           `— vibe: ${vibe}`,
           `— ${proLabel}${draft.proactivity !== "off" ? `, quiet 23:00–08:00` : ""}`,
           ``,
-          `You're talking to it now. Its files: agents/${name}/ (persona, memory, skills — all editable on the dashboard).`,
+          `You're talking to it now. Its persona, memory, and skills are private runtime data editable on the dashboard.`,
         ].join("\n"),
       });
       void t.push(chatId, { text: `Say hi to **${name}** — try: "what can you do for me?"` });
@@ -1099,12 +1114,12 @@ export class PiBot implements HeartbeatHost {
     if (job.delivery === "agent") {
       const ck = this.primaryChat(job);
       if (ck) {
-        const idx = ck.indexOf(":");
-        const t = this.transports.get(ck.slice(0, idx));
+        const { transport, chatId } = this.splitChatKey(ck);
+        const t = this.transports.get(transport);
         if (t) {
           await this.promptAgent(
             t,
-            ck.slice(idx + 1),
+            chatId,
             job.agentId,
             `[scheduler] It's time for “${job.title}”${job.detail ? ` — ${job.detail}` : ""}. Compose a short, natural message telling the user this is due now${snoozed ? " (it fired during their snooze — acknowledge that lightly)" : ""}.`
           );
@@ -1114,7 +1129,7 @@ export class PiBot implements HeartbeatHost {
     }
 
     const t = this.transports.get(job.chat.transport);
-    if (!t) return;
+    if (!t) throw new Error(`delivery transport unavailable: ${job.chat.transport}`);
     const icon = job.kind === "task" ? "📋" : job.kind === "note" ? "📝" : job.kind === "subject" ? "🧭" : "⏰";
     const lines = [`${icon} **${job.title}**`];
     if (job.detail) lines.push(job.detail);
@@ -1252,9 +1267,9 @@ export class PiBot implements HeartbeatHost {
   async deliverToAgent(agentId: string, text: string) {
     const cks = this.agentChats.get(agentId) ?? new Set<string>();
     for (const ck of cks) {
-      const idx = ck.indexOf(":");
-      const t = this.transports.get(ck.slice(0, idx));
-      if (t) await t.push(ck.slice(idx + 1), { text }).catch((e) => console.error("[bot] deliver failed:", e));
+      const { transport, chatId } = this.splitChatKey(ck);
+      const t = this.transports.get(transport);
+      if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] deliver failed:", e));
     }
   }
 

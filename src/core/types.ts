@@ -34,6 +34,9 @@ export interface Schedule {
   cardPending?: boolean;
   createdAt: number;
   firedCount: number;
+  /** Consecutive failed delivery attempts for the current occurrence. */
+  deliveryAttempts?: number;
+  lastDeliveryError?: string;
   /** internal jobs (heartbeat rhythm) are invisible to the user */
   internal?: boolean;
   /** jobs sharing a groupId cancel together (promise + its pre-check) */
@@ -99,9 +102,12 @@ export interface AgentManifest {
   description?: string;
   /** pi model shorthand: "sonnet:medium", "anthropic/claude-…", or omit for first available */
   model?: string;
-  /** ordered model fallbacks used when `model` errors (auth/credits/rate-limit/transient).
-   *  After these, PIBOT_MODEL_CASCADE env applies, then every authenticated model. */
+  /** Ordered model fallbacks used when `model` errors. Global/authenticated
+   * fallbacks are included only when their provider is allowed below. */
   cascade?: string[];
+  /** Providers this agent may send prompts to. Omit to use only providers named
+   * directly by model/cascade; global and authenticated-provider tails stay off. */
+  providers?: string[];
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   /** built-in + custom tool names; default excludes bash (safer for remote chats) */
   tools?: string[];
@@ -116,7 +122,7 @@ export interface AgentManifest {
   workspace?: "agent-dir" | "repo";
 }
 
-export const DEFAULT_AGENT_TOOLS = ["read", "write", "edit", "grep", "find", "ls"];
+export const DEFAULT_AGENT_TOOLS: string[] = [];
 
 export function defaultManifest(name: string): AgentManifest {
   const model = process.env.PIBOT_DEFAULT_MODEL || undefined;

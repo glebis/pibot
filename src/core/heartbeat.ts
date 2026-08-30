@@ -158,6 +158,10 @@ export class HeartbeatEngine {
     let choice: { model?: CreateAgentSessionOptions["model"]; spec?: string } = {};
     try {
       choice = this.heartbeatModelWithFallback(agent);
+      if (this.deps.cascade && !choice.model) {
+        this.deps.events.log(agent.id, "system", "heartbeat skipped: no permitted model available");
+        return null;
+      }
       session = (
         await createAgentSession({
           cwd: agent.dir,
@@ -236,8 +240,8 @@ export class HeartbeatEngine {
         return {};
       }
     }
-    const chain = cascade.chainFor({ model: wanted, cascade: agent.manifest.cascade });
-    const healthy = cascade.firstHealthy(chain) ?? wanted ?? "";
+    const chain = cascade.chainFor({ model: wanted, cascade: agent.manifest.cascade, providers: agent.manifest.providers });
+    const healthy = cascade.firstHealthy(chain) ?? "";
     if (!healthy) return {};
     const model = cascade.resolveModel(healthy);
     return model ? { model, spec: healthy } : {};

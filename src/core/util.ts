@@ -25,11 +25,12 @@ export function readJson<T>(file: string, fallback: T): T {
   }
 }
 
-export function writeJsonAtomic(file: string, value: unknown): void {
+export function writeJsonAtomic(file: string, value: unknown, mode?: number): void {
   ensureDir(path.dirname(file));
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), mode === undefined ? undefined : { mode });
   fs.renameSync(tmp, file);
+  if (mode !== undefined) fs.chmodSync(file, mode);
 }
 
 // ─── durations & times ──────────────────────────────────────────────────────

@@ -133,6 +133,7 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
       </select></div>
     <div><label>Tools (comma-separated)</label><input type="text" name="tools" value="${esc((m.tools ?? []).join(","))}"></div>
   </div>
+  <div><label>Allowed model providers (comma-separated; empty disables automatic provider fallback)</label><input type="text" name="providers" value="${esc((m.providers ?? []).join(","))}" placeholder="ollama,anthropic"></div>
   <h2 style="border:0;margin-top:18px">Heartbeat</h2>
   <div class="row">
     <div><label class="mono">enabled <input type="checkbox" name="hb_enabled" ${hb.enabled ? "checked" : ""} style="width:auto"></label></div>
@@ -166,6 +167,8 @@ export function createWebApp(deps: WebDeps): Hono {
   const rpId = deps.webRpId ?? process.env.PIBOT_WEB_RP_ID?.trim() ?? process.env.PIBOT_WEB_AUTH?.trim() ?? "127.0.0.1";
   const webPort = deps.webPort ?? parseInt(process.env.PIBOT_WEB_PORT || "7860", 10);
   const rpName = "pibot dashboard";
+  let invalidTokenAttempts: number[] = [];
+  let webauthRequests: number[] = [];
 
   const authStore: WebAuthStore = deps.webAuthStore ?? new WebAuthStore(deps.dataDir, { rpId, rpName });
   (app as any)._authStore = authStore;
@@ -174,6 +177,14 @@ export function createWebApp(deps: WebDeps): Hono {
 
   function checkCsrf(body: Record<string, unknown>): boolean {
     return String(body["_csrf"] ?? "") === csrfToken;
+  }
+
+  function webauthRateLimited(): boolean {
+    const cutoff = Date.now() - 60_000;
+    webauthRequests = webauthRequests.filter((attempt) => attempt >= cutoff);
+    if (webauthRequests.length >= 30) return true;
+    webauthRequests.push(Date.now());
+    return false;
   }
 
   function expectedOrigins(): string[] {
@@ -199,7 +210,7 @@ export function createWebApp(deps: WebDeps): Hono {
   }
 
   function authRequired(): boolean {
-    return !!webToken || authStore.hasCredentials();
+    return true;
   }
 
   function requireAuth(c: any): boolean {
@@ -234,12 +245,12 @@ export function createWebApp(deps: WebDeps): Hono {
     <button id="btn-touch" class="btn" style="background:#1a7f37">👆 Unlock with Touch ID</button>
     <span id="wa-msg" class="muted" style="margin-left:10px"></span>
   </div>
-  ${hasCreds ? `<p class="muted">${authStore.credentials.length} passkey enrolled — this is the admin. Use Touch ID above to unlock.</p>` : `<p class="muted">No passkey yet — you can enroll below once logged in with a token, or enroll immediately if dashboard is still open.</p>`}
-  ${!hasCreds && !hasToken ? `<div class="flash warn">Dashboard is open (no passkey, no PIBOT_WEB_TOKEN). Enroll a passkey now to lock it.</div>` : ""}
-  ${!hasCreds ? `<div id="enroll" style="margin-top:14px">
+  ${hasCreds ? `<p class="muted">${authStore.credentials.length} passkey enrolled — this is the admin. Use Touch ID above to unlock.</p>` : `<p class="muted">No passkey yet — unlock with PIBOT_WEB_TOKEN before enrolling this Mac.</p>`}
+  ${!hasCreds && !hasToken ? `<div class="flash warn">Dashboard is locked. Set PIBOT_WEB_TOKEN and restart to enrol the first passkey.</div>` : ""}
+  ${!hasCreds && hasToken ? `<div id="enroll" style="margin-top:14px">
     <button id="btn-enroll" class="btn ghost">➕ Enroll this Mac (Touch ID)</button>
     <span id="enroll-msg" class="muted" style="margin-left:10px"></span>
-  </div>` : `<div id="enroll" style="margin-top:14px" class="muted">Enrolled — single admin. To re-enroll, remove <span class="mono">data/web-auth.json</span> and restart.</div>`}
+  </div>` : hasCreds ? `<div id="enroll" style="margin-top:14px" class="muted">Enrolled — single admin. To re-enroll, remove <span class="mono">data/web-auth.json</span> and restart.</div>` : ""}
 </div>
 ${hasToken ? `<div class="card">
   <h2 style="margin-top:0">Token fallback</h2>
@@ -327,10 +338,15 @@ ${hasToken ? `<div class="card">
     if (!checkCsrf(body as any)) return c.text("CSRF failed", 403);
     if (!webToken) return c.redirect("/auth?msg=" + encodeURIComponent("No PIBOT_WEB_TOKEN configured"));
     if (String(body.token ?? "").trim() === webToken) {
+      invalidTokenAttempts = [];
       const tok = authStore.createSession();
       c.header("Set-Cookie", authStore.makeCookie(tok));
       return c.redirect("/?msg=" + encodeURIComponent("Unlocked via token"));
     }
+    const cutoff = Date.now() - 60_000;
+    invalidTokenAttempts = invalidTokenAttempts.filter((attempt) => attempt >= cutoff);
+    if (invalidTokenAttempts.length >= 5) return c.text("Too many authentication attempts", 429);
+    invalidTokenAttempts.push(Date.now());
     return c.redirect("/auth?msg=" + encodeURIComponent("Invalid token"));
   });
 
@@ -352,10 +368,13 @@ ${hasToken ? `<div class="card">
 
   // ── WebAuthn: registration ──
   app.get("/auth/webauthn/register-options", async (c) => {
+    if (webauthRateLimited()) return c.json({ error: "Too many authentication attempts" }, 429);
     const hasCreds = authStore.hasCredentials();
     if (hasCreds) {
       return c.json({ error: "already enrolled — single admin, remove data/web-auth.json to reset" }, 403);
     }
+    if (!webToken) return c.json({ error: "PIBOT_WEB_TOKEN is required to enrol the first passkey" }, 503);
+    if (!isAuthenticated(c)) return c.json({ error: "bearer authentication required before passkey enrolment" }, 401);
     const challenge = authStore.createChallenge("register");
     // SimpleWebAuthn expects raw bytes — pass Uint8Array to avoid double-base64url encoding
     const challengeBytes = Buffer.from(challenge, "base64url");
@@ -368,15 +387,18 @@ ${hasToken ? `<div class="card">
       userID: new Uint8Array([1,2,3,4]),
       challenge: challengeBytes as any,
       attestationType: "none",
-      authenticatorSelection: { residentKey: "preferred", userVerification: "preferred", authenticatorAttachment: "platform" },
+      authenticatorSelection: { residentKey: "preferred", userVerification: "required", authenticatorAttachment: "platform" },
       excludeCredentials: authStore.credentials.map((cc) => ({ id: cc.id, transports: cc.transports as any })),
     } as any);
     return c.json(opts);
   });
 
   app.post("/auth/webauthn/register-verify", async (c) => {
+    if (webauthRateLimited()) return c.json({ verified: false, error: "Too many authentication attempts" }, 429);
     const hasCreds = authStore.hasCredentials();
     if (hasCreds) return c.json({ verified: false, error: "already enrolled — single admin" }, 403);
+    if (!webToken) return c.json({ verified: false, error: "PIBOT_WEB_TOKEN is required to enrol the first passkey" }, 503);
+    if (!isAuthenticated(c)) return c.json({ verified: false, error: "bearer authentication required before passkey enrolment" }, 401);
     let body: any;
     try { body = await c.req.json(); } catch { return c.json({ verified:false, error:"invalid json" },400); }
     const expectedChallenge = (chall: string) => authStore.hasChallenge(chall);
@@ -387,7 +409,7 @@ ${hasToken ? `<div class="card">
         expectedChallenge,
         expectedOrigin: expectedOrigins(),
         expectedRPID: rpId,
-        requireUserVerification: false,
+        requireUserVerification: true,
       } as any);
     } catch (e:any) {
       return c.json({ verified:false, error: e?.message ?? String(e) }, 400);
@@ -424,6 +446,7 @@ ${hasToken ? `<div class="card">
 
   // ── WebAuthn: authentication ──
   app.get("/auth/webauthn/auth-options", async (c) => {
+    if (webauthRateLimited()) return c.json({ error: "Too many authentication attempts" }, 429);
     const challenge = authStore.createChallenge("auth");
     const challengeBytes = Buffer.from(challenge, "base64url");
     const allow = authStore.credentials.map((cc) => ({ id: cc.id, transports: cc.transports as any }));
@@ -431,12 +454,13 @@ ${hasToken ? `<div class="card">
       rpID: rpId,
       challenge: challengeBytes as any,
       allowCredentials: allow.length ? allow : undefined,
-      userVerification: "preferred",
+      userVerification: "required",
     } as any);
     return c.json(opts);
   });
 
   app.post("/auth/webauthn/auth-verify", async (c) => {
+    if (webauthRateLimited()) return c.json({ verified: false, error: "Too many authentication attempts" }, 429);
     let body: any;
     try { body = await c.req.json(); } catch { return c.json({ verified:false, error:"invalid json" },400); }
     const credId: string = body.id ?? body.rawId;
@@ -460,7 +484,7 @@ ${hasToken ? `<div class="card">
         expectedOrigin: expectedOrigins(),
         expectedRPID: rpId,
         credential,
-        requireUserVerification: false,
+        requireUserVerification: true,
       } as any);
     } catch (e:any) {
       return c.json({ verified:false, error: e?.message ?? String(e) }, 400);
@@ -528,7 +552,7 @@ ${hasToken ? `<div class="card">
 </div>
 <h2>Cloud providers</h2>
 <div class="card">
-  <span class="muted">Keys & subscription logins (Claude Pro/Max, SuperGrok, …) — models join the cascade automatically.</span>
+  <span class="muted">Keys & subscription logins (Claude Pro/Max, SuperGrok, …) — each agent must allow a provider before its models join that agent's cascade.</span>
   <a href="/providers">Manage →</a>
 </div>
 <h2>New agent</h2>
@@ -760,6 +784,7 @@ ${manifestForm(agent, csrfToken)}
       model: str("model") || undefined,
       thinking: (str("thinking") as AgentManifest["thinking"]) || "off",
       tools: str("tools") ? str("tools").split(",").map((t) => t.trim()).filter(Boolean) : undefined,
+      providers: str("providers") ? str("providers").split(",").map((provider) => provider.trim()).filter(Boolean) : undefined,
       heartbeat: {
         enabled: on("hb_enabled"),
         interval: hbInterval,
@@ -818,7 +843,7 @@ ${manifestForm(agent, csrfToken)}
     // For formaction wake, body still has _csrf
     return (async () => {
       const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
-      if (Object.keys(b).length && !checkCsrf(b as any)) return c.text("CSRF failed", 403);
+      if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
       deps.scheduler.unsnooze(agent.id);
       return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Rhythm resumed")}`);
     })() as any;
@@ -827,10 +852,7 @@ ${manifestForm(agent, csrfToken)}
   // ── schedules ──
   app.post("/schedules/:id/cancel", async (c) => {
     const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
-    if (Object.keys(b).length && !checkCsrf(b as any)) return c.text("CSRF failed", 403);
-    // also accept csrf via form field even when parsing empty? For schedule cancel, form sends _csrf
-    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
-    // if body empty but method is POST, still require?orig forms include _csrf, so enforce if present
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     const job = deps.scheduler.cancel(c.req.param("id"));
     const back = job ? `/agents/${encodeURIComponent(job.agentId)}` : "/";
     return c.redirect(`${back}?msg=${encodeURIComponent(job ? `Cancelled: ${job.title}` : "Already gone")}`);
@@ -852,16 +874,14 @@ ${manifestForm(agent, csrfToken)}
 
   app.post("/agents/:id/staged/:name/promote", async (c) => {
     const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
-    if (!checkCsrf(b as any) && Object.keys(b).length) return c.text("CSRF failed", 403);
-    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
-    // enforce csrf even if body empty: require header? For staged, form includes _csrf, so already checked
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     const ok = deps.evolution.promote(c.req.param("id"), c.req.param("name"));
     return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent(ok ? "Promoted ✅" : "Nothing staged with that name")}`);
   });
 
   app.post("/agents/:id/staged/:name/reject", async (c) => {
     const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
-    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     deps.evolution.reject(c.req.param("id"), c.req.param("name"));
     return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Rejected 🗑")}`);
   });
@@ -881,14 +901,14 @@ ${manifestForm(agent, csrfToken)}
     const agent = agentOr404(c.req.param("id"));
     if (!agent || !deps.telegram) return c.notFound();
     const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
-    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     await deps.telegram.requestSubBotCreation(agent.id);
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Sub-bot creation requested — tap the link in Telegram and confirm")}`);
   });
 
   app.post("/agents/:id/subbot/detach", async (c) => {
     const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
-    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     await deps.telegram?.detachSubBot(c.req.param("id"));
     return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Sub-bot detached")}`);
   });
@@ -951,7 +971,7 @@ ${enabled
 
   app.post("/telegram/disable", async (c) => {
     const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
-    if (b["_csrf"] && String(b["_csrf"]) !== csrfToken) return c.text("CSRF failed", 403);
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     if (deps.telegram) await deps.telegram.disableTelegram();
     await deps.secrets?.save({ telegram: undefined });
     return c.redirect(`/telegram?msg=${encodeURIComponent("Bot disconnected")}`);
@@ -964,7 +984,7 @@ ${enabled
     try { list = await deps.providers.status(); } catch { list = []; }
     const rows = list.map((p) => providerRowHtml(p, deps.providers!.loginState(p.id), csrfToken)).join("\n");
     const body = `<h2>Cloud providers</h2>
-<p class="muted">Subscription sign-ins (Claude Pro/Max, SuperGrok / X Premium, …) are stored in the shared pi credentials — the same login pi uses. New models join every agent's cascade automatically, no restart.</p>
+<p class="muted">Subscription sign-ins (Claude Pro/Max, SuperGrok / X Premium, …) are stored in the shared pi credentials — the same login pi uses. A model becomes a fallback only for agents that allow its provider.</p>
 ${rows || `<p class="muted">No providers discovered.</p>`}`;
     return c.html(page("providers", body, c.req.query("msg")));
   });

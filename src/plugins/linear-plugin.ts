@@ -27,7 +27,13 @@ async function linearUpdate(id: string, status: string): Promise<string> {
  * Shared plugin: Linear.
  * Allows agents to list, create, and update Linear issues via Linear CLI.
  */
-export function linearPlugin(): InlineExtension {
+export type MutationConfirm = (description: string) => Promise<boolean>;
+
+function confirmationRequired() {
+  return { content: [{ type: "text" as const, text: "Cancelled: owner confirmation required." }], details: {} };
+}
+
+export function linearPlugin(confirm?: MutationConfirm): InlineExtension {
   return {
     name: "linear",
     factory: (pi) => {
@@ -52,6 +58,7 @@ export function linearPlugin(): InlineExtension {
           description: Type.String({ description: "Issue description" }),
         }),
         async execute(_tcid, params) {
+          if (!confirm || !await confirm(`Create Linear issue “${params.title}”?`)) return confirmationRequired();
           const result = await linearCreate(params.title, params.description);
           return { content: [{ type: "text", text: result }], details: {} };
         },
@@ -65,6 +72,7 @@ export function linearPlugin(): InlineExtension {
           status: Type.String({ description: "New status" }),
         }),
         async execute(_tcid, params) {
+          if (!confirm || !await confirm(`Update Linear issue ${params.id} to “${params.status}”?`)) return confirmationRequired();
           const result = await linearUpdate(params.id, params.status);
           return { content: [{ type: "text", text: result }], details: {} };
         },

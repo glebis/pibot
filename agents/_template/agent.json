@@ -3,7 +3,7 @@
   "description": "(describe this agent in one line — shown in /agents)",
   "model": "",
   "thinking": "off",
-  "tools": ["read", "write", "edit", "grep", "find", "ls"],
+  "tools": [],
   "heartbeat": {
     "enabled": true,
     "interval": "45m",

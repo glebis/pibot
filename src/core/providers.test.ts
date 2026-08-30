@@ -173,9 +173,11 @@ describe("providers dashboard page", () => {
       evolution: {} as never,
       dataDir,
       providers,
+      webToken: "provider-test-token",
     });
     try {
-      const res = await app.request("/providers");
+      const auth = { Authorization: "Bearer provider-test-token" };
+      const res = await app.request("/providers", { headers: auth });
       const html = await res.text();
       expect(res.status).toBe(200);
       expect(html).toContain("Cloud providers");
@@ -184,6 +186,7 @@ describe("providers dashboard page", () => {
       const bad = await app.request("/providers/xai/answer", {
         method: "POST",
         body: new URLSearchParams({ value: "x", _csrf: "nope" }),
+        headers: auth,
       });
       expect(bad.status).toBe(403);
     } finally {

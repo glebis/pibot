@@ -46,6 +46,15 @@ function withCsrf(form: FormData, app: ReturnType<typeof createWebApp>): FormDat
   return form;
 }
 
+function authenticateTestApp(app: ReturnType<typeof createWebApp>): void {
+  const request = app.request.bind(app);
+  app.request = ((input: Parameters<typeof request>[0], init?: Parameters<typeof request>[1]) => {
+    const headers = new Headers(init?.headers);
+    headers.set("Authorization", "Bearer dashboard-test-token");
+    return request(input, { ...init, headers });
+  }) as typeof app.request;
+}
+
 describe("web dashboard", () => {
   let dir: string;
   let app: ReturnType<typeof createWebApp>;
@@ -68,7 +77,8 @@ describe("web dashboard", () => {
       host: { announce: async () => {} },
       io,
     });
-    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, secrets: { get: () => ({}), save: async () => {} } } satisfies WebDeps);
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, webToken: "dashboard-test-token", secrets: { get: () => ({}), save: async () => {} } } satisfies WebDeps);
+    authenticateTestApp(app);
   });
 
   afterEach(() => {
@@ -134,6 +144,7 @@ describe("web dashboard", () => {
     form.set("model", "");
     form.set("thinking", "low");
     form.set("tools", "read,write,grep");
+    form.set("providers", "ollama,anthropic");
     form.set("hb_enabled", "on");
     form.set("hb_interval", "30m");
     form.set("hb_model", "deepseek/deepseek-chat");
@@ -147,6 +158,7 @@ describe("web dashboard", () => {
     expect(saved.heartbeat).toMatchObject({ enabled: true, interval: "30m", model: "deepseek/deepseek-chat", quietHours: { from: "22:00", to: "07:00" } });
     expect(saved.evolution).toMatchObject({ enabled: false, interval: "3h" });
     expect(saved.tools).toEqual(["read", "write", "grep"]);
+    expect(saved.providers).toEqual(["ollama", "anthropic"]);
   });
 
   it("manifest rejects invalid intervals", async () => {
@@ -237,6 +249,11 @@ describe("web dashboard", () => {
     const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form });
     expect(res.status).toBe(403);
   });
+
+  it("rejects an empty mutating POST without CSRF", async () => {
+    const res = await app.request("/agents/assistant/wake", { method: "POST" });
+    expect(res.status).toBe(403);
+  });
 });
 
 describe("telegram settings", () => {
@@ -271,7 +288,8 @@ describe("web /telegram", () => {
       io: { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() },
     });
     control = fakeControl(over);
-    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, telegram: control, secrets: { get: () => loadSettings(dir), save: async (p) => { await saveSettings(dir, p); } } } satisfies WebDeps);
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, webToken: "dashboard-test-token", telegram: control, secrets: { get: () => loadSettings(dir), save: async (p) => { await saveSettings(dir, p); } } } satisfies WebDeps);
+    authenticateTestApp(app);
   }
 
   let scheduler: Scheduler;
@@ -374,7 +392,8 @@ describe("web /agents/new", () => {
       host: { announce: async () => {} },
       io: { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() },
     });
-    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, secrets: { get: () => ({}), save: async () => {} } } satisfies WebDeps);
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, webToken: "dashboard-test-token", secrets: { get: () => ({}), save: async () => {} } } satisfies WebDeps);
+    authenticateTestApp(app);
   });
 
   afterEach(() => {
@@ -448,15 +467,17 @@ describe("web auth — Touch ID + Bearer + CSRF", () => {
     expect(html).toContain("navigator.credentials");
   });
 
-  it("WebAuthn options endpoints return 200 with challenge", async () => {
-    makeApp();
+  it("WebAuthn authentication stays open but first-passkey registration requires the configured bearer", async () => {
+    makeApp({ webToken: "bootstrap-secret" });
     const r1 = await app.request("/auth/webauthn/auth-options");
     expect(r1.status).toBe(200);
     const j1 = await r1.json() as any;
     expect(typeof j1.challenge).toBe("string");
     expect(j1.challenge.length).toBeGreaterThan(10);
 
-    const r2 = await app.request("/auth/webauthn/register-options");
+    const denied = await app.request("/auth/webauthn/register-options");
+    expect(denied.status).toBe(401);
+    const r2 = await app.request("/auth/webauthn/register-options", { headers: { Authorization: "Bearer bootstrap-secret" } });
     expect(r2.status).toBe(200);
     const j2 = await r2.json() as any;
     expect(typeof j2.challenge).toBe("string");
@@ -537,10 +558,42 @@ describe("web auth — Touch ID + Bearer + CSRF", () => {
     expect(res.headers.get("location")).toContain("Invalid");
   });
 
-  it("open dashboard when no token and no creds", async () => {
+  it("rate-limits repeated invalid token attempts", async () => {
+    makeApp({ webToken: "s3cr3t" });
+    for (let i = 0; i < 5; i++) {
+      const form = new FormData(); form.set("token", "wrong"); withCsrf(form, app);
+      expect((await app.request("/auth/token", { method: "POST", body: form })).status).toBe(302);
+    }
+    const form = new FormData(); form.set("token", "wrong"); withCsrf(form, app);
+    expect((await app.request("/auth/token", { method: "POST", body: form })).status).toBe(429);
+  });
+
+  it("rate-limits repeated WebAuthn challenge requests", async () => {
+    makeApp({ hasCred: true });
+    for (let i = 0; i < 30; i++) expect((await app.request("/auth/webauthn/auth-options")).status).toBe(200);
+    expect((await app.request("/auth/webauthn/auth-options")).status).toBe(429);
+  });
+
+  it("stores passkeys and sessions with owner-only permissions", () => {
+    makeApp();
+    const store = (app as any)._authStore;
+    store.addCredential({ id: "cred", publicKey: Buffer.from("key").toString("base64"), counter: 0 });
+    store.createSession();
+    expect(fs.statSync(path.join(dir, "web-auth.json")).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(path.join(dir, "web-sessions.json")).mode & 0o777).toBe(0o600);
+  });
+
+  it("fails closed when no token and no passkey are configured", async () => {
     makeApp();
     const res = await app.request("/");
-    expect(res.status).toBe(200);
-    expect(await res.text()).toContain("pibot config");
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toContain("/auth");
+  });
+
+  it("rejects a malformed signed-session cookie without crashing", async () => {
+    makeApp({ hasCred: true });
+    const res = await app.request("/", { headers: { Cookie: "pibot_session=x.y" } });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toContain("/auth");
   });
 });

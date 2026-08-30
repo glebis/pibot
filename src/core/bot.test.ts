@@ -15,8 +15,8 @@ import type { PushOptions, Schedule, Transport } from "./types.js";
 // model cascade stub — chain empty, everything healthy
 function makeCascadeStub() {
   return {
-    chainFor: vi.fn(() => [] as string[]),
-    firstHealthy: vi.fn(() => undefined),
+    chainFor: vi.fn(() => ["ollama/test"] as string[]),
+    firstHealthy: vi.fn(() => "ollama/test"),
     nextCandidate: vi.fn(() => undefined),
     resolveModel: vi.fn(() => undefined),
     isOpen: vi.fn(() => false),
@@ -82,6 +82,7 @@ class MockTransport implements Transport {
 function fakeAgentManager(promptSpy = vi.fn()) {
   const fakeSession = {
     prompt: promptSpy.mockResolvedValue(undefined),
+    setModel: vi.fn(async () => {}),
     subscribe: vi.fn(),
   } as unknown as AgentSession;
   return {
@@ -147,6 +148,23 @@ describe("PiBot commands", () => {
   it("answers /help", async () => {
     await t.transport.say("/help");
     expect(t.transport.lastText()).toContain("/agents");
+  });
+
+  it("delivers host messages through a sub-bot transport whose name contains colons", async () => {
+    const subBot = new MockTransport("telegram:assistant");
+    t.bot.addTransport(subBot);
+    await subBot.say("remember this chat");
+    subBot.pushed = [];
+    await t.bot.deliverToAgent("assistant", "hello");
+    expect(subBot.pushed).toEqual([{ chatId: "42", opts: { text: "hello" } }]);
+  });
+
+  it("surfaces a missing reminder transport so the scheduler can retry", async () => {
+    await expect(t.bot.deliverFire({
+      id: "sc_retry", agentId: "assistant", chat: { transport: "offline", chatId: "42" },
+      title: "retry me", kind: "reminder", dueAt: Date.now(), wake: "normal",
+      delivery: "direct", status: "pending", createdAt: Date.now(), firedCount: 0,
+    }, false)).rejects.toThrow("offline");
   });
 
   it("replies to unknown commands", async () => {
@@ -382,6 +400,8 @@ describe("cascade dead-letter loop guards", () => {
 
   beforeEach(() => {
     t = makeBot();
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue([]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue(undefined);
     t.promptSpy.mockRejectedValue(new Error("402 payment required"));
   });
   afterEach(() => {
@@ -390,18 +410,22 @@ describe("cascade dead-letter loop guards", () => {
 
   it("queues genuine user messages on cascade exhaustion and notifies the chat", async () => {
     await t.transport.say("hello there");
+    expect(t.promptSpy).not.toHaveBeenCalled();
     expect(t.cascade.queueDead).toHaveBeenCalledTimes(1);
     expect(t.cascade.queueDead).toHaveBeenCalledWith(expect.objectContaining({ text: "hello there", agentId: "assistant" }));
     expect(t.transport.lastText()).toContain("couldn't reach any model");
   });
 
   it("never queues host-generated prompts — they re-fire instead of compounding", async () => {
-    await t.transport.say("[scheduler] It's time for “stretch”");
+    await expect(t.bot.promptAgent(t.transport, "42", "assistant", "[scheduler] It's time for “stretch”")).rejects.toThrow("permitted model");
     expect(t.cascade.queueDead).not.toHaveBeenCalled();
     expect(t.transport.pushed.filter((p) => p.opts.text.startsWith("⚠︎"))).toHaveLength(0);
   });
 
   it("flushDeadLetters replays raw text — no synthetic wrapper", async () => {
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockResolvedValue(undefined);
     (t.cascade.takeOneDead as ReturnType<typeof vi.fn>)
       .mockReturnValueOnce({ id: "dl2", agentId: "assistant", transport: "mock", chatId: "42", text: "stretch in 20m", createdAt: Date.now(), attempts: [], lastError: "x" })
       .mockReturnValue(undefined);

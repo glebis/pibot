@@ -42,7 +42,13 @@ function line(label: string, r: PromiseSettledResult<string>): string {
  * calendar (local macOS via icalBuddy + Google via gws) so they can reason
  * about the moment, deadlines, and promises before scheduling anything.
  */
-export function calendarPlugin(): InlineExtension {
+export type MutationConfirm = (description: string) => Promise<boolean>;
+
+function confirmationRequired() {
+  return { content: [{ type: "text" as const, text: "Cancelled: owner confirmation required." }], details: {} };
+}
+
+export function calendarPlugin(confirm?: MutationConfirm): InlineExtension {
   return {
     name: "calendar",
     factory: (pi) => {
@@ -68,6 +74,7 @@ export function calendarPlugin(): InlineExtension {
           end: Type.String({ description: "End time (ISO 8601)" }),
         }),
         async execute(_tcid, params) {
+          if (!confirm || !await confirm(`Create calendar event “${params.summary}” from ${params.start} to ${params.end}?`)) return confirmationRequired();
           const result = await gwsCreateEvent(params.summary, params.start, params.end);
           return { content: [{ type: "text", text: result }], details: {} };
         },
@@ -80,6 +87,7 @@ export function calendarPlugin(): InlineExtension {
           id: Type.String({ description: "Event ID" }),
         }),
         async execute(_tcid, params) {
+          if (!confirm || !await confirm(`Delete calendar event ${params.id}?`)) return confirmationRequired();
           const result = await gwsDeleteEvent(params.id);
           return { content: [{ type: "text", text: result }], details: {} };
         },
@@ -94,6 +102,7 @@ export function calendarPlugin(): InlineExtension {
           end: Type.String({ description: "New end time (ISO 8601)" }),
         }),
         async execute(_tcid, params) {
+          if (!confirm || !await confirm(`Move calendar event ${params.id} to ${params.start}–${params.end}?`)) return confirmationRequired();
           const result = await gwsMoveEvent(params.id, params.start, params.end);
           return { content: [{ type: "text", text: result }], details: {} };
         },

@@ -15,7 +15,7 @@ async function main(): Promise<void> {
   const goal = rest.filter((a) => !a.startsWith("--")).join(" ") || undefined;
 
   if (!agentId) {
-    console.error("usage: npm run evolve -- <agentId> [\"goal\"] [--status|--force]\n  agents are directories under agents/ (see /agents or ls agents/)");
+    console.error("usage: npm run evolve -- <agentId> [\"goal\"] [--status|--force]\n  agents are private runtime directories (see /agents in pibot)");
     process.exit(1);
   }
 

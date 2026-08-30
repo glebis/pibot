@@ -56,13 +56,13 @@ function tmpAgentDir(): string {
 function makeAgent(dir: string, over: Partial<LoadedAgent["manifest"]> = {}): LoadedAgent {
   return { id: "assistant", dir, manifest: { name: "assistant", heartbeat: { enabled: true, interval: "45m" }, ...over } };
 }
-function makeEngine(agent: LoadedAgent, dir: string, over: Partial<HeartbeatHost> = {}) {
+function makeEngine(agent: LoadedAgent, dir: string, over: Partial<HeartbeatHost> = {}, cascade?: import("./cascade.js").ModelCascade) {
   const agents = { getAgent: vi.fn((id: string) => (id === agent.id ? agent : undefined)), heartbeatModel: vi.fn(() => undefined), resolveModel: vi.fn(() => undefined) } as unknown as import("./agent-manager.js").AgentManager;
   const scheduler = { snoozeState: vi.fn(() => null), list: vi.fn(() => []) } as unknown as import("./scheduler.js").Scheduler;
   const events = { log: vi.fn(), tail: vi.fn(() => []) } as unknown as import("./events.js").EventLog;
   const host: HeartbeatHost = { deliverToAgent: vi.fn(async () => {}), escalateToAgent: vi.fn(async () => {}), lastUserMessageAt: vi.fn(() => 0), ...over };
   const modelRuntime = {} as PiAgent.ModelRuntime;
-  const engine = new HeartbeatEngine({ agents, scheduler, modelRuntime, events, vaultDir: dir, host });
+  const engine = new HeartbeatEngine({ agents, scheduler, modelRuntime, events, vaultDir: dir, host, cascade });
   return { engine, agents, scheduler, events, host };
 }
 
@@ -77,6 +77,14 @@ describe("HeartbeatEngine backoff", () => {
     nextActs.length = 0;
     vi.mocked(PiAgent.createAgentSession).mockClear();
     vi.mocked(PiAgent.getAgentDir).mockClear();
+  });
+
+  it("does not create an automatic-model heartbeat session when no permitted model is healthy", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/blocked", providers: ["ollama"] });
+    const cascade = { chainFor: vi.fn(() => []), firstHealthy: vi.fn(() => undefined) } as unknown as import("./cascade.js").ModelCascade;
+    const { engine } = makeEngine(agent, dir, {}, cascade);
+    await (engine as unknown as { tickInner: (agent: LoadedAgent, opts: {}) => Promise<void> }).tickInner(agent, {});
+    expect(PiAgent.createAgentSession).not.toHaveBeenCalled();
   });
   describe("shouldTick", () => {
     it("allows ticks when under the backoff threshold", () => {
