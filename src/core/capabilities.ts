@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { agentCommsPlugin, type CommsHooks } from "../plugins/agent-comms-plugin.js";
+import { avatarPlugin } from "../plugins/avatar-plugin.js";
 import { attendPlugin, ATTEND_CLI } from "../plugins/attend-plugin.js";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
 import { delegatePlugin, DELEGATE_CLIS } from "../plugins/delegate-plugin.js";
@@ -18,6 +19,7 @@ import { DEV_AGENT_ID, DEV_TOOLS, WORKSHOP_TOOLS, readDevRemoteConfig } from "./
 import type { QuestionAnswer, QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import type { AgentManifest, ChatRef } from "./types.js";
+import type { AvatarArtifactStore, AvatarProviderRegistry } from "./avatar.js";
 
 export interface CapabilityAgent { id: string; dir: string; manifest: AgentManifest }
 export interface CapabilityContext {
@@ -28,6 +30,11 @@ export interface CapabilityContext {
   chat: ChatRef;
   ask?: (spec: QuestionSpec) => Promise<QuestionAnswer | null>;
   comms?: CommsHooks;
+  avatar?: {
+    providers: AvatarProviderRegistry;
+    store: AvatarArtifactStore;
+    applyProfilePhoto: (transport: string, filePath: string) => Promise<void>;
+  };
 }
 
 /** One auditable source for a plugin's factory, exposed tools and prompt contract. */
@@ -66,6 +73,19 @@ const confirmMutation = (ctx: CapabilityContext) => async (description: string):
 };
 
 export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
+  {
+    id: "avatar", defaultEnabled: false, tools: ["avatar_generate", "avatar_apply"],
+    prompt: "avatar_generate creates a selected bot avatar but never applies it. avatar_apply changes only this Telegram bot's profile photo and always requires explicit owner confirmation.",
+    available: (ctx) => Boolean(ctx.avatar && ctx.chat.transport.startsWith("telegram")),
+    create: (ctx) => avatarPlugin({
+      agentId: ctx.agent.id,
+      transport: ctx.chat.transport,
+      providers: ctx.avatar!.providers,
+      store: ctx.avatar!.store,
+      confirm: confirmMutation(ctx),
+      applyProfilePhoto: ctx.avatar!.applyProfilePhoto,
+    }),
+  },
   {
     id: "scheduler", defaultEnabled: true,
     tools: ["schedule_create", "schedule_list", "schedule_cancel", "schedule_resume", "snooze", "promise_make", "promise_keep"],

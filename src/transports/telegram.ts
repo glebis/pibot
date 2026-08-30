@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { Bot, type Context } from "grammy";
+import { Bot, InputFile, type Context } from "grammy";
 import type { InlineKeyboardButton } from "grammy/types";
 import type { Card, IncomingMedia, PushOptions, ReplyContext, Transport } from "../core/types.js";
 import { truncate } from "../core/util.js";
@@ -218,6 +218,12 @@ export class TelegramTransport implements Transport {
       const pa = ctx.pollAnswer;
       if (this.onPollAnswerCb) void this.onPollAnswerCb(pa.poll_id, pa.option_ids[0] ?? -1, String(pa.user?.id ?? "")).catch(() => {});
     });
+  }
+
+  /** Telegram requires a fresh multipart upload for every profile-photo change. */
+  async setProfilePhoto(filePath: string): Promise<void> {
+    const photo = new InputFile(filePath, path.basename(filePath));
+    await this.bot.api.setMyProfilePhoto({ type: "static", photo });
   }
 
   private onManagedBotCb: ((info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>) | null = null;

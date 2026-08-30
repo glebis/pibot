@@ -29,9 +29,15 @@ The host process (`src/`) runs a **scheduler** (JSON-backed timer wheel with sno
 }
 ```
 
-Available ids are `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `attend`, `telegram-responder`, `delegate`, `developer`, and `remote-workshop`. Calendar and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
+Available ids are `avatar`, `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `attend`, `telegram-responder`, `delegate`, `developer`, and `remote-workshop`. Avatar, Calendar, and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
 
 `providers` is a per-agent model-provider allowlist. Without it, only models named directly in `model`/`cascade` are used; global and authenticated-provider fallback discovery is disabled.
+
+### Telegram bot avatars
+
+Add `avatar` to an agent's `capabilities` to let that agent generate a candidate avatar and, in a separate step, ask the owner to apply it to the Telegram bot handling the current chat. `avatar_generate` never changes a profile; `avatar_apply` always presents the existing Confirm/Cancel gate and targets only the invoking Telegram transport. There is no scheduled or automatic rotation.
+
+The `local` provider is deterministic, works offline, and needs no key. Generated JPG files stay private under the agent's runtime directory. Optional `openai` and `nano-banana` adapters remain unavailable until their environment configuration is present; listing providers never calls them. Keep keys in the environment or the daemon's secret store, never in `agent.json` or Git. The Nano Banana adapter is an OpenAI-compatible endpoint seam for future/self-hosted compatibility, not a claim of native Google API support.
 
 ## Run
 
@@ -145,7 +151,7 @@ npm run evolve -- assistant "goal text"   # CLI evolution cycle
 
 - Skill Forge pattern-mining from event/session history (from `pi-skill-evolution`)
 - Multi-strategy mutation archive (compress/quality/radical, from `@artale/pi-evolve`)
-- Image capability
+- Rich image-generation previews and provider-specific adapters beyond bot avatars
 - Stronger process-level sandboxing for agent-private extensions
 ## License
 

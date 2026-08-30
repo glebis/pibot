@@ -114,6 +114,8 @@ export interface Transport {
   onPollAnswer?(cb: (pollId: string, optionIndex: number, voterId: string) => Promise<void>): void;
   /** Send an image/document by URL (optional; Telegram only) */
   sendMedia?(chatId: string, url: string): Promise<void>;
+  /** Set this bot identity's profile photo (optional; Telegram only). */
+  setProfilePhoto?(filePath: string): Promise<void>;
   /** Manager-mode bots receive managed-bot creation/token updates (optional) */
   onManagedBot?(cb: (info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>): void;
 }

@@ -331,7 +331,13 @@ export class PiBot implements HeartbeatHost {
       { transport: t.name, chatId },
       this.deps.scheduler,
       (spec: QuestionSpec) => this.questions.ask(agentId, { transport: t.name, chatId }, spec),
-      this.commsHooks()
+      this.commsHooks(),
+      async (transportName, filePath) => {
+        if (transportName !== t.name) throw new Error("Avatar target does not match the invoking transport");
+        const target = this.transports.get(transportName);
+        if (!target?.setProfilePhoto) throw new Error("The invoking transport cannot update a profile photo");
+        await target.setProfilePhoto(filePath);
+      },
     );
     const wkey = `${agentId}::${ck}`;
     if (!this.wired.has(wkey)) {

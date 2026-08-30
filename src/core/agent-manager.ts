@@ -12,6 +12,7 @@ import {
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type { CommsHooks } from "../plugins/agent-comms-plugin.js";
+import { AvatarArtifactStore, createDefaultAvatarProviders } from "./avatar.js";
 import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext, type CapabilityDefinition } from "./capabilities.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
@@ -118,7 +119,8 @@ export class AgentManager {
     chat: ChatRef,
     scheduler: Scheduler,
     ask?: (spec: import("./questions.js").QuestionSpec) => Promise<import("./questions.js").QuestionAnswer | null>,
-    comms?: CommsHooks
+    comms?: CommsHooks,
+    applyProfilePhoto?: (transport: string, filePath: string) => Promise<void>,
   ): Promise<AgentSession> {
     const key = `${agentId}::${chatKey}`;
     const cached = this.sessions.get(key);
@@ -147,6 +149,11 @@ export class AgentManager {
       chat,
       ask,
       comms,
+      avatar: applyProfilePhoto && chat.transport.startsWith("telegram") && agent.manifest.capabilities?.includes("avatar") ? {
+        providers: createDefaultAvatarProviders(),
+        store: new AvatarArtifactStore(path.join(agent.dir, "runtime", "avatars")),
+        applyProfilePhoto,
+      } : undefined,
     });
     if (capabilitySet.unavailable.length) {
       console.warn(`[${agentId}] unavailable capabilities skipped: ${capabilitySet.unavailable.join(", ")}`);

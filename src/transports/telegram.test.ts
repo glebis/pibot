@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { InputFile } from "grammy";
+import type { InputProfilePhoto } from "grammy/types";
 import { TelegramDuplicateGuard, telegramRetryAfterMs, replyContextFrom, extFromMime } from "./telegram.js";
 
 describe("TelegramDuplicateGuard", () => {
@@ -77,5 +79,26 @@ describe("extFromMime", () => {
     expect(extFromMime("application/pdf")).toBe(".pdf");
     expect(extFromMime("application/x-unknown")).toBeUndefined();
     expect(extFromMime(undefined)).toBeUndefined();
+  });
+});
+
+describe("Telegram profile photo adapter", () => {
+  it("uploads every static JPG through setMyProfilePhoto with a fresh InputFile", async () => {
+    const transport = new (await import("./telegram.js")).TelegramTransport("123:test", ["42"], { nameSuffix: "coach", boundAgentId: "coach" });
+    const setMyProfilePhoto = vi.fn(async (_photo: InputProfilePhoto) => true);
+    (transport as unknown as { bot: { api: { setMyProfilePhoto: typeof setMyProfilePhoto } } }).bot.api.setMyProfilePhoto = setMyProfilePhoto;
+
+    await transport.setProfilePhoto("/tmp/coach-avatar.jpg");
+    await transport.setProfilePhoto("/tmp/coach-avatar.jpg");
+
+    expect(setMyProfilePhoto).toHaveBeenCalledTimes(2);
+    const first = setMyProfilePhoto.mock.calls[0][0];
+    const second = setMyProfilePhoto.mock.calls[1][0];
+    expect(first.type).toBe("static");
+    if (first.type !== "static" || second.type !== "static") throw new Error("expected static profile photos");
+    expect(first.photo).toBeInstanceOf(InputFile);
+    expect(first.photo.filename).toBe("coach-avatar.jpg");
+    expect(second.photo).toBeInstanceOf(InputFile);
+    expect(second.photo).not.toBe(first.photo);
   });
 });
