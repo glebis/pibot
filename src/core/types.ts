@@ -64,6 +64,16 @@ export interface PushOptions {
   card?: Card;
 }
 
+/** Context about a Telegram message the user replied to (transport-supplied). */
+export interface ReplyContext {
+  /** id of the quoted message */
+  messageId: number;
+  /** display name of the quoted message's sender (first name; "you" when the bot itself) */
+  sender: string;
+  /** quoted text or caption, truncated */
+  quoted: string;
+}
+
 export interface Transport {
   readonly name: string;
   /** sub-bot transports are bound to exactly one agent */
@@ -74,7 +84,7 @@ export interface Transport {
   push(chatId: string, opts: PushOptions): Promise<void>;
   /** System-level error notice (agent crashed, bad model, …) */
   notifyError(chatId: string, message: string): Promise<void>;
-  onMessage(cb: (text: string, chatId: string) => Promise<void>): void;
+  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext) => Promise<void>): void;
   /** cb may return a short toast string for Telegram callback feedback */
   onAction(cb: (action: string, chatId: string) => Promise<string | void>): void;
   /** Show "typing…" while the agent works (optional) */

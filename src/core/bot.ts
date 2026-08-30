@@ -13,7 +13,7 @@ import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
 import { QuestionBus, type QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
-import type { Card, ChatRef, Schedule, Transport } from "./types.js";
+import type { Card, ChatRef, ReplyContext, Schedule, Transport } from "./types.js";
 import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
@@ -73,7 +73,7 @@ export class PiBot implements HeartbeatHost {
 
   addTransport(t: Transport): void {
     this.transports.set(t.name, t);
-    t.onMessage((text, chatId) => this.handleIncoming(t, chatId, text).catch((e) => console.error("[bot] message error:", e)));
+    t.onMessage((text, chatId, reply) => this.handleIncoming(t, chatId, text, reply).catch((e) => console.error("[bot] message error:", e)));
     t.onAction((action, chatId) => this.handleAction(t, chatId, action).catch((e) => console.error("[bot] action error:", e)));
     if (t.onManagedBot) {
       t.onManagedBot(async (info) => this.handleManagedBot(t, info).catch((e) => console.error("[bot] managed bot error:", e)));
@@ -364,7 +364,7 @@ export class PiBot implements HeartbeatHost {
     "wake": "/wake",
   };
 
-  async handleIncoming(t: Transport, chatId: string, raw: string): Promise<void> {
+  async handleIncoming(t: Transport, chatId: string, raw: string, reply?: ReplyContext): Promise<void> {
     const text = raw.trim();
     if (!text) return;
     const ck = this.chatKey(t, chatId);
@@ -382,7 +382,7 @@ export class PiBot implements HeartbeatHost {
     }
     this.lastUserMessage.set(agentId, Date.now());
     this.deps.heartbeat.noteUserMessage?.(agentId);
-    await this.promptAgent(t, chatId, agentId, text);
+    await this.promptAgent(t, chatId, agentId, text, { reply });
   }
 
   /** Every prompt gets a subtle time envelope so the agent always knows the moment. */
@@ -391,7 +391,7 @@ export class PiBot implements HeartbeatHost {
     chatId: string,
     agentId: string,
     text: string,
-    opts: { recoveringDeadLetter?: boolean } = {},
+    opts: { recoveringDeadLetter?: boolean; reply?: ReplyContext } = {},
   ): Promise<void> {
     const ck = this.chatKey(t, chatId);
     this.rememberChat(agentId, ck);
@@ -407,7 +407,7 @@ export class PiBot implements HeartbeatHost {
     t.setTyping?.(chatId, true);
     try {
       // followUp: concurrent messages queue behind the running turn instead of erroring
-      await this.turnWithCascade(t, chatId, agentId, session, ck, text, opts.recoveringDeadLetter ?? false);
+      await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, text), opts.recoveringDeadLetter ?? false);
       await Promise.resolve();
       const delivery = this.pendingPushes.get(`${agentId}::${ck}`);
       if (delivery) {
@@ -1316,7 +1316,14 @@ export class PiBot implements HeartbeatHost {
   }
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── helpers ──────────────────────────────────────────────────────────────────────
+
+/** Compose the user's text with reply-quote context when the transport supplied it. */
+function replyPrefix(reply: ReplyContext | undefined, text: string): string {
+  if (!reply) return text;
+  const who = reply.sender === "you" ? "your" : `${reply.sender}'s`;
+  return `↩ replying to ${who} message "${reply.quoted}":\n\n${text}`;
+}
 
 /** Per-turn bound: primary + at most this many fallback models try one user turn */
 const MAX_TURN_MODELS = 5;

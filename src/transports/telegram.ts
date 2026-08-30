@@ -1,6 +1,6 @@
 import { Bot, type Context } from "grammy";
 import type { InlineKeyboardButton } from "grammy/types";
-import type { Card, PushOptions, Transport } from "../core/types.js";
+import type { Card, PushOptions, ReplyContext, Transport } from "../core/types.js";
 import { truncate } from "../core/util.js";
 
 const TG_LIMIT = 4000;
@@ -65,6 +65,25 @@ function toTelegramHtml(text: string): string {
   return out;
 }
 
+const QUOTE_MAX = 400;
+
+/**
+ * Pure reply-context extraction from a raw Telegram `reply_to_message`
+ * (shaped input so it's unit-testable without a live bot). Undefined when
+ * the quoted message carries no text/caption worth re-anchoring to.
+ */
+export function replyContextFrom(
+  rt: { message_id?: number; text?: string; caption?: string; from?: { id?: number; first_name?: string } } | undefined,
+  selfId?: number,
+): ReplyContext | undefined {
+  if (!rt) return undefined;
+  const quoted = (rt.text ?? rt.caption ?? "").trim();
+  if (!quoted) return undefined;
+  const fromSelf = selfId !== undefined && rt.from?.id === selfId;
+  const sender = fromSelf ? "you" : (rt.from?.first_name?.trim() || "someone");
+  return { messageId: rt.message_id ?? 0, sender, quoted: truncate(quoted, QUOTE_MAX) };
+}
+
 export function assertCallbackData(action: string): string {
   if (action.length <= 64) return action;
   if (process.env.NODE_ENV !== "production") {
@@ -103,7 +122,7 @@ export class TelegramTransport implements Transport {
   private openWhenEmpty: boolean;
   private me?: { id: number; username?: string; first_name: string; can_manage_bots?: boolean };
   private lastCallbackQuery?: { id: string; data?: string };
-  private onMessageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
+  private onMessageCb: ((text: string, chatId: string, reply?: ReplyContext) => Promise<void>) | null = null;
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   private onPollAnswerCb: ((pollId: string, optionIndex: number, voterId: string) => Promise<void>) | null = null;
   private duplicateGuard = new TelegramDuplicateGuard();
@@ -119,10 +138,13 @@ export class TelegramTransport implements Transport {
 
     this.bot.on("message:text", (ctx: Context) => {
       if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
-      const text = ctx.message?.text?.trim();
-      if (!text || !this.onMessageCb) return;
+      const msg = ctx.message;
+      if (!msg || !this.onMessageCb) return;
+      const text = msg.text?.trim();
+      if (!text) return;
+      const reply = replyContextFrom(msg.reply_to_message, this.me?.id);
       // fire-and-forget: agent turns can run long (ask_user blocks) — never stall polling
-      void this.onMessageCb(text, String(ctx.chat?.id)).catch((e) => console.error("[telegram] message handler:", e));
+      void this.onMessageCb(text, String(ctx.chat?.id), reply).catch((e) => console.error("[telegram] message handler:", e));
     });
 
     this.bot.on("callback_query:data", async (ctx) => {

@@ -10,7 +10,7 @@ import type { HeartbeatEngine } from "./heartbeat.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
 import type { ModelCascade } from "./cascade.js";
-import type { PushOptions, Schedule, Transport } from "./types.js";
+import type { PushOptions, ReplyContext, Schedule, Transport } from "./types.js";
 
 // model cascade stub — chain empty, everything healthy
 function makeCascadeStub() {
@@ -42,7 +42,7 @@ class MockTransport implements Transport {
   readonly chatId = "42";
   pushed: Array<{ chatId: string; opts: PushOptions }> = [];
   typing: Array<[string, boolean]> = [];
-  messageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
+  messageCb: ((text: string, chatId: string, reply?: ReplyContext) => Promise<void>) | null = null;
   actionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
 
   constructor(name = "mock", boundAgentId?: string) {
@@ -58,7 +58,7 @@ class MockTransport implements Transport {
   async notifyError(chatId: string, message: string): Promise<void> {
     this.pushed.push({ chatId, opts: { text: `⚠︎ ${message}` } });
   }
-  onMessage(cb: (text: string, chatId: string) => Promise<void>): void {
+  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext) => Promise<void>): void {
     this.messageCb = cb;
   }
   onAction(cb: (action: string, chatId: string) => Promise<void>): void {
@@ -75,6 +75,9 @@ class MockTransport implements Transport {
   }
   async say(text: string): Promise<void> {
     await this.messageCb?.(text, this.chatId);
+  }
+  async sayReply(text: string, reply: ReplyContext): Promise<void> {
+    await this.messageCb?.(text, this.chatId, reply);
   }
   async act(action: string): Promise<void> {
     await this.actionCb?.(action, this.chatId);
@@ -222,6 +225,20 @@ describe("PiBot commands", () => {
     const arg = t.promptSpy.mock.calls[0][0] as string;
     expect(arg.startsWith("[")).toBe(true);
     expect(arg).toContain("hello there");
+  });
+
+  it("prefixes prompts with reply-quote context when the user replies to a message", async () => {
+    // replying to the bot's own earlier message
+    await t.transport.sayReply("yes do that", { messageId: 7, sender: "you", quoted: "Want me to open the spike?" });
+    let arg = t.promptSpy.mock.calls[0][0] as string;
+    expect(arg).toContain("↩ replying to your message \"Want me to open the spike?\"");
+    expect(arg).toContain("yes do that");
+    expect(arg.startsWith("[")).toBe(true); // envelope still wraps the whole prompt
+
+    // replying to the user's own earlier message in a DM
+    await t.transport.sayReply("and this one", { messageId: 8, sender: "Gleb", quoted: "earlier thought" });
+    arg = t.promptSpy.mock.calls[1][0] as string;
+    expect(arg).toContain("↩ replying to Gleb's message \"earlier thought\"");
   });
 
   it("passes inter-agent communication hooks into chat sessions", async () => {
