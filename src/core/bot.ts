@@ -386,7 +386,13 @@ export class PiBot implements HeartbeatHost {
   }
 
   /** Every prompt gets a subtle time envelope so the agent always knows the moment. */
-  async promptAgent(t: Transport, chatId: string, agentId: string, text: string): Promise<void> {
+  async promptAgent(
+    t: Transport,
+    chatId: string,
+    agentId: string,
+    text: string,
+    opts: { recoveringDeadLetter?: boolean } = {},
+  ): Promise<void> {
     const ck = this.chatKey(t, chatId);
     this.rememberChat(agentId, ck);
 
@@ -401,7 +407,7 @@ export class PiBot implements HeartbeatHost {
     t.setTyping?.(chatId, true);
     try {
       // followUp: concurrent messages queue behind the running turn instead of erroring
-      await this.turnWithCascade(t, chatId, agentId, session, ck, text);
+      await this.turnWithCascade(t, chatId, agentId, session, ck, text, opts.recoveringDeadLetter ?? false);
       await Promise.resolve();
       const delivery = this.pendingPushes.get(`${agentId}::${ck}`);
       if (delivery) {
@@ -428,7 +434,8 @@ export class PiBot implements HeartbeatHost {
     agentId: string,
     session: AgentSession,
     ck: string,
-    text: string
+    text: string,
+    recoveringDeadLetter = false,
   ): Promise<void> {
     const cascade = this.deps.cascade;
     const attempts: string[] = [];
@@ -525,8 +532,11 @@ export class PiBot implements HeartbeatHost {
     // compounded the dead-letter queue into a self-feeding loop (each failed
     // replay got re-queued wrapped in another [cascade-recover] layer — Aug 2026 incident).
     const internal = INTERNAL_PROMPT_PREFIXES.some((p) => text.startsWith(p));
-    if (internal) {
-      this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — internal prompt dropped, will re-fire: ${truncate(text, 120)}`);
+    if (internal || recoveringDeadLetter) {
+      const disposition = recoveringDeadLetter
+        ? "dead-letter replay failed; retained for a later retry"
+        : "internal prompt dropped, will re-fire";
+      this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — ${disposition}: ${truncate(text, 120)}`);
       throw new Error(`no permitted model available for ${agentId}`);
     }
     const dl = cascade.queueDead({ agentId, transport: t.name, chatId, text, createdAt: Date.now(), attempts, lastError });
@@ -582,7 +592,7 @@ export class PiBot implements HeartbeatHost {
       const t = this.transports.get(dl.transport);
       if (!t) continue; // transport gone (sub-bot detached) — drop
       try {
-        await this.promptAgent(t, dl.chatId, dl.agentId, dl.text);
+        await this.promptAgent(t, dl.chatId, dl.agentId, dl.text, { recoveringDeadLetter: true });
         flushed++;
       } catch (e) {
         cascade.unshiftDead(dl); // delivery failed — stop, retry on next probe
@@ -1275,7 +1285,15 @@ export class PiBot implements HeartbeatHost {
 
   async deliverToAgent(agentId: string, text: string) {
     const cks = this.agentChats.get(agentId) ?? new Set<string>();
-    for (const ck of cks) {
+    const all = [...cks];
+    const dedicated = all.filter((ck) => {
+      const { transport } = this.splitChatKey(ck);
+      return this.transports.get(transport)?.boundAgentId === agentId;
+    });
+    // Once an agent has its own Telegram identity, proactive output belongs there.
+    // Broadcasting it through the main bot as well creates duplicate heartbeats.
+    const targets = dedicated.length ? dedicated : all;
+    for (const ck of targets) {
       const { transport, chatId } = this.splitChatKey(ck);
       const t = this.transports.get(transport);
       if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] deliver failed:", e));

@@ -53,6 +53,25 @@ describe("Scheduler", () => {
     s.stop();
   });
 
+  it("does not fire the same overdue job twice while delivery is still running", async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const fireCb = vi.fn(async () => blocked);
+    const s = new Scheduler(dataDir, fireCb);
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000 }) });
+    job.dueAt = Date.now() - 1;
+
+    const first = (s as unknown as { fire: (j: Schedule) => Promise<void> }).fire(job);
+    await waitFor(() => fireCb.mock.calls.length === 1);
+    s.rearm(job.id);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(fireCb).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+    s.stop();
+  });
+
   it("persists a failed delivery as pending and retries it later", async () => {
     const s = new Scheduler(dataDir, async () => { throw new Error("transport offline"); });
     const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000 }) });

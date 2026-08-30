@@ -38,14 +38,16 @@ function makeCascadeStub() {
 
 class MockTransport implements Transport {
   readonly name: string;
+  readonly boundAgentId?: string;
   readonly chatId = "42";
   pushed: Array<{ chatId: string; opts: PushOptions }> = [];
   typing: Array<[string, boolean]> = [];
   messageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
   actionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
 
-  constructor(name = "mock") {
+  constructor(name = "mock", boundAgentId?: string) {
     this.name = name;
+    this.boundAgentId = boundAgentId;
   }
 
   async start() {}
@@ -151,12 +153,26 @@ describe("PiBot commands", () => {
   });
 
   it("delivers host messages through a sub-bot transport whose name contains colons", async () => {
-    const subBot = new MockTransport("telegram:assistant");
+    const subBot = new MockTransport("telegram:assistant", "assistant");
     t.bot.addTransport(subBot);
     await subBot.say("remember this chat");
     subBot.pushed = [];
     await t.bot.deliverToAgent("assistant", "hello");
     expect(subBot.pushed).toEqual([{ chatId: "42", opts: { text: "hello" } }]);
+  });
+
+  it("prefers an agent's dedicated bot for proactive delivery", async () => {
+    const subBot = new MockTransport("telegram:assistant", "assistant");
+    t.bot.addTransport(subBot);
+    await t.transport.say("remember the main bot chat");
+    await subBot.say("remember the dedicated bot chat");
+    t.transport.pushed = [];
+    subBot.pushed = [];
+
+    await t.bot.deliverToAgent("assistant", "one proactive message");
+
+    expect(t.transport.pushed).toHaveLength(0);
+    expect(subBot.pushed).toEqual([{ chatId: "42", opts: { text: "one proactive message" } }]);
   });
 
   it("surfaces a missing reminder transport so the scheduler can retry", async () => {
@@ -435,6 +451,32 @@ describe("cascade dead-letter loop guards", () => {
     const prompted = t.promptSpy.mock.calls[0][0] as string;
     expect(prompted).toContain("stretch in 20m");
     expect(prompted).not.toContain("[cascade-recover]");
+  });
+
+  it("failed dead-letter recovery retains one item without notifying or re-queueing copies", async () => {
+    const original = {
+      id: "dl-focus", agentId: "assistant", transport: "mock", chatId: "42",
+      text: "test", createdAt: Date.now(), attempts: ["ollama/test"], lastError: "402 payment required",
+    };
+    const queue = [original];
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>).mockImplementation(() => queue.shift());
+    (t.cascade.queueDead as ReturnType<typeof vi.fn>).mockImplementation((dl) => {
+      const copy = { id: `copy-${queue.length}`, ...dl };
+      queue.push(copy);
+      return copy;
+    });
+    (t.cascade.unshiftDead as ReturnType<typeof vi.fn>).mockImplementation((dl) => { queue.unshift(dl); });
+
+    const n = await t.bot.flushDeadLetters();
+
+    expect(n).toBe(0);
+    expect(t.promptSpy).toHaveBeenCalledTimes(1);
+    expect(t.cascade.queueDead).not.toHaveBeenCalled();
+    expect(t.cascade.unshiftDead).toHaveBeenCalledWith(original);
+    expect(queue).toEqual([original]);
+    expect(t.transport.pushed.filter((p) => p.opts.text.startsWith("⚠︎"))).toHaveLength(0);
   });
 
   it("flushDeadLetters drops legacy wrapped meta-entries (loop guard)", async () => {

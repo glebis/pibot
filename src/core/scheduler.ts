@@ -20,6 +20,7 @@ export class Scheduler {
   private jobs = new Map<string, Schedule>();
   private snoozeByAgent = new Map<string, SnoozeState>();
   private timers = new Map<string, NodeJS.Timeout>();
+  private firing = new Set<string>();
   private file: string;
   private saveTimer: NodeJS.Timeout | null = null;
   private fireCb: (job: Schedule, snoozed: boolean) => void | Promise<void>;
@@ -229,6 +230,16 @@ export class Scheduler {
 
   private async fire(job: Schedule): Promise<void> {
     if (this.stopped || job.status !== "pending") return;
+    if (this.firing.has(job.id)) return;
+    this.firing.add(job.id);
+    try {
+      await this.fireOnce(job);
+    } finally {
+      this.firing.delete(job.id);
+    }
+  }
+
+  private async fireOnce(job: Schedule): Promise<void> {
     const now = Date.now();
 
     // snooze handling
