@@ -45,8 +45,9 @@ npm start                        # telegram bot
 The **web dashboard** runs at `http://127.0.0.1:7860` (disable: `PIBOT_WEB=0`, port: `PIBOT_WEB_PORT`). It is always locked: set `PIBOT_WEB_TOKEN` for the first login, then enrol a passkey. First-passkey enrolment requires that token-authenticated session.
 
 ### Voice notes & media
-Beyond text, the bot accepts **voice notes** (transcribed → routed like typed text), **photos/documents** (agent gets the local file path + caption), and politely declines other media types instead of dropping them. Transcription uses a provider fallback chain controlled by `STT_PROVIDERS` (default `groq,local_whisper`):
+Beyond text, the bot accepts **voice notes** (transcribed → routed like typed text), **photos/documents** (agent gets the local file path + caption), and politely declines other media types instead of dropping them. Transcription uses a provider fallback chain controlled by `STT_PROVIDERS` (default `whisperkit,groq,local_whisper`):
 
+- `whisperkit-cli` — Apple Silicon native (default local-first on macOS; model `STT_WHISPERKIT_MODEL`, default `whisper-tiny`, cached in `~/Library/whisperkit`)
 - `GROQ_API_KEY` — Groq Whisper API (default model `whisper-large-v3-turbo`, override `STT_GROQ_MODEL`)
 - local fallback: the `whisper` CLI on PATH (model override `STT_LOCAL_MODEL`)
 - `STT_LANGUAGE` — optional ISO-639-1 language hint (omit for auto-detect)

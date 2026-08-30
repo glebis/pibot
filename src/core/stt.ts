@@ -9,8 +9,9 @@ import { errorMessage, truncate } from "./util.js";
  * Speech-to-Text with a configurable provider fallback chain
  * (pattern from verity-agent's stt_service.py).
  *
- * Providers, tried in order (STT_PROVIDERS env, default "groq,local_whisper"):
- * - groq:         Groq Whisper API — fast, remote. Needs GROQ_API_KEY.
+ * Providers, tried in order (STT_PROVIDERS env, default "whisperkit,groq,local_whisper"):
+ * - whisperkit:    whisperkit-cli (Apple Silicon native; best local default on macOS).
+ * - groq:          Groq Whisper API — fast, remote. Needs GROQ_API_KEY.
  * - local_whisper: local `whisper` CLI via subprocess, best-effort.
  */
 
@@ -21,10 +22,11 @@ export interface SttResult {
   error?: string;
 }
 
-export const DEFAULT_STT_PROVIDERS = ["groq", "local_whisper"] as const;
-export const KNOWN_STT_PROVIDERS = new Set(["groq", "local_whisper"]);
+export const DEFAULT_STT_PROVIDERS = ["whisperkit", "groq", "local_whisper"] as const;
+export const KNOWN_STT_PROVIDERS = new Set(["whisperkit", "groq", "local_whisper"]);
 const GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 const GROQ_MODEL = process.env.STT_GROQ_MODEL || "whisper-large-v3-turbo";
+const WHISPERKIT_MODEL = process.env.STT_WHISPERKIT_MODEL || "whisper-tiny";
 
 export function sttProvidersFromEnv(): string[] {
   const raw = (process.env.STT_PROVIDERS ?? "").trim();
@@ -36,9 +38,11 @@ export function sttProvidersFromEnv(): string[] {
 export interface SttDeps {
   fetchFn?: typeof fetch;
   execFileFn?: typeof execFile;
-  /** precomputed availability of the local whisper CLI (tests inject) */
+  /** precomputed availability of local CLIs (tests inject; null = absent) */
   whisperBin?: string | null;
+  whisperkitBin?: string | null;
   timeoutMs?: number;
+  whisperkitTimeoutMs?: number;
 }
 
 /** One provider attempt. Isolated so tests can stub fetch/exec. */
@@ -104,6 +108,36 @@ function depsFetch(deps: SttDeps): typeof fetch {
   return deps.fetchFn ?? fetch;
 }
 
+/** whisperkit-cli (Apple Silicon): transcript arrives on stdout. */
+async function transcribeWhisperkit(
+  audioPath: string,
+  language: string | undefined,
+  bin: string | null,
+  deps: SttDeps,
+): Promise<SttResult> {
+  if (!bin) return { ok: false, text: "", provider: "whisperkit", error: "whisperkit-cli not installed" };
+  const exec = deps.execFileFn ?? execFile;
+  const args = ["transcribe", "--audio-path", path.resolve(audioPath), "--model", WHISPERKIT_MODEL, "--download-model-path", process.env.STT_WHISPERKIT_MODEL_PATH || path.join(process.env.HOME ?? "~/", "Library/whisperkit")];
+  if (language) args.push("--language", language);
+  try {
+    const [stdout, stderr] = await new Promise<[string, string]>((resolve, reject) => {
+      exec(bin, args, { timeout: deps.whisperkitTimeoutMs ?? 600_000, maxBuffer: 16 * 1024 * 1024 }, (err, so, se) =>
+        err ? reject(err) : resolve([so.toString(), se.toString()])
+      );
+    });
+    const text = (stdout || stderr)
+      .split("\n")
+      .map((l) => l.replace(/^\[\d{2}:\d{2}[:.].*?\]\s*/, "").trim())
+      .filter((l) => l && !/^(Transcrib|Loading)/i.test(l) && !/^Error:/i.test(l))
+      .join(" ")
+      .trim();
+    if (!text) return { ok: false, text: "", provider: "whisperkit", error: "whisperkit produced no output" };
+    return { ok: true, text, provider: "whisperkit" };
+  } catch (e) {
+    return { ok: false, text: "", provider: "whisperkit", error: `whisperkit: ${errorMessage(e)}` };
+  }
+}
+
 export class SttService {
   private providers: string[];
   private language: string | undefined;
@@ -124,10 +158,13 @@ export class SttService {
   async transcribe(audioPath: string): Promise<SttResult> {
     const failures: string[] = [];
     for (const provider of this.providers) {
+      const deps = this.deps;
       const result =
         provider === "groq"
-          ? await transcribeGroq(audioPath, this.language, this.deps)
-          : await transcribeLocalWhisper(audioPath, this.language, this.deps.whisperBin ?? (await whichWhisper(this.deps.execFileFn ?? execFile)), this.deps);
+          ? await transcribeGroq(audioPath, this.language, deps)
+          : provider === "whisperkit"
+            ? await transcribeWhisperkit(audioPath, this.language, deps.whisperkitBin ?? (await whichBin(deps.execFileFn ?? execFile, "whisperkit-cli")), deps)
+            : await transcribeLocalWhisper(audioPath, this.language, deps.whisperBin ?? (await whichBin(deps.execFileFn ?? execFile, "whisper")), deps);
       if (result.ok) return result;
       failures.push(`${result.provider}: ${result.error}`);
     }
@@ -135,10 +172,10 @@ export class SttService {
   }
 }
 
-/** Best-effort `which whisper` — cached per path lookup, undefined if absent. */
-async function whichWhisper(execFn: typeof execFile): Promise<string | null> {
+/** Best-effort `command -v <name>` — resolves the binary path or null. */
+async function whichBin(execFn: typeof execFile, name: string): Promise<string | null> {
   return new Promise((resolve) => {
-    execFn("sh", ["-c", "command -v whisper"], { timeout: 5_000 }, (err, stdout) => {
+    execFn("sh", ["-c", `command -v ${name}`], { timeout: 5_000 }, (err, stdout) => {
       resolve(err ? null : stdout.trim() || null);
     });
   });
