@@ -136,7 +136,7 @@ async function main(): Promise<void> {
   const mediaDir = path.join(config.dataDir, "media");
   const transports =
     telegramToken && config.transport !== "cli"
-      ? [new TelegramTransport(telegramToken, allowedChats, { openWhenEmpty: config.telegramOpen, mediaDir })]
+      ? [new TelegramTransport(telegramToken, allowedChats, { openWhenEmpty: config.telegramOpen, mediaDir, reactions: process.env.PIBOT_REACTIONS !== "0" })]
       : [new CliTransport()];
 
   const providerManager = new ProviderManager(modelRuntime);

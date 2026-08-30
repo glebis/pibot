@@ -203,7 +203,7 @@ export class PiBot implements HeartbeatHost {
     const allow = allowedChats ?? persisted?.allowedChats ?? secrets.telegram?.allowedChats ?? [];
     // persist only an explicit/persisted choice — inheritance stays live so main-allowlist edits propagate
     const pinned = allowedChats ?? persisted?.allowedChats;
-    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media") });
+    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0" });
     let botName: string;
     try {
       botName = await t.verify();
@@ -270,7 +270,7 @@ export class PiBot implements HeartbeatHost {
     if (this.transports.has("telegram")) {
       return { ok: false, error: "Telegram is already enabled — disable it first." };
     }
-    const t = new TelegramTransport(token, allowedChats, { openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media") });
+    const t = new TelegramTransport(token, allowedChats, { openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0" });
     let botName: string;
     try {
       botName = await t.verify();
@@ -473,6 +473,10 @@ export class PiBot implements HeartbeatHost {
         return;
       }
       const corrected = applyCorrections(result.text, dictionary.entries);
+      // transcript echo: the sender immediately sees what we heard (PIBOT_VOICE_ECHO=0 disables)
+      if (process.env.PIBOT_VOICE_ECHO !== "0") {
+        await t.push(media.chatId, { text: `🎙 ${corrected}` });
+      }
       // speech answers pending questions with the bare transcript, exactly like typing
       if (this.questions.answerViaText(this.chatKey(t, media.chatId), result.text)) return;
       const dur = ` (${Math.round(prepared.durationSec)}s)`;

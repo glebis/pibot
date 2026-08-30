@@ -196,14 +196,17 @@ export class TelegramTransport implements Transport {
 
   private onMediaCb: ((media: IncomingMedia) => Promise<void>) | null = null;
   private mediaDir: string;
+  private reactions: boolean;
+  private processingIds = new Map<string, number[]>();
 
-  constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string; openWhenEmpty?: boolean; mediaDir?: string } = {}) {
+  constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string; openWhenEmpty?: boolean; mediaDir?: string; reactions?: boolean } = {}) {
     this.bot = new Bot(token);
     this.allowed = new Set(allowedChats);
     this.openWhenEmpty = opts.openWhenEmpty ?? false;
     this.name = opts.nameSuffix ? `telegram:${opts.nameSuffix}` : "telegram";
     this.boundAgentId = opts.boundAgentId;
     this.mediaDir = opts.mediaDir ?? "";
+    this.reactions = opts.reactions ?? true;
 
     this.bot.on("message:text", (ctx: Context) => {
       if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
@@ -211,6 +214,7 @@ export class TelegramTransport implements Transport {
       if (!msg || !this.onMessageCb) return;
       const text = msg.text?.trim();
       if (!text) return;
+      void this.markIncoming(String(ctx.chat?.id), msg.message_id);
       const reply = replyContextFrom(msg.reply_to_message, this.me?.id);
       // fire-and-forget: agent turns can run long (ask_user blocks) — never stall polling
       void this.onMessageCb(text, String(ctx.chat?.id), reply).catch((e) => console.error("[telegram] message handler:", e));
@@ -360,6 +364,31 @@ export class TelegramTransport implements Transport {
   }
 
 
+  /** Signal receipt/processing of an incoming message with an emoji reaction. */
+  private async markIncoming(chatId: string, messageId: number, emoji = "👀"): Promise<void> {
+    const list = this.processingIds.get(chatId) ?? [];
+    if (!list.includes(messageId)) list.push(messageId);
+    while (list.length > 12) list.shift();
+    this.processingIds.set(chatId, list);
+    await this.setReaction(chatId, messageId, emoji);
+  }
+
+  /** All messages still marked 👀 get the completion reaction when the bot answers. */
+  private async settleIncoming(chatId: string, emoji = "👍"): Promise<void> {
+    const list = this.processingIds.get(chatId) ?? [];
+    this.processingIds.set(chatId, []);
+    for (const messageId of list) await this.setReaction(chatId, messageId, emoji);
+  }
+
+  private async setReaction(chatId: string, messageId: number, emoji: string): Promise<void> {
+    if (!this.reactions || Number.isNaN(messageId) || messageId <= 0) return;
+    try {
+      await this.bot.api.setMessageReaction(Number(chatId), messageId, [{ type: "reaction", emoji }] as never, { is_big: false });
+    } catch (e) {
+      console.warn("[telegram] reaction failed:", (e as Error).message);
+    }
+  }
+
   private check(ctx: Context): boolean {
     if (!this.allowed.size) return this.openWhenEmpty;
     return this.allowed.has(String(ctx.chat?.id ?? ""));
@@ -409,6 +438,7 @@ export class TelegramTransport implements Transport {
     if (!spec) return;
     if (!spec.ok) { await ctx.reply(spec.error); return; }
 
+    void this.markIncoming(chatId, m.message_id);
     try {
       const filePath = await this.downloadTelegramFile(spec.fileId, spec.extension);
       await this.onMediaCb({ kind: spec.kind, chatId, filePath, fileId: spec.fileId, caption: m.caption, durationSec: spec.durationSec, mimeType: spec.mimeType, fileSize: spec.fileSize });
@@ -528,6 +558,7 @@ export class TelegramTransport implements Transport {
         console.warn(`[telegram] suppressed duplicate send to chat ${chatId}`);
         return;
       }
+      await this.settleIncoming(chatId);
       // first plain message in a chat attaches the persistent quick-action keyboard
       if (!this.keyboardSent.has(chatId) && !opts.card) {
         await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
@@ -551,6 +582,7 @@ export class TelegramTransport implements Transport {
       if (!this.duplicateGuard.shouldSend(chatId, text)) return;
       try {
         await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, text));
+        await this.settleIncoming(chatId, "👎");
         this.duplicateGuard.markSent(chatId, text);
       } catch {
         // Error notices are best effort; a failed attempt remains eligible for retry.

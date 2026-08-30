@@ -958,3 +958,27 @@ describe("splitMediaLines", () => {
 expect(clean).not.toContain("/tmp/d.jpg");
   });
 });
+
+describe("voice transcript echo", () => {
+  it("pushes the corrected transcript to the chat alongside the agent turn", async () => {
+    const t = makeBot();
+    fs.writeFileSync(path.join(t.dir, "dictionary.json"), JSON.stringify({ entries: [{ from: "west", to: "WhisperKit" }] }));
+    (t.stt.transcribe as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, text: "I tested west today", provider: "whisperkit" });
+    await t.transport.sayMedia({ kind: "voice", durationSec: 5 });
+    expect(t.transport.pushed.some((p) => p.opts.text.startsWith("🎙 I tested WhisperKit today"))).toBe(true);
+    expect(t.transport.lastText().endsWith("I tested WhisperKit today")).toBe(true);
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("echo can be disabled with PIBOT_VOICE_ECHO=0", async () => {
+    process.env.PIBOT_VOICE_ECHO = "0";
+    try {
+      const t2 = makeBot();
+      await t2.transport.sayMedia({ kind: "voice", durationSec: 5 });
+      expect(t2.transport.pushed.some((p) => p.opts.text.startsWith("🎙"))).toBe(false);
+      fs.rmSync(t2.dir, { recursive: true, force: true });
+    } finally {
+      delete process.env.PIBOT_VOICE_ECHO;
+    }
+  });
+});
