@@ -18,7 +18,13 @@ import type { ModelCascade } from "./cascade.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
-import { errorMessage, fmtWhen, inQuietHours, readJson, truncate, writeJsonAtomic } from "./util.js";
+import { errorMessage, fmtWhen, inQuietHours, parseDuration, readJson, truncate, writeJsonAtomic } from "./util.js";
+
+/** Adaptive-wakeup bounds (Ouroboros set_next_wakeup pattern): the agent may
+ *  compress the next gap when something is brewing, stretch it when idle.
+ *  Manifest heartbeat.minInterval/maxInterval narrows these further. */
+const MIN_WAKEUP_MS = 5 * 60e3;
+const MAX_WAKEUP_MS = 12 * 3600e3;
 
 export interface HeartbeatHost {
   /** Heartbeat wants to say something short to the user */
@@ -46,12 +52,19 @@ Principles:
 - Light nudges about items due soon are good. Repeating what the user already knows is bad.
 - If nothing is worth saying, call heartbeat_act with no fields (or a private note only).
 
+Adaptive rhythm — you pace yourself:
+- heartbeat_act also accepts wakeup: how long until you want your next wakeup (e.g. "10m", "45m", "2h").
+- Request a SHORTER delay when something interesting or unfinished is brewing that does not yet justify interrupting the user. Request a LONGER one (hours) when nothing is happening and everything is fresh — this saves budget.
+- Omit wakeup to keep your normal cadence. Hard floor and ceiling are enforced automatically, so you cannot disable yourself.
+
 Call the heartbeat_act tool exactly once with your decision.`;
 
 interface HeartbeatAct {
   speak?: string;
   escalate?: string;
   note?: string;
+  /** requested delay until this agent's next heartbeat tick (e.g. "10m", "3h") */
+  wakeup?: string;
 }
 
 interface PersistedHeartbeatAgentState {
@@ -71,6 +84,8 @@ export class HeartbeatEngine {
   private inflight = new Set<string>();
   /** proactive speaks that got no user reaction — 2 in a row = back off */
   private unansweredSpeaks = new Map<string, number>();
+  /** per-agent next-wakeup delay (ms) requested by the last tick; consumed by the host */
+  private pendingWakeup = new Map<string, number>();
   private lastSpeakFingerprint = new Map<string, string>();
   private hydratedAgents = new Set<string>();
   private persistedState: PersistedHeartbeatState;
@@ -132,6 +147,8 @@ export class HeartbeatEngine {
     if (this.inflight.has(agentId)) return; // previous tick still running
     // fast-path backoff without invoking shouldTick (covers cases where caller bypasses it)
     if ((this.unansweredSpeaks.get(agentId) ?? 0) >= 2) return;
+    // any new tick invalidates a previous request (only the latest beat may pace)
+    this.pendingWakeup.delete(agentId);
 
     const guard = this.shouldTick(agent, {
       snoozed: Boolean(this.deps.scheduler.snoozeState(agentId)),
@@ -160,6 +177,11 @@ export class HeartbeatEngine {
         speak: Type.Optional(Type.String({ description: "Short message to send to the user (1-3 sentences, in the agent's voice). Omit if nothing is worth saying." })),
         escalate: Type.Optional(Type.String({ description: "Something needs the full agent brain — describe what and why; the main session will be prompted with it." })),
         note: Type.Optional(Type.String({ description: "Private observation for the event log; never shown to the user." })),
+        ...(opts.brief
+          ? {}
+          : {
+              wakeup: Type.Optional(Type.String({ description: 'Delay until your next wakeup, e.g. "10m", "45m", "2h". Shorter when something is brewing, longer when idle. Omit to keep the normal rhythm.' })),
+            }),
       }),
       execute: async (_toolCallId, params) => {
         called = true;
@@ -236,6 +258,11 @@ export class HeartbeatEngine {
     const act = await this.tickOnce(agent, opts);
     if (!act) return;
 
+    if (!opts.brief && act.wakeup) {
+      const ms = this.clampWakeup(agent, parseDuration(act.wakeup));
+      if (ms != null) this.pendingWakeup.set(agent.id, ms);
+    }
+
     const summary = act.speak ?? act.escalate ?? act.note ?? "(silent)";
     this.deps.events.log(agent.id, "heartbeat", summary);
 
@@ -251,6 +278,28 @@ export class HeartbeatEngine {
       this.lastSpeakFingerprint.set(agent.id, speakFingerprint);
       this.persistAgent(agent.id);
     }
+  }
+
+  /**
+   * The next-wakeup delay (ms) requested by this agent's last heartbeat tick,
+   * or null when the tick did not ask for a change. Consumes the request — the
+   * host applies it by re-arming the heartbeat job before the scheduler's
+   * post-fire repeat computation runs.
+   */
+  takeNextWakeup(agentId: string): number | null {
+    const ms = this.pendingWakeup.get(agentId);
+    this.pendingWakeup.delete(agentId);
+    return ms ?? null;
+  }
+
+  /** Clamp a requested wakeup delay to the global bounds, narrowed by the manifest window. */
+  private clampWakeup(agent: LoadedAgent, ms: number | null): number | null {
+    if (ms == null || !Number.isFinite(ms) || ms <= 0) return null;
+    const hb = agent.manifest.heartbeat;
+    const min = Math.max(MIN_WAKEUP_MS, parseDuration(hb?.minInterval ?? "") ?? 0);
+    const manifestMax = parseDuration(hb?.maxInterval ?? "");
+    const max = Math.min(MAX_WAKEUP_MS, manifestMax ?? Number.POSITIVE_INFINITY);
+    return min > max ? min : Math.min(Math.max(ms, min), max);
   }
 
   private hydrateAgent(agentId: string): void {
@@ -337,6 +386,13 @@ export function buildHeartbeatDigest(
     parts.push(
       `# Recent activity (avoid repeating any of this)\n${evts.map((e) => `- [${e.type}] ${e.summary}`).join("\n")}`
     );
+  }
+
+  // rhythm awareness (adaptive wakeups)
+  if (agent.manifest.heartbeat?.enabled) {
+    const minI = agent.manifest.heartbeat.minInterval ?? "5m";
+    const maxI = agent.manifest.heartbeat.maxInterval ?? "12h";
+    parts.push(`# Heartbeat rhythm\nBase cadence: every ${agent.manifest.heartbeat.interval}. You may request your next wakeup sooner or later via "wakeup" in heartbeat_act (allowed: ${minI} … ${maxI}).`);
   }
 
   return parts.join("\n\n");

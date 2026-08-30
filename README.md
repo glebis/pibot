@@ -29,7 +29,7 @@ The host process (`src/`) runs a **scheduler** (JSON-backed timer wheel with sno
 }
 ```
 
-Available ids are `avatar`, `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `attend`, `telegram-responder`, `delegate`, `developer`, and `remote-workshop`. Avatar, Calendar, and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
+Available ids are `avatar`, `speech`, `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `attend`, `telegram-responder`, `delegate`, `developer`, and `remote-workshop`. Avatar, Calendar, and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
 
 `providers` is a per-agent model-provider allowlist. Without it, only models named directly in `model`/`cascade` are used; global and authenticated-provider fallback discovery is disabled.
 
@@ -59,12 +59,20 @@ npm start                        # telegram bot
 The **web dashboard** runs at `http://127.0.0.1:7860` (disable: `PIBOT_WEB=0`, port: `PIBOT_WEB_PORT`). It is always locked: set `PIBOT_WEB_TOKEN` for the first login, then enrol a passkey. First-passkey enrolment requires that token-authenticated session.
 
 ### Voice notes & media
-Beyond text, the bot accepts **voice notes** (transcribed → routed like typed text), **photos/documents** (agent gets the local file path + caption), and politely declines other media types instead of dropping them. Transcription uses a provider fallback chain controlled by `STT_PROVIDERS` (default `whisperkit,groq,local_whisper`):
+Beyond text, the bot accepts Telegram **voice**, **audio**, **video notes**, and audio documents (locally validated and transcribed → routed like typed text), plus **photos/documents** (agent gets the local file path + caption). Unsupported media is declined instead of dropped. Video-note audio is extracted locally; the video itself is never passed into the agent context.
+
+Transcription is local-first and controlled by `STT_PROVIDERS` (default `whisperkit,local_whisper`):
 
 - `whisperkit-cli` — Apple Silicon native (default local-first on macOS; model `STT_WHISPERKIT_MODEL`, default `whisper-tiny`, cached in `~/Library/whisperkit`)
-- `GROQ_API_KEY` — Groq Whisper API (default model `whisper-large-v3-turbo`, override `STT_GROQ_MODEL`)
 - local fallback: the `whisper` CLI on PATH (model override `STT_LOCAL_MODEL`)
+- optional external fallback: `groq` with `GROQ_API_KEY` (model override `STT_GROQ_MODEL`) is used only when the resolved agent manifest explicitly lists it under `speech.sttProviders` and sets `speech.allowExternalStt: true`
 - `STT_LANGUAGE` — optional ISO-639-1 language hint (omit for auto-detect)
+
+Downloaded speech media uses private runtime storage, opaque filenames, local media probing, bounded duration/size/timeouts, and is removed after the transcription attempt. Photos and ordinary documents follow the separate bounded retention work tracked for runtime media.
+
+Outgoing speech is local-only and opt-in per agent. Add `speech` to that agent's `capabilities`. `speech_generate` uses macOS `say` plus local `ffmpeg` to create either an OGG/Opus Telegram voice message or M4A music-player audio; it never sends. `speech_send` sends the selected artifact only to the same invoking Telegram chat through the normal per-chat queue, rate-limit retry, and duplicate guard. A successful send deletes the artifact; unsent artifacts expire after 24 hours.
+
+Speech is never generated or sent automatically, and it has no heartbeat, scheduler, replay, or automatic reply-conversion hook. No external TTS provider or credential is included in this foundation.
 
 The dashboard provides:
 agent CRUD, manifest editor (model/heartbeat/evolution/quiet hours), persona + memory editors,
@@ -87,6 +95,8 @@ Ask naturally: *"remind me to stretch in 20 minutes"*, *"note to take: check the
 **Give each agent a checklist:** edit `~/.local/share/pibot/agents/<name>/HEARTBEAT.md` — a tiny, user-editable list the agent follows on every tick (OpenClaw's most-loved pattern). Agents can also send images: include `MEDIA: <url>` in a reply.
 
 Every agent's manifest sets a rhythm (`interval`, cheap `model`, `quietHours`). Each tick spawns an **ephemeral cheap-model session** (never touching the main session's cache) with a compact digest: persona + memory + pending items + recent events. It decides via one tool call: `speak` (short proactive message), `escalate` (hand to the full agent brain), or nothing (a few hundred tokens).
+
+**Adaptive wakeups (self-paced rhythm, from Ouroboros's `set_next_wakeup`):** the heartbeat decision can also include `wakeup` ("10m"…"12h") — the agent compresses the next gap when something is brewing and stretches it when everything is quiet, instead of firing on a fixed drumbeat. Hard bounds come from the global clamp (5m–12h), narrowed per-agent via manifest `heartbeat.minInterval` / `heartbeat.maxInterval` (editable in the dashboard). Skipped ticks (quiet hours, snooze, backoff) always fall back to the base rhythm.
 
 ## Self-evolution (Hermes-style, pibot-native)
 

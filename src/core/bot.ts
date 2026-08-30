@@ -18,6 +18,8 @@ import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
 import { SttService } from "./stt.js";
+import type { SttPolicy } from "./stt.js";
+import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { classifyModelError, ModelCascade } from "./cascade.js";
 import { devAgentEnabled, DEV_AGENT_ID, scaffoldDevAgent } from "./dev-agent.js";
@@ -69,6 +71,8 @@ export class PiBot implements HeartbeatHost {
       providers?: import("./providers.js").ProviderManager;
       /** speech-to-text for voice notes (optional; voice degrades without it) */
       stt?: SttService;
+      /** local media probing/extraction and private cleanup */
+      audioMedia?: AudioMediaProcessor;
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
@@ -338,6 +342,18 @@ export class PiBot implements HeartbeatHost {
         if (!target?.setProfilePhoto) throw new Error("The invoking transport cannot update a profile photo");
         await target.setProfilePhoto(filePath);
       },
+      async (transportName, targetChatId, kind, filePath, caption) => {
+        if (transportName !== t.name || targetChatId !== chatId) throw new Error("Speech target does not match the invoking chat");
+        const target = this.transports.get(transportName);
+        if (!target) throw new Error("The invoking transport is unavailable");
+        if (kind === "voice") {
+          if (!target.sendVoice) throw new Error("The invoking transport cannot send voice messages");
+          await target.sendVoice(targetChatId, filePath, caption);
+        } else {
+          if (!target.sendAudio) throw new Error("The invoking transport cannot send audio messages");
+          await target.sendAudio(targetChatId, filePath, caption);
+        }
+      },
     );
     const wkey = `${agentId}::${ck}`;
     if (!this.wired.has(wkey)) {
@@ -393,7 +409,7 @@ export class PiBot implements HeartbeatHost {
    * commands, pending questions, then the agent. Media turns re-enter here
    * after transcription/prompt composition.
    */
-  private async routeUserTurn(t: Transport, chatId: string, text: string, reply?: ReplyContext): Promise<void> {
+  private async routeUserTurn(t: Transport, chatId: string, text: string, reply?: ReplyContext, resolvedAgentId?: string): Promise<void> {
     const ck = this.chatKey(t, chatId);
     // quick-action keyboard buttons arrive as plain text
     const quick = PiBot.QUICK_ACTIONS[text.toLowerCase()];
@@ -402,7 +418,7 @@ export class PiBot implements HeartbeatHost {
     if (text.startsWith("/")) return void (await this.handleCommand(t, chatId, text));
     // a pending structured question eats the next plain message in this chat
     if (this.questions.answerViaText(ck, text)) return;
-    const agentId = this.currentAgent(ck);
+    const agentId = resolvedAgentId ?? this.currentAgent(ck);
     if (!agentId) {
       await t.notifyError(chatId, "No agents yet. Create one: /newagent myfriend <persona text>");
       return;
@@ -414,30 +430,48 @@ export class PiBot implements HeartbeatHost {
 
   /** Media message from a transport: transcribe voice, reference files, then route as a user turn. */
   private async handleMedia(t: Transport, media: IncomingMedia): Promise<void> {
-    if (media.kind === "voice" || media.kind === "audio") {
-      await this.handleVoiceMedia(t, media);
+    if (media.kind === "voice" || media.kind === "audio" || media.kind === "video_note" || media.kind === "audio_document") {
+      const agentId = this.currentAgent(this.chatKey(t, media.chatId));
+      if (!agentId) {
+        await t.notifyError(media.chatId, "No agents yet. Create one before sending audio.");
+        return;
+      }
+      await this.handleVoiceMedia(t, media, agentId);
       return;
     }
     await this.routeUserTurn(t, media.chatId, mediaPromptText(media));
   }
 
   /** Download-and-transcribe path for voice notes and audio files. */
-  private async handleVoiceMedia(t: Transport, media: IncomingMedia): Promise<void> {
+  private async handleVoiceMedia(t: Transport, media: IncomingMedia, agentId: string): Promise<void> {
     const stt = this.deps.stt;
-    if (!stt || !stt.configured()) {
-      await t.push(media.chatId, { text: "🎙 Voice needs transcription configured — set GROQ_API_KEY (or install local whisper) and restart." });
+    const speech = this.deps.agents.getAgent(agentId)?.manifest.speech;
+    const policy: SttPolicy = { providers: speech?.sttProviders, allowExternal: speech?.allowExternalStt === true };
+    const processor = this.deps.audioMedia ?? new AudioMediaProcessor(path.join(this.deps.config.dataDir, "media"));
+    const prepared = await processor.prepare(media);
+    if (!prepared.ok) {
+      await t.push(media.chatId, { text: `🎙 Audio validation failed — ${safeAudioError(prepared.error)}` });
       return;
     }
-    const result = await stt.transcribe(media.filePath).catch((e) => ({ ok: false as const, text: "", provider: "none", error: errorMessage(e) }));
-    if (!result.ok) {
-      await t.push(media.chatId, { text: `🎙 Transcription failed — ${truncate(result.error ?? "unknown error", 200)}` });
-      return;
+    try {
+      if (!stt || !stt.configured(policy)) {
+        await t.push(media.chatId, { text: "🎙 Voice needs a permitted local transcription provider. External STT must be explicitly enabled in this agent's speech policy." });
+        return;
+      }
+      const result = await stt.transcribe(prepared.filePath, policy).catch((e) => ({ ok: false as const, text: "", provider: "none", error: errorMessage(e) }));
+      if (!result.ok) {
+        await t.push(media.chatId, { text: `🎙 Transcription failed — ${truncate(result.error ?? "unknown error", 200)}` });
+        return;
+      }
+      // speech answers pending questions with the bare transcript, exactly like typing
+      if (this.questions.answerViaText(this.chatKey(t, media.chatId), result.text)) return;
+      const dur = ` (${Math.round(prepared.durationSec)}s)`;
+      const label = media.kind === "video_note" ? "video note" : media.kind === "voice" ? "voice note" : "audio";
+      const body = media.caption ? `${result.text}\n\n(caption: ${media.caption})` : result.text;
+      await this.routeUserTurn(t, media.chatId, `🎙 ${label}${dur} — transcribed via ${result.provider}:\n\n${body}`, undefined, agentId);
+    } finally {
+      await prepared.cleanup();
     }
-    // voice answers pending questions with the bare transcript, exactly like typing
-    if (this.questions.answerViaText(this.chatKey(t, media.chatId), result.text)) return;
-    const dur = media.durationSec !== undefined ? ` (${media.durationSec}s)` : "";
-    const body = media.caption ? `${result.text}\n\n(caption: ${media.caption})` : result.text;
-    await this.routeUserTurn(t, media.chatId, `🎙 voice note${dur} — transcribed via ${result.provider}:\n\n${body}`);
   }
 
   /** Every prompt gets a subtle time envelope so the agent always knows the moment. */
@@ -1184,6 +1218,11 @@ export class PiBot implements HeartbeatHost {
   async deliverFire(job: Schedule, snoozed: boolean): Promise<void> {
     if (job.kind === "heartbeat") {
       await this.deps.heartbeat.tick(job.agentId);
+      // Adaptive wakeup: the agent may request a shorter/longer gap for its next
+      // beat; adjust the repeat interval so the scheduler's post-fire re-arm picks
+      // it up. Bounds are enforced by the engine; skipped ticks keep the base rhythm.
+      const wanted = this.deps.heartbeat.takeNextWakeup?.(job.agentId);
+      if (job.repeat && wanted) job.repeat.everyMs = wanted;
       return;
     }
     if (job.kind === "cascade-probe") {
@@ -1405,6 +1444,16 @@ function replyPrefix(reply: ReplyContext | undefined, text: string): string {
   if (!reply) return text;
   const who = reply.sender === "you" ? "your" : `${reply.sender}'s`;
   return `↩ replying to ${who} message "${reply.quoted}":\n\n${text}`;
+}
+
+function safeAudioError(error: string): string {
+  const lower = error.toLowerCase();
+  if (lower.includes("no audio track")) return "the file has no audio track";
+  if (lower.includes("duration")) return "the recording is outside the allowed duration";
+  if (lower.includes("too large")) return "the recording is too large";
+  if (lower.includes("not installed")) return "local audio processing is unavailable";
+  if (lower.includes("timeout") || lower.includes("timed out")) return "local audio processing timed out";
+  return "the media is malformed or unsupported";
 }
 
 /** Photo/document prompt: reference the local file, plus caption. */

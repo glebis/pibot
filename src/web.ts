@@ -144,6 +144,10 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
     <div><label>Quiet from</label><input type="text" name="hb_from" value="${esc(qh.from)}"></div>
     <div><label>Quiet to</label><input type="text" name="hb_to" value="${esc(qh.to)}"></div>
   </div>
+  <div class="row">
+    <div><label>Wakeup min (floor for adaptive wakeups)</label><input type="text" name="hb_min" value="${esc(hb.minInterval ?? "5m")}"></div>
+    <div><label>Wakeup max (ceiling for adaptive wakeups)</label><input type="text" name="hb_max" value="${esc(hb.maxInterval ?? "12h")}"></div>
+  </div>
   <h2 style="border:0;margin-top:18px">Evolution</h2>
   <div class="row">
     <div><label class="mono">enabled <input type="checkbox" name="ev_enabled" ${ev.enabled ? "checked" : ""} style="width:auto"></label></div>
@@ -774,8 +778,10 @@ ${manifestForm(agent, csrfToken)}
     const on = (k: string) => b[k] === "on";
 
     const hbInterval = str("hb_interval") || "45m";
+    const hbMin = str("hb_min") || "5m";
+    const hbMax = str("hb_max") || "12h";
     const evInterval = str("ev_interval") || "6h";
-    if (!parseDuration(hbInterval) || !parseDuration(evInterval)) {
+    if (!parseDuration(hbInterval) || !parseDuration(evInterval) || !parseDuration(hbMin) || !parseDuration(hbMax)) {
       return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Invalid interval (try 45m, 2h, 6h)")}`);
     }
 
@@ -791,6 +797,8 @@ ${manifestForm(agent, csrfToken)}
         interval: hbInterval,
         model: str("hb_model") || "same",
         quietHours: { from: str("hb_from") || "23:00", to: str("hb_to") || "08:00" },
+        minInterval: hbMin,
+        maxInterval: hbMax,
       },
       evolution: {
         enabled: on("ev_enabled"),

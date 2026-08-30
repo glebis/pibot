@@ -3,9 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { nextActs } = vi.hoisted(() => ({ nextActs: [] as Array<null | { speak?: string; escalate?: string; note?: string }> }));
+const { nextActs } = vi.hoisted(() => ({ nextActs: [] as Array<null | { speak?: string; escalate?: string; note?: string; wakeup?: string }> }));
 
-function queueActs(acts: Array<null | { speak?: string; escalate?: string; note?: string }>) {
+function queueActs(acts: Array<null | { speak?: string; escalate?: string; note?: string; wakeup?: string }>) {
   nextActs.length = 0;
   nextActs.push(...acts);
 }
@@ -281,6 +281,83 @@ describe("HeartbeatEngine backoff", () => {
       await engine.tick(agent.id);
       expect((host.deliverToAgent as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1]).toBe("c");
       expect((engine as unknown as { unansweredSpeaks: Map<string, number> }).unansweredSpeaks.get(agent.id)).toBe(1);
+    });
+  });
+
+  describe("adaptive wakeups", () => {
+    let dir: string;
+    beforeEach(() => {
+      dir = tmpAgentDir();
+      nextActs.length = 0;
+    });
+    afterEach(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+      nextActs.length = 0;
+      vi.mocked(PiAgent.createAgentSession).mockClear();
+      vi.mocked(PiAgent.getAgentDir).mockClear();
+    });
+
+    it("exposes a requested wakeup as ms, consumable once", async () => {
+      const agent = makeAgent(dir);
+      const { engine } = makeEngine(agent, dir);
+      queueActs([{ wakeup: "3h" }]);
+      await engine.tick(agent.id);
+      expect(engine.takeNextWakeup(agent.id)).toBe(3 * 3600e3);
+      expect(engine.takeNextWakeup(agent.id)).toBeNull();
+    });
+
+    it("clamps to the global floor and ceiling", async () => {
+      const agent = makeAgent(dir);
+      const { engine } = makeEngine(agent, dir);
+      queueActs([{ wakeup: "1m" }]);
+      await engine.tick(agent.id);
+      expect(engine.takeNextWakeup(agent.id)).toBe(5 * 60e3);
+
+      queueActs([{ wakeup: "3d" }]);
+      await engine.tick(agent.id);
+      expect(engine.takeNextWakeup(agent.id)).toBe(12 * 3600e3);
+    });
+
+    it("honors the manifest min/max window", async () => {
+      const agent = makeAgent(dir, { heartbeat: { enabled: true, interval: "45m", minInterval: "30m", maxInterval: "4h" } });
+      const { engine } = makeEngine(agent, dir);
+      queueActs([{ wakeup: "2m" }]);
+      await engine.tick(agent.id);
+      expect(engine.takeNextWakeup(agent.id)).toBe(30 * 60e3);
+
+      queueActs([{ wakeup: "8h" }]);
+      await engine.tick(agent.id);
+      expect(engine.takeNextWakeup(agent.id)).toBe(4 * 3600e3);
+    });
+
+    it("ignores wakeup on brief ticks", async () => {
+      const agent = makeAgent(dir);
+      const { engine } = makeEngine(agent, dir);
+      queueActs([{ wakeup: "10m", speak: "brief text" }]);
+      await engine.tick(agent.id, { brief: true });
+      expect(engine.takeNextWakeup(agent.id)).toBeNull();
+    });
+
+    it("does not keep a stale request across ticks", async () => {
+      const agent = makeAgent(dir);
+      const { engine } = makeEngine(agent, dir);
+      queueActs([{ wakeup: "2h" }, null]);
+      await engine.tick(agent.id);
+      expect(engine.takeNextWakeup(agent.id)).toBe(2 * 3600e3);
+      queueActs([{ note: "nothing to see" }]);
+      await engine.tick(agent.id);
+      expect(engine.takeNextWakeup(agent.id)).toBeNull();
+    });
+
+    it("returns null for garbage or missing wakeup values", async () => {
+      const agent = makeAgent(dir);
+      const { engine } = makeEngine(agent, dir);
+      queueActs([{ wakeup: "banana" }]);
+      await engine.tick(agent.id);
+      expect(engine.takeNextWakeup(agent.id)).toBeNull();
+      queueActs([{}]);
+      await engine.tick(agent.id);
+      expect(engine.takeNextWakeup(agent.id)).toBeNull();
     });
   });
 });

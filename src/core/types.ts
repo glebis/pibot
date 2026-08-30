@@ -76,7 +76,7 @@ export interface ReplyContext {
 
 /** A media message the transport downloaded locally (photo, voice, audio, document). */
 export interface IncomingMedia {
-  kind: "voice" | "audio" | "photo" | "document";
+  kind: "voice" | "audio" | "video_note" | "audio_document" | "photo" | "document";
   /** chat the media arrived in */
   chatId: string;
   /** local path of the downloaded file */
@@ -116,6 +116,10 @@ export interface Transport {
   sendMedia?(chatId: string, url: string): Promise<void>;
   /** Set this bot identity's profile photo (optional; Telegram only). */
   setProfilePhoto?(filePath: string): Promise<void>;
+  /** Send a local OGG/Opus voice artifact through this transport. */
+  sendVoice?(chatId: string, filePath: string, caption?: string): Promise<void>;
+  /** Send a local MP3/M4A music-player artifact through this transport. */
+  sendAudio?(chatId: string, filePath: string, caption?: string): Promise<void>;
   /** Manager-mode bots receive managed-bot creation/token updates (optional) */
   onManagedBot?(cb: (info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>): void;
 }
@@ -129,6 +133,10 @@ export interface HeartbeatConfig {
   /** "same" | model id like "anthropic/claude-haiku-4-5" */
   model?: string;
   quietHours?: { from: string; to: string };
+  /** Adaptive wakeups: shortest gap the agent may request for its next beat (default "5m") */
+  minInterval?: string;
+  /** Longest gap the agent may stretch its next beat to (default "12h") */
+  maxInterval?: string;
 }
 
 export interface AgentManifest {
@@ -148,6 +156,12 @@ export interface AgentManifest {
   /** Host capability ids. Omit for the conservative default set; opt in to
    * external-data or mutation capabilities explicitly per agent. */
   capabilities?: string[];
+  /** Speech privacy policy. External STT is denied unless both the provider is
+   * listed here and allowExternalStt is true. Defaults to local providers only. */
+  speech?: {
+    sttProviders?: Array<"whisperkit" | "local_whisper" | "groq">;
+    allowExternalStt?: boolean;
+  };
   heartbeat?: HeartbeatConfig;
   /** goal-driven skill self-evolution (Hermes-style propose → gate → eval → apply) */
   evolution?: { enabled?: boolean; interval?: string; model?: string };

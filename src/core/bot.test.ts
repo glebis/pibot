@@ -46,6 +46,7 @@ class MockTransport implements Transport {
   actionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   mediaCb: ((media: import("./types.js").IncomingMedia) => Promise<void>) | null = null;
   mediaSeen: import("./types.js").IncomingMedia[] = [];
+  speechSeen: Array<{ kind: "voice" | "audio"; chatId: string; filePath: string; caption?: string }> = [];
 
   constructor(name = "mock", boundAgentId?: string) {
     this.name = name;
@@ -59,6 +60,12 @@ class MockTransport implements Transport {
   }
   async notifyError(chatId: string, message: string): Promise<void> {
     this.pushed.push({ chatId, opts: { text: `⚠︎ ${message}` } });
+  }
+  async sendVoice(chatId: string, filePath: string, caption?: string): Promise<void> {
+    this.speechSeen.push({ kind: "voice", chatId, filePath, caption });
+  }
+  async sendAudio(chatId: string, filePath: string, caption?: string): Promise<void> {
+    this.speechSeen.push({ kind: "audio", chatId, filePath, caption });
   }
   onMessage(cb: (text: string, chatId: string, reply?: ReplyContext) => Promise<void>): void {
     this.messageCb = cb;
@@ -154,8 +161,11 @@ function makeBot() {
     configured: vi.fn(() => true),
     transcribe: vi.fn(async () => ({ ok: true, text: "spoken words", provider: "groq" })),
   };
-  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never });
-  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt, emitSessionEvent };
+  const audioMedia = {
+    prepare: vi.fn(async (media: IncomingMedia) => ({ ok: true, filePath: media.filePath, durationSec: media.durationSec ?? 1, cleanup: vi.fn(async () => {}) })),
+  };
+  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never, audioMedia: audioMedia as never });
+  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt, audioMedia, emitSessionEvent };
 }
 
 describe("PiBot commands", () => {
@@ -271,12 +281,50 @@ describe("PiBot commands", () => {
     expect(hooks.listAgents()).toEqual([{ id: "assistant", description: undefined }]);
   });
 
+  it("binds speech delivery to the exact invoking transport and chat", async () => {
+    await t.transport.say("hello");
+    const sendSpeech = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls[0][7] as (
+      transport: string,
+      chatId: string,
+      kind: "voice" | "audio",
+      filePath: string,
+      caption?: string,
+    ) => Promise<void>;
+
+    expect(sendSpeech).toBeTypeOf("function");
+    await sendSpeech("mock", "42", "voice", "/tmp/generated.ogg", "requested");
+    expect(t.transport.speechSeen).toEqual([{ kind: "voice", chatId: "42", filePath: "/tmp/generated.ogg", caption: "requested" }]);
+    await expect(sendSpeech("mock", "different", "voice", "/tmp/generated.ogg")).rejects.toThrow(/invoking chat/i);
+  });
+
   it("transcribes voice notes and routes them like typed text", async () => {
     await t.transport.sayMedia({ kind: "voice", durationSec: 12 });
     expect(t.promptSpy).toHaveBeenCalledTimes(1);
     const arg = t.promptSpy.mock.calls[0][0] as string;
     expect(arg).toContain("🎙 voice note (12s)");
     expect(arg).toContain("spoken words");
+  });
+
+  it("uses the resolved agent speech policy for video-note transcription", async () => {
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => id === "assistant"
+      ? { id, dir: "/tmp/fake-assistant", manifest: { name: id, speech: { sttProviders: ["whisperkit", "groq"], allowExternalStt: true } } }
+      : undefined);
+
+    await t.transport.sayMedia({ kind: "video_note", durationSec: 9, filePath: "/tmp/note.mp4" });
+
+    expect(t.stt.configured).toHaveBeenCalledWith({ providers: ["whisperkit", "groq"], allowExternal: true });
+    expect(t.stt.transcribe).toHaveBeenCalledWith("/tmp/note.mp4", { providers: ["whisperkit", "groq"], allowExternal: true });
+    expect(t.promptSpy.mock.calls[0][0]).toContain("video note (9s)");
+  });
+
+  it("does not expose private media paths when validation fails", async () => {
+    t.audioMedia.prepare.mockResolvedValueOnce({ ok: false, error: "ffprobe failed for /private/media/secret-chat-id.ogg" } as never);
+
+    await t.transport.sayMedia({ kind: "voice", filePath: "/private/media/secret-chat-id.ogg" });
+
+    expect(t.transport.lastText()).toContain("Audio validation failed");
+    expect(t.transport.lastText()).not.toContain("/private/media");
+    expect(t.transport.lastText()).not.toContain("secret-chat-id");
   });
 
   it("answers pending questions from voice transcripts before promoting to the agent", async () => {
@@ -396,6 +444,32 @@ describe("PiBot fire delivery", () => {
       false
     );
     expect(t.heartbeat.tick).toHaveBeenCalledWith("assistant");
+  });
+
+  it("heartbeat jobs adopt an agent-requested adaptive wakeup", async () => {
+    const t = makeBot();
+    (t.heartbeat as unknown as { takeNextWakeup: ReturnType<typeof vi.fn> }).takeNextWakeup = vi.fn(() => 2 * 3600e3);
+    const job = {
+      id: "hb:assistant", agentId: "assistant", chat: { transport: "internal", chatId: "heartbeat" },
+      title: "heartbeat", kind: "heartbeat" as const, dueAt: Date.now(), wake: "normal" as const,
+      delivery: "direct" as const, status: "pending" as const, createdAt: 0, firedCount: 1, internal: true,
+      repeat: { everyMs: 45 * 60e3 },
+    };
+    await t.bot.deliverFire(job, false);
+    expect((t.heartbeat as unknown as { takeNextWakeup: ReturnType<typeof vi.fn> }).takeNextWakeup).toHaveBeenCalledWith("assistant");
+    expect(job.repeat.everyMs).toBe(2 * 3600e3);
+  });
+
+  it("heartbeat jobs without an adaptive request keep their base rhythm", async () => {
+    const t = makeBot();
+    const job = {
+      id: "hb:assistant", agentId: "assistant", chat: { transport: "internal", chatId: "heartbeat" },
+      title: "heartbeat", kind: "heartbeat" as const, dueAt: Date.now(), wake: "normal" as const,
+      delivery: "direct" as const, status: "pending" as const, createdAt: 0, firedCount: 1, internal: true,
+      repeat: { everyMs: 45 * 60e3 },
+    };
+    await t.bot.deliverFire(job, false);
+    expect(job.repeat.everyMs).toBe(45 * 60e3);
   });
 
   it("heartbeat speak reaches all chats of the agent", async () => {
