@@ -98,6 +98,8 @@ Every agent's manifest sets a rhythm (`interval`, cheap `model`, `quietHours`). 
 
 **Adaptive wakeups (self-paced rhythm, from Ouroboros's `set_next_wakeup`):** the heartbeat decision can also include `wakeup` ("10m"…"12h") — the agent compresses the next gap when something is brewing and stretches it when everything is quiet, instead of firing on a fixed drumbeat. Hard bounds come from the global clamp (5m–12h), narrowed per-agent via manifest `heartbeat.minInterval` / `heartbeat.maxInterval` (editable in the dashboard). Skipped ticks (quiet hours, snooze, backoff) always fall back to the base rhythm.
 
+**Maintenance rotation (one item per wakeup):** each tick's digest ends with a maintenance panel — freshness of `memory/MEMORY.md`, `AGENTS.md`, memory notes, and the last maintenance entry (Ouroboros CONSCIOUSNESS.md pattern). The agent services **at most one** stale item per tick and rotates, recording what it did via the `maintain` field: a one-line durable note appended to `memory/maintenance.jsonl` (also logged as a `maintenance` event, visible to you in the dashboard event tail). Everything fresh → silence + longer wakeup; maintenance never breaks a tick.
+
 ## Self-evolution (Hermes-style, pibot-native)
 
 Adapted from [NousResearch/hermes-agent-self-evolution](https://github.com/NousResearch/hermes-agent-self-evolution) (GEPA loop: propose → evaluate → guardrails → apply) and the pi ecosystem's existing packages (`pi-agent-skill-evolution`, `pk-pi-hermes-evolve`, `@artale/pi-evolve`, `pi-skill-evolution`) — none of which fit pibot's per-agent architecture, so the loop is built in:

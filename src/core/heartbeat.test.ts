@@ -3,9 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { nextActs } = vi.hoisted(() => ({ nextActs: [] as Array<null | { speak?: string; escalate?: string; note?: string; wakeup?: string }> }));
+const { nextActs } = vi.hoisted(() => ({ nextActs: [] as Array<null | { speak?: string; escalate?: string; note?: string; wakeup?: string; maintain?: string }> }));
 
-function queueActs(acts: Array<null | { speak?: string; escalate?: string; note?: string; wakeup?: string }>) {
+function queueActs(acts: Array<null | { speak?: string; escalate?: string; note?: string; wakeup?: string; maintain?: string }>) {
   nextActs.length = 0;
   nextActs.push(...acts);
 }
@@ -43,7 +43,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   };
 });
 
-import { HeartbeatEngine } from "./heartbeat.js";
+import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine } from "./heartbeat.js";
 import type { LoadedAgent } from "./agent-manager.js";
 import type { HeartbeatHost } from "./heartbeat.js";
 import * as PiAgent from "@earendil-works/pi-coding-agent";
@@ -358,6 +358,105 @@ describe("HeartbeatEngine backoff", () => {
       queueActs([{}]);
       await engine.tick(agent.id);
       expect(engine.takeNextWakeup(agent.id)).toBeNull();
+    });
+  });
+
+  describe("maintenance rotation", () => {
+    let dir: string;
+    beforeEach(() => {
+      dir = tmpAgentDir();
+      nextActs.length = 0;
+    });
+    afterEach(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+      nextActs.length = 0;
+      vi.mocked(PiAgent.createAgentSession).mockClear();
+      vi.mocked(PiAgent.getAgentDir).mockClear();
+    });
+
+    it("heartbeat_act maintain persists a durable note and logs a maintenance event", async () => {
+      const agent = makeAgent(dir);
+      const { engine, events } = makeEngine(agent, dir);
+      queueActs([{ maintain: "memory: Anna prefers voice notes" }]);
+      await engine.tick(agent.id);
+      const file = path.join(dir, "memory", "maintenance.jsonl");
+      expect(fs.existsSync(file)).toBe(true);
+      const line = JSON.parse(fs.readFileSync(file, "utf8").trim());
+      expect(line.note).toContain("voice notes");
+      expect(line.ts).toBeTruthy();
+      const calls = (events.log as ReturnType<typeof vi.fn>).mock.calls as Array<[string, string, string]>;
+      expect(calls.some((c) => c[1] === "maintenance" && c[2].includes("voice notes"))).toBe(true);
+    });
+
+    it("maintain alone does not deliver or escalate", async () => {
+      const agent = makeAgent(dir);
+      const { engine, host } = makeEngine(agent, dir);
+      queueActs([{ maintain: "persona: noticed drift into report mode" }]);
+      await engine.tick(agent.id);
+      expect((host.deliverToAgent as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0);
+      expect((host.escalateToAgent as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0);
+    });
+
+    it("report is included in the digest for heartbeat agents only", () => {
+      const schedule = { list: vi.fn(() => []) } as unknown as import("./scheduler.js").Scheduler;
+      const events = { tail: vi.fn(() => []) } as unknown as import("./events.js").EventLog;
+      const hbAgent = makeAgent(dir);
+      expect(buildHeartbeatDigest(hbAgent, schedule, events)).toContain("# Maintenance");
+      const plain: LoadedAgent = { id: "other", dir, manifest: { name: "other" } };
+      expect(buildHeartbeatDigest(plain, schedule, events)).not.toContain("# Maintenance");
+    });
+  });
+
+  describe("maintenance panel", () => {
+    let dir: string;
+    beforeEach(() => {
+      dir = tmpAgentDir();
+      nextActs.length = 0;
+    });
+    afterEach(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    function utime(p: string, daysAgo: number) {
+      const t = new Date(Date.now() - daysAgo * 86_400e3);
+      fs.utimesSync(p, t, t);
+    }
+
+    it("reports freshness, notes count, and the rotation rule", () => {
+      fs.mkdirSync(path.join(dir, "memory"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "memory", "MEMORY.md"), "x");
+      fs.writeFileSync(path.join(dir, "memory", "notes-placeholder"), "");
+      fs.utimesSync(path.join(dir, "memory", "MEMORY.md"), new Date(Date.now() - 2 * 3600e3), new Date(Date.now() - 2 * 3600e3));
+      utime(path.join(dir, "AGENTS.md"), 6);
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toContain("# Maintenance");
+      expect(panel).toContain("AT MOST ONE");
+      expect(panel).toContain("MEMORY.md");
+      expect(panel).toMatch(/2h ago/);
+      expect(panel).toMatch(/AGENTS\.md/);
+      expect(panel).toMatch(/6d ago/);
+    });
+
+    it("marks missing files and shows the last maintenance entry", () => {
+      fs.mkdirSync(path.join(dir, "memory"), { recursive: true });
+      const journal = path.join(dir, "memory", "maintenance.jsonl");
+      const ts = new Date(Date.now() - 5 * 3600e3).toISOString();
+      fs.writeFileSync(journal, JSON.stringify({ ts, note: "memory: consolidated calendar lessons" }) + "\n");
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toContain("(missing)");
+      expect(panel).toContain("last maintenance");
+      expect(panel).toContain("consolidated calendar lessons");
+      expect(panel).toMatch(/5h ago/);
+    });
+
+    it("handles empty agents without crashing", () => {
+      const empty = fs.mkdtempSync(path.join(path.dirname(dir), "pibot-empty-"));
+      try {
+        const panel = buildMaintenancePanel(empty);
+        expect(panel).toContain("(missing)");
+      } finally {
+        fs.rmSync(empty, { recursive: true, force: true });
+      }
     });
   });
 });

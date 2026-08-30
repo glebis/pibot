@@ -18,7 +18,7 @@ import type { ModelCascade } from "./cascade.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
-import { errorMessage, fmtWhen, inQuietHours, parseDuration, readJson, truncate, writeJsonAtomic } from "./util.js";
+import { ensureDir, errorMessage, fmtWhen, inQuietHours, parseDuration, readJson, truncate, writeJsonAtomic } from "./util.js";
 
 /** Adaptive-wakeup bounds (Ouroboros set_next_wakeup pattern): the agent may
  *  compress the next gap when something is brewing, stretch it when idle.
@@ -57,6 +57,11 @@ Adaptive rhythm — you pace yourself:
 - Request a SHORTER delay when something interesting or unfinished is brewing that does not yet justify interrupting the user. Request a LONGER one (hours) when nothing is happening and everything is fresh — this saves budget.
 - Omit wakeup to keep your normal cadence. Hard floor and ceiling are enforced automatically, so you cannot disable yourself.
 
+Maintenance rotation — keep your own house in order:
+- The digest includes a maintenance panel of freshness checks (memory, persona, notes, maintenance journal).
+- Service AT MOST ONE stale item per tick, rotating across ticks — never everything at once. What you did gets recorded via heartbeat_act "maintain" (a one-line durable note into your maintenance journal).
+- If everything is fresh, record nothing and prefer a longer wakeup. Never let the same item stay stale for many cycles.
+
 Call the heartbeat_act tool exactly once with your decision.`;
 
 interface HeartbeatAct {
@@ -65,6 +70,88 @@ interface HeartbeatAct {
   note?: string;
   /** requested delay until this agent's next heartbeat tick (e.g. "10m", "3h") */
   wakeup?: string;
+  /** durable one-line record of a maintenance action (Ouroboros rotation pattern) */
+  maintain?: string;
+}
+
+// ─── Maintenance rotation (Ouroboros CONSCIOUSNESS.md pattern) ──────────────
+
+const MAINTENANCE_JOURNAL = path.join("memory", "maintenance.jsonl");
+
+function ageAgo(ms: number, now: number): string {
+  const s = Math.max(0, Math.floor((now - ms) / 1000));
+  if (s < 90) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 90) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 36) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+function fileAge(p: string, now: number): string | null {
+  try {
+    return ageAgo(fs.statSync(p).mtimeMs, now);
+  } catch {
+    return null;
+  }
+}
+
+/** Appends a durable maintenance note to memory/maintenance.jsonl (best-effort). */
+export function recordMaintenanceNote(agentDir: string, note: string): void {
+  try {
+    ensureDir(path.join(agentDir, "memory"));
+    const entry = JSON.stringify({ ts: new Date().toISOString(), note: truncate(note.trim(), 300) });
+    fs.appendFileSync(path.join(agentDir, MAINTENANCE_JOURNAL), entry + "\n");
+  } catch {
+    /* best effort — maintenance must never break a tick */
+  }
+}
+
+/**
+ * Pure maintenance-rotation panel for the heartbeat digest (Ouroboros
+ * CONSCIOUSNESS.md pattern): every tick the agent checks freshness, services
+ * AT MOST ONE stale item, and rotates — never everything at once. When
+ * everything is fresh, stay silent and prefer a longer adaptive wakeup.
+ */
+export function buildMaintenancePanel(agentDir: string, now = Date.now()): string {
+  const memoryAge = fileAge(path.join(agentDir, "memory", "MEMORY.md"), now);
+  const personaAge = fileAge(path.join(agentDir, "AGENTS.md"), now);
+  const journalAge = fileAge(path.join(agentDir, MAINTENANCE_JOURNAL), now);
+
+  let notes = "(missing)";
+  try {
+    const files = fs.readdirSync(path.join(agentDir, "memory", "notes")).filter((f) => f.endsWith(".md"));
+    if (!files.length) {
+      notes = "none yet";
+    } else {
+      const newest = Math.max(...files.map((f) => fs.statSync(path.join(agentDir, "memory", "notes", f)).mtimeMs));
+      notes = `${files.length} note${files.length === 1 ? "" : "s"}, newest ${ageAgo(newest, now)}`;
+    }
+  } catch {
+    notes = "(missing)";
+  }
+
+  const lines = [
+    "# Maintenance (service AT MOST ONE stale item per tick — rotate, never everything at once)",
+    `- memory (memory/MEMORY.md): ${memoryAge ? `updated ${memoryAge}` : "(missing)"} — the durable memory your digest carries`,
+    `- persona (AGENTS.md): ${personaAge ? `updated ${personaAge}` : "(missing)"} — one paragraph on how you changed lately keeps it alive`,
+    `- notes (memory/notes): ${notes} — durable facts, decisions, preferences`,
+  ];
+  if (journalAge) {
+    let last = "";
+    let age = journalAge;
+    try {
+      const lines = fs.readFileSync(path.join(agentDir, MAINTENANCE_JOURNAL), "utf8").trim().split("\n").filter(Boolean);
+      const entry = JSON.parse(lines[lines.length - 1]) as { ts?: string; note?: string };
+      if (entry.ts) age = ageAgo(Date.parse(entry.ts), now);
+      if (entry.note) last = ` — "${truncate(entry.note, 80)}"`;
+    } catch {
+      /* unreadable journal — show file age only */
+    }
+    lines.push(`- last maintenance: ${age}${last}`);
+  }
+  lines.push("If everything is fresh: record nothing, stay quiet, prefer a longer wakeup. A repeating failure pattern is data — record it before it fades.");
+  return lines.join("\n");
 }
 
 interface PersistedHeartbeatAgentState {
@@ -181,6 +268,7 @@ export class HeartbeatEngine {
           ? {}
           : {
               wakeup: Type.Optional(Type.String({ description: 'Delay until your next wakeup, e.g. "10m", "45m", "2h". Shorter when something is brewing, longer when idle. Omit to keep the normal rhythm.' })),
+              maintain: Type.Optional(Type.String({ description: "One-line durable record of a maintenance action you just did (e.g. 'memory: learned Anna prefers voice notes'). Service at most ONE stale item per tick; rotate." })),
             }),
       }),
       execute: async (_toolCallId, params) => {
@@ -263,7 +351,12 @@ export class HeartbeatEngine {
       if (ms != null) this.pendingWakeup.set(agent.id, ms);
     }
 
-    const summary = act.speak ?? act.escalate ?? act.note ?? "(silent)";
+    if (!opts.brief && act.maintain) {
+      recordMaintenanceNote(agent.dir, act.maintain);
+      this.deps.events.log(agent.id, "maintenance", act.maintain);
+    }
+
+    const summary = act.speak ?? act.escalate ?? act.note ?? act.maintain ?? "(silent)";
     this.deps.events.log(agent.id, "heartbeat", summary);
 
     if (act.escalate) {
@@ -393,6 +486,7 @@ export function buildHeartbeatDigest(
     const minI = agent.manifest.heartbeat.minInterval ?? "5m";
     const maxI = agent.manifest.heartbeat.maxInterval ?? "12h";
     parts.push(`# Heartbeat rhythm\nBase cadence: every ${agent.manifest.heartbeat.interval}. You may request your next wakeup sooner or later via "wakeup" in heartbeat_act (allowed: ${minI} … ${maxI}).`);
+    parts.push(buildMaintenancePanel(agent.dir));
   }
 
   return parts.join("\n\n");
