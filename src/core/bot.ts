@@ -912,26 +912,34 @@ export class PiBot implements HeartbeatHost {
   }
 
   /** Manager-mode: register a pending sub-bot creation + push the deep link into the agent's chats */
-  async requestSubBotCreation(agentId: string): Promise<void> {
+  async requestSubBotCreation(agentId: string, fromChat?: { transport: string; chatId: string }): Promise<void> {
     const agent = this.deps.agents.getAgent(agentId);
     if (!agent) throw new Error(`unknown agent "${agentId}"`);
     if (!this.managerMode()) throw new Error("manager mode is off — enable bot management mode for @pimother_bot in BotFather's mini app");
     const suggestedUsername = suggestedSubBotUsername(agentId, this.telegramUsername());
     this.pendingSubBots.set(agentId, agentId);
     const link = this.subBotDeepLink(agentId, suggestedUsername, agentId);
+    const card = {
+      text: `🧬 Create **@${suggestedUsername}** for ${agentId}:`,
+      card: { text: "", buttons: [{ label: `Create @${suggestedUsername}`, action: `url:${link}`, url: link }] },
+    };
     await this.deliverToAgent(agentId, [
       `Tap to give **${agentId}** its own Telegram identity:`,
       ``,
       `Telegram pre-fills @${suggestedUsername} — confirm and I'll fetch the token and wire it automatically. The bot will be restricted to you.`,
     ].join("\n"));
-    // deep-link URL button into the agent's registered chats
+    // deep-link URL button into the agent's registered chats…
     for (const ck of this.agentChats.get(agentId) ?? new Set<string>()) {
       const idx = ck.lastIndexOf(":");
       const t = this.transports.get(ck.slice(0, idx));
-      if (t) void t.push(ck.slice(idx + 1), {
-        text: `🧬 Create **@${suggestedUsername}** for ${agentId}:`,
-        card: { text: "", buttons: [{ label: `Create @${suggestedUsername}`, action: `url:${this.subBotDeepLink(agentId, suggestedUsername, agent.id)}`, url: this.subBotDeepLink(agentId, suggestedUsername, agent.id) }] },
-      }).catch(() => {});
+      if (t) void t.push(ck.slice(idx + 1), card).catch(() => {});
+    }
+    // …and always into the chat that asked (the requesting chat may not be registered yet)
+    if (fromChat) {
+      const t = this.transports.get(fromChat.transport);
+      if (t && !((this.agentChats.get(agentId) ?? new Set()).has(`${fromChat.transport}:${fromChat.chatId}`))) {
+        await t.push(fromChat.chatId, card).catch(() => {});
+      }
     }
   }
 

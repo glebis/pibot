@@ -42,7 +42,7 @@ export interface CommandContext {
     subBotFor(agentId: string): { username?: string } | undefined;
     attachSubBot(agentId: string, token: string, allowedChats?: string[]): Promise<{ ok: boolean; botName?: string; error?: string }>;
     detachSubBot(agentId: string): Promise<boolean>;
-    requestSubBotCreation(agentId: string): Promise<void>;
+    requestSubBotCreation(agentId: string, fromChat?: { transport: string; chatId: string }): Promise<void>;
   };
   currentAgent(ck: string): string | undefined;
   chatKey(t: Transport, chatId: string): string;
@@ -309,8 +309,8 @@ export function createCommandHandler(ctx: CommandContext) {
           return;
         }
         try {
-          await deps.telegram.requestSubBotCreation(target);
-          await reply(`🧬 **${target}** — tap the Create link in this chat. Telegram creates the bot under my management, hands me the token, and wires everything — no tokens touch anyone's hands.`);
+          await deps.telegram.requestSubBotCreation(target, { transport: t.name, chatId });
+          return;
         } catch (e) {
           await reply(`⚠︎ ${errorMessage(e)}`);
         }
