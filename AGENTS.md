@@ -23,6 +23,43 @@ bd close <id>         # Complete work
 bd dolt push          # Push beads data to remote
 ```
 
+## Runtime diagnostics
+
+- Daemon stdout/stderr: `/Users/glebkalinin/ai_projects/pibot/data/daemon.log`
+- Durable model circuit-breaker and dead-letter state: `/Users/glebkalinin/ai_projects/pibot/data/cascade-state.json`
+- PiBot-dev turn logs: `${PIBOT_AGENTS_DIR:-~/.local/share/pibot/agents}/pibot-dev/sessions/*.jsonl`
+- PiBot-dev compact events: `${PIBOT_AGENTS_DIR:-~/.local/share/pibot/agents}/pibot-dev/state/events.jsonl`
+
+Treat cascade, session, and event files as private: they can contain user message text. For “couldn't reach any model” incidents, correlate the daemon error category with the persisted circuit state; restarting alone does not clear persisted breakers or queued messages.
+
+### Operational safety
+
+- Inspect private runtime files narrowly: filter by bounded time, agent, event type, or error category. Do not print whole session, cascade, event, settings, or environment files into tool output.
+- Treat queues, circuit breakers, heartbeat deduplication/fatigue state, and replay blocks as durable state. A restart is not a reset and must never be used as a substitute for diagnosis.
+- Do not clear, flush, reorder, rearm, delete, or reroute queues, schedules, breakers, heartbeat state, or replay blocks unless the user explicitly authorizes that exact mutation. Ambiguous or partially delivered work stays blocked for review.
+- For proactive-message incidents, establish three facts independently: the causal trigger, the content origin, and the delivery/replay route. Do not infer one from another merely because their schedules align.
+- Heartbeats are silent when there is no new meaningful user-relevant information. Never add automatic replay, repeated unchanged output, or automatic avatar/profile rotation.
+
+### Deployment and runtime health
+
+- Commit, push, deploy, or restart only with explicit user authorization. Preserve unrelated work and stage exact paths only.
+- Restart the existing launchd job at most once per authorized deployment. Afterward verify one active job with a successful exit state, one dashboard listener bound to loopback, an authentication challenge for unauthenticated dashboard access, every configured Telegram poller connected, and no immediate fatal, replay, or delivery error.
+- The launchd wrapper and its runtime child may both appear in process listings; determine duplicate service instances from the launchd job, PiBot lock, listeners, and poller conflicts rather than raw process count alone.
+
+### Agents, bots, capabilities, and providers
+
+- Skills, capabilities, model policy, and provider allowlists belong to an agent. A Telegram bot transport binds to an agent; there is no bot-specific capability override unless the architecture explicitly adds one.
+- The same agent reached through multiple bot transports exposes the same capability set. Any mutation must still target only the invoking transport. Resolve the current main-bot chat-to-agent mapping from runtime state instead of assuming the default agent.
+- Live agent manifests, sessions, memories, skills, and generated artifacts are private runtime state outside Git. Preserve owner-only permissions and never copy them into the repository merely to make a commit.
+- Never print decrypted settings, tokens, keys, credential values, or secret-bearing environment content. Presence/health checks must return provider and status metadata only.
+- Credentials do not grant an agent provider access by themselves: provider use remains explicitly allowed by agent policy. Discovery and status checks must not make external or paid calls; external generation and profile mutations require explicit owner intent.
+
+### Dirty worktrees and Beads
+
+- Check `git status` before and after work. Never reset, checkout, overwrite, stage, or commit unrelated user/agent changes.
+- Stage explicit files or index hunks only; never use broad staging in a dirty worktree. Report remaining staged and unstaged changes separately.
+- `.beads/issues.jsonl` is a passive export and may contain reordering or other agents' updates. Use the Beads database as source of truth and, when a Git record is required, stage only the task-specific record rather than the whole unrelated export delta.
+
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
