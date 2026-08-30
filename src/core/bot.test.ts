@@ -96,8 +96,8 @@ class MockTransport implements Transport {
     this.mediaSeen.push(full);
     await this.mediaCb?.(full);
   }
-  async act(action: string): Promise<void> {
-    await this.actionCb?.(action, this.chatId);
+  async act(action: string): Promise<string | void> {
+    return await this.actionCb?.(action, this.chatId);
   }
 }
 
@@ -382,6 +382,32 @@ describe("PiBot commands", () => {
   it("rejects switching to unknown agents", async () => {
     await t.transport.say("/agent ghost");
     expect(t.transport.lastText()).toContain("No agent");
+  });
+
+  it("switches agents via the born-card action and confirms in the toast", async () => {
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      const known = { fitness: { id: "fitness", dir: "/tmp/fake-fitness", manifest: { name: "fitness" } } } as Record<string, unknown>;
+      const fallback = { id: "assistant", dir: "/tmp/fake-assistant", manifest: { name: "assistant" } };
+      return (known as Record<string, unknown>)[id] ?? (id === "assistant" ? fallback : undefined);
+    });
+    // switch away, then back via the card action
+    await t.transport.say("/agent fitness");
+    await t.transport.act("agt:assistant");
+    await t.transport.say("hello again");
+    expect((t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0]).toBe("assistant");
+    // unknown agent handled gracefully — toast, not a push
+    const toast = await t.transport.act("agt:ghost");
+    expect(String(toast)).toContain("doesn't exist");
+  });
+
+  it("posts an interactive card on agent creation (direct path)", async () => {
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => ({ id, dir: `/tmp/fake-${id}`, manifest: { name: id, heartbeat: { enabled: true, interval: "45m" } } }));
+    await t.transport.say("/newagent runner Run with me every morning");
+    const card = t.transport.lastCard();
+    expect(card).toBeDefined();
+    const actions = card!.map((b) => b.action);
+    expect(actions).toContain("agt:runner");
+    expect(actions).toContain("subbot:runner");
   });
 });
 

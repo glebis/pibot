@@ -805,6 +805,21 @@ export class PiBot implements HeartbeatHost {
       this.deps.events.log("system", "system", `question tap: ${action} → ${answer ? `resolved: ${answer.choice}` : "stale (ignored)"}`);
       return answer ? `✅ ${answer.choice}` : "⏳ This question expired";
     }
+    if (action.startsWith("agt:")) {
+      const name = action.slice(4);
+      if (!this.deps.agents.getAgent(name)) return "That agent doesn't exist (or was renamed).";
+      this.rememberChat(name, this.chatKey(t, chatId));
+      this.deps.events.log(name, "message", `chat ${chatId} switched to agent via card`);
+      return `✅ Now talking to **${name}**`;
+    }
+    if (action.startsWith("subbot:")) {
+      const name = action.slice(7);
+      const fresh = this.deps.agents.getAgent(name);
+      if (!fresh) return "That agent doesn't exist (or was renamed).";
+      this.deps.events.log(name, "message", `subbot setup requested via card (chat ${chatId})`);
+      void this.setupSubBot(t, chatId, fresh).catch((e) => console.error("[bot] subbot card setup failed:", e));
+      return `Setting up ${name}'s Telegram identity…`;
+    }
     if (!action.startsWith("scd:")) return;
     const [, id, verb] = action.split(":");
     const job = this.deps.scheduler.get(id);
@@ -987,17 +1002,15 @@ export class PiBot implements HeartbeatHost {
           ``,
           `You're talking to it now. Its persona, memory, and skills are private runtime data editable on the dashboard.`,
         ].join("\n"),
+        card: {
+          text: "",
+          buttons: [
+            { label: `🤖 talk to ${name} later`, action: `agt:${name}` },
+            { label: "🪪 own Telegram identity", action: `subbot:${name}` },
+          ],
+        },
       });
       void t.push(chatId, { text: `Say hi to **${name}** — try: "what can you do for me?"` });
-
-      // 5. own Telegram identity (optional)
-      const wantBot = await ask(`Give ${name} its own Telegram bot? (separate chat, its own @identity)`, [
-        "yes — create it now",
-        "skip for now",
-      ]);
-      if (wantBot?.startsWith("yes") && fresh) {
-        await this.setupSubBot(t, chatId, fresh);
-      }
     } finally {
       this.wizardChats.delete(ck);
     }

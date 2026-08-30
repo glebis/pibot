@@ -137,9 +137,16 @@ export function createCommandHandler(ctx: CommandContext) {
         ctx.ensureHeartbeatJob(agent);
         ctx.ensureEvolutionJob(agent);
         ctx.rememberChat(agent.id, ck);
-        await reply(
-          `Born: **${agent.id}** 🎉\nPersona: ${agent.dir}/AGENTS.md · plugins: agent.json · memory: memory/\nYou're talking to it now. It wakes every ${agent.manifest.heartbeat?.interval ?? "45m"}.`
-        );
+        await t.push(chatId, {
+          text: `Born: **${agent.id}** 🎉\nPersona: ${agent.dir}/AGENTS.md · plugins: agent.json · memory: memory/\nYou're talking to it now. It wakes every ${agent.manifest.heartbeat?.interval ?? "45m"}.`,
+          card: {
+            text: "",
+            buttons: [
+              { label: `🤖 talk to ${agent.id} later`, action: `agt:${agent.id}` },
+              { label: "🪪 own Telegram identity", action: `subbot:${agent.id}` },
+            ],
+          },
+        });
         return;
       }
 
