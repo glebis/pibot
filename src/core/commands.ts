@@ -289,6 +289,34 @@ export function createCommandHandler(ctx: CommandContext) {
         return;
       }
 
+      case "subbot": {
+        const target = (arg || agentId || "").trim().toLowerCase();
+        if (!target) {
+          await reply("Usage: /subbot <agent-id> — give that agent its own Telegram identity. /agents for the list.");
+          return;
+        }
+        if (!deps.agents.getAgent(target)) {
+          await reply(`No agent "${target}". /agents for the list.`);
+          return;
+        }
+        if (!deps.telegram) {
+          await reply("Telegram transport is not wired in this build.");
+          return;
+        }
+        const existing = deps.telegram.subBotFor(target);
+        if (existing?.username) {
+          await reply(`**${target}** already has its own bot: @${existing.username.replace("@", "")} — use the dashboard's Detach button first if you want to replace it.`);
+          return;
+        }
+        try {
+          await deps.telegram.requestSubBotCreation(target);
+          await reply(`🧬 **${target}** — tap the Create link in this chat. Telegram creates the bot under my management, hands me the token, and wires everything — no tokens touch anyone's hands.`);
+        } catch (e) {
+          await reply(`⚠︎ ${errorMessage(e)}`);
+        }
+        return;
+      }
+
       case "quit":
         if (t.name === "cli") process.exit(0);
         await reply("/quit only works in the CLI.");
