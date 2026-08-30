@@ -21,15 +21,22 @@ export class EventLog {
   }
 
   log(agentId: string, type: EventEntry["type"], summary: string): void {
-    ensureDir(path.dirname(this.file(agentId)));
+    const file = this.file(agentId);
+    const stateDir = path.dirname(file);
+    const agentDir = path.dirname(stateDir);
+    ensureDir(stateDir);
+    fs.chmodSync(agentDir, 0o700);
+    fs.chmodSync(stateDir, 0o700);
     const entry: EventEntry = { t: Date.now(), type, summary: truncate(summary, 300) };
-    fs.appendFileSync(this.file(agentId), JSON.stringify(entry) + "\n");
+    fs.appendFileSync(file, JSON.stringify(entry) + "\n", { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
     // keep the file bounded
     try {
-      const st = fs.statSync(this.file(agentId));
+      const st = fs.statSync(file);
       if (st.size > 512 * 1024) {
-        const lines = fs.readFileSync(this.file(agentId), "utf8").trimEnd().split("\n");
-        fs.writeFileSync(this.file(agentId), lines.slice(-500).join("\n") + "\n");
+        const lines = fs.readFileSync(file, "utf8").trimEnd().split("\n");
+        fs.writeFileSync(file, lines.slice(-500).join("\n") + "\n", { mode: 0o600 });
+        fs.chmodSync(file, 0o600);
       }
     } catch {
       /* ignore */

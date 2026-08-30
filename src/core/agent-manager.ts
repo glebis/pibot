@@ -62,6 +62,7 @@ export class AgentManager {
       if (!e.isDirectory() || e.name.startsWith("_") || e.name.startsWith(".")) continue;
       const dir = path.join(this.agentsDir, e.name);
       if (!fs.existsSync(path.join(dir, "agent.json"))) continue;
+      fs.chmodSync(dir, 0o700);
       const manifest = { ...defaultManifest(e.name), ...readJson<Partial<AgentManifest>>(path.join(dir, "agent.json"), {}) };
       manifest.name = manifest.name || e.name;
       this.agents.set(e.name, { id: e.name, dir, manifest });

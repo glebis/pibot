@@ -34,4 +34,15 @@ describe("EventLog", () => {
     log.log("b", "message", "two");
     expect(log.tail("a").map((e) => e.summary)).toEqual(["one"]);
   });
+
+  it("keeps runtime event directories and files owner-only", () => {
+    log.log("system", "system", "private event");
+    const agentDir = path.join(dir, "system");
+    const stateDir = path.join(agentDir, "state");
+    const eventFile = path.join(stateDir, "events.jsonl");
+
+    expect(fs.statSync(agentDir).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(stateDir).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(eventFile).mode & 0o777).toBe(0o600);
+  });
 });

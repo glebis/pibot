@@ -37,6 +37,17 @@ describe("AgentManager scaffolding", () => {
     expect(mgr.defaultAgentId()).toBeDefined();
   });
 
+  it("repairs permissions on discovered runtime agent directories", async () => {
+    const agentDir = path.join(dir, "existing");
+    fs.mkdirSync(agentDir, { recursive: true, mode: 0o755 });
+    fs.writeFileSync(path.join(agentDir, "agent.json"), JSON.stringify({ name: "existing" }));
+    fs.chmodSync(agentDir, 0o755);
+
+    await mgr.discover();
+
+    expect(fs.statSync(agentDir).mode & 0o777).toBe(0o700);
+  });
+
   it("createAgent scaffolds manifest, persona, and directories", async () => {
     const err = mgr.createAgent("coach", "You are a strict but kind coach.");
     expect(err).toBeUndefined();
