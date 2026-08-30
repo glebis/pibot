@@ -1,6 +1,9 @@
+import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 import { Bot, type Context } from "grammy";
 import type { InlineKeyboardButton } from "grammy/types";
-import type { Card, PushOptions, ReplyContext, Transport } from "../core/types.js";
+import type { Card, IncomingMedia, PushOptions, ReplyContext, Transport } from "../core/types.js";
 import { truncate } from "../core/util.js";
 
 const TG_LIMIT = 4000;
@@ -66,6 +69,10 @@ function toTelegramHtml(text: string): string {
 }
 
 const QUOTE_MAX = 400;
+const VOICE_MAX_SECONDS = 300;
+const AUDIO_MAX_SECONDS = 1800;
+const DOCUMENT_MAX_BYTES = 20 * 1024 * 1024; // getFile hard limit
+const IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 
 /**
  * Pure reply-context extraction from a raw Telegram `reply_to_message`
@@ -82,6 +89,17 @@ export function replyContextFrom(
   const fromSelf = selfId !== undefined && rt.from?.id === selfId;
   const sender = fromSelf ? "you" : (rt.from?.first_name?.trim() || "someone");
   return { messageId: rt.message_id ?? 0, sender, quoted: truncate(quoted, QUOTE_MAX) };
+}
+
+/** Map a media mime type to a sensible file extension (undefined if unknown). */
+export function extFromMime(mime: string | undefined): string | undefined {
+  const map: Record<string, string> = {
+    "audio/ogg": ".ogg", "audio/opus": ".ogg", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".aac", "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/flac": ".flac",
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "image/heic": ".heic",
+    "application/pdf": ".pdf", "text/plain": ".txt", "text/markdown": ".md",
+  };
+  return mime ? map[mime.toLowerCase().split(";")[0].trim()] : undefined;
 }
 
 export function assertCallbackData(action: string): string {
@@ -129,12 +147,16 @@ export class TelegramTransport implements Transport {
   private outboxByChat = new Map<string, Promise<void>>();
   private lastSentAtByChat = new Map<string, number>();
 
-  constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string; openWhenEmpty?: boolean } = {}) {
+  private onMediaCb: ((media: IncomingMedia) => Promise<void>) | null = null;
+  private mediaDir: string;
+
+  constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string; openWhenEmpty?: boolean; mediaDir?: string } = {}) {
     this.bot = new Bot(token);
     this.allowed = new Set(allowedChats);
     this.openWhenEmpty = opts.openWhenEmpty ?? false;
     this.name = opts.nameSuffix ? `telegram:${opts.nameSuffix}` : "telegram";
     this.boundAgentId = opts.boundAgentId;
+    this.mediaDir = opts.mediaDir ?? "";
 
     this.bot.on("message:text", (ctx: Context) => {
       if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
@@ -145,6 +167,18 @@ export class TelegramTransport implements Transport {
       const reply = replyContextFrom(msg.reply_to_message, this.me?.id);
       // fire-and-forget: agent turns can run long (ask_user blocks) — never stall polling
       void this.onMessageCb(text, String(ctx.chat?.id), reply).catch((e) => console.error("[telegram] message handler:", e));
+    });
+
+    this.bot.on("message:voice", (ctx) => void this.handleMediaMessage(ctx, "voice").catch((e) => console.error("[telegram] voice handler:", e)));
+    this.bot.on("message:audio", (ctx) => void this.handleMediaMessage(ctx, "audio").catch((e) => console.error("[telegram] audio handler:", e)));
+    this.bot.on("message:photo", (ctx) => void this.handleMediaMessage(ctx, "photo").catch((e) => console.error("[telegram] photo handler:", e)));
+    this.bot.on("message:document", (ctx) => void this.handleMediaMessage(ctx, "document").catch((e) => console.error("[telegram] document handler:", e)));
+    // everything else the bot can't process — say so instead of dropping silently
+    this.bot.on("message", async (ctx) => {
+      if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
+      const m = ctx.message;
+      const kind = m?.sticker ? "stickers" : m?.video ? "videos" : m?.video_note ? "video notes" : m?.animation ? "animations" : "this media type";
+      void this.push(String(ctx.chat?.id ?? ""), { text: `I can't process ${kind} yet — send text, a voice note, a photo, or a document.` }).catch(() => {});
     });
 
     this.bot.on("callback_query:data", async (ctx) => {
@@ -245,8 +279,81 @@ export class TelegramTransport implements Transport {
     }
   }
 
-  onMessage(cb: (text: string, chatId: string) => Promise<void>): void {
+  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext) => Promise<void>): void {
     this.onMessageCb = cb;
+  }
+
+  onMedia(cb: (media: IncomingMedia) => Promise<void>): void {
+    this.onMediaCb = cb;
+  }
+
+  /**
+   * Shared media path: validate + download to mediaDir, then hand to the bot.
+   */
+  private async handleMediaMessage(ctx: Context, kind: IncomingMedia["kind"]): Promise<void> {
+    if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
+    if (!this.onMediaCb) return; // bot not wired for media — ignore
+    const m = ctx.message;
+    if (!m) return;
+    const chatId = String(ctx.chat?.id ?? "");
+    if (!this.mediaDir) return; // no media dir configured — degrade to old silent behavior
+
+    let fileId: string | undefined;
+    let durationSec: number | undefined;
+    let mimeType: string | undefined;
+    let fileSize: number | undefined;
+    let ext = ".bin";
+    let resolvedKind: IncomingMedia["kind"] = kind;
+
+    if (m.voice) {
+      if (m.voice.duration > VOICE_MAX_SECONDS) {
+        await ctx.reply(`Voice note is ${m.voice.duration}s — limit is ${VOICE_MAX_SECONDS}s. Split it or type it out.`);
+        return;
+      }
+      fileId = m.voice.file_id; durationSec = m.voice.duration; mimeType = m.voice.mime_type; ext = ".ogg";
+    } else if (m.audio) {
+      if (m.audio.duration > AUDIO_MAX_SECONDS) {
+        await ctx.reply(`Audio is ${m.audio.duration}s — limit is ${AUDIO_MAX_SECONDS}s.`);
+        return;
+      }
+      fileId = m.audio.file_id; durationSec = m.audio.duration; mimeType = m.audio.mime_type; ext = extFromMime(m.audio.mime_type) ?? ".mp3";
+    } else if (m.photo?.length) {
+      fileId = m.photo.at(-1)?.file_id;
+      ext = ".jpg"; // largest size is last
+    } else if (m.document) {
+      const mime = m.document.mime_type ?? "";
+      if ((m.document.file_size ?? 0) > DOCUMENT_MAX_BYTES) {
+        await ctx.reply("Document is too large (limit 20MB).");
+        return;
+      }
+      fileId = m.document.file_id; mimeType = m.document.mime_type; fileSize = m.document.file_size;
+      resolvedKind = IMAGE_MIME.has(mime) ? "photo" : "document";
+      ext = extFromMime(mime)
+        ?? (m.document.file_name?.includes(".") ? m.document.file_name.slice(m.document.file_name.lastIndexOf(".")) : ".bin");
+    }
+    if (!fileId) return;
+
+    const reply = replyContextFrom(m.reply_to_message, this.me?.id);
+    try {
+      const filePath = await this.downloadTelegramFile(fileId, `${chatId}-${m.message_id}-${resolvedKind}${ext}`);
+      await this.onMediaCb({ kind: resolvedKind, chatId, filePath, fileId, caption: m.caption, durationSec, mimeType, fileSize });
+    } catch (e) {
+      console.error("[telegram] media download failed:", e);
+      await ctx.reply("Couldn't download that file — try again.").catch(() => {});
+    }
+  }
+
+  /** Download a Telegram file by id into mediaDir (Telegram getFile API). */
+  private async downloadTelegramFile(fileId: string, destName: string): Promise<string> {
+    fs.mkdirSync(this.mediaDir, { recursive: true });
+    const file = await this.bot.api.getFile(fileId);
+    if (!file.file_path) throw new Error(`getFile returned no path for ${fileId}`);
+    const url = `https://api.telegram.org/file/bot${(this.bot as unknown as { token: string }).token}/${file.file_path}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
+    if (!res.ok) throw new Error(`file download HTTP ${res.status}`);
+    const destPath = path.join(this.mediaDir, destName.replace(/[^\w.-]/g, "_"));
+    await fsp.writeFile(destPath, Buffer.from(await res.arrayBuffer()));
+    return destPath;
   }
 
   onAction(cb: (action: string, chatId: string) => Promise<void>): void {

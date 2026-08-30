@@ -74,6 +74,23 @@ export interface ReplyContext {
   quoted: string;
 }
 
+/** A media message the transport downloaded locally (photo, voice, audio, document). */
+export interface IncomingMedia {
+  kind: "voice" | "audio" | "photo" | "document";
+  /** chat the media arrived in */
+  chatId: string;
+  /** local path of the downloaded file */
+  filePath: string;
+  /** original Telegram file id */
+  fileId: string;
+  caption?: string;
+  /** voice/audio duration in seconds */
+  durationSec?: number;
+  mimeType?: string;
+  /** audio bytes when known (documents) */
+  fileSize?: number;
+}
+
 export interface Transport {
   readonly name: string;
   /** sub-bot transports are bound to exactly one agent */
@@ -85,6 +102,8 @@ export interface Transport {
   /** System-level error notice (agent crashed, bad model, …) */
   notifyError(chatId: string, message: string): Promise<void>;
   onMessage(cb: (text: string, chatId: string, reply?: ReplyContext) => Promise<void>): void;
+  /** Media messages (optional; telegram only). Transport downloads to a local dir first. */
+  onMedia?(cb: (media: IncomingMedia) => Promise<void>): void;
   /** cb may return a short toast string for Telegram callback feedback */
   onAction(cb: (action: string, chatId: string) => Promise<string | void>): void;
   /** Show "typing…" while the agent works (optional) */

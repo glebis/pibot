@@ -16,6 +16,7 @@ import { createWebApp } from "./web.js";
 import { CliTransport } from "./transports/cli.js";
 import { TelegramTransport } from "./transports/telegram.js";
 import { ProviderManager } from "./core/providers.js";
+import { SttService } from "./core/stt.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -130,13 +131,14 @@ async function main(): Promise<void> {
   const allowedChats = config.allowedChats.length
     ? config.allowedChats
     : settings.telegram?.allowedChats ?? [];
+  const mediaDir = path.join(config.dataDir, "media");
   const transports =
     telegramToken && config.transport !== "cli"
-      ? [new TelegramTransport(telegramToken, allowedChats, { openWhenEmpty: config.telegramOpen })]
+      ? [new TelegramTransport(telegramToken, allowedChats, { openWhenEmpty: config.telegramOpen, mediaDir })]
       : [new CliTransport()];
 
   const providerManager = new ProviderManager(modelRuntime);
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore, cascade, providers: providerManager });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService() });
 
   await bot.start();
   scheduler.rearm();

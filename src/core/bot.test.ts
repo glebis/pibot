@@ -10,7 +10,7 @@ import type { HeartbeatEngine } from "./heartbeat.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
 import type { ModelCascade } from "./cascade.js";
-import type { PushOptions, ReplyContext, Schedule, Transport } from "./types.js";
+import type { PushOptions, ReplyContext, Schedule, Transport, IncomingMedia } from "./types.js";
 
 // model cascade stub — chain empty, everything healthy
 function makeCascadeStub() {
@@ -44,6 +44,8 @@ class MockTransport implements Transport {
   typing: Array<[string, boolean]> = [];
   messageCb: ((text: string, chatId: string, reply?: ReplyContext) => Promise<void>) | null = null;
   actionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
+  mediaCb: ((media: import("./types.js").IncomingMedia) => Promise<void>) | null = null;
+  mediaSeen: import("./types.js").IncomingMedia[] = [];
 
   constructor(name = "mock", boundAgentId?: string) {
     this.name = name;
@@ -60,6 +62,9 @@ class MockTransport implements Transport {
   }
   onMessage(cb: (text: string, chatId: string, reply?: ReplyContext) => Promise<void>): void {
     this.messageCb = cb;
+  }
+  onMedia(cb: (media: import("./types.js").IncomingMedia) => Promise<void>): void {
+    this.mediaCb = cb;
   }
   onAction(cb: (action: string, chatId: string) => Promise<void>): void {
     this.actionCb = cb;
@@ -78,6 +83,11 @@ class MockTransport implements Transport {
   }
   async sayReply(text: string, reply: ReplyContext): Promise<void> {
     await this.messageCb?.(text, this.chatId, reply);
+  }
+  async sayMedia(media: Partial<import("./types.js").IncomingMedia>): Promise<void> {
+    const full = { kind: "voice", chatId: this.chatId, filePath: "/tmp/x.ogg", fileId: "f1", ...media } as import("./types.js").IncomingMedia;
+    this.mediaSeen.push(full);
+    await this.mediaCb?.(full);
   }
   async act(action: string): Promise<void> {
     await this.actionCb?.(action, this.chatId);
@@ -135,8 +145,12 @@ function makeBot() {
 
   const transport = new MockTransport();
   const cascade = makeCascadeStub();
-  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade });
-  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir };
+  const stt = {
+    configured: vi.fn(() => true),
+    transcribe: vi.fn(async () => ({ ok: true, text: "spoken words", provider: "groq" })),
+  };
+  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never });
+  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt };
 }
 
 describe("PiBot commands", () => {
@@ -250,6 +264,41 @@ describe("PiBot commands", () => {
       listAgents: expect.any(Function),
     });
     expect(hooks.listAgents()).toEqual([{ id: "assistant", description: undefined }]);
+  });
+
+  it("transcribes voice notes and routes them like typed text", async () => {
+    await t.transport.sayMedia({ kind: "voice", durationSec: 12 });
+    expect(t.promptSpy).toHaveBeenCalledTimes(1);
+    const arg = t.promptSpy.mock.calls[0][0] as string;
+    expect(arg).toContain("🎙 voice note (12s)");
+    expect(arg).toContain("spoken words");
+  });
+
+  it("answers pending questions from voice transcripts before promoting to the agent", async () => {
+    const t2 = makeBot();
+    (t2.stt.transcribe as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, text: "personal", provider: "groq" });
+    const promise = t2.bot.askUser("assistant", { transport: "mock", chatId: "42" }, { text: "Which account?", options: ["client", "personal", "own-account", "unsure"] });
+    await vi.waitFor(() => expect(t2.transport.lastCard()).toBeDefined());
+    await t2.transport.sayMedia({ kind: "voice" });
+    expect(await promise).toMatchObject({ choice: "personal", via: "text" });
+    expect(t2.promptSpy).not.toHaveBeenCalled();
+    fs.rmSync(t2.dir, { recursive: true, force: true });
+  });
+
+  it("references photo files with caption in the prompt", async () => {
+    await t.transport.sayMedia({ kind: "photo", filePath: "/tmp/42-7-photo.jpg", caption: "the whiteboard" });
+    const arg = t.promptSpy.mock.calls[0][0] as string;
+    expect(arg).toContain("📎 photo attached — file: /tmp/42-7-photo.jpg");
+    expect(arg).toContain("caption: the whiteboard");
+    expect(arg).toContain("read tool");
+  });
+
+  it("notifies instead of prompting when transcription fails", async () => {
+    t.stt.transcribe.mockRejectedValueOnce(new Error("network down"));
+    await t.transport.sayMedia({ kind: "voice" });
+    expect(t.promptSpy).not.toHaveBeenCalled();
+    expect(t.transport.lastText()).toContain("Transcription failed");
+    expect(t.transport.lastText()).toContain("network down");
   });
 
   it("switches agents with /agent", async () => {

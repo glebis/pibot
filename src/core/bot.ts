@@ -13,10 +13,11 @@ import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
 import { QuestionBus, type QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
-import type { Card, ChatRef, ReplyContext, Schedule, Transport } from "./types.js";
+import type { Card, ChatRef, IncomingMedia, ReplyContext, Schedule, Transport } from "./types.js";
 import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
+import { SttService } from "./stt.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { classifyModelError, ModelCascade } from "./cascade.js";
 import { devAgentEnabled, DEV_AGENT_ID, scaffoldDevAgent } from "./dev-agent.js";
@@ -65,6 +66,8 @@ export class PiBot implements HeartbeatHost {
       cascade?: ModelCascade;
       /** cloud provider status + subscription/API-key login flows */
       providers?: import("./providers.js").ProviderManager;
+      /** speech-to-text for voice notes (optional; voice degrades without it) */
+      stt?: SttService;
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
@@ -75,6 +78,9 @@ export class PiBot implements HeartbeatHost {
     this.transports.set(t.name, t);
     t.onMessage((text, chatId, reply) => this.handleIncoming(t, chatId, text, reply).catch((e) => console.error("[bot] message error:", e)));
     t.onAction((action, chatId) => this.handleAction(t, chatId, action).catch((e) => console.error("[bot] action error:", e)));
+    if (t.onMedia) {
+      t.onMedia((media) => this.handleMedia(t, media).catch((e) => console.error("[bot] media error:", e)));
+    }
     if (t.onManagedBot) {
       t.onManagedBot(async (info) => this.handleManagedBot(t, info).catch((e) => console.error("[bot] managed bot error:", e)));
     }
@@ -192,7 +198,7 @@ export class PiBot implements HeartbeatHost {
     const allow = allowedChats ?? persisted?.allowedChats ?? secrets.telegram?.allowedChats ?? [];
     // persist only an explicit/persisted choice — inheritance stays live so main-allowlist edits propagate
     const pinned = allowedChats ?? persisted?.allowedChats;
-    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen });
+    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media") });
     let botName: string;
     try {
       botName = await t.verify();
@@ -259,7 +265,7 @@ export class PiBot implements HeartbeatHost {
     if (this.transports.has("telegram")) {
       return { ok: false, error: "Telegram is already enabled — disable it first." };
     }
-    const t = new TelegramTransport(token, allowedChats, { openWhenEmpty: this.deps.config.telegramOpen });
+    const t = new TelegramTransport(token, allowedChats, { openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media") });
     let botName: string;
     try {
       botName = await t.verify();
@@ -367,6 +373,15 @@ export class PiBot implements HeartbeatHost {
   async handleIncoming(t: Transport, chatId: string, raw: string, reply?: ReplyContext): Promise<void> {
     const text = raw.trim();
     if (!text) return;
+    await this.routeUserTurn(t, chatId, text, reply);
+  }
+
+  /**
+   * Full user-turn pipeline for text-like content: quick-actions, slash
+   * commands, pending questions, then the agent. Media turns re-enter here
+   * after transcription/prompt composition.
+   */
+  private async routeUserTurn(t: Transport, chatId: string, text: string, reply?: ReplyContext): Promise<void> {
     const ck = this.chatKey(t, chatId);
     // quick-action keyboard buttons arrive as plain text
     const quick = PiBot.QUICK_ACTIONS[text.toLowerCase()];
@@ -383,6 +398,34 @@ export class PiBot implements HeartbeatHost {
     this.lastUserMessage.set(agentId, Date.now());
     this.deps.heartbeat.noteUserMessage?.(agentId);
     await this.promptAgent(t, chatId, agentId, text, { reply });
+  }
+
+  /** Media message from a transport: transcribe voice, reference files, then route as a user turn. */
+  private async handleMedia(t: Transport, media: IncomingMedia): Promise<void> {
+    if (media.kind === "voice" || media.kind === "audio") {
+      await this.handleVoiceMedia(t, media);
+      return;
+    }
+    await this.routeUserTurn(t, media.chatId, mediaPromptText(media));
+  }
+
+  /** Download-and-transcribe path for voice notes and audio files. */
+  private async handleVoiceMedia(t: Transport, media: IncomingMedia): Promise<void> {
+    const stt = this.deps.stt;
+    if (!stt || !stt.configured()) {
+      await t.push(media.chatId, { text: "🎙 Voice needs transcription configured — set GROQ_API_KEY (or install local whisper) and restart." });
+      return;
+    }
+    const result = await stt.transcribe(media.filePath).catch((e) => ({ ok: false as const, text: "", provider: "none", error: errorMessage(e) }));
+    if (!result.ok) {
+      await t.push(media.chatId, { text: `🎙 Transcription failed — ${truncate(result.error ?? "unknown error", 200)}` });
+      return;
+    }
+    // voice answers pending questions with the bare transcript, exactly like typing
+    if (this.questions.answerViaText(this.chatKey(t, media.chatId), result.text)) return;
+    const dur = media.durationSec !== undefined ? ` (${media.durationSec}s)` : "";
+    const body = media.caption ? `${result.text}\n\n(caption: ${media.caption})` : result.text;
+    await this.routeUserTurn(t, media.chatId, `🎙 voice note${dur} — transcribed via ${result.provider}:\n\n${body}`);
   }
 
   /** Every prompt gets a subtle time envelope so the agent always knows the moment. */
@@ -1323,6 +1366,15 @@ function replyPrefix(reply: ReplyContext | undefined, text: string): string {
   if (!reply) return text;
   const who = reply.sender === "you" ? "your" : `${reply.sender}'s`;
   return `↩ replying to ${who} message "${reply.quoted}":\n\n${text}`;
+}
+
+/** Photo/document prompt: reference the local file, plus caption. */
+function mediaPromptText(media: IncomingMedia): string {
+  const meta = media.mimeType && media.kind === "document" ? ` (${media.mimeType})` : "";
+  const lines = [`📎 ${media.kind} attached — file: ${media.filePath}${meta}`];
+  if (media.caption) lines.push(`caption: ${media.caption}`);
+  lines.push("Use your read tool to open the file.");
+  return lines.join("\n");
 }
 
 /** Per-turn bound: primary + at most this many fallback models try one user turn */

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TelegramDuplicateGuard, telegramRetryAfterMs, replyContextFrom } from "./telegram.js";
+import { TelegramDuplicateGuard, telegramRetryAfterMs, replyContextFrom, extFromMime } from "./telegram.js";
 
 describe("TelegramDuplicateGuard", () => {
   it("suppresses an identical payload to the same chat inside the window", () => {
@@ -66,5 +66,16 @@ describe("replyContextFrom", () => {
   it("uses captions for media quotes and truncates long quotes", () => {
     expect(replyContextFrom({ message_id: 9, caption: "a photo caption", from: { id: 2, first_name: "Gleb" } }, 111)?.quoted).toBe("a photo caption");
     expect(replyContextFrom({ message_id: 10, text: "x".repeat(1000), from: { id: 2, first_name: "Gleb" } }, 111)?.quoted.length).toBeLessThanOrEqual(400);
+  });
+});
+
+describe("extFromMime", () => {
+  it("maps common media mimes and ignores parameters", () => {
+    expect(extFromMime("audio/ogg; codecs=opus")).toBe(".ogg");
+    expect(extFromMime("audio/mpeg")).toBe(".mp3");
+    expect(extFromMime("image/jpeg")).toBe(".jpg");
+    expect(extFromMime("application/pdf")).toBe(".pdf");
+    expect(extFromMime("application/x-unknown")).toBeUndefined();
+    expect(extFromMime(undefined)).toBeUndefined();
   });
 });
