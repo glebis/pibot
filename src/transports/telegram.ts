@@ -4,6 +4,30 @@ import type { Card, PushOptions, Transport } from "../core/types.js";
 import { truncate } from "../core/util.js";
 
 const TG_LIMIT = 4000;
+const DUPLICATE_WINDOW_MS = 30_000;
+
+/** Final transport-level backstop against accidental repeat sends. */
+export class TelegramDuplicateGuard {
+  private recent = new Map<string, number>();
+
+  constructor(private readonly windowMs = DUPLICATE_WINDOW_MS, private readonly maxEntries = 512) {}
+
+  allow(chatId: string, payload: string, now = Date.now()): boolean {
+    for (const [key, sentAt] of this.recent) {
+      if (now - sentAt > this.windowMs) this.recent.delete(key);
+    }
+    const key = `${chatId}\u0000${payload}`;
+    const sentAt = this.recent.get(key);
+    if (sentAt !== undefined && now - sentAt <= this.windowMs) return false;
+    this.recent.set(key, now);
+    while (this.recent.size > this.maxEntries) {
+      const oldest = this.recent.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.recent.delete(oldest);
+    }
+    return true;
+  }
+}
 
 const BOT_COMMANDS = [
   { command: "help", description: "What pibot can do" },
@@ -70,6 +94,7 @@ export class TelegramTransport implements Transport {
   private onMessageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   private onPollAnswerCb: ((pollId: string, optionIndex: number, voterId: string) => Promise<void>) | null = null;
+  private duplicateGuard = new TelegramDuplicateGuard();
 
   constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string; openWhenEmpty?: boolean } = {}) {
     this.bot = new Bot(token);
@@ -171,6 +196,7 @@ export class TelegramTransport implements Transport {
       console.warn(`[telegram] blocked chat ${chatId} — not in allowlist (closed by default). Add TELEGRAM_ALLOWED_CHATS=${chatId} or set PIBOT_TELEGRAM_OPEN=1 to allow all.`);
     }
     const help = `⛔️ Bot not paired. Your chat id is \`${chatId}\`\n\nAdd \`TELEGRAM_ALLOWED_CHATS=${chatId}\` to your env (or set allowed chats in the dashboard) and restart.\n\nTo allow all chats (not recommended) set \`PIBOT_TELEGRAM_OPEN=1\`.`;
+    if (!this.duplicateGuard.allow(chatId, `denied:${help}`)) return;
     try {
       const target = ctx.chat?.id ?? ctx.from?.id;
       if (target) await this.bot.api.sendMessage(target, help, { parse_mode: "Markdown" }).catch(() => {});
@@ -267,6 +293,10 @@ export class TelegramTransport implements Transport {
 
   async push(chatId: string, opts: PushOptions): Promise<void> {
     const text = truncate(opts.text, TG_LIMIT) + (opts.text.length > TG_LIMIT ? "\n\n…(truncated)" : "");
+    if (!this.duplicateGuard.allow(chatId, JSON.stringify({ text, card: opts.card ?? null }))) {
+      console.warn(`[telegram] suppressed duplicate send to chat ${chatId}`);
+      return;
+    }
     // first message in a chat attaches the persistent quick-action keyboard
     if (!this.keyboardSent.has(chatId) && !opts.card) {
       this.keyboardSent.add(chatId);
@@ -284,7 +314,9 @@ export class TelegramTransport implements Transport {
   }
 
   async notifyError(chatId: string, message: string): Promise<void> {
-    await this.bot.api.sendMessage(chatId, `⚠︎ ${truncate(message, 500)}`).catch(() => {});
+    const text = `⚠︎ ${truncate(message, 500)}`;
+    if (!this.duplicateGuard.allow(chatId, text)) return;
+    await this.bot.api.sendMessage(chatId, text).catch(() => {});
   }
 
   setTyping(chatId: string, on: boolean): void {
