@@ -35,7 +35,7 @@ export const KNOWN_STT_PROVIDERS = new Set(["whisperkit", "groq", "local_whisper
 const EXTERNAL_STT_PROVIDERS = new Set<SttProviderId>(["groq"]);
 const GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 const GROQ_MODEL = process.env.STT_GROQ_MODEL || "whisper-large-v3-turbo";
-const WHISPERKIT_MODEL = process.env.STT_WHISPERKIT_MODEL || "whisper-tiny";
+const WHISPERKIT_MODEL = process.env.STT_WHISPERKIT_MODEL || "whisper-small";
 
 export function sttProvidersFromEnv(): SttProviderId[] {
   const raw = (process.env.STT_PROVIDERS ?? "").trim();

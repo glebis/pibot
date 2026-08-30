@@ -103,7 +103,7 @@ describe("SttService", () => {
     ) => {
       const args = _args as string[];
       expect(args[0]).toBe("transcribe");
-      expect(args[4]).toBe("whisper-tiny");
+      expect(args[4]).toBe("whisper-small");
       queueMicrotask(() => cb(null, "Hello, this is a test of the voice pipeline.\n", ""));
     }) as unknown as typeof execFile;
     const stt = new SttService(["whisperkit"], { execFileFn: fakeExec, whisperkitBin: "/opt/homebrew/bin/whisperkit-cli" });
