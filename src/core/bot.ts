@@ -1452,12 +1452,30 @@ export class PiBot implements HeartbeatHost {
   }
 
   async escalateToAgent(agentId: string, instruction: string): Promise<void> {
-    const ck = this.primaryChat({ agentId } as Schedule);
-    if (!ck) return;
+    // Same ownership rule as deliverToAgent: escalate only into chats this agent
+    // owns (bound subbot or currently selected agent) — never into a chat some
+    // other agent owns, or the heartbeat turns crosstalk into main-chat noise.
+    const ck = this.agentOwnedChat(agentId);
+    if (!ck) {
+      this.deps.events.log(agentId, "system", `heartbeat escalation suppressed — no chat currently owned by this agent (bind one: /agent ${agentId} or /subbot ${agentId}). Instruction kept in log: ${truncate(instruction, 100)}`);
+      return;
+    }
     const idx = ck.lastIndexOf(":");
     const t = this.transports.get(ck.slice(0, idx));
     if (!t) return;
     await this.promptAgent(t, ck.slice(idx + 1), agentId, `[heartbeat] ${instruction}`);
+  }
+
+  /** The agent's home chat: a bound subbot chat, else a chat where it is the currently bound agent. */
+  private agentOwnedChat(agentId: string): string | null {
+    for (const ck of this.agentChats.get(agentId) ?? []) {
+      const idx = ck.lastIndexOf(":");
+      if (this.transports.get(ck.slice(0, idx))?.boundAgentId === agentId) return ck;
+    }
+    for (const ck of this.agentChats.get(agentId) ?? []) {
+      if (this.chatAgent.get(ck) === agentId) return ck;
+    }
+    return null;
   }
 
   private primaryChat(job: Pick<Schedule, "agentId" | "chat">): string | null {

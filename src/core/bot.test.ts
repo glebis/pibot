@@ -558,6 +558,36 @@ describe("PiBot fire delivery", () => {
     expect(t.transport.lastText()).toBe("good morning ✨");
   });
 
+  it("suppresses heartbeat escalations for agents that own no chat", async () => {
+    const t2 = makeBot();
+    (t2.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "creator"
+        ? { id: "creator", dir: "/tmp/fake-creator", manifest: { name: "creator", heartbeat: { enabled: true, interval: "20m" } } }
+        : { id: "assistant", dir: "/tmp/fake-assistant", manifest: { name: "assistant" } }
+    );
+    await t2.transport.say("ping"); // main chat owns assistant
+    t2.promptSpy.mockClear();
+
+    await t2.bot.escalateToAgent("creator", "MEMORY.md is missing");
+
+    expect(t2.promptSpy).not.toHaveBeenCalled();
+    expect(t2.transport.lastText()).toBe(""); // nothing surfaced in someone else's chat
+    expect(t2.events.log).toHaveBeenCalledWith("creator", "system", expect.stringContaining("suppressed"));
+    fs.rmSync(t2.dir, { recursive: true, force: true });
+  });
+
+  it("escalations still work for the chat's own agent", async () => {
+    const t2 = makeBot();
+    await t2.transport.say("ping"); // assistant owns the main chat
+    t2.promptSpy.mockClear();
+
+    await t2.bot.escalateToAgent("assistant", "check in");
+
+    expect(t2.promptSpy).toHaveBeenCalledTimes(1);
+    expect(String(t2.promptSpy.mock.calls[0][0])).toContain("[heartbeat]");
+    fs.rmSync(t2.dir, { recursive: true, force: true });
+  });
+
   it("escalations route into the main session", async () => {
     const t = makeBot();
     await t.transport.say("ping");
