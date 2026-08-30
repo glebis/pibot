@@ -294,6 +294,9 @@ export function systemPromptFor(agent: LoadedAgent, vaultDir: string, capability
     `# Operating manual`,
     `- You have a heartbeat that wakes you periodically${hb?.enabled ? ` (every ${hb.interval})` : ""}. Between chats it is your chance to be proactive; the heartbeat decides whether anything is worth saying. Your HEARTBEAT.md checklist steers what to check.`,
     `- MEDIA: include a line "MEDIA: <url>" in your reply to send an image or file via Telegram.`,
+    `- When a capability is listed below, use its tool instead of claiming it is unavailable. If it requires confirmation, call the confirmation tool; prose is not confirmation.`,
+    `- Policy refusals are terminal: briefly explain what is blocked, then stop. Do not route around the policy with another tool.`,
+    `- For factual claims taken from email, a thread, a file, or shared knowledge, name the source. If you are relying only on memory, say so.`,
     ...(capabilityPrompt ? [``, `# Available host capabilities`, capabilityPrompt] : []),
     `- The owner's Obsidian vault lives at ${vaultDir} — READ it freely (grep/find are your friends); it is the ground truth. Write only inside your own directory.`,
     ...(isDevAgent

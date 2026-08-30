@@ -17,7 +17,7 @@ const HELP = [
   `**pibot** — your agents. Talk normally; ask to schedule anything ("remind me to stretch in 20m", "daily standup note at 9am").`,
   ``,
   `/agents — list agents  ·  /agent <name> — switch  ·  /newagent — guided wizard`,
-  `/schedules — pending items  ·  /cancel <id>  ·  /new — fresh session`,
+  `/schedules — active and paused items  ·  /cancel <id>  ·  /resume <id>  ·  /new — fresh session`,
   `/handoff <agent> — move this conversation (with context) to another agent`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
   `/cascade — model fallback health  ·  /cascade probe|retry|clear`,
@@ -110,8 +110,11 @@ export function createCommandHandler(ctx: CommandContext) {
           await reply("Wizard cancelled. Nothing was created.");
         } else if (ctx.questions.cancelPending(ck)) {
           await reply("Question dismissed.");
+        } else if (arg && agentId) {
+          const job = deps.scheduler.cancel(arg);
+          await reply(job ? `🗑 Cancelled: ${job.title}` : `Nothing matches "${arg}". /schedules for ids.`);
         } else {
-          await reply("Nothing to cancel.");
+          await reply("Nothing to cancel. Use /cancel <schedule-id> for a scheduled item.");
         }
         return;
 
@@ -214,7 +217,7 @@ export function createCommandHandler(ctx: CommandContext) {
 
       case "schedules": {
         if (!agentId) return void (await reply("No agent selected."));
-        const jobs = deps.scheduler.list(agentId).filter((j) => !j.internal);
+        const jobs = deps.scheduler.list(agentId, { includePaused: true }).filter((j) => !j.internal);
         if (!jobs.length) {
           await reply("Nothing pending. Ask the agent to schedule something.");
           return;
@@ -222,16 +225,16 @@ export function createCommandHandler(ctx: CommandContext) {
         await reply(
           jobs
             .slice(0, 20)
-            .map((j) => `• [${j.id}] **${j.title}** — ${fmtWhen(j.dueAt)}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " ⚡" : ""}`)
+            .map((j) => `• [${j.id}]${j.status === "paused" ? " **PAUSED**" : ""} **${j.title}** — ${fmtWhen(j.dueAt)}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " ⚡" : ""}${j.status === "paused" && j.lastDeliveryError ? ` — ${j.lastDeliveryError}` : ""}`)
             .join("\n")
         );
         return;
       }
 
-      case "cancel": {
+      case "resume": {
         if (!agentId) return void (await reply("No agent selected."));
-        const job = deps.scheduler.cancel(arg);
-        await reply(job ? `🗑 Cancelled: ${job.title}` : `Nothing matches "${arg}". /schedules for ids.`);
+        const job = deps.scheduler.resume(arg);
+        await reply(job ? `▶️ Resumed: ${job.title}` : `No paused schedule matches "${arg}". /schedules for ids.`);
         return;
       }
 
@@ -247,7 +250,9 @@ export function createCommandHandler(ctx: CommandContext) {
         const agent = deps.agents.getAgent(agentId)!;
         const hb = agent.manifest.heartbeat;
         const sn = deps.scheduler.snoozeState(agentId);
-        const pending = deps.scheduler.list(agentId);
+        const active = deps.scheduler.list(agentId, { includePaused: true });
+        const pending = active.filter((j) => j.status === "pending");
+        const paused = active.filter((j) => j.status === "paused" && !j.internal);
         const next = pending[0];
         await reply(
           [
@@ -255,7 +260,7 @@ export function createCommandHandler(ctx: CommandContext) {
             `model: ${agent.manifest.model ?? "auto"} · thinking: ${agent.manifest.thinking ?? "off"}`,
             `heartbeat: ${hb?.enabled ? `every ${hb.interval}${hb.model ? ` (${hb.model})` : ""}` : "off"}${hb?.quietHours ? ` · quiet ${hb.quietHours.from}–${hb.quietHours.to}` : ""}`,
             `snoozed: ${sn ? `until ${fmtWhen(sn.until)}` : "no"}`,
-            `pending: ${pending.filter((j) => !j.internal).length}${next && !next.internal ? ` · next: “${next.title}” ${fmtWhen(next.dueAt)}` : ""}`,
+            `pending: ${pending.filter((j) => !j.internal).length} · paused: ${paused.length}${next && !next.internal ? ` · next: “${next.title}” ${fmtWhen(next.dueAt)}` : ""}`,
           ].join("\n")
         );
         return;

@@ -1,5 +1,58 @@
-import { describe, expect, it } from "vitest";
-import { fmtWhen, inQuietHours, nextRepeatAt, parseDuration, parseWhen } from "./util.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { fmtWhen, hardenRuntimeDataDir, inQuietHours, nextRepeatAt, parseDuration, parseWhen, writeJsonAtomic } from "./util.js";
+
+const tempDirs: string[] = [];
+
+function tempDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-util-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+function permissions(file: string): number {
+  return fs.lstatSync(file).mode & 0o777;
+}
+
+describe("runtime data permissions", () => {
+  it("writes JSON atomically with owner-only permissions by default", () => {
+    const file = path.join(tempDir(), "state.json");
+
+    writeJsonAtomic(file, { private: true });
+
+    expect(permissions(file)).toBe(0o600);
+  });
+
+  it("hardens existing runtime trees without following symlinks", () => {
+    const root = tempDir();
+    const nested = path.join(root, "nested");
+    const state = path.join(nested, "state.json");
+    const outside = path.join(tempDir(), "outside.txt");
+    const link = path.join(root, "outside-link");
+    fs.mkdirSync(nested);
+    fs.writeFileSync(state, "private");
+    fs.writeFileSync(outside, "external");
+    fs.symlinkSync(outside, link);
+    fs.chmodSync(root, 0o755);
+    fs.chmodSync(nested, 0o755);
+    fs.chmodSync(state, 0o644);
+    fs.chmodSync(outside, 0o644);
+
+    hardenRuntimeDataDir(root);
+
+    expect(permissions(root)).toBe(0o700);
+    expect(permissions(nested)).toBe(0o700);
+    expect(permissions(state)).toBe(0o600);
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(permissions(outside)).toBe(0o644);
+  });
+});
 
 // fixed reference: a Thursday, 2026-08-27 18:20 local
 const NOW = new Date(2026, 7, 27, 18, 20, 0).getTime();

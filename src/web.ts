@@ -523,7 +523,7 @@ ${hasToken ? `<div class="card">
     const agents = deps.agents.list();
     const cards = agents
       .map((a) => {
-        const pending = deps.scheduler.list(a.id).filter((j) => !j.internal);
+        const pending = deps.scheduler.list(a.id, { includePaused: true }).filter((j) => !j.internal);
         const sn = deps.scheduler.snoozeState(a.id);
         const staged = deps.evolution.staged(a.id);
         const skills = listSkillDirs(path.join(a.dir, "skills"));
@@ -532,7 +532,8 @@ ${hasToken ? `<div class="card">
   <span class="muted">${esc(a.manifest.description ?? "")}</span><br>
   <span class="pill ${a.manifest.heartbeat?.enabled ? "on" : ""}">heartbeat ${esc(a.manifest.heartbeat?.interval ?? "off")}</span>
   <span class="pill ${a.manifest.evolution?.enabled ? "on" : ""}">evolution ${esc(a.manifest.evolution?.interval ?? "off")}</span>
-  <span class="pill">${pending.length} pending</span>
+  <span class="pill">${pending.filter((j) => j.status === "pending").length} pending</span>
+  ${pending.some((j) => j.status === "paused") ? `<span class="pill">${pending.filter((j) => j.status === "paused").length} paused</span>` : ""}
   ${skills.length ? `<span class="pill">${skills.length} skills</span>` : ""}
   ${staged.length ? `<span class="pill on">🧬 ${staged.length} staged</span>` : ""}
   ${sn ? `<span class="pill">😴 until ${esc(fmtWhen(sn.until))}</span>` : ""}
@@ -659,7 +660,7 @@ ${hasToken ? `<div class="card">
     const agent = agentOr404(c.req.param("id"));
     if (!agent) return c.notFound();
     const m = agent.manifest;
-    const pending = deps.scheduler.list(agent.id).filter((j) => !j.internal);
+    const pending = deps.scheduler.list(agent.id, { includePaused: true }).filter((j) => !j.internal);
     const staged = deps.evolution.staged(agent.id);
     const skills = listSkillDirs(path.join(agent.dir, "skills"));
     const events = deps.events.tail(agent.id, 12);
@@ -669,9 +670,9 @@ ${hasToken ? `<div class="card">
     const scheduleRows = pending
       .map(
         (j: Schedule) => `<tr>
-  <td class="mono">${esc(j.id)}</td><td><strong>${esc(j.title)}</strong>${j.detail ? `<br><span class="muted">${esc(truncate(j.detail, 120))}</span>` : ""}</td>
+  <td class="mono">${esc(j.id)}</td><td><strong>${j.status === "paused" ? "PAUSED · " : ""}${esc(j.title)}</strong>${j.detail ? `<br><span class="muted">${esc(truncate(j.detail, 120))}</span>` : ""}${j.status === "paused" && j.lastDeliveryError ? `<br><span class="muted">Last error: ${esc(j.lastDeliveryError)}</span>` : ""}</td>
   <td>${esc(fmtWhen(j.dueAt))}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " ⚡" : ""}<br><span class="muted">${esc(j.kind)} · ${esc(j.delivery)}</span></td>
-  <td><form method="post" action="/schedules/${esc(j.id)}/cancel">${csrfField()}<button class="danger mini" type="submit">Cancel</button></form></td>
+  <td>${j.status === "paused" ? `<form method="post" action="/schedules/${esc(j.id)}/resume">${csrfField()}<button class="mini" type="submit">Resume</button></form>` : ""}<form method="post" action="/schedules/${esc(j.id)}/cancel">${csrfField()}<button class="danger mini" type="submit">Cancel</button></form></td>
 </tr>`
       )
       .join("\n") || `<tr><td colspan="4" class="muted">Nothing pending.</td></tr>`;
@@ -856,6 +857,14 @@ ${manifestForm(agent, csrfToken)}
     const job = deps.scheduler.cancel(c.req.param("id"));
     const back = job ? `/agents/${encodeURIComponent(job.agentId)}` : "/";
     return c.redirect(`${back}?msg=${encodeURIComponent(job ? `Cancelled: ${job.title}` : "Already gone")}`);
+  });
+
+  app.post("/schedules/:id/resume", async (c) => {
+    const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
+    const job = deps.scheduler.resume(c.req.param("id"));
+    const back = job ? `/agents/${encodeURIComponent(job.agentId)}` : "/";
+    return c.redirect(`${back}?msg=${encodeURIComponent(job ? `Resumed: ${job.title}` : "Schedule is not paused")}`);
   });
 
   // ── evolution ──

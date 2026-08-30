@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { serve } from "@hono/node-server";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.js";
-import { readJson } from "./core/util.js";
+import { ensureDir, hardenRuntimeDataDir, readJson } from "./core/util.js";
 import { SecretStore } from "./core/secrets.js";
 import { AgentManager } from "./core/agent-manager.js";
 import { PiBot } from "./core/bot.js";
@@ -12,7 +12,6 @@ import { ModelCascade } from "./core/cascade.js";
 import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
 import { HeartbeatEngine } from "./core/heartbeat.js";
 import { Scheduler } from "./core/scheduler.js";
-import { ensureDir } from "./core/util.js";
 import { createWebApp } from "./web.js";
 import { CliTransport } from "./transports/cli.js";
 import { TelegramTransport } from "./transports/telegram.js";
@@ -21,6 +20,7 @@ import { ProviderManager } from "./core/providers.js";
 async function main(): Promise<void> {
   const config = loadConfig();
   ensureDir(config.dataDir);
+  hardenRuntimeDataDir(config.dataDir);
 
   // rotate the daemon log if it grows past 5 MB
   const daemonLog = path.join(config.dataDir, "daemon.log");
@@ -78,7 +78,16 @@ async function main(): Promise<void> {
   // bot is created after its collaborators; they reach it through this ref
   let bot!: PiBot;
 
-  const scheduler = new Scheduler(config.dataDir, (job, snoozed) => bot.deliverFire(job, snoozed));
+  const scheduler = new Scheduler(
+    config.dataDir,
+    (job, snoozed) => bot.deliverFire(job, snoozed),
+    (job, event) => bot.deliverToAgent(
+      job.agentId,
+      event.kind === "paused"
+        ? `Scheduled item "${job.title}" was automatically paused. ${job.pauseReason ?? "Repeated delivery failures."} Last error: ${event.error}. Fix the delivery problem, then resume schedule ${job.id}.`
+        : `Scheduled item "${job.title}" could not be delivered. It will retry without sending repeated notices. Last error: ${event.error}.`,
+    ),
+  );
 
   const heartbeat = new HeartbeatEngine({
     agents,

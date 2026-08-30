@@ -15,6 +15,15 @@ interface StoreShape {
 
 const PRUNE_MS = 3 * 86400e3; // drop finished jobs older than 3 days
 const MAX_TIMEOUT = 2 ** 31 - 1; // node setTimeout cap ≈ 24.8 days
+const MIN_AGENT_REPEAT_MS = 15 * 60_000;
+const MAX_ACTIVE_AGENT_SCHEDULES = 20;
+const MAX_ATTEMPTS_PER_OCCURRENCE = 3;
+const MAX_CONSECUTIVE_FAILURES = 5;
+
+export interface ScheduleFailureNotice {
+  kind: "first-failure" | "paused";
+  error: string;
+}
 
 export class Scheduler {
   private jobs = new Map<string, Schedule>();
@@ -24,11 +33,17 @@ export class Scheduler {
   private file: string;
   private saveTimer: NodeJS.Timeout | null = null;
   private fireCb: (job: Schedule, snoozed: boolean) => void | Promise<void>;
+  private noticeCb?: (job: Schedule, event: ScheduleFailureNotice) => void | Promise<void>;
   private stopped = false;
 
-  constructor(dataDir: string, fireCb: (job: Schedule, snoozed: boolean) => void | Promise<void>) {
+  constructor(
+    dataDir: string,
+    fireCb: (job: Schedule, snoozed: boolean) => void | Promise<void>,
+    noticeCb?: (job: Schedule, event: ScheduleFailureNotice) => void | Promise<void>,
+  ) {
     this.file = path.join(dataDir, "schedules.json");
     this.fireCb = fireCb;
+    this.noticeCb = noticeCb;
     this.load();
   }
 
@@ -39,7 +54,7 @@ export class Scheduler {
     const now = Date.now();
     for (const job of store.jobs ?? []) {
       // prune finished jobs, and stale pending one-shots from a previous boot
-      if (job.status !== "pending" && now - job.dueAt > PRUNE_MS) continue;
+      if ((job.status === "done" || job.status === "cancelled") && now - job.dueAt > PRUNE_MS) continue;
       if (job.status === "pending" && !job.repeat && job.dueAt + 86400e3 < now) {
         job.status = "done"; // missed while offline > 1 day; don't spam old fires
         continue;
@@ -65,7 +80,7 @@ export class Scheduler {
       this.saveTimer = null;
     }
     const jobs = [...this.jobs.values()].filter(
-      (j) => j.status === "pending" || Date.now() - j.dueAt <= PRUNE_MS
+      (j) => j.status === "pending" || j.status === "paused" || Date.now() - j.dueAt <= PRUNE_MS
     );
     const snooze: Record<string, SnoozeState> = {};
     for (const [k, v] of this.snoozeByAgent) snooze[k] = v;
@@ -75,6 +90,12 @@ export class Scheduler {
   // ── CRUD ──────────────────────────────────────────────────────────────────
 
   create(job: Omit<Schedule, "id" | "createdAt" | "firedCount" | "status"> & { id?: string }): Schedule {
+    if (!job.internal) {
+      if (job.repeat?.everyMs != null && job.repeat.everyMs < MIN_AGENT_REPEAT_MS) {
+        throw new Error("Recurring schedules must be at least 15 minutes apart.");
+      }
+      this.assertCapacity(job.agentId, 1);
+    }
     const full: Schedule = {
       status: "pending",
       createdAt: Date.now(),
@@ -86,6 +107,15 @@ export class Scheduler {
     this.save();
     this.rearm(full.id);
     return full;
+  }
+
+  assertCapacity(agentId: string, requested = 1): void {
+    const active = [...this.jobs.values()].filter(
+      (job) => job.agentId === agentId && !job.internal && (job.status === "pending" || job.status === "paused"),
+    ).length;
+    if (active + requested > MAX_ACTIVE_AGENT_SCHEDULES) {
+      throw new Error(`An agent may have at most 20 active schedules; this action needs ${requested} free slot${requested === 1 ? "" : "s"}.`);
+    }
   }
 
   /** Create or replace a job by id (used for heartbeat rhythm jobs) */
@@ -102,7 +132,7 @@ export class Scheduler {
 
   cancel(id: string): Schedule | null {
     const job = this.get(id);
-    if (!job || job.status !== "pending") return null;
+    if (!job || (job.status !== "pending" && job.status !== "paused")) return null;
     job.status = "cancelled";
     this.save();
     this.rearm(job.id);
@@ -118,8 +148,22 @@ export class Scheduler {
     return job;
   }
 
-  list(agentId?: string): Schedule[] {
-    const all = [...this.jobs.values()].filter((j) => j.status === "pending");
+  resume(id: string): Schedule | null {
+    const job = this.get(id);
+    if (!job || job.status !== "paused") return null;
+    job.status = "pending";
+    job.deliveryAttempts = 0;
+    job.consecutiveFailures = 0;
+    delete job.lastDeliveryError;
+    delete job.pauseReason;
+    job.dueAt = job.repeat ? (this.nextFire(job, Date.now()) ?? Date.now() + 1000) : Date.now() + 1000;
+    this.save();
+    this.rearm(job.id);
+    return job;
+  }
+
+  list(agentId?: string, opts: { includePaused?: boolean } = {}): Schedule[] {
+    const all = [...this.jobs.values()].filter((j) => j.status === "pending" || (opts.includePaused && j.status === "paused"));
     const filtered = agentId ? all.filter((j) => j.agentId === agentId) : all;
     return filtered.sort((a, b) => a.dueAt - b.dueAt);
   }
@@ -268,16 +312,39 @@ export class Scheduler {
       console.error("[scheduler] fire handler error:", e);
       job.deliveryAttempts = (job.deliveryAttempts ?? 0) + 1;
       job.lastDeliveryError = errorMessage(e).slice(0, 300);
-      job.dueAt = Date.now() + Math.min(5 * 60_000, 10_000 * 2 ** Math.min(job.deliveryAttempts - 1, 5));
-      job.status = "pending";
+      let noticeKind: ScheduleFailureNotice["kind"] | null = null;
+      if (job.repeat && job.deliveryAttempts >= MAX_ATTEMPTS_PER_OCCURRENCE) {
+        job.deliveryAttempts = 0;
+        job.consecutiveFailures = (job.consecutiveFailures ?? 0) + 1;
+        if (job.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          job.status = "paused";
+          job.pauseReason = `Paused after ${job.consecutiveFailures} consecutive failed occurrences.`;
+          noticeKind = "paused";
+        } else {
+          job.dueAt = this.nextFire(job, Date.now()) ?? Date.now() + MIN_AGENT_REPEAT_MS;
+          job.status = "pending";
+          if (job.consecutiveFailures === 1) noticeKind = "first-failure";
+        }
+      } else if (!job.repeat && job.deliveryAttempts >= MAX_CONSECUTIVE_FAILURES) {
+        job.status = "paused";
+        job.pauseReason = `Paused after ${job.deliveryAttempts} failed delivery attempts.`;
+        noticeKind = "paused";
+      } else {
+        job.dueAt = Date.now() + Math.min(5 * 60_000, 10_000 * 2 ** Math.min(job.deliveryAttempts - 1, 5));
+        job.status = "pending";
+        if (!job.repeat && job.deliveryAttempts === 1) noticeKind = "first-failure";
+      }
       this.save();
       this.rearm(job.id);
+      if (noticeKind) await this.notifyFailure(job, { kind: noticeKind, error: job.lastDeliveryError });
       return;
     }
 
     job.firedCount += 1;
     job.deliveryAttempts = 0;
+    job.consecutiveFailures = 0;
     delete job.lastDeliveryError;
+    delete job.pauseReason;
     if (job.repeat) {
       const next = this.nextFire(job, now);
       if (next != null && next > now) {
@@ -291,6 +358,15 @@ export class Scheduler {
     } else {
       job.status = "done";
       this.save();
+    }
+  }
+
+  private async notifyFailure(job: Schedule, event: ScheduleFailureNotice): Promise<void> {
+    if (!this.noticeCb) return;
+    try {
+      await this.noticeCb(job, event);
+    } catch (e) {
+      console.error("[scheduler] failure notice error:", e);
     }
   }
 

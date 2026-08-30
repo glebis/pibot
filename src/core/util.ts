@@ -28,9 +28,26 @@ export function readJson<T>(file: string, fallback: T): T {
 export function writeJsonAtomic(file: string, value: unknown, mode?: number): void {
   ensureDir(path.dirname(file));
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), mode === undefined ? undefined : { mode });
+  const fileMode = mode ?? 0o600;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: fileMode });
   fs.renameSync(tmp, file);
-  if (mode !== undefined) fs.chmodSync(file, mode);
+  fs.chmodSync(file, fileMode);
+}
+
+/** Restrict an existing runtime-data tree to the current user without traversing symlinks. */
+export function hardenRuntimeDataDir(root: string): void {
+  const harden = (entry: string): void => {
+    const stat = fs.lstatSync(entry);
+    if (stat.isSymbolicLink()) return;
+    if (stat.isDirectory()) {
+      fs.chmodSync(entry, 0o700);
+      for (const child of fs.readdirSync(entry)) harden(path.join(entry, child));
+    } else if (stat.isFile()) {
+      fs.chmodSync(entry, 0o600);
+    }
+  };
+
+  harden(root);
 }
 
 // ─── durations & times ──────────────────────────────────────────────────────

@@ -53,9 +53,28 @@ describe("scheduler plugin", () => {
 
   it("registers all scheduling tools", () => {
     const { tools } = pluginFor();
-    for (const name of ["schedule_create", "schedule_list", "schedule_cancel", "snooze", "promise_make", "promise_keep"]) {
+    for (const name of ["schedule_create", "schedule_list", "schedule_cancel", "schedule_resume", "snooze", "promise_make", "promise_keep"]) {
       expect(tools.has(name)).toBe(true);
     }
+  });
+
+  it("shows and resumes an automatically paused schedule", async () => {
+    const { tools } = pluginFor();
+    const job = scheduler.create({
+      agentId: "a1", chat: { transport: "test", chatId: "c1" }, title: "daily check-in",
+      kind: "reminder", dueAt: Date.now() + 3600_000, repeat: { everyMs: 15 * 60_000 },
+      wake: "normal", delivery: "direct",
+    });
+    job.status = "paused";
+    job.lastDeliveryError = "transport unavailable";
+
+    const listed = await tools.get("schedule_list")!.execute("t1", {});
+    expect(listed.content[0].text).toContain("PAUSED");
+    expect(listed.content[0].text).toContain("transport unavailable");
+
+    const resumed = await tools.get("schedule_resume")!.execute("t2", { id: job.id });
+    expect(resumed.content[0].text).toContain("Resumed");
+    expect(job.status).toBe("pending");
   });
 
   it("schedule_create parses natural language and creates a card-pending job", async () => {
@@ -78,6 +97,28 @@ describe("scheduler plugin", () => {
     const res = await tools.get("schedule_create")!.execute("t1", { title: "x", when: "wheneverish" });
     expect(res.content[0].text).toContain("ERROR");
     expect(scheduler.list()).toHaveLength(0);
+  });
+
+  it("schedule_create refuses recurring intervals below fifteen minutes", async () => {
+    const { tools } = pluginFor();
+    const res = await tools.get("schedule_create")!.execute("t1", { title: "nag", when: "every 1m" });
+    expect(res.content[0].text).toContain("ERROR");
+    expect(res.content[0].text).toContain("15 minutes");
+    expect(scheduler.list()).toHaveLength(0);
+  });
+
+  it("promise_make preflights both slots instead of creating half a promise", async () => {
+    const { tools } = pluginFor();
+    for (let i = 0; i < 19; i++) {
+      scheduler.create({
+        agentId: "a1", chat: { transport: "test", chatId: "c1" }, title: `existing ${i}`,
+        kind: "reminder", dueAt: Date.now() + 3600_000 + i, wake: "normal", delivery: "direct",
+      });
+    }
+    const res = await tools.get("promise_make")!.execute("t1", { title: "send report", deadline: "in 3d" });
+    expect(res.content[0].text).toContain("ERROR");
+    expect(res.content[0].text).toContain("2 free");
+    expect(scheduler.list("a1")).toHaveLength(19);
   });
 
   it("important wake and agent delivery are recorded", async () => {

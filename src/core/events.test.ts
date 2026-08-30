@@ -45,4 +45,53 @@ describe("EventLog", () => {
     expect(fs.statSync(stateDir).mode & 0o777).toBe(0o700);
     expect(fs.statSync(eventFile).mode & 0o777).toBe(0o600);
   });
+
+  it("redacts sensitive key assignments before persisting summaries", () => {
+    log.log(
+      "agent",
+      "system",
+      'token=top-secret api_key: "sk-live-123" password = hunter2 authorization: Basic-Zm9v client_secret=s3cr3t OPENAI_API_KEY=provider-key TELEGRAM_BOT_TOKEN=bot-key',
+    );
+
+    const eventFile = path.join(dir, "agent", "state", "events.jsonl");
+    const persisted = fs.readFileSync(eventFile, "utf8");
+    expect(persisted).not.toContain("top-secret");
+    expect(persisted).not.toContain("sk-live-123");
+    expect(persisted).not.toContain("hunter2");
+    expect(persisted).not.toContain("Basic-Zm9v");
+    expect(persisted).not.toContain("s3cr3t");
+    expect(persisted).not.toContain("provider-key");
+    expect(persisted).not.toContain("bot-key");
+    expect(log.tail("agent")[0].summary).toBe(
+      "token=[REDACTED] api_key: [REDACTED] password = [REDACTED] authorization: [REDACTED] client_secret=[REDACTED] OPENAI_API_KEY=[REDACTED] TELEGRAM_BOT_TOKEN=[REDACTED]",
+    );
+  });
+
+  it("redacts Bearer credentials and Telegram bot-token shapes", () => {
+    log.log(
+      "agent",
+      "system",
+      "request failed: Bearer eyJhbGciOiJIUzI1Ni.test.sig; bot 123456789:AAEabcdefghijklmnopqrstuvwxyz012345",
+    );
+
+    expect(log.tail("agent")[0].summary).toBe(
+      "request failed: Bearer [REDACTED]; bot [TELEGRAM_BOT_TOKEN_REDACTED]",
+    );
+  });
+
+  it("redacts sensitive values embedded in JSON text", () => {
+    log.log("agent", "system", '{"operation":"connect","token":"json-secret","nested":{"password":"json-password"}}');
+
+    const summary = log.tail("agent")[0].summary;
+    expect(summary).not.toContain("json-secret");
+    expect(summary).not.toContain("json-password");
+    expect(summary).toContain("[REDACTED]");
+  });
+
+  it("leaves ordinary prose about sensitive concepts unchanged", () => {
+    const summary = "The password is wrong; rotate the token after authorization fails.";
+    log.log("agent", "system", summary);
+
+    expect(log.tail("agent")[0].summary).toBe(summary);
+  });
 });

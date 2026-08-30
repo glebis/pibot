@@ -50,24 +50,29 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
             text = `ERROR: could not understand when "${params.when}". Ask the user for a clearer time.`;
             details = { scheduleId: "", dueAt: 0 };
           } else {
-            const wake = params.wake === "important" ? "important" : "normal";
-            const delivery = params.delivery === "agent" ? "agent" : "direct";
-            const kind = (params.kind as never) ?? "reminder";
-            const job = scheduler.create({
-              agentId,
-              chat,
-              title: params.title,
-              detail: params.detail,
-              kind,
-              dueAt: parsed.dueAt,
-              repeat: parsed.repeat,
-              wake,
-              delivery,
-              cardPending: !jobIsInternal(kind),
-            });
-            const when = fmtWhen(job.dueAt) + (job.repeat ? " ↻" : "");
-            text = `Scheduled ✅ "${job.title}" fires ${when} (id ${job.id})${wake === "important" ? ", pierces snooze" : ""}`;
-            details = { scheduleId: job.id, dueAt: job.dueAt };
+            try {
+              const wake = params.wake === "important" ? "important" : "normal";
+              const delivery = params.delivery === "agent" ? "agent" : "direct";
+              const kind = (params.kind as never) ?? "reminder";
+              const job = scheduler.create({
+                agentId,
+                chat,
+                title: params.title,
+                detail: params.detail,
+                kind,
+                dueAt: parsed.dueAt,
+                repeat: parsed.repeat,
+                wake,
+                delivery,
+                cardPending: !jobIsInternal(kind),
+              });
+              const when = fmtWhen(job.dueAt) + (job.repeat ? " ↻" : "");
+              text = `Scheduled ✅ "${job.title}" fires ${when} (id ${job.id})${wake === "important" ? ", pierces snooze" : ""}`;
+              details = { scheduleId: job.id, dueAt: job.dueAt };
+            } catch (error) {
+              text = `ERROR: ${error instanceof Error ? error.message : String(error)}`;
+              details = { scheduleId: "", dueAt: 0 };
+            }
           }
           return { content: [{ type: "text", text }], details };
         },
@@ -94,39 +99,46 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
             text = `ERROR: could not understand deadline "${params.deadline}".`;
             details = { groupId: "", promiseId: "" };
           } else {
-            const groupId = uid("pr", 6);
-            const promise = scheduler.create({
-              agentId,
-              chat,
-              title: params.title,
-              detail: params.detail,
-              kind: "promise",
-              dueAt: parsed.dueAt,
-              repeat: parsed.repeat,
-              wake: "important",
-              delivery: "agent",
-              groupId,
-              cardPending: true,
-            });
             // pre-check: 24h before, or midway if that's already past
-            let preCheck = promise.dueAt - 86400e3;
-            if (preCheck <= Date.now()) preCheck = Date.now() + Math.max(5 * 60e3, (promise.dueAt - Date.now()) / 2);
-            if (preCheck < promise.dueAt) {
-              scheduler.create({
+            let preCheck = parsed.dueAt - 86400e3;
+            if (preCheck <= Date.now()) preCheck = Date.now() + Math.max(5 * 60e3, (parsed.dueAt - Date.now()) / 2);
+            const neededSlots = preCheck < parsed.dueAt ? 2 : 1;
+            try {
+              scheduler.assertCapacity(agentId, neededSlots);
+              const groupId = uid("pr", 6);
+              const promise = scheduler.create({
                 agentId,
                 chat,
-                title: `pre-check: ${params.title}`,
-                detail: `A promise is due ${fmtWhen(promise.dueAt)}. Check in with the user: are they on track? Offer help, don't nag.`,
+                title: params.title,
+                detail: params.detail,
                 kind: "promise",
-                dueAt: preCheck,
-                wake: "normal",
+                dueAt: parsed.dueAt,
+                repeat: parsed.repeat,
+                wake: "important",
                 delivery: "agent",
                 groupId,
-                cardPending: false,
+                cardPending: true,
               });
+              if (preCheck < promise.dueAt) {
+                scheduler.create({
+                  agentId,
+                  chat,
+                  title: `pre-check: ${params.title}`,
+                  detail: `A promise is due ${fmtWhen(promise.dueAt)}. Check in with the user: are they on track? Offer help, don't nag.`,
+                  kind: "promise",
+                  dueAt: preCheck,
+                  wake: "normal",
+                  delivery: "agent",
+                  groupId,
+                  cardPending: false,
+                });
+              }
+              text = `Promise tracked ✅ "${params.title}" — due ${fmtWhen(promise.dueAt)}, I'll pre-check ${fmtWhen(preCheck)} (id ${promise.id})`;
+              details = { groupId, promiseId: promise.id };
+            } catch (error) {
+              text = `ERROR: ${error instanceof Error ? error.message : String(error)}`;
+              details = { groupId: "", promiseId: "" };
             }
-            text = `Promise tracked ✅ "${params.title}" — due ${fmtWhen(promise.dueAt)}, I'll pre-check ${fmtWhen(preCheck)} (id ${promise.id})`;
-            details = { groupId, promiseId: promise.id };
           }
           return { content: [{ type: "text", text }], details };
         },
@@ -163,14 +175,28 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
         description: "List your pending scheduled items, soonest first.",
         parameters: Type.Object({}),
         async execute() {
-          const jobs = scheduler.list(agentId).filter((j) => !j.internal);
+          const jobs = scheduler.list(agentId, { includePaused: true }).filter((j) => !j.internal);
           if (!jobs.length) {
             return { content: [{ type: "text", text: "Nothing scheduled." }], details: {} };
           }
           const lines = jobs.slice(0, 30).map(
-            (j) => `- [${j.id}] ${j.title} — ${fmtWhen(j.dueAt)}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " (!)" : ""}${j.detail ? ` — ${j.detail}` : ""}`
+            (j) => `- [${j.id}]${j.status === "paused" ? " PAUSED" : ""} ${j.title} — ${fmtWhen(j.dueAt)}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " (!)" : ""}${j.detail ? ` — ${j.detail}` : ""}${j.status === "paused" && j.lastDeliveryError ? ` — last error: ${j.lastDeliveryError}` : ""}`
           );
           return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
+        },
+      });
+
+      pi.registerTool({
+        name: "schedule_resume",
+        label: "Resume schedule",
+        description: "Resume an automatically paused schedule after its delivery problem has been fixed.",
+        parameters: Type.Object({
+          id: Type.String({ description: "Paused schedule id, prefixes allowed" }),
+        }),
+        async execute(_tcid, params) {
+          const job = scheduler.resume(params.id);
+          if (!job) return { content: [{ type: "text", text: `No paused schedule matching "${params.id}".` }], details: {} };
+          return { content: [{ type: "text", text: `Resumed "${job.title}" (${job.id}).` }], details: {} };
         },
       });
 
