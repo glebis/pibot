@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { CommsHooks } from "../plugins/agent-comms-plugin.js";
 import { AvatarArtifactStore, createDefaultAvatarProviders } from "./avatar.js";
+import { createDefaultSpeechProviders, SpeechArtifactStore, type SpeechKind } from "./speech.js";
 import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext, type CapabilityDefinition } from "./capabilities.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
@@ -121,6 +122,7 @@ export class AgentManager {
     ask?: (spec: import("./questions.js").QuestionSpec) => Promise<import("./questions.js").QuestionAnswer | null>,
     comms?: CommsHooks,
     applyProfilePhoto?: (transport: string, filePath: string) => Promise<void>,
+    sendSpeech?: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>,
   ): Promise<AgentSession> {
     const key = `${agentId}::${chatKey}`;
     const cached = this.sessions.get(key);
@@ -153,6 +155,11 @@ export class AgentManager {
         providers: createDefaultAvatarProviders(),
         store: new AvatarArtifactStore(path.join(agent.dir, "runtime", "avatars")),
         applyProfilePhoto,
+      } : undefined,
+      speech: sendSpeech && chat.transport.startsWith("telegram") && agent.manifest.capabilities?.includes("speech") ? {
+        providers: createDefaultSpeechProviders(),
+        store: new SpeechArtifactStore(path.join(agent.dir, "runtime", "speech")),
+        send: sendSpeech,
       } : undefined,
     });
     if (capabilitySet.unavailable.length) {

@@ -17,6 +17,7 @@ import { CliTransport } from "./transports/cli.js";
 import { TelegramTransport } from "./transports/telegram.js";
 import { ProviderManager } from "./core/providers.js";
 import { SttService } from "./core/stt.js";
+import { AudioMediaProcessor } from "./core/audio-media.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -139,7 +140,7 @@ async function main(): Promise<void> {
       : [new CliTransport()];
 
   const providerManager = new ProviderManager(modelRuntime);
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService() });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir) });
 
   await bot.start();
   scheduler.rearm();

@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { SttService, sttProvidersFromEnv } from "./stt.js";
+import { SttService, sttProviderChain, sttProvidersFromEnv } from "./stt.js";
 
 const tmpDirs: string[] = [];
 function tmpOgg(content = "fake-opus-bytes"): string {
@@ -25,7 +25,7 @@ function fakeFetchJson(handler: (url: string, init?: RequestInit) => Response): 
 describe("sttProvidersFromEnv", () => {
   it("falls back to defaults, filters unknown names, honors env", () => {
     delete process.env.STT_PROVIDERS;
-    expect(sttProvidersFromEnv()).toEqual(["whisperkit", "groq", "local_whisper"]);
+    expect(sttProvidersFromEnv()).toEqual(["whisperkit", "local_whisper"]);
     process.env.STT_PROVIDERS = "bogus, groq ,";
     expect(sttProvidersFromEnv()).toEqual(["groq"]);
     process.env.STT_PROVIDERS = "local_whisper";
@@ -34,6 +34,18 @@ describe("sttProvidersFromEnv", () => {
 });
 
 describe("SttService", () => {
+  it("keeps external STT out of the chain without explicit agent permission", () => {
+    expect(sttProviderChain(["groq", "local_whisper"], { providers: ["groq", "local_whisper"] })).toEqual(["local_whisper"]);
+    expect(sttProviderChain(["groq", "local_whisper"], { providers: ["groq"], allowExternal: false })).toEqual([]);
+  });
+
+  it("runs local STT before an explicitly allowed external fallback", () => {
+    expect(sttProviderChain(["groq", "local_whisper", "whisperkit"], {
+      providers: ["groq", "local_whisper", "whisperkit"],
+      allowExternal: true,
+    })).toEqual(["local_whisper", "whisperkit", "groq"]);
+  });
+
   it("returns the groq transcript on success", async () => {
     process.env.GROQ_API_KEY = "test-key";
     const file = tmpOgg();
@@ -43,7 +55,7 @@ describe("SttService", () => {
       return new Response(JSON.stringify({ text: "  hello from the voice note " }), { status: 200 });
     });
     const stt = new SttService(["groq"], { fetchFn });
-    const res = await stt.transcribe(file);
+    const res = await stt.transcribe(file, { providers: ["groq"], allowExternal: true });
     expect(res).toMatchObject({ ok: true, text: "hello from the voice note", provider: "groq" });
     expect(sawAuth).toBe("Bearer test-key");
   });
@@ -74,7 +86,7 @@ describe("SttService", () => {
     process.env.GROQ_API_KEY = "bad-key";
     const fetchFn = fakeFetchJson(() => new Response("unauthorized", { status: 401 }));
     const stt = new SttService(["groq", "local_whisper"], { fetchFn, whisperBin: null });
-    const res = await stt.transcribe(tmpOgg());
+    const res = await stt.transcribe(tmpOgg(), { providers: ["groq", "local_whisper"], allowExternal: true });
     expect(res.ok).toBe(false);
     expect(res.provider).toBe("none");
     expect(res.error).toContain("groq: groq HTTP 401");
@@ -125,9 +137,10 @@ describe("SttService", () => {
   });
 
   it("configured() is false only when groq is the sole provider without a key", () => {
-    expect(new SttService(["groq"]).configured()).toBe(false);
+    expect(new SttService(["groq"]).configured({ providers: ["groq"], allowExternal: true })).toBe(false);
     process.env.GROQ_API_KEY = "k";
-    expect(new SttService(["groq"]).configured()).toBe(true);
+    expect(new SttService(["groq"]).configured()).toBe(false);
+    expect(new SttService(["groq"]).configured({ providers: ["groq"], allowExternal: true })).toBe(true);
     expect(new SttService(["local_whisper"]).configured()).toBe(true);
   });
 });

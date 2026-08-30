@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { InputFile } from "grammy";
 import type { InputProfilePhoto } from "grammy/types";
-import { TelegramDuplicateGuard, telegramRetryAfterMs, replyContextFrom, extFromMime } from "./telegram.js";
+import { TelegramDuplicateGuard, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec } from "./telegram.js";
 
 describe("TelegramDuplicateGuard", () => {
   it("suppresses an identical payload to the same chat inside the window", () => {
@@ -82,6 +85,36 @@ describe("extFromMime", () => {
   });
 });
 
+describe("telegramMediaSpec", () => {
+  it("accepts bounded video notes for local audio extraction", () => {
+    expect(telegramMediaSpec({ video_note: { file_id: "vn", duration: 12, file_size: 1024 } })).toMatchObject({
+      ok: true,
+      kind: "video_note",
+      fileId: "vn",
+      durationSec: 12,
+      extension: ".mp4",
+    });
+  });
+
+  it("classifies only audio MIME documents as audio documents", () => {
+    expect(telegramMediaSpec({ document: { file_id: "a", mime_type: "audio/mpeg", file_size: 2048 } })).toMatchObject({
+      ok: true,
+      kind: "audio_document",
+      fileId: "a",
+    });
+    expect(telegramMediaSpec({ document: { file_id: "x", mime_type: "application/pdf", file_size: 2048 } })).toMatchObject({
+      ok: true,
+      kind: "document",
+      fileId: "x",
+    });
+  });
+
+  it("rejects oversized voice and video-note downloads before getFile", () => {
+    expect(telegramMediaSpec({ voice: { file_id: "v", duration: 2, file_size: 20 * 1024 * 1024 + 1 } })).toMatchObject({ ok: false, error: expect.stringContaining("20MB") });
+    expect(telegramMediaSpec({ video_note: { file_id: "vn", duration: 301, file_size: 1 } })).toMatchObject({ ok: false, error: expect.stringContaining("300s") });
+  });
+});
+
 describe("Telegram profile photo adapter", () => {
   it("uploads every static JPG through setMyProfilePhoto with a fresh InputFile", async () => {
     const transport = new (await import("./telegram.js")).TelegramTransport("123:test", ["42"], { nameSuffix: "coach", boundAgentId: "coach" });
@@ -100,5 +133,59 @@ describe("Telegram profile photo adapter", () => {
     expect(first.photo.filename).toBe("coach-avatar.jpg");
     expect(second.photo).toBeInstanceOf(InputFile);
     expect(second.photo).not.toBe(first.photo);
+  });
+});
+
+describe("Telegram speech delivery", () => {
+  it("sends voice through the guarded per-chat outbox and suppresses an immediate duplicate", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-voice-"));
+    const file = path.join(dir, "voice.ogg");
+    fs.writeFileSync(file, "OggS-voice", { mode: 0o600 });
+    const transport = new (await import("./telegram.js")).TelegramTransport("123:test", ["42"]);
+    const sendVoice = vi.fn(async (_chatId: string, _voice: unknown, _options?: unknown) => ({ message_id: 1 }));
+    (transport as unknown as { bot: { api: { sendVoice: typeof sendVoice } } }).bot.api.sendVoice = sendVoice;
+
+    await transport.sendVoice("42", file, "hello");
+    await transport.sendVoice("42", file, "hello");
+
+    expect(sendVoice).toHaveBeenCalledTimes(1);
+    expect(sendVoice.mock.calls[0][0]).toBe("42");
+    expect(sendVoice.mock.calls[0][1]).toBeInstanceOf(InputFile);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("sends M4A through Telegram audio delivery", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-audio-"));
+    const file = path.join(dir, "audio.m4a");
+    fs.writeFileSync(file, Buffer.concat([Buffer.alloc(4), Buffer.from("ftyp-audio")]), { mode: 0o600 });
+    const transport = new (await import("./telegram.js")).TelegramTransport("123:test", ["42"]);
+    const sendAudio = vi.fn(async (_chatId: string, _audio: unknown, _options?: unknown) => ({ message_id: 1 }));
+    (transport as unknown as { bot: { api: { sendAudio: typeof sendAudio } } }).bot.api.sendAudio = sendAudio;
+
+    await transport.sendAudio("42", file);
+
+    expect(sendAudio).toHaveBeenCalledTimes(1);
+    expect(sendAudio.mock.calls[0][1]).toBeInstanceOf(InputFile);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("opens a fresh voice upload when Telegram asks for a rate-limit retry", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-retry-"));
+    const file = path.join(dir, "voice.ogg");
+    fs.writeFileSync(file, "OggS-voice", { mode: 0o600 });
+    const transport = new (await import("./telegram.js")).TelegramTransport("123:test", ["42"]);
+    const uploads: unknown[] = [];
+    const sendVoice = vi.fn(async (_chatId: string, voice: unknown) => {
+      uploads.push(voice);
+      if (uploads.length === 1) throw { error_code: 429, parameters: { retry_after: 0 } };
+      return { message_id: 1 };
+    });
+    (transport as unknown as { bot: { api: { sendVoice: typeof sendVoice } } }).bot.api.sendVoice = sendVoice;
+
+    await transport.sendVoice("42", file);
+
+    expect(uploads).toHaveLength(2);
+    expect(uploads[0] === uploads[1]).toBe(false);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

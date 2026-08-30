@@ -62,6 +62,31 @@ describe("capability registry", () => {
     }
   });
 
+  it("keeps speech opt-in and exposes separate generate and send tools only when Telegram speech is available", () => {
+    const definition = CAPABILITY_REGISTRY.find((item) => item.id === "speech");
+    expect(definition).toMatchObject({ defaultEnabled: false, tools: ["speech_generate", "speech_send"] });
+    const context = {
+      ...baseContext,
+      chat: { transport: "telegram:coach", chatId: "42" },
+      speech: { providers: { list: () => [{ id: "local", configured: true }] }, store: {}, send: vi.fn() },
+    } as unknown as CapabilityContext;
+    const result = resolveCapabilities(context, CAPABILITY_REGISTRY, ["speech"]);
+    expect(result.ids).toEqual(["speech"]);
+    expect(result.prompt).toContain("explicitly asks");
+    expect(result.prompt).toContain("Never use speech from heartbeat");
+  });
+
+  it("does not expose speech when no local speech provider is configured", () => {
+    const context = {
+      ...baseContext,
+      chat: { transport: "telegram:coach", chatId: "42" },
+      speech: { providers: { list: () => [{ id: "local", configured: false }] }, store: {}, send: vi.fn() },
+    } as unknown as CapabilityContext;
+    const result = resolveCapabilities(context, CAPABILITY_REGISTRY, ["speech"]);
+    expect(result.ids).toEqual([]);
+    expect(result.unavailable).toEqual(["speech"]);
+  });
+
   it("loads and advertises the formerly disconnected plugins when explicitly selected and available", () => {
     const ids = ["agent-comms", "knowledge", "attend", "telegram-responder", "delegate"];
     const definitions = CAPABILITY_REGISTRY

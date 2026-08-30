@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import { Bot, InputFile, type Context } from "grammy";
 import type { InlineKeyboardButton } from "grammy/types";
 import type { Card, IncomingMedia, PushOptions, ReplyContext, Transport } from "../core/types.js";
@@ -71,7 +72,7 @@ function toTelegramHtml(text: string): string {
 const QUOTE_MAX = 400;
 const VOICE_MAX_SECONDS = 300;
 const AUDIO_MAX_SECONDS = 1800;
-const DOCUMENT_MAX_BYTES = 20 * 1024 * 1024; // getFile hard limit
+const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 
 /**
@@ -100,6 +101,52 @@ export function extFromMime(mime: string | undefined): string | undefined {
     "application/pdf": ".pdf", "text/plain": ".txt", "text/markdown": ".md",
   };
   return mime ? map[mime.toLowerCase().split(";")[0].trim()] : undefined;
+}
+
+type TelegramMediaInput = {
+  voice?: { file_id: string; duration: number; file_size?: number; mime_type?: string };
+  audio?: { file_id: string; duration: number; file_size?: number; mime_type?: string };
+  video_note?: { file_id: string; duration: number; file_size?: number };
+  photo?: Array<{ file_id: string; file_size?: number }>;
+  document?: { file_id: string; file_size?: number; mime_type?: string; file_name?: string };
+};
+
+export type TelegramMediaSpec =
+  | { ok: true; kind: IncomingMedia["kind"]; fileId: string; durationSec?: number; mimeType?: string; fileSize?: number; extension: string }
+  | { ok: false; error: string };
+
+/** Pure Telegram media classification and pre-download bounds. Content-level
+ * audio validation happens later through ffprobe. */
+export function telegramMediaSpec(message: TelegramMediaInput): TelegramMediaSpec | null {
+  const bounded = (fileSize: number | undefined): TelegramMediaSpec | null =>
+    fileSize !== undefined && fileSize > MEDIA_MAX_BYTES ? { ok: false, error: "Media is too large (limit 20MB)." } : null;
+  if (message.voice) {
+    const tooLarge = bounded(message.voice.file_size); if (tooLarge) return tooLarge;
+    if (message.voice.duration > VOICE_MAX_SECONDS) return { ok: false, error: `Voice note is too long (limit ${VOICE_MAX_SECONDS}s).` };
+    return { ok: true, kind: "voice", fileId: message.voice.file_id, durationSec: message.voice.duration, mimeType: message.voice.mime_type, fileSize: message.voice.file_size, extension: ".ogg" };
+  }
+  if (message.audio) {
+    const tooLarge = bounded(message.audio.file_size); if (tooLarge) return tooLarge;
+    if (message.audio.duration > AUDIO_MAX_SECONDS) return { ok: false, error: `Audio is too long (limit ${AUDIO_MAX_SECONDS}s).` };
+    return { ok: true, kind: "audio", fileId: message.audio.file_id, durationSec: message.audio.duration, mimeType: message.audio.mime_type, fileSize: message.audio.file_size, extension: extFromMime(message.audio.mime_type) ?? ".mp3" };
+  }
+  if (message.video_note) {
+    const tooLarge = bounded(message.video_note.file_size); if (tooLarge) return tooLarge;
+    if (message.video_note.duration > VOICE_MAX_SECONDS) return { ok: false, error: `Video note is too long (limit ${VOICE_MAX_SECONDS}s).` };
+    return { ok: true, kind: "video_note", fileId: message.video_note.file_id, durationSec: message.video_note.duration, fileSize: message.video_note.file_size, mimeType: "video/mp4", extension: ".mp4" };
+  }
+  if (message.photo?.length) {
+    const selected = message.photo.at(-1)!;
+    const tooLarge = bounded(selected.file_size); if (tooLarge) return tooLarge;
+    return { ok: true, kind: "photo", fileId: selected.file_id, fileSize: selected.file_size, extension: ".jpg" };
+  }
+  if (message.document) {
+    const tooLarge = bounded(message.document.file_size); if (tooLarge) return tooLarge;
+    const mime = message.document.mime_type ?? "";
+    const kind: IncomingMedia["kind"] = IMAGE_MIME.has(mime) ? "photo" : mime.toLowerCase().startsWith("audio/") ? "audio_document" : "document";
+    return { ok: true, kind, fileId: message.document.file_id, mimeType: message.document.mime_type, fileSize: message.document.file_size, extension: extFromMime(mime) ?? ".bin" };
+  }
+  return null;
 }
 
 export function assertCallbackData(action: string): string {
@@ -171,13 +218,14 @@ export class TelegramTransport implements Transport {
 
     this.bot.on("message:voice", (ctx) => void this.handleMediaMessage(ctx, "voice").catch((e) => console.error("[telegram] voice handler:", e)));
     this.bot.on("message:audio", (ctx) => void this.handleMediaMessage(ctx, "audio").catch((e) => console.error("[telegram] audio handler:", e)));
+    this.bot.on("message:video_note", (ctx) => void this.handleMediaMessage(ctx, "video_note").catch((e) => console.error("[telegram] video-note handler:", e)));
     this.bot.on("message:photo", (ctx) => void this.handleMediaMessage(ctx, "photo").catch((e) => console.error("[telegram] photo handler:", e)));
     this.bot.on("message:document", (ctx) => void this.handleMediaMessage(ctx, "document").catch((e) => console.error("[telegram] document handler:", e)));
     // everything else the bot can't process — say so instead of dropping silently
     this.bot.on("message", async (ctx) => {
       if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
       const m = ctx.message;
-      const kind = m?.sticker ? "stickers" : m?.video ? "videos" : m?.video_note ? "video notes" : m?.animation ? "animations" : "this media type";
+      const kind = m?.sticker ? "stickers" : m?.video ? "videos" : m?.animation ? "animations" : "this media type";
       void this.push(String(ctx.chat?.id ?? ""), { text: `I can't process ${kind} yet — send text, a voice note, a photo, or a document.` }).catch(() => {});
     });
 
@@ -224,6 +272,40 @@ export class TelegramTransport implements Transport {
   async setProfilePhoto(filePath: string): Promise<void> {
     const photo = new InputFile(filePath, path.basename(filePath));
     await this.bot.api.setMyProfilePhoto({ type: "static", photo });
+  }
+
+  async sendVoice(chatId: string, filePath: string, caption?: string): Promise<void> {
+    await this.sendSpeechFile("voice", chatId, filePath, caption);
+  }
+
+  async sendAudio(chatId: string, filePath: string, caption?: string): Promise<void> {
+    await this.sendSpeechFile("audio", chatId, filePath, caption);
+  }
+
+  private async sendSpeechFile(kind: "voice" | "audio", chatId: string, filePath: string, caption?: string): Promise<void> {
+    const resolved = path.resolve(filePath);
+    const stat = await fsp.lstat(resolved);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Invalid speech artifact file");
+    if (stat.size <= 0 || stat.size > 50 * 1024 * 1024) throw new Error("Speech artifact must be between 1 byte and 50MB");
+    const extension = path.extname(resolved).toLowerCase();
+    if (kind === "voice" && extension !== ".ogg") throw new Error("Telegram voice artifacts must be OGG/Opus");
+    if (kind === "audio" && extension !== ".m4a" && extension !== ".mp3") throw new Error("Telegram audio artifacts must be MP3 or M4A");
+    const digest = createHash("sha256").update(await fsp.readFile(resolved)).digest("hex");
+    const safeCaption = caption?.trim() ? truncate(caption.trim(), 1024) : undefined;
+    const payload = `speech:${kind}:${digest}:${safeCaption ?? ""}`;
+    await this.enqueue(chatId, async () => {
+      if (!this.duplicateGuard.shouldSend(chatId, payload)) {
+        console.warn(`[telegram] suppressed duplicate ${kind} send to chat ${chatId}`);
+        return;
+      }
+      await this.sendTelegram(chatId, () => {
+        const input = new InputFile(resolved, path.basename(resolved));
+        return kind === "voice"
+          ? this.bot.api.sendVoice(chatId, input, { caption: safeCaption })
+          : this.bot.api.sendAudio(chatId, input, { caption: safeCaption });
+      });
+      this.duplicateGuard.markSent(chatId, payload);
+    });
   }
 
   private onManagedBotCb: ((info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>) | null = null;
@@ -296,7 +378,7 @@ export class TelegramTransport implements Transport {
   /**
    * Shared media path: validate + download to mediaDir, then hand to the bot.
    */
-  private async handleMediaMessage(ctx: Context, kind: IncomingMedia["kind"]): Promise<void> {
+  private async handleMediaMessage(ctx: Context, _kind: IncomingMedia["kind"]): Promise<void> {
     if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
     if (!this.onMediaCb) return; // bot not wired for media — ignore
     const m = ctx.message;
@@ -304,45 +386,13 @@ export class TelegramTransport implements Transport {
     const chatId = String(ctx.chat?.id ?? "");
     if (!this.mediaDir) return; // no media dir configured — degrade to old silent behavior
 
-    let fileId: string | undefined;
-    let durationSec: number | undefined;
-    let mimeType: string | undefined;
-    let fileSize: number | undefined;
-    let ext = ".bin";
-    let resolvedKind: IncomingMedia["kind"] = kind;
+    const spec = telegramMediaSpec(m);
+    if (!spec) return;
+    if (!spec.ok) { await ctx.reply(spec.error); return; }
 
-    if (m.voice) {
-      if (m.voice.duration > VOICE_MAX_SECONDS) {
-        await ctx.reply(`Voice note is ${m.voice.duration}s — limit is ${VOICE_MAX_SECONDS}s. Split it or type it out.`);
-        return;
-      }
-      fileId = m.voice.file_id; durationSec = m.voice.duration; mimeType = m.voice.mime_type; ext = ".ogg";
-    } else if (m.audio) {
-      if (m.audio.duration > AUDIO_MAX_SECONDS) {
-        await ctx.reply(`Audio is ${m.audio.duration}s — limit is ${AUDIO_MAX_SECONDS}s.`);
-        return;
-      }
-      fileId = m.audio.file_id; durationSec = m.audio.duration; mimeType = m.audio.mime_type; ext = extFromMime(m.audio.mime_type) ?? ".mp3";
-    } else if (m.photo?.length) {
-      fileId = m.photo.at(-1)?.file_id;
-      ext = ".jpg"; // largest size is last
-    } else if (m.document) {
-      const mime = m.document.mime_type ?? "";
-      if ((m.document.file_size ?? 0) > DOCUMENT_MAX_BYTES) {
-        await ctx.reply("Document is too large (limit 20MB).");
-        return;
-      }
-      fileId = m.document.file_id; mimeType = m.document.mime_type; fileSize = m.document.file_size;
-      resolvedKind = IMAGE_MIME.has(mime) ? "photo" : "document";
-      ext = extFromMime(mime)
-        ?? (m.document.file_name?.includes(".") ? m.document.file_name.slice(m.document.file_name.lastIndexOf(".")) : ".bin");
-    }
-    if (!fileId) return;
-
-    const reply = replyContextFrom(m.reply_to_message, this.me?.id);
     try {
-      const filePath = await this.downloadTelegramFile(fileId, `${chatId}-${m.message_id}-${resolvedKind}${ext}`);
-      await this.onMediaCb({ kind: resolvedKind, chatId, filePath, fileId, caption: m.caption, durationSec, mimeType, fileSize });
+      const filePath = await this.downloadTelegramFile(spec.fileId, spec.extension);
+      await this.onMediaCb({ kind: spec.kind, chatId, filePath, fileId: spec.fileId, caption: m.caption, durationSec: spec.durationSec, mimeType: spec.mimeType, fileSize: spec.fileSize });
     } catch (e) {
       console.error("[telegram] media download failed:", e);
       await ctx.reply("Couldn't download that file — try again.").catch(() => {});
@@ -350,15 +400,22 @@ export class TelegramTransport implements Transport {
   }
 
   /** Download a Telegram file by id into mediaDir (Telegram getFile API). */
-  private async downloadTelegramFile(fileId: string, destName: string): Promise<string> {
-    fs.mkdirSync(this.mediaDir, { recursive: true });
+  private async downloadTelegramFile(fileId: string, extension: string): Promise<string> {
+    fs.mkdirSync(this.mediaDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(this.mediaDir, 0o700);
     const file = await this.bot.api.getFile(fileId);
     if (!file.file_path) throw new Error(`getFile returned no path for ${fileId}`);
     const url = `https://api.telegram.org/file/bot${(this.bot as unknown as { token: string }).token}/${file.file_path}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
     if (!res.ok) throw new Error(`file download HTTP ${res.status}`);
-    const destPath = path.join(this.mediaDir, destName.replace(/[^\w.-]/g, "_"));
-    await fsp.writeFile(destPath, Buffer.from(await res.arrayBuffer()));
+    const declaredSize = Number(res.headers.get("content-length") ?? 0);
+    if (declaredSize > MEDIA_MAX_BYTES) throw new Error("file download exceeds 20MB limit");
+    const bytes = Buffer.from(await res.arrayBuffer());
+    if (bytes.length > MEDIA_MAX_BYTES) throw new Error("file download exceeds 20MB limit");
+    const safeExtension = /^\.[a-z0-9]{1,5}$/i.test(extension) ? extension.toLowerCase() : ".bin";
+    const destPath = path.join(this.mediaDir, `${randomUUID()}${safeExtension}`);
+    await fsp.writeFile(destPath, bytes, { mode: 0o600, flag: "wx" });
+    await fsp.chmod(destPath, 0o600);
     return destPath;
   }
 

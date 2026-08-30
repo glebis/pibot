@@ -14,12 +14,14 @@ import { memoryPlugin } from "../plugins/memory-plugin.js";
 import { questionPlugin } from "../plugins/question-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
 import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
+import { speechPlugin } from "../plugins/speech-plugin.js";
 import { resolveResponderDb, tgResponderPlugin } from "../plugins/tg-responder-plugin.js";
 import { DEV_AGENT_ID, DEV_TOOLS, WORKSHOP_TOOLS, readDevRemoteConfig } from "./dev-agent.js";
 import type { QuestionAnswer, QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import type { AgentManifest, ChatRef } from "./types.js";
 import type { AvatarArtifactStore, AvatarProviderRegistry } from "./avatar.js";
+import type { SpeechArtifactStore, SpeechKind, SpeechProviderRegistry } from "./speech.js";
 
 export interface CapabilityAgent { id: string; dir: string; manifest: AgentManifest }
 export interface CapabilityContext {
@@ -34,6 +36,11 @@ export interface CapabilityContext {
     providers: AvatarProviderRegistry;
     store: AvatarArtifactStore;
     applyProfilePhoto: (transport: string, filePath: string) => Promise<void>;
+  };
+  speech?: {
+    providers: SpeechProviderRegistry;
+    store: SpeechArtifactStore;
+    send: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>;
   };
 }
 
@@ -73,6 +80,19 @@ const confirmMutation = (ctx: CapabilityContext) => async (description: string):
 };
 
 export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
+  {
+    id: "speech", defaultEnabled: false, tools: ["speech_generate", "speech_send"],
+    prompt: "speech_generate creates a private local voice/audio artifact and never sends it. speech_send sends that selected artifact only to this invoking Telegram chat. Use both only when the owner explicitly asks for speech. Never use speech from heartbeat, schedules, replay, or automatic reply conversion.",
+    available: (ctx) => Boolean(ctx.speech && ctx.chat.transport.startsWith("telegram") && ctx.speech.providers.list().some((provider) => provider.configured)),
+    create: (ctx) => speechPlugin({
+      agentId: ctx.agent.id,
+      transport: ctx.chat.transport,
+      chatId: ctx.chat.chatId,
+      providers: ctx.speech!.providers,
+      store: ctx.speech!.store,
+      send: ctx.speech!.send,
+    }),
+  },
   {
     id: "avatar", defaultEnabled: false, tools: ["avatar_generate", "avatar_apply"],
     prompt: "avatar_generate creates a selected bot avatar but never applies it. avatar_apply changes only this Telegram bot's profile photo and always requires explicit owner confirmation.",

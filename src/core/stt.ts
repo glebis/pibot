@@ -9,7 +9,9 @@ import { errorMessage, truncate } from "./util.js";
  * Speech-to-Text with a configurable provider fallback chain
  * (pattern from verity-agent's stt_service.py).
  *
- * Providers, tried in order (STT_PROVIDERS env, default "whisperkit,groq,local_whisper"):
+ * Providers enabled on the host (STT_PROVIDERS env, default
+ * "whisperkit,local_whisper"). Agent policy narrows this list further and
+ * remote providers are always tried after local providers.
  * - whisperkit:    whisperkit-cli (Apple Silicon native; best local default on macOS).
  * - groq:          Groq Whisper API — fast, remote. Needs GROQ_API_KEY.
  * - local_whisper: local `whisper` CLI via subprocess, best-effort.
@@ -22,17 +24,36 @@ export interface SttResult {
   error?: string;
 }
 
-export const DEFAULT_STT_PROVIDERS = ["whisperkit", "groq", "local_whisper"] as const;
+export type SttProviderId = "whisperkit" | "groq" | "local_whisper";
+export interface SttPolicy {
+  providers?: SttProviderId[];
+  allowExternal?: boolean;
+}
+
+export const DEFAULT_STT_PROVIDERS = ["whisperkit", "local_whisper"] as const;
 export const KNOWN_STT_PROVIDERS = new Set(["whisperkit", "groq", "local_whisper"]);
+const EXTERNAL_STT_PROVIDERS = new Set<SttProviderId>(["groq"]);
 const GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 const GROQ_MODEL = process.env.STT_GROQ_MODEL || "whisper-large-v3-turbo";
 const WHISPERKIT_MODEL = process.env.STT_WHISPERKIT_MODEL || "whisper-tiny";
 
-export function sttProvidersFromEnv(): string[] {
+export function sttProvidersFromEnv(): SttProviderId[] {
   const raw = (process.env.STT_PROVIDERS ?? "").trim();
   if (!raw) return [...DEFAULT_STT_PROVIDERS];
-  const parsed = raw.split(",").map((p) => p.trim()).filter((p) => KNOWN_STT_PROVIDERS.has(p));
+  const parsed = raw.split(",").map((p) => p.trim()).filter((p): p is SttProviderId => KNOWN_STT_PROVIDERS.has(p));
   return parsed.length ? parsed : [...DEFAULT_STT_PROVIDERS];
+}
+
+/** Host availability intersected with explicit agent policy. Remote STT is
+ * denied by default and can never precede a local provider. */
+export function sttProviderChain(configured: readonly string[], policy: SttPolicy = {}): SttProviderId[] {
+  const host = new Set(configured.filter((p): p is SttProviderId => KNOWN_STT_PROVIDERS.has(p)));
+  const requested = policy.providers ?? [...DEFAULT_STT_PROVIDERS];
+  const allowed = requested.filter((provider) => host.has(provider) && (policy.allowExternal || !EXTERNAL_STT_PROVIDERS.has(provider)));
+  return [
+    ...allowed.filter((provider) => !EXTERNAL_STT_PROVIDERS.has(provider)),
+    ...allowed.filter((provider) => EXTERNAL_STT_PROVIDERS.has(provider)),
+  ];
 }
 
 export interface SttDeps {
@@ -139,32 +160,36 @@ async function transcribeWhisperkit(
 }
 
 export class SttService {
-  private providers: string[];
+  private providers: SttProviderId[];
   private language: string | undefined;
   private deps: SttDeps;
 
   constructor(providers?: string[], deps: SttDeps = {}) {
-    this.providers = providers ?? sttProvidersFromEnv();
+    this.providers = (providers ?? sttProvidersFromEnv()).filter((p): p is SttProviderId => KNOWN_STT_PROVIDERS.has(p));
     const lang = (process.env.STT_LANGUAGE ?? "").trim();
     this.language = lang || undefined;
     this.deps = deps;
   }
 
   /** True when at least one provider in the chain can plausibly run. */
-  configured(): boolean {
-    return this.providers.some((p) => (p === "groq" ? !!process.env.GROQ_API_KEY : true));
+  configured(policy: SttPolicy = {}): boolean {
+    return sttProviderChain(this.providers, policy).some((p) => (p === "groq" ? !!process.env.GROQ_API_KEY : true));
   }
 
-  async transcribe(audioPath: string): Promise<SttResult> {
+  async transcribe(audioPath: string, policy: SttPolicy = {}): Promise<SttResult> {
     const failures: string[] = [];
-    for (const provider of this.providers) {
+    const providers = sttProviderChain(this.providers, policy);
+    if (!providers.length) {
+      return { ok: false, text: "", provider: "none", error: "no STT provider permitted by agent policy" };
+    }
+    for (const provider of providers) {
       const deps = this.deps;
       const result =
         provider === "groq"
           ? await transcribeGroq(audioPath, this.language, deps)
           : provider === "whisperkit"
-            ? await transcribeWhisperkit(audioPath, this.language, deps.whisperkitBin ?? (await whichBin(deps.execFileFn ?? execFile, "whisperkit-cli")), deps)
-            : await transcribeLocalWhisper(audioPath, this.language, deps.whisperBin ?? (await whichBin(deps.execFileFn ?? execFile, "whisper")), deps);
+            ? await transcribeWhisperkit(audioPath, this.language, "whisperkitBin" in deps ? deps.whisperkitBin ?? null : await whichBin(deps.execFileFn ?? execFile, "whisperkit-cli"), deps)
+            : await transcribeLocalWhisper(audioPath, this.language, "whisperBin" in deps ? deps.whisperBin ?? null : await whichBin(deps.execFileFn ?? execFile, "whisper"), deps);
       if (result.ok) return result;
       failures.push(`${result.provider}: ${result.error}`);
     }
