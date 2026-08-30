@@ -67,7 +67,12 @@ export interface SttDeps {
 }
 
 /** One provider attempt. Isolated so tests can stub fetch/exec. */
-async function transcribeGroq(audioPath: string, language: string | undefined, deps: SttDeps): Promise<SttResult> {
+export interface SttOptions {
+  /** custom-vocabulary bias prompt (dictionary terms; sent as --prompt / initial_prompt / API prompt) */
+  bias?: string;
+}
+
+async function transcribeGroq(audioPath: string, language: string | undefined, deps: SttDeps, bias?: string): Promise<SttResult> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!process.env.GROQ_API_KEY) {
     return { ok: false, text: "", provider: "groq", error: "GROQ_API_KEY not set" };
@@ -80,6 +85,7 @@ async function transcribeGroq(audioPath: string, language: string | undefined, d
     form.append("model", GROQ_MODEL);
     form.append("response_format", "json");
     if (language) form.append("language", language);
+    if (bias) form.append("prompt", truncate(bias, 800));
     const res = await fetchFn(GROQ_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
@@ -104,12 +110,14 @@ async function transcribeLocalWhisper(
   language: string | undefined,
   bin: string | null,
   deps: SttDeps,
+  bias?: string,
 ): Promise<SttResult> {
   if (!bin) return { ok: false, text: "", provider: "local_whisper", error: "whisper CLI not installed" };
   const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-whisper-"));
   const exec = deps.execFileFn ?? execFile;
   const args = [path.resolve(audioPath), "--model", process.env.STT_LOCAL_MODEL || "base", "--output_format", "txt", "--output_dir", outDir];
   if (language) args.push("--language", language);
+  if (bias) args.push("--initial_prompt", truncate(bias, 800));
   try {
     await new Promise<void>((resolve, reject) => {
       exec(bin, args, { timeout: deps.timeoutMs ?? 300_000 }, (err) => (err ? reject(err) : resolve()));
@@ -135,11 +143,13 @@ async function transcribeWhisperkit(
   language: string | undefined,
   bin: string | null,
   deps: SttDeps,
+  bias?: string,
 ): Promise<SttResult> {
   if (!bin) return { ok: false, text: "", provider: "whisperkit", error: "whisperkit-cli not installed" };
   const exec = deps.execFileFn ?? execFile;
   const args = ["transcribe", "--audio-path", path.resolve(audioPath), "--model", WHISPERKIT_MODEL, "--download-model-path", process.env.STT_WHISPERKIT_MODEL_PATH || path.join(process.env.HOME ?? "~/", "Library/whisperkit")];
   if (language) args.push("--language", language);
+  if (bias) args.push("--prompt", truncate(bias, 800));
   try {
     const [stdout, stderr] = await new Promise<[string, string]>((resolve, reject) => {
       exec(bin, args, { timeout: deps.whisperkitTimeoutMs ?? 600_000, maxBuffer: 16 * 1024 * 1024 }, (err, so, se) =>
@@ -176,7 +186,8 @@ export class SttService {
     return sttProviderChain(this.providers, policy).some((p) => (p === "groq" ? !!process.env.GROQ_API_KEY : true));
   }
 
-  async transcribe(audioPath: string, policy: SttPolicy = {}): Promise<SttResult> {
+  async transcribe(audioPath: string, policy: SttPolicy = {}, options: SttOptions = {}): Promise<SttResult> {
+    const bias = options.bias ? truncate(options.bias, 800) : undefined;
     const failures: string[] = [];
     const providers = sttProviderChain(this.providers, policy);
     if (!providers.length) {
@@ -186,10 +197,10 @@ export class SttService {
       const deps = this.deps;
       const result =
         provider === "groq"
-          ? await transcribeGroq(audioPath, this.language, deps)
+          ? await transcribeGroq(audioPath, this.language, deps, bias)
           : provider === "whisperkit"
-            ? await transcribeWhisperkit(audioPath, this.language, "whisperkitBin" in deps ? deps.whisperkitBin ?? null : await whichBin(deps.execFileFn ?? execFile, "whisperkit-cli"), deps)
-            : await transcribeLocalWhisper(audioPath, this.language, "whisperBin" in deps ? deps.whisperBin ?? null : await whichBin(deps.execFileFn ?? execFile, "whisper"), deps);
+            ? await transcribeWhisperkit(audioPath, this.language, "whisperkitBin" in deps ? deps.whisperkitBin ?? null : await whichBin(deps.execFileFn ?? execFile, "whisperkit-cli"), deps, bias)
+            : await transcribeLocalWhisper(audioPath, this.language, "whisperBin" in deps ? deps.whisperBin ?? null : await whichBin(deps.execFileFn ?? execFile, "whisper"), deps, bias);
       if (result.ok) return result;
       failures.push(`${result.provider}: ${result.error}`);
     }

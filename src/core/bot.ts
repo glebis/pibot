@@ -17,8 +17,8 @@ import type { Card, ChatRef, IncomingMedia, ReplyContext, Schedule, Transport } 
 import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
-import { SttService } from "./stt.js";
-import type { SttPolicy } from "./stt.js";
+import { SttService, type SttPolicy } from "./stt.js";
+import { applyCorrections, composeBias, loadDictionary } from "./dictionary.js";
 import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { classifyModelError, ModelCascade } from "./cascade.js";
@@ -458,16 +458,20 @@ export class PiBot implements HeartbeatHost {
         await t.push(media.chatId, { text: "🎙 Voice needs a permitted local transcription provider. External STT must be explicitly enabled in this agent's speech policy." });
         return;
       }
-      const result = await stt.transcribe(prepared.filePath, policy).catch((e) => ({ ok: false as const, text: "", provider: "none", error: errorMessage(e) }));
+      // custom vocabulary: bias the decoder + correct the transcript afterwards
+      const dictionary = loadDictionary(this.deps.config.dataDir);
+      const bias = composeBias(dictionary);
+      const result = await stt.transcribe(prepared.filePath, policy, ...(bias ? [{ bias }] as const : [])).catch((e) => ({ ok: false as const, text: "", provider: "none", error: errorMessage(e) }));
       if (!result.ok) {
         await t.push(media.chatId, { text: `🎙 Transcription failed — ${truncate(result.error ?? "unknown error", 200)}` });
         return;
       }
+      const corrected = applyCorrections(result.text, dictionary.entries);
       // speech answers pending questions with the bare transcript, exactly like typing
       if (this.questions.answerViaText(this.chatKey(t, media.chatId), result.text)) return;
       const dur = ` (${Math.round(prepared.durationSec)}s)`;
       const label = media.kind === "video_note" ? "video note" : media.kind === "voice" ? "voice note" : "audio";
-      const body = media.caption ? `${result.text}\n\n(caption: ${media.caption})` : result.text;
+      const body = media.caption ? `${corrected}\n\n(caption: ${media.caption})` : corrected;
       await this.routeUserTurn(t, media.chatId, `🎙 ${label}${dur} — transcribed via ${result.provider}:\n\n${body}`, undefined, agentId);
     } finally {
       await prepared.cleanup();

@@ -346,6 +346,19 @@ describe("PiBot commands", () => {
     expect(arg).toContain("read tool");
   });
 
+  it("applies custom-dictionary corrections to voice transcripts", async () => {
+    fs.writeFileSync(path.join(t.dir, "dictionary.json"), JSON.stringify({ entries: [{ from: "west", to: "WhisperKit" }] }));
+    (t.stt.transcribe as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, text: "I tested west today", provider: "whisperkit" });
+    await t.transport.sayMedia({ kind: "voice", durationSec: 4 });
+    // bias reached the STT call…
+    const args = (t.stt.transcribe as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(String(args[2]?.bias)).toContain("WhisperKit");
+    // …and the transcript was corrected before the agent saw it
+    const arg = t.promptSpy.mock.calls[0][0] as string;
+    expect(arg).not.toContain("tested west");
+    expect(arg).toContain("I tested WhisperKit today");
+  });
+
   it("notifies instead of prompting when transcription fails", async () => {
     t.stt.transcribe.mockRejectedValueOnce(new Error("network down"));
     await t.transport.sayMedia({ kind: "voice" });

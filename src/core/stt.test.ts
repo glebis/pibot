@@ -136,6 +136,31 @@ describe("SttService", () => {
     expect(res.text).toBe("local result");
   });
 
+  it("passes the bias prompt to whisperkit and local whisper", async () => {
+    const file = tmpOgg();
+    const seen: string[] = [];
+    const fakeExec = ((
+      cmd: string,
+      _args: readonly string[],
+      _opts: unknown,
+      cb: (err: Error | null, stdout: string | Buffer, stderr: string | Buffer) => void,
+    ) => {
+      const args = _args as string[];
+      seen.push(String(args.join(" ")));
+      if (cmd === "sh") { queueMicrotask(() => cb(null, "", "")); return; } // command -v probe → absent
+      if (args[0] === "transcribe") { queueMicrotask(() => cb(new Error("boom"), "", "")); return; } // whisperkit fails
+      const src = args.find((a) => a.endsWith(".ogg"))!;
+      const outDir = args[args.indexOf("--output_dir") + 1]!;
+      fs.writeFileSync(path.join(outDir, path.basename(src).replace(/\.ogg$/, ".txt")), "local fallback text");
+      queueMicrotask(() => cb(null, "", ""));
+    }) as unknown as typeof execFile;
+    const stt = new SttService(["whisperkit", "local_whisper"], { execFileFn: fakeExec, whisperkitBin: "/opt/homebrew/bin/whisperkit-cli", whisperBin: "/opt/fake/whisper" });
+    const res = await stt.transcribe(file, {}, { bias: "This audio may mention these words and names, keep them spelled exactly: WhisperKit, beads." });
+    expect(res).toMatchObject({ ok: true, text: "local fallback text", provider: "local_whisper" });
+    expect(seen[0]).toContain("--prompt This audio may mention");
+    expect(seen[1]).toContain("--initial_prompt This audio may mention");
+  });
+
   it("configured() is false only when groq is the sole provider without a key", () => {
     expect(new SttService(["groq"]).configured({ providers: ["groq"], allowExternal: true })).toBe(false);
     process.env.GROQ_API_KEY = "k";

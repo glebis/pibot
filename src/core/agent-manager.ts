@@ -31,12 +31,14 @@ export class AgentManager {
   private agentsDir: string;
   private vaultDir: string;
   private repoRoot: string;
+  private dataDir: string;
   private modelRuntime: ModelRuntime;
 
-  constructor(agentsDir: string, modelRuntime: ModelRuntime, vaultDir?: string, repoRoot = process.cwd()) {
+  constructor(agentsDir: string, modelRuntime: ModelRuntime, vaultDir?: string, repoRoot = process.cwd(), dataDir?: string) {
     this.agentsDir = path.resolve(agentsDir);
     this.vaultDir = vaultDir ?? path.join(os.homedir(), "Brains", "brain");
     this.repoRoot = path.resolve(repoRoot);
+    this.dataDir = dataDir ? path.resolve(dataDir) : path.join(this.repoRoot, "data");
     this.modelRuntime = modelRuntime;
   }
 
@@ -151,6 +153,7 @@ export class AgentManager {
       chat,
       ask,
       comms,
+      dictionary: { dataDir: this.dataDir },
       avatar: applyProfilePhoto && chat.transport.startsWith("telegram") && agent.manifest.capabilities?.includes("avatar") ? {
         providers: createDefaultAvatarProviders(),
         store: new AvatarArtifactStore(path.join(agent.dir, "runtime", "avatars")),

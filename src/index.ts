@@ -63,7 +63,7 @@ async function main(): Promise<void> {
   });
 
   const modelRuntime = await ModelRuntime.create();
-  const agents = new AgentManager(config.agentsDir, modelRuntime, config.vaultDir, process.cwd());
+  const agents = new AgentManager(config.agentsDir, modelRuntime, config.vaultDir, process.cwd(), config.dataDir);
   const events = new EventLog(config.agentsDir);
 
   // model cascade: primary → manifest fallbacks → PIBOT_MODEL_CASCADE → authenticated models → queue

@@ -15,6 +15,7 @@ import { questionPlugin } from "../plugins/question-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
 import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
 import { speechPlugin } from "../plugins/speech-plugin.js";
+import { dictionaryPlugin } from "../plugins/dictionary-plugin.js";
 import { resolveResponderDb, tgResponderPlugin } from "../plugins/tg-responder-plugin.js";
 import { DEV_AGENT_ID, DEV_TOOLS, WORKSHOP_TOOLS, readDevRemoteConfig } from "./dev-agent.js";
 import type { QuestionAnswer, QuestionSpec } from "./questions.js";
@@ -41,6 +42,10 @@ export interface CapabilityContext {
     providers: SpeechProviderRegistry;
     store: SpeechArtifactStore;
     send: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>;
+  };
+  /** global STT custom-vocabulary store (bot-wide data dir) */
+  dictionary?: {
+    dataDir: string;
   };
 }
 
@@ -105,6 +110,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
       confirm: confirmMutation(ctx),
       applyProfilePhoto: ctx.avatar!.applyProfilePhoto,
     }),
+  },
+  {
+    id: "dictionary", defaultEnabled: true, tools: ["dictionary_add", "dictionary_list", "dictionary_remove"],
+    prompt: "dictionary_add/dictionary_list/dictionary_remove manage bot-wide custom transcription vocabulary. When a voice transcript mishears a recurring name or term, offer (or, with the owner's go-ahead, make) an entry: from = misheard form, to = canonical spelling.",
+    available: (ctx) => Boolean(ctx.dictionary),
+    create: (ctx) => dictionaryPlugin({ dataDir: ctx.dictionary!.dataDir }),
   },
   {
     id: "scheduler", defaultEnabled: true,
