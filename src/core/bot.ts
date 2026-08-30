@@ -1428,10 +1428,23 @@ export class PiBot implements HeartbeatHost {
       const { transport } = this.splitChatKey(ck);
       return this.transports.get(transport)?.boundAgentId === agentId;
     });
-    // Once an agent has its own Telegram identity, proactive output belongs there.
-    // Broadcasting it through the main bot as well creates duplicate heartbeats.
-    const targets = dedicated.length ? dedicated : all;
-    for (const ck of targets) {
+    if (dedicated.length) {
+      // Once an agent has its own Telegram identity, proactive output belongs there.
+      for (const ck of dedicated) {
+        const { transport, chatId } = this.splitChatKey(ck);
+        const t = this.transports.get(transport);
+        if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] deliver failed:", e));
+      }
+      return;
+    }
+    // No dedicated identity: only chats the agent currently owns (is the bound agent of).
+    // Historical bindings don't grant a license to inject sibling chatter into other chats.
+    const owned = all.filter((ck) => this.chatAgent.get(ck) === agentId);
+    if (all.length && !owned.length) {
+      this.deps.events.log(agentId, "system", `proactive message suppressed — no chat currently owned by this agent (bind one: /agent ${agentId} or /subbot ${agentId}). Preview: ${truncate(text, 120)}`);
+      return;
+    }
+    for (const ck of owned) {
       const { transport, chatId } = this.splitChatKey(ck);
       const t = this.transports.get(transport);
       if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] deliver failed:", e));

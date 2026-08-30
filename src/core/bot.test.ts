@@ -511,6 +511,45 @@ describe("PiBot fire delivery", () => {
     expect(job.repeat.everyMs).toBe(45 * 60e3);
   });
 
+  it("suppresses sibling proactive output in chats owned by another agent", async () => {
+    const t = makeBot();
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "creator"
+        ? { id: "creator", dir: "/tmp/fake-creator", manifest: { name: "creator", heartbeat: { enabled: true, interval: "20m" } } }
+        : { id: "assistant", dir: "/tmp/fake-assistant", manifest: { name: "assistant" } }
+    );
+    // creator historically spoke in the main chat…
+    await t.transport.say("/agent creator");
+    await t.transport.say("/agent assistant"); // …main chat is pibot-dev's again
+    t.transport.pushed.length = 0;
+
+    await t.bot.deliverToAgent("creator", "Opinions loaded, red pen ready.");
+
+    expect(t.transport.pushed).toHaveLength(0); // no sibling chatter in the main chat
+    expect(t.events.log).toHaveBeenCalledWith("creator", "system", expect.stringContaining("suppressed"));
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("still delivers proactive output via the agent's dedicated subbot transport", async () => {
+    const t = makeBot();
+    const creatorBot = new MockTransport("telegram:creator", "creator");
+    t.bot.addTransport(creatorBot);
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "creator"
+        ? { id: "creator", dir: "/tmp/fake-creator", manifest: { name: "creator", heartbeat: { enabled: true, interval: "20m" } } }
+        : { id: "assistant", dir: "/tmp/fake-assistant", manifest: { name: "assistant" } }
+    );
+    await creatorBot.say("creator registers its home chat");
+    await t.transport.say("/agent assistant"); // main chat stays the assistant's
+    t.transport.pushed.length = 0;
+
+    await t.bot.deliverToAgent("creator", "Draft review nudge");
+
+    expect(creatorBot.pushed).toHaveLength(1);
+    expect(t.transport.pushed).toHaveLength(0);
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
   it("heartbeat speak reaches all chats of the agent", async () => {
     const t = makeBot();
     await t.transport.say("ping"); // registers chat
