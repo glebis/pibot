@@ -53,6 +53,24 @@ describe("Scheduler", () => {
     s.stop();
   });
 
+  it("rejects agent-created recurring schedules below fifteen minutes", () => {
+    const s = new Scheduler(dataDir, () => {});
+    expect(() => s.create({ ...makeJob({ repeat: { everyMs: 60_000 } }) })).toThrow(/15 minutes/);
+    expect(s.list()).toHaveLength(0);
+    s.stop();
+  });
+
+  it("caps active agent-created schedules at twenty per agent", () => {
+    const s = new Scheduler(dataDir, () => {});
+    for (let i = 0; i < 20; i++) {
+      s.create({ ...makeJob({ title: `job ${i}`, dueAt: Date.now() + 60_000 + i }) });
+    }
+    expect(() => s.create({ ...makeJob({ title: "job 21", dueAt: Date.now() + 120_000 }) })).toThrow(/20 active/);
+    expect(s.list("a1")).toHaveLength(20);
+    expect(() => s.create({ ...makeJob({ agentId: "a2", title: "other agent" }) })).not.toThrow();
+    s.stop();
+  });
+
   it("does not fire the same overdue job twice while delivery is still running", async () => {
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => { release = resolve; });
@@ -94,6 +112,98 @@ describe("Scheduler", () => {
     await waitFor(() => delivered === 1);
     expect(restartedScheduler.get(job.id)?.status).toBe("done");
     restartedScheduler.stop();
+  });
+
+  it("counts exhausted recurring occurrences and pauses after five consecutive failures", async () => {
+    const notices: string[] = [];
+    const SchedulerWithNotice = Scheduler as unknown as new (
+      dir: string,
+      fireCb: (job: Schedule, snoozed: boolean) => Promise<void>,
+      noticeCb: (job: Schedule, event: { kind: string }) => Promise<void>,
+    ) => Scheduler;
+    const s = new SchedulerWithNotice(
+      dataDir,
+      async () => { throw new Error("credential revoked"); },
+      async (_job, event) => { notices.push(event.kind); },
+    );
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000, repeat: { everyMs: 15 * 60_000 } }) });
+    const fire = (s as unknown as { fire: (j: Schedule) => Promise<void> }).fire.bind(s);
+
+    for (let occurrence = 0; occurrence < 5; occurrence++) {
+      for (let attempt = 0; attempt < 3; attempt++) await fire(job);
+    }
+
+    expect(job.status).toBe("paused");
+    expect(job.deliveryAttempts).toBe(0);
+    expect((job as Schedule & { consecutiveFailures?: number }).consecutiveFailures).toBe(5);
+    expect(job.lastDeliveryError).toContain("credential revoked");
+    expect(notices).toEqual(["first-failure", "paused"]);
+    s.stop();
+  });
+
+  it("resets the consecutive failure streak after a successful recurring occurrence", async () => {
+    let failing = true;
+    const s = new Scheduler(dataDir, async () => {
+      if (failing) throw new Error("temporary outage");
+    });
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000, repeat: { everyMs: 15 * 60_000 } }) });
+    const fire = (s as unknown as { fire: (j: Schedule) => Promise<void> }).fire.bind(s);
+    await fire(job);
+    await fire(job);
+    await fire(job);
+    expect((job as Schedule & { consecutiveFailures?: number }).consecutiveFailures).toBe(1);
+
+    failing = false;
+    await fire(job);
+
+    expect((job as Schedule & { consecutiveFailures?: number }).consecutiveFailures).toBe(0);
+    expect(job.deliveryAttempts).toBe(0);
+    expect(job.lastDeliveryError).toBeUndefined();
+    expect(job.status).toBe("pending");
+    s.stop();
+  });
+
+  it("resumes an automatically paused schedule and keeps it visible", async () => {
+    const s = new Scheduler(dataDir, async () => { throw new Error("offline"); });
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000, repeat: { everyMs: 15 * 60_000 } }) });
+    const fire = (s as unknown as { fire: (j: Schedule) => Promise<void> }).fire.bind(s);
+    for (let i = 0; i < 15; i++) await fire(job);
+
+    const listIncludingPaused = (s.list as unknown as (agentId: string, opts: { includePaused: boolean }) => Schedule[])("a1", { includePaused: true });
+    expect(listIncludingPaused.map((j) => j.id)).toContain(job.id);
+    const resumed = (s as unknown as { resume: (id: string) => Schedule | null }).resume(job.id);
+    expect(resumed?.status).toBe("pending");
+    expect((resumed as Schedule & { consecutiveFailures?: number }).consecutiveFailures).toBe(0);
+    s.stop();
+  });
+
+  it("stops retrying a failed one-shot forever", async () => {
+    const notices: string[] = [];
+    const s = new Scheduler(
+      dataDir,
+      async () => { throw new Error("chat unavailable"); },
+      async (_job, event) => { notices.push(event.kind); },
+    );
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000 }) });
+    const fire = (s as unknown as { fire: (j: Schedule) => Promise<void> }).fire.bind(s);
+    for (let attempt = 0; attempt < 5; attempt++) await fire(job);
+
+    expect(job.status).toBe("paused");
+    expect(job.deliveryAttempts).toBe(5);
+    expect(notices).toEqual(["first-failure", "paused"]);
+    s.stop();
+  });
+
+  it("retains an old paused schedule across restart", () => {
+    const s = new Scheduler(dataDir, () => {});
+    const job = s.create({ ...makeJob({ dueAt: Date.now() - 4 * 86400e3 }) });
+    job.status = "paused";
+    s.flush();
+    s.stop();
+
+    const restarted = new Scheduler(dataDir, () => {});
+    expect(restarted.get(job.id)?.status).toBe("paused");
+    restarted.stop();
   });
 
   it("cancels pending jobs", async () => {
@@ -158,7 +268,7 @@ describe("Scheduler", () => {
   it("recurs everyMs jobs from fire time", async () => {
     const fired: number[] = [];
     const s = new Scheduler(dataDir, () => void fired.push(Date.now()));
-    s.create({ ...makeJob({ repeat: { everyMs: 60 }, dueAt: Date.now() + 20 }) });
+    s.create({ ...makeJob({ internal: true, repeat: { everyMs: 60 }, dueAt: Date.now() + 20 }) });
     await waitFor(() => fired.length >= 3, 3000);
     expect(fired[1] - fired[0]).toBeGreaterThanOrEqual(50);
     expect(s.list()).toHaveLength(1); // still pending

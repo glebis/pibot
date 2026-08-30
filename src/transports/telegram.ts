@@ -5,6 +5,14 @@ import { truncate } from "../core/util.js";
 
 const TG_LIMIT = 4000;
 const DUPLICATE_WINDOW_MS = 30_000;
+const MIN_CHAT_SEND_GAP_MS = 1_000;
+
+export function telegramRetryAfterMs(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null;
+  const value = error as { error_code?: unknown; parameters?: { retry_after?: unknown } };
+  if (value.error_code !== 429 || typeof value.parameters?.retry_after !== "number") return null;
+  return Math.max(0, Math.min(60_000, value.parameters.retry_after * 1000));
+}
 
 /** Final transport-level backstop against accidental repeat sends. */
 export class TelegramDuplicateGuard {
@@ -12,20 +20,24 @@ export class TelegramDuplicateGuard {
 
   constructor(private readonly windowMs = DUPLICATE_WINDOW_MS, private readonly maxEntries = 512) {}
 
-  allow(chatId: string, payload: string, now = Date.now()): boolean {
+  shouldSend(chatId: string, payload: string, now = Date.now()): boolean {
     for (const [key, sentAt] of this.recent) {
       if (now - sentAt > this.windowMs) this.recent.delete(key);
     }
     const key = `${chatId}\u0000${payload}`;
     const sentAt = this.recent.get(key);
-    if (sentAt !== undefined && now - sentAt <= this.windowMs) return false;
+    return sentAt === undefined || now - sentAt > this.windowMs;
+  }
+
+  markSent(chatId: string, payload: string, now = Date.now()): void {
+    const key = `${chatId}\u0000${payload}`;
+    this.recent.delete(key);
     this.recent.set(key, now);
     while (this.recent.size > this.maxEntries) {
       const oldest = this.recent.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       this.recent.delete(oldest);
     }
-    return true;
   }
 }
 
@@ -95,6 +107,8 @@ export class TelegramTransport implements Transport {
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   private onPollAnswerCb: ((pollId: string, optionIndex: number, voterId: string) => Promise<void>) | null = null;
   private duplicateGuard = new TelegramDuplicateGuard();
+  private outboxByChat = new Map<string, Promise<void>>();
+  private lastSentAtByChat = new Map<string, number>();
 
   constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string; openWhenEmpty?: boolean } = {}) {
     this.bot = new Bot(token);
@@ -196,10 +210,14 @@ export class TelegramTransport implements Transport {
       console.warn(`[telegram] blocked chat ${chatId} — not in allowlist (closed by default). Add TELEGRAM_ALLOWED_CHATS=${chatId} or set PIBOT_TELEGRAM_OPEN=1 to allow all.`);
     }
     const help = `⛔️ Bot not paired. Your chat id is \`${chatId}\`\n\nAdd \`TELEGRAM_ALLOWED_CHATS=${chatId}\` to your env (or set allowed chats in the dashboard) and restart.\n\nTo allow all chats (not recommended) set \`PIBOT_TELEGRAM_OPEN=1\`.`;
-    if (!this.duplicateGuard.allow(chatId, `denied:${help}`)) return;
+    const payload = `denied:${help}`;
+    if (!this.duplicateGuard.shouldSend(chatId, payload)) return;
     try {
       const target = ctx.chat?.id ?? ctx.from?.id;
-      if (target) await this.bot.api.sendMessage(target, help, { parse_mode: "Markdown" }).catch(() => {});
+      if (target) {
+        await this.sendTelegram(chatId, () => this.bot.api.sendMessage(target, help, { parse_mode: "Markdown" }));
+        this.duplicateGuard.markSent(chatId, payload);
+      }
     } catch {
       /* ignore */
     }
@@ -292,31 +310,65 @@ export class TelegramTransport implements Transport {
   };
 
   async push(chatId: string, opts: PushOptions): Promise<void> {
-    const text = truncate(opts.text, TG_LIMIT) + (opts.text.length > TG_LIMIT ? "\n\n…(truncated)" : "");
-    if (!this.duplicateGuard.allow(chatId, JSON.stringify({ text, card: opts.card ?? null }))) {
-      console.warn(`[telegram] suppressed duplicate send to chat ${chatId}`);
-      return;
-    }
-    // first message in a chat attaches the persistent quick-action keyboard
-    if (!this.keyboardSent.has(chatId) && !opts.card) {
-      this.keyboardSent.add(chatId);
-      await this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
-        parse_mode: "HTML",
-        reply_markup: TelegramTransport.QUICK_KEYBOARD,
-      });
-      return;
-    }
-    if (!this.keyboardSent.has(chatId)) this.keyboardSent.add(chatId); // card already carried markup; keyboard next time
-    await this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
-      parse_mode: "HTML",
-      reply_markup: keyboard(opts.card),
+    return this.enqueue(chatId, async () => {
+      const text = truncate(opts.text, TG_LIMIT) + (opts.text.length > TG_LIMIT ? "\n\n…(truncated)" : "");
+      const payload = JSON.stringify({ text, card: opts.card ?? null });
+      if (!this.duplicateGuard.shouldSend(chatId, payload)) {
+        console.warn(`[telegram] suppressed duplicate send to chat ${chatId}`);
+        return;
+      }
+      // first plain message in a chat attaches the persistent quick-action keyboard
+      if (!this.keyboardSent.has(chatId) && !opts.card) {
+        await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
+          parse_mode: "HTML",
+          reply_markup: TelegramTransport.QUICK_KEYBOARD,
+        }));
+        this.keyboardSent.add(chatId);
+      } else {
+        await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
+          parse_mode: "HTML",
+          reply_markup: keyboard(opts.card),
+        }));
+      }
+      this.duplicateGuard.markSent(chatId, payload);
     });
   }
 
   async notifyError(chatId: string, message: string): Promise<void> {
-    const text = `⚠︎ ${truncate(message, 500)}`;
-    if (!this.duplicateGuard.allow(chatId, text)) return;
-    await this.bot.api.sendMessage(chatId, text).catch(() => {});
+    return this.enqueue(chatId, async () => {
+      const text = `⚠︎ ${truncate(message, 500)}`;
+      if (!this.duplicateGuard.shouldSend(chatId, text)) return;
+      try {
+        await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, text));
+        this.duplicateGuard.markSent(chatId, text);
+      } catch {
+        // Error notices are best effort; a failed attempt remains eligible for retry.
+      }
+    });
+  }
+
+  private enqueue(chatId: string, send: () => Promise<void>): Promise<void> {
+    const previous = this.outboxByChat.get(chatId) ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(send);
+    this.outboxByChat.set(chatId, current);
+    void current.finally(() => {
+      if (this.outboxByChat.get(chatId) === current) this.outboxByChat.delete(chatId);
+    }).catch(() => {});
+    return current;
+  }
+
+  private async sendTelegram(chatId: string, send: () => Promise<unknown>): Promise<void> {
+    const waitMs = MIN_CHAT_SEND_GAP_MS - (Date.now() - (this.lastSentAtByChat.get(chatId) ?? 0));
+    if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    try {
+      await send();
+    } catch (error) {
+      const retryAfterMs = telegramRetryAfterMs(error);
+      if (retryAfterMs == null) throw error;
+      await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+      await send();
+    }
+    this.lastSentAtByChat.set(chatId, Date.now());
   }
 
   setTyping(chatId: string, on: boolean): void {

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentManager, resolveAgentCapabilitySet } from "./agent-manager.js";
+import { AgentManager, resolveAgentCapabilitySet, systemPromptFor } from "./agent-manager.js";
 import type { CapabilityContext, CapabilityDefinition } from "./capabilities.js";
 import { buildHeartbeatDigest } from "./heartbeat.js";
 import type { LoadedAgent } from "./agent-manager.js";
@@ -138,6 +138,18 @@ describe("common knowledge", () => {
 });
 
 describe("agent capability integration", () => {
+  it("makes tool use, confirmation, refusal, and source attribution explicit", () => {
+    const prompt = systemPromptFor(
+      { id: "a1", dir: "/tmp/a1", manifest: { name: "a1" } } as LoadedAgent,
+      "/tmp/vault",
+      "calendar_create is available and requires confirmation.",
+    );
+    expect(prompt).toContain("use its tool instead of claiming it is unavailable");
+    expect(prompt).toContain("prose is not confirmation");
+    expect(prompt).toContain("Policy refusals are terminal");
+    expect(prompt).toContain("name the source");
+  });
+
   it("does not grant generic filesystem tools to ordinary agents by default", () => {
     const context = {
       agent: { id: "a1", dir: "/tmp/a1", manifest: { name: "a1" } },

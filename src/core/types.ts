@@ -29,14 +29,17 @@ export interface Schedule {
   wake: "normal" | "important";
   /** direct: host formats the ping. agent: full agent session composes it */
   delivery: "direct" | "agent";
-  status: "pending" | "done" | "cancelled";
+  status: "pending" | "paused" | "done" | "cancelled";
   /** bot should show an inline card (✅ / +10m / +1h / Cancel) after the agent's turn */
   cardPending?: boolean;
   createdAt: number;
   firedCount: number;
   /** Consecutive failed delivery attempts for the current occurrence. */
   deliveryAttempts?: number;
+  /** Consecutive occurrences that exhausted their delivery retries. */
+  consecutiveFailures?: number;
   lastDeliveryError?: string;
+  pauseReason?: string;
   /** internal jobs (heartbeat rhythm) are invisible to the user */
   internal?: boolean;
   /** jobs sharing a groupId cancel together (promise + its pre-check) */
