@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "./agent-manager.js";
+import { appendBacklogItems, loadBacklogItems } from "./backlog.js";
 import { applyPatch, containsRiskyPattern, EvolutionEngine, extractRecentProposals, validateSkillFile, validateSkillName, type EvolutionIO, type EvolutionProposal } from "./evolution.js";
 import { EventLog } from "./events.js";
 
@@ -164,6 +165,94 @@ describe("EvolutionEngine", () => {
     expect(engine.reject("assistant", "morning-brief")).toBe(true);
     expect(engine.staged("assistant")).toHaveLength(0);
   });
+    describe("improvement backlog", () => {
+      it("a goal-less cycle sources the top-ranked backlog item as its goal", async () => {
+        appendBacklogItems(path.join(dir, "assistant"), [{ summary: "get better at morning briefings", source: "heartbeat", priority: "high" }]);
+        await engine.evolve("assistant");
+        expect((io.propose as ReturnType<typeof vi.fn>).mock.calls[0][0].goal).toContain("morning briefings");
+      });
+
+      it("an explicit goal ignores the backlog", async () => {
+        appendBacklogItems(path.join(dir, "assistant"), [{ summary: "improve scheduling", source: "heartbeat" }]);
+        await engine.evolve("assistant", "custom goal here");
+        expect((io.propose as ReturnType<typeof vi.fn>).mock.calls[0][0].goal).toBe("custom goal here");
+        expect(loadBacklogItems(path.join(dir, "assistant")).every((i) => i.status === "open")).toBe(true);
+      });
+
+      it("auto-promotion closes the sourced (+ declared) backlog items; unknown ids are ignored", async () => {
+        const aDir = path.join(dir, "assistant");
+        appendBacklogItems(aDir, [{ summary: "top item", source: "chat", priority: "high" }]);
+        const top = loadBacklogItems(aDir)[0];
+        appendBacklogItems(aDir, [{ summary: "declared item", source: "chat" }]);
+        const declared = loadBacklogItems(aDir)[1];
+        (io.propose as ReturnType<typeof vi.fn>).mockResolvedValue({
+          mode: "create",
+          skillName: "brief-skill",
+          description: "Use when briefings are requested.",
+          content: "# Brief\n\n## Steps\n- brief\n",
+          rationale: "addresses backlog",
+          probes: [{ task: "brief me", criteria: "briefs" }],
+          closesBacklog: declared.id,
+        });
+        const report = await engine.evolve("assistant"); // goal-less → sources top item
+        expect(report.promoted).toBe(true);
+        const after = Object.fromEntries(loadBacklogItems(aDir).map((i) => [i.id, i.status]));
+        expect(after[top.id]).toBe("done");
+        expect(after[declared.id]).toBe("done");
+        // staging sidecar removed with the staging dir, live skill in place
+        expect(fs.existsSync(path.join(aDir, "skills", "brief-skill"))).toBe(true);
+        // a bogus closesBacklog id is ignored — the referenced item stays open
+        appendBacklogItems(aDir, [{ summary: "bogus id case", source: "chat", priority: "low" }]);
+        const bogus = loadBacklogItems(aDir).find((i) => i.summary === "bogus id case")!;
+        (io.propose as ReturnType<typeof vi.fn>).mockResolvedValue({
+          mode: "create" as const,
+          skillName: "bogus-skill",
+          description: "Use when bogus ids are declared.",
+          content: "# B\n\n## Steps\n- x\n",
+          rationale: "r",
+          probes: [{ task: "t", criteria: "c" }],
+          closesBacklog: "definitely-not-a-real-id",
+        });
+        await engine.evolve("assistant", "goal");
+        expect(loadBacklogItems(aDir).find((i) => i.id === bogus.id)?.status).toBe("open");
+      });
+
+      it("a staged (low-probe) candidate with a sidecar closes its item only on manual promote", async () => {
+        const aDir = path.join(dir, "assistant");
+        appendBacklogItems(aDir, [{ summary: "sidecar case", source: "chat" }]);
+        const item = loadBacklogItems(aDir)[0];
+        (io.judge as ReturnType<typeof vi.fn>).mockResolvedValue(2);
+        (io.propose as ReturnType<typeof vi.fn>).mockResolvedValue({
+          mode: "create",
+          skillName: "staged-skill",
+          description: "Use when staging matters.",
+          content: "# Staged\n\n## Steps\n- x\n",
+          rationale: "r",
+          probes: [{ task: "t", criteria: "c" }],
+          closesBacklog: item.id,
+        });
+        const report = await engine.evolve("assistant", "explicit goal (no sourcing)");
+        expect(report.staged).toBe(true);
+        expect(loadBacklogItems(aDir)[0].status).toBe("open"); // not yet landed
+        expect(engine.promote("assistant", "staged-skill")).toBe(true);
+        expect(loadBacklogItems(aDir)[0].status).toBe("done");
+        // rejection keeps the item open
+        appendBacklogItems(aDir, [{ summary: "rejected case", source: "chat", priority: "low" }]);
+        const item2 = loadBacklogItems(aDir).find((i) => i.summary === "rejected case")!;
+        (io.propose as ReturnType<typeof vi.fn>).mockResolvedValue({
+          mode: "create",
+          skillName: "rejected-skill",
+          description: "Use when rejected.",
+          content: "# R\n\n## Steps\n- x\n",
+          rationale: "r",
+          probes: [{ task: "t", criteria: "c" }],
+          closesBacklog: item2.id,
+        });
+        await engine.evolve("assistant", "goal");
+        expect(engine.reject("assistant", "rejected-skill")).toBe(true);
+        expect(loadBacklogItems(aDir).find((i) => i.id === item2.id)?.status).toBe("open");
+      });
+    });
 });
 describe("containsRiskyPattern", () => {
   it("detects risky patterns", () => {
@@ -258,4 +347,5 @@ describe("extractRecentProposals", () => {
     ];
     expect(extractRecentProposals(entries)).toEqual(["morning-brief"]);
   });
+
 });

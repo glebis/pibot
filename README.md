@@ -113,6 +113,7 @@ collect (events + persona + skills) → propose (cheap model)
 ```
 
 - **Automatic**: `evolution.enabled: true` in agent.json runs a cycle on a rhythm (default 6h, max 4/day), announces promotions in chat.
+- **Improvement backlog** (per agent, `memory/improvement-backlog.md`): durable, deduplicated candidates ranked priority → recurrence → recency (ported from Ouroboros's improvement backlog — a repeated irritation is *counted*, never dropped). Heartbeats append candidates via `maintain: "backlog: <summary>"`; the digest shows the top 5 to every heartbeat and evolution cycle; a goal-less `/evolve` (scheduled tick, dashboard) targets the top-ranked open item as its goal, and landing the skill closes what it addressed (`closesBacklog` proposal field + staging sidecar, close-on-promote). Advisory only — implementation always goes through the gated cycle.
 - **Manual**: `/evolve [goal]` runs a cycle now; `npm run evolve -- assistant "get better at morning briefings"`.
 - **Staging workflow**: `/evolve status` → `/evolve promote <name>` / `/evolve reject <name>`. Probes below 4 avg never auto-apply.
 - **Agents evolve themselves mid-chat** too: `skill_save` / `skill_patch` / `skill_list` (Hermes `skill_manage` style) after non-trivial workflows.

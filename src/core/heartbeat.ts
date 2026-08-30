@@ -19,6 +19,7 @@ import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
 import { ensureDir, errorMessage, fmtWhen, inQuietHours, parseDuration, readJson, truncate, writeJsonAtomic } from "./util.js";
+import { appendBacklogItems, formatBacklogDigest } from "./backlog.js";
 
 /** Adaptive-wakeup bounds (Ouroboros set_next_wakeup pattern): the agent may
  *  compress the next gap when something is brewing, stretch it when idle.
@@ -268,7 +269,7 @@ export class HeartbeatEngine {
           ? {}
           : {
               wakeup: Type.Optional(Type.String({ description: 'Delay until your next wakeup, e.g. "10m", "45m", "2h". Shorter when something is brewing, longer when idle. Omit to keep the normal rhythm.' })),
-              maintain: Type.Optional(Type.String({ description: "One-line durable record of a maintenance action you just did (e.g. 'memory: learned Anna prefers voice notes'). Service at most ONE stale item per tick; rotate." })),
+              maintain: Type.Optional(Type.String({ description: 'One-line durable record of a maintenance action you just did (e.g. "memory: learned Anna prefers voice notes"). Use "backlog: <summary>" to add a self-improvement candidate to your improvement backlog instead. Service at most ONE stale item per tick; rotate.' })),
             }),
       }),
       execute: async (_toolCallId, params) => {
@@ -352,8 +353,16 @@ export class HeartbeatEngine {
     }
 
     if (!opts.brief && act.maintain) {
-      recordMaintenanceNote(agent.dir, act.maintain);
-      this.deps.events.log(agent.id, "maintenance", act.maintain);
+      const raw = act.maintain.trim();
+      const backlogCandidate = /^backlog:?\s*/i.exec(raw);
+      if (backlogCandidate && raw.slice(backlogCandidate[0].length).trim()) {
+        // heartbeat backlog hook: "backlog: <improvement summary>"
+        appendBacklogItems(agent.dir, [{ summary: raw.slice(backlogCandidate[0].length), source: "heartbeat" }]);
+        this.deps.events.log(agent.id, "maintenance", act.maintain);
+      } else {
+        recordMaintenanceNote(agent.dir, act.maintain);
+        this.deps.events.log(agent.id, "maintenance", act.maintain);
+      }
     }
 
     const summary = act.speak ?? act.escalate ?? act.note ?? act.maintain ?? "(silent)";
@@ -488,6 +497,10 @@ export function buildHeartbeatDigest(
     parts.push(`# Heartbeat rhythm\nBase cadence: every ${agent.manifest.heartbeat.interval}. You may request your next wakeup sooner or later via "wakeup" in heartbeat_act (allowed: ${minI} … ${maxI}).`);
     parts.push(buildMaintenancePanel(agent.dir));
   }
+
+  // improvement backlog (advisory; feeds /evolve goal selection)
+  const backlog = formatBacklogDigest(agent.dir, { limit: 5 });
+  if (backlog) parts.push(backlog);
 
   return parts.join("\n\n");
 }

@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
+import { closeBacklogItems, loadBacklogItems, topBacklogItem } from "./backlog.js";
 import type { EventLog } from "./events.js";
 import { buildHeartbeatDigest } from "./heartbeat.js";
 import { errorMessage, readJson, truncate, writeJsonAtomic } from "./util.js";
@@ -73,6 +74,19 @@ export function applyPatch(raw: string, find: string, replace: string): { ok: bo
 
 // ─── proposal shape ─────────────────────────────────────────────────────────
 
+/** Staging sidecar: the backlog ids a staged candidate addresses (close-on-promote). */
+const STAGING_BACKLOG_SIDECAR = ".backlog.json";
+
+function readStagingBacklogIds(agent: LoadedAgent, skillName: string): string[] {
+  const sidecar = path.join(agent.dir, "skills", ".staging", skillName, STAGING_BACKLOG_SIDECAR);
+  try {
+    const ids = readJson<{ ids?: unknown }>(sidecar, {}) as { ids?: unknown };
+    return Array.isArray(ids.ids) ? ids.ids.map(String).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
 export interface EvolutionProposal {
   mode: "create" | "patch";
   skillName: string;
@@ -84,6 +98,8 @@ export interface EvolutionProposal {
   replace?: string;
   rationale: string;
   probes: Array<{ task: string; criteria: string }>;
+  /** optional id of an open improvement-backlog item this proposal addresses (validated) */
+  closesBacklog?: string;
 }
 
 export interface ProposalContext {
@@ -173,7 +189,12 @@ export class EvolutionEngine {
     if (!agent) return false;
     const stagedFile = path.join(agent.dir, "skills", ".staging", skillName, "SKILL.md");
     if (!fs.existsSync(stagedFile)) return false;
-    return this.promoteCandidate(agent, skillName, fs.readFileSync(stagedFile, "utf8"), "manually promoted from staging");
+    // read the sidecar BEFORE promotion deletes the staging dir
+    const backlogIds = readStagingBacklogIds(agent, skillName);
+    if (!this.promoteCandidate(agent, skillName, fs.readFileSync(stagedFile, "utf8"), "manually promoted from staging")) return false;
+    // close-on-commit: the sidecar records which backlog items the skill addresses
+    this.closeBacklogIds(agent, backlogIds);
+    return true;
   }
 
   reject(agentId: string, skillName: string): boolean {
@@ -204,10 +225,15 @@ export class EvolutionEngine {
     const digest = buildHeartbeatDigest(agent, { list: () => [] }, this.deps.events);
     const recentProposals = extractRecentProposals(this.deps.events.tail(agentId, 40));
 
+    // goal-less cycles target the top-ranked open improvement-backlog item
+    const sourcedBacklog = goal ? undefined : topBacklogItem(agent.dir);
+    const effectiveGoal = goal ?? sourcedBacklog?.summary;
+    if (sourcedBacklog) this.deps.events.log(agentId, "system", `evolution: goal sourced from backlog item ${sourcedBacklog.id} (priority=${sourcedBacklog.priority}, count=${sourcedBacklog.count})`);
+
     // 2. propose
     let proposal: EvolutionProposal;
     try {
-      proposal = await this.deps.io.propose({ agent, digest, existingSkills, goal, recentProposals });
+      proposal = await this.deps.io.propose({ agent, digest, existingSkills, goal: effectiveGoal, recentProposals });
     } catch (e) {
       this.deps.events.log(agentId, "system", `evolution propose failed: ${errorMessage(e)}`);
       return { agentId, ok: false, summary: `propose failed: ${errorMessage(e)}`, errors: [errorMessage(e)] };
@@ -227,11 +253,13 @@ export class EvolutionEngine {
       };
     }
 
-    // 4. stage
+    // 4. stage (+ sidecar of the backlog items this candidate addresses)
     const stagedDir = path.join(skillsDir, ".staging", proposal.skillName);
     fs.mkdirSync(stagedDir, { recursive: true });
     const candidateContent = this.candidateContent(agent, proposal);
     fs.writeFileSync(path.join(stagedDir, "SKILL.md"), candidateContent);
+    const closesIds = this.validCloseIds(agent, [sourcedBacklog?.id, proposal.closesBacklog]);
+    if (closesIds.length) writeJsonAtomic(path.join(stagedDir, STAGING_BACKLOG_SIDECAR), { ids: closesIds }, 0o600);
 
     // 5. eval probes (staging dir takes precedence over live skills dir)
     const scores: number[] = [];
@@ -253,8 +281,9 @@ export class EvolutionEngine {
       if (containsRiskyPattern(candidateContent)) {
         this.deps.events.log(agentId, "system", `evolution: risky pattern detected in "${proposal.skillName}", requires manual promote`);
       } else {
-        // 6a. auto-promote with git checkpoint
+        // 6a. auto-promote with git checkpoint — close the backlog items the skill lands
       const promoted = this.promoteCandidate(agent, proposal.skillName, candidateContent, proposal.rationale);
+      if (promoted) this.closeBacklogIds(agent, closesIds);
       return {
         agentId,
         ok: true,
@@ -280,7 +309,21 @@ export class EvolutionEngine {
     };
   }
 
-  // ── internals ─────────────────────────────────────────────────────────────
+  // ── internals ────────────────────────────────────────────────────────
+
+  /** Filter backlog ids down to actually-open items, then mark them done. */
+  private closeBacklogIds(agent: LoadedAgent, ids: string[]): void {
+    const valid = this.validCloseIds(agent, ids);
+    if (!valid.length) return;
+    const closed = closeBacklogItems(agent.dir, valid);
+    if (closed) this.deps.events.log(agent.id, "system", `evolution: closed ${closed} improvement-backlog item(s) [${valid.join(", ")}]`);
+  }
+
+  /** Keep only ids that are open backlog items of this agent. */
+  private validCloseIds(agent: LoadedAgent, ids: Array<string | undefined>): string[] {
+    const open = new Set(loadBacklogItems(agent.dir).filter((i) => i.status === "open").map((i) => i.id));
+    return [...new Set(ids.map((i) => String(i ?? "").trim()).filter(Boolean))].filter((id) => open.has(id));
+  }
 
   private readExistingSkills(skillsDir: string): Array<{ name: string; description: string; raw: string }> {
     if (!fs.existsSync(skillsDir)) return [];
@@ -416,6 +459,7 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
           find: Type.Optional(Type.String({ description: "Exact text to replace (patch mode)" })),
           replace: Type.Optional(Type.String({ description: "Replacement (patch mode)" })),
           rationale: Type.String({ description: "Why this makes the agent better w.r.t. the goal/events" }),
+          closesBacklog: Type.Optional(Type.String({ description: "Optional id of an open improvement-backlog item (from the backlog digest) that this proposal addresses and closes." })),
           probes: Type.Array(
             Type.Object({
               task: Type.String({ description: "A concrete task the skill should handle" }),
