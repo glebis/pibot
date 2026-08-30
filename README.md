@@ -35,9 +35,17 @@ Available ids are `avatar`, `scheduler`, `memory`, `calendar-read`, `calendar-wr
 
 ### Telegram bot avatars
 
-Add `avatar` to an agent's `capabilities` to let that agent generate a candidate avatar and, in a separate step, ask the owner to apply it to the Telegram bot handling the current chat. `avatar_generate` never changes a profile; `avatar_apply` always presents the existing Confirm/Cancel gate and targets only the invoking Telegram transport. There is no scheduled or automatic rotation.
+Avatar access is opt-in per agent. Add `avatar` to that agent's manifest; bots bound to other agents do not gain the capability:
 
-The `local` provider is deterministic, works offline, and needs no key. Generated JPG files stay private under the agent's runtime directory. Optional `openai` and `nano-banana` adapters remain unavailable until their environment configuration is present; listing providers never calls them. Keep keys in the environment or the daemon's secret store, never in `agent.json` or Git. The Nano Banana adapter is an OpenAI-compatible endpoint seam for future/self-hosted compatibility, not a claim of native Google API support.
+```json
+{
+  "capabilities": ["scheduler", "memory", "avatar"]
+}
+```
+
+Generation uses the deterministic, offline `local` provider by default. Optional external image providers are configured separately and remain unavailable until explicitly configured; provider discovery does not call them. Generated JPG artifacts remain private in the owning agent's runtime data.
+
+`avatar_generate` only creates a candidate. A later `avatar_apply` targets the Telegram bot handling that chat and presents an explicit **Confirm / Cancel** choice before changing its profile photo. PiBot never rotates avatars on a timer or applies a generated image automatically.
 
 ## Run
 
