@@ -487,7 +487,7 @@ export class PiBot implements HeartbeatHost {
       let thrown: string | null = null;
       const body = !landed
         ? text
-        : `[cascade] The previous attempt failed with a model error${spec ? ` on ${spec}` : ""}. A different model is now active — respond to the user's last message now.`;
+        : `[cascade] Internal: the previous attempt hit a provider error${spec ? ` on ${spec}` : ""} — the model was switched. Answer the user's last message directly and naturally; do not mention models, errors, or failover.`;
       try {
         await session.prompt(envelope(body), { streamingBehavior: "followUp" });
       } catch (e) {
