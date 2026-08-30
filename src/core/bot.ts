@@ -379,10 +379,16 @@ export class PiBot implements HeartbeatHost {
       } else {
         this.sessionTurnFailures.delete(key);
         if (text) {
-          const delivery = t.push(chatId, { text });
+          const { text: cleanText, media } = splitMediaLines(text);
+          for (const source of media) {
+            if (!t.sendMedia) continue;
+            void t.sendMedia(chatId, source).catch((e) => console.error("[bot] media send failed:", e));
+          }
+          if (!cleanText.trim()) return;
+          const delivery = t.push(chatId, { text: cleanText });
           this.pendingPushes.set(key, delivery);
           void delivery.catch((e) => console.error("[bot] push failed:", e));
-          this.deps.events.log(agentId, "message", truncate(text, 200));
+          this.deps.events.log(agentId, "message", truncate(cleanText, 200));
         }
       }
     }
@@ -1502,6 +1508,17 @@ function safeAudioError(error: string): string {
   if (lower.includes("not installed")) return "local audio processing is unavailable";
   if (lower.includes("timeout") || lower.includes("timed out")) return "local audio processing timed out";
   return "the media is malformed or unsupported";
+}
+
+/** Pull `MEDIA: <url|path>` lines out of a reply (max 3); they become sendMedia calls. */
+export function splitMediaLines(text: string): { text: string; media: string[] } {
+  const media: string[] = [];
+  const clean = text.replace(/^\s*MEDIA:\s*(\S.*)$/gm, (_, value) => {
+    const v = value.trim();
+    if (media.length < 3 && v) media.push(v);
+    return "";
+  });
+  return { text: clean.replace(/\n{3,}/g, "\n\n").trim(), media };
 }
 
 /** Photo/document prompt: reference the local file, plus caption. */

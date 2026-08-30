@@ -936,3 +936,25 @@ describe("cascade dead-letter loop guards", () => {
     expect(t.events.log).toHaveBeenCalledWith("focuscoach", "system", expect.stringContaining("loop guard"));
   });
 });
+
+describe("splitMediaLines", () => {
+  it("extracts url and local-path media lines, strips them from text, caps at 3", async () => {
+    const { splitMediaLines } = await import("./bot.js");
+    const text = [
+      "Here are the candidates:",
+      "MEDIA: /tmp/a.jpg",
+      "",
+      "MEDIA: https://x.example/b.png",
+      "extra note",
+      "MEDIA: /tmp/c.jpg",
+      "MEDIA: /tmp/d.jpg",
+      "MEDIA: /tmp/e.jpg (this one is over the cap)",
+    ].join("\n");
+    const { text: clean, media } = splitMediaLines(text);
+    expect(media).toEqual(["/tmp/a.jpg", "https://x.example/b.png", "/tmp/c.jpg"]);
+    expect(clean).not.toContain("MEDIA:");
+    expect(clean).toContain("Here are the candidates:");
+    expect(clean).toContain("extra note");
+expect(clean).not.toContain("/tmp/d.jpg");
+  });
+});

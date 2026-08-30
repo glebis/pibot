@@ -269,6 +269,25 @@ export class TelegramTransport implements Transport {
   }
 
   /** Telegram requires a fresh multipart upload for every profile-photo change. */
+  async sendMedia(chatId: string, source: string): Promise<void> {
+    // http(s) URL → Telegram fetches it; absolute local path → upload from disk.
+    if (/^https?:\/\//i.test(source)) {
+      await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, source));
+      return;
+    }
+    const local = path.resolve(source);
+    if (!fs.existsSync(local)) throw new Error(`MEDIA file not found: ${local}`);
+    const stat = fs.statSync(local);
+    if (stat.size > MEDIA_MAX_BYTES) throw new Error("file exceeds 20MB limit");
+    const lower = local.toLowerCase();
+    const isImage = /\.(jpe?g|png|webp|gif|heic)$/.test(lower);
+    if (isImage) {
+      await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, new InputFile(local)));
+    } else {
+      await this.sendTelegram(chatId, () => this.bot.api.sendDocument(chatId, new InputFile(local)));
+    }
+  }
+
   async setProfilePhoto(filePath: string): Promise<void> {
     const photo = new InputFile(filePath, path.basename(filePath));
     await this.bot.api.setMyProfilePhoto({ type: "static", photo });
