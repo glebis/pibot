@@ -117,6 +117,7 @@ export class PiBot implements HeartbeatHost {
         this.deps.events.log(agentId, "system", `sub-bot wiring failed: ${r.error}`);
       }
     } catch (e) {
+      console.error(`[telegram] managed bot token fetch failed for ${botName}: ${(e as Error).message}`);
       this.deps.events.log("system", "system", `managed bot token fetch failed: ${errorMessage(e)}`);
     }
   }

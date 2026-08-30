@@ -132,10 +132,20 @@ export class TelegramTransport implements Transport {
     return Boolean(this.me?.can_manage_bots);
   }
 
-  /** Fetch a managed bot's token (manager bots only; Bot API 9.6) */
+  /** Fetch a managed bot's token (manager bots only; Bot API 9.6).
+   *  Telegram can 400 with "invalid user_id" for a few seconds right after a bot
+   *  is created (eventual consistency) — retry transient-looking failures. */
   async getManagedBotToken(botUserId: number): Promise<string> {
-    const r = await this.bot.api.getManagedBotToken({ user_id: botUserId } as never);
-    return String(r);
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 3000 * attempt));
+      const r = await this.bot.api.getManagedBotToken({ user_id: botUserId } as never).catch((e: unknown) => {
+        lastErr = e;
+        return null;
+      });
+      if (r) return String(r);
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
   /** Restrict a managed bot to its owner (Bot API 9.6) */
