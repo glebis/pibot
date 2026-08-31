@@ -10,6 +10,11 @@ import { truncate } from "../core/util.js";
 const TG_LIMIT = 4000;
 const DUPLICATE_WINDOW_MS = 30_000;
 const MIN_CHAT_SEND_GAP_MS = 1_000;
+/** Hard ceiling per Telegram API call — a hung request must never wedge a chat's outbox forever. */
+const DEFAULT_SEND_TIMEOUT_MS = 30_000;
+function sendTimeoutMs(): number {
+  return Math.max(250, Number(process.env.PIBOT_TG_SEND_TIMEOUT_MS) || DEFAULT_SEND_TIMEOUT_MS);
+}
 
 /**
  * Delay (ms) before each getManagedBotToken retry. Monotonic, ~4.75 min total:
@@ -406,7 +411,7 @@ export class TelegramTransport implements Transport {
         );
       });
     } catch (e) {
-      console.warn("[telegram] reaction failed:", (e as Error).message);
+      console.warn("[telegram] reaction failed:", (e as Error).message, `[chat ${chatId} msg ${messageId}]`);
     }
   }
 
@@ -659,20 +664,31 @@ export class TelegramTransport implements Transport {
   private async sendTelegram(chatId: string, send: () => Promise<unknown>): Promise<unknown> {
     const waitMs = MIN_CHAT_SEND_GAP_MS - (Date.now() - (this.lastSentAtByChat.get(chatId) ?? 0));
     if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
-    let result: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
+      // A hung HTTP request (black-holed connection, VPN flap) must not wedge this
+      // chat's outbox queue forever: each attempt is raced against a hard timeout,
+      // then fails loudly so callers and logs see it.
+      const limit = sendTimeoutMs();
+      const sendP = send();
+      sendP.catch(() => {}); // a call we already abandoned must not raise unhandled rejections later
       try {
-        result = await send();
+        const result = await Promise.race([
+          sendP,
+          new Promise<never>((_, reject) => {
+            const timer = setTimeout(() => reject(new Error(`telegram api call timed out after ${limit}ms (chat ${chatId})`)), limit);
+            (timer as NodeJS.Timeout).unref?.();
+          }),
+        ]);
         this.lastSentAtByChat.set(chatId, Date.now());
         return result;
       } catch (error) {
+        this.lastSentAtByChat.set(chatId, Date.now());
         const retryAfterMs = telegramRetryAfterMs(error);
         if (retryAfterMs == null || attempt === 2) throw error;
         await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
       }
     }
-    this.lastSentAtByChat.set(chatId, Date.now());
-    return result;
+    throw new Error("telegram send exhausted retries");
   }
 
   setTyping(chatId: string, on: boolean): void {

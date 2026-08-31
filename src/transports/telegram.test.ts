@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { InputFile } from "grammy";
 import type { InputProfilePhoto } from "grammy/types";
-import { TelegramDuplicateGuard, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec } from "./telegram.js";
+import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec } from "./telegram.js";
 
 describe("TelegramDuplicateGuard", () => {
   it("suppresses an identical payload to the same chat inside the window", () => {
@@ -187,5 +187,29 @@ describe("Telegram speech delivery", () => {
     expect(uploads).toHaveLength(2);
     expect(uploads[0] === uploads[1]).toBe(false);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("sendTelegram send timeout (outbox wedge guard)", () => {
+  function bareTransport(): TelegramTransport {
+    return new TelegramTransport("123:test", ["42"]);
+  }
+  it("fails a hung api call with a loud timeout error and does not wedge the queue", async () => {
+    vi.stubEnv("PIBOT_TG_SEND_TIMEOUT_MS", "250");
+    const t = bareTransport();
+    const hung = new Promise(() => {});
+    await expect((t as unknown as { sendTelegram: (cid: string, s: () => Promise<unknown>) => Promise<unknown> }).sendTelegram("42", () => hung)).rejects.toThrow(/timed out/);
+    // the same chat's queue must still work after the timed-out attempt
+    const next = await (t as unknown as { sendTelegram: (cid: string, s: () => Promise<unknown>) => Promise<unknown> }).sendTelegram("42", async () => "ok");
+    expect(next).toBe("ok");
+    vi.unstubAllEnvs();
+  });
+
+  it("returns the result when the call settles within the budget", async () => {
+    vi.stubEnv("PIBOT_TG_SEND_TIMEOUT_MS", "2000");
+    const t = bareTransport();
+    const r = await (t as unknown as { sendTelegram: (cid: string, s: () => Promise<unknown>) => Promise<unknown> }).sendTelegram("42", async () => "delivered");
+    expect(r).toBe("delivered");
+    vi.unstubAllEnvs();
   });
 });
