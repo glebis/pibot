@@ -190,6 +190,32 @@ describe("Telegram speech delivery", () => {
   });
 });
 
+describe("push settle deadlock guard", () => {
+  it("a reply that settles a marked message must not self-deadlock the outbox", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    const calls: string[] = [];
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendMessage: async () => {
+          calls.push("sendMessage");
+          return { message_id: 7 };
+        },
+        setMessageReaction: async () => {
+          calls.push("setMessageReaction");
+          return {};
+        },
+      },
+    };
+    // simulate: incoming message 99 still marked 👀 (settleIncoming has work to do)
+    (t as unknown as { processingIds: Map<string, number[]> }).processingIds.set("42", [99]);
+    // the old code deadlocked here (reaction enqueued behind the push itself)
+    const p = t.push("42", { text: "here is your answer" });
+    await Promise.race([p, new Promise((_, reject) => setTimeout(() => reject(new Error("push deadlocked")), 3_000))]);
+    expect(calls).toContain("sendMessage");
+    expect(calls).toContain("setMessageReaction");
+  });
+});
+
 describe("sendTelegram send timeout (outbox wedge guard)", () => {
   function bareTransport(): TelegramTransport {
     return new TelegramTransport("123:test", ["42"]);

@@ -208,7 +208,7 @@ export class TelegramTransport implements Transport {
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   private onPollAnswerCb: ((pollId: string, optionIndex: number, voterId: string) => Promise<void>) | null = null;
   private duplicateGuard = new TelegramDuplicateGuard();
-  private outboxByChat = new Map<string, Promise<void>>();
+  private outboxByChat = new Map<string, Promise<unknown>>();
   private lastSentAtByChat = new Map<string, number>();
 
   private onMediaCb: ((media: IncomingMedia) => Promise<void>) | null = null;
@@ -401,17 +401,22 @@ export class TelegramTransport implements Transport {
   private async settleIncoming(chatId: string, emoji = "👍"): Promise<void> {
     const list = this.processingIds.get(chatId) ?? [];
     this.processingIds.set(chatId, []);
-    for (const messageId of list) await this.setReaction(chatId, messageId, emoji);
+    for (const messageId of list) await this.setReaction(chatId, messageId, emoji, true);
   }
 
-  private async setReaction(chatId: string, messageId: number, emoji: string): Promise<void> {
+  private async setReaction(chatId: string, messageId: number, emoji: string, bypassQueue = false): Promise<void> {
     if (!this.reactions || Number.isNaN(messageId) || messageId <= 0) return;
+    const call = () =>
+      this.sendTelegram(chatId, () =>
+        this.bot.api.setMessageReaction(Number(chatId), messageId, [{ type: "emoji", emoji }] as never, { is_big: false })
+      );
     try {
-      await this.enqueue(chatId, async () => {
-        await this.sendTelegram(chatId, () =>
-          this.bot.api.setMessageReaction(Number(chatId), messageId, [{ type: "emoji", emoji }] as never, { is_big: false })
-        );
-      });
+      // bypassQueue=true is used from INSIDE an enqueued task (push settles the
+      // incoming 👀 before sending): chaining through enqueue again would wait
+      // on this very task — a silent self-deadlock. Reactions are lightweight
+      // side-calls; running them beside the queue is safe.
+      if (bypassQueue) await call();
+      else await this.enqueue(chatId, call);
     } catch (e) {
       console.warn("[telegram] reaction failed:", (e as Error).message, `[chat ${chatId} msg ${messageId}]`);
     }
@@ -660,13 +665,13 @@ export class TelegramTransport implements Transport {
     });
   }
 
-  private enqueue(chatId: string, send: () => Promise<void>): Promise<void> {
+  private enqueue<T>(chatId: string, send: () => Promise<T>): Promise<T> {
     const previous = this.outboxByChat.get(chatId) ?? Promise.resolve();
     const current = previous.catch(() => {}).then(send);
     this.outboxByChat.set(chatId, current);
     void current.finally(() => {
       if (this.outboxByChat.get(chatId) === current) this.outboxByChat.delete(chatId);
-    }).catch(() => {});
+    }).then(() => undefined, () => undefined);
     return current;
   }
 
