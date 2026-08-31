@@ -11,6 +11,13 @@ const TG_LIMIT = 4000;
 const DUPLICATE_WINDOW_MS = 30_000;
 const MIN_CHAT_SEND_GAP_MS = 1_000;
 
+/**
+ * Delay (ms) before each getManagedBotToken retry. Monotonic, ~4.75 min total:
+ * Telegram's managed-bot user records propagate slowly enough that a patient
+ * fetch succeeds where a short retry loop silently fails.
+ */
+export const MANAGED_BOT_TOKEN_BACKOFF_MS = [2_000, 8_000, 20_000, 45_000, 90_000, 120_000];
+
 export function telegramRetryAfterMs(error: unknown): number | null {
   if (!error || typeof error !== "object") return null;
   const value = error as { error_code?: unknown; parameters?: { retry_after?: unknown } };
@@ -43,6 +50,11 @@ export class TelegramDuplicateGuard {
       this.recent.delete(oldest);
     }
   }
+}
+
+function messageIdOf(sent: unknown): number | undefined {
+  const m = sent as { message_id?: unknown } | undefined;
+  return typeof m?.message_id === "number" ? m.message_id : undefined;
 }
 
 const BOT_COMMANDS = [
@@ -207,6 +219,7 @@ export class TelegramTransport implements Transport {
     this.boundAgentId = opts.boundAgentId;
     this.mediaDir = opts.mediaDir ?? "";
     this.reactions = opts.reactions ?? true;
+    this.cardTtlMs = Number(process.env.PIBOT_CARD_TTL_MS || 600_000);
 
     this.bot.on("message:text", (ctx: Context) => {
       if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
@@ -275,21 +288,23 @@ export class TelegramTransport implements Transport {
   /** Telegram requires a fresh multipart upload for every profile-photo change. */
   async sendMedia(chatId: string, source: string): Promise<void> {
     // http(s) URL → Telegram fetches it; absolute local path → upload from disk.
-    if (/^https?:\/\//i.test(source)) {
-      await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, source));
-      return;
-    }
-    const local = path.resolve(source);
-    if (!fs.existsSync(local)) throw new Error(`MEDIA file not found: ${local}`);
-    const stat = fs.statSync(local);
-    if (stat.size > MEDIA_MAX_BYTES) throw new Error("file exceeds 20MB limit");
-    const lower = local.toLowerCase();
-    const isImage = /\.(jpe?g|png|webp|gif|heic)$/.test(lower);
-    if (isImage) {
-      await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, new InputFile(local)));
-    } else {
-      await this.sendTelegram(chatId, () => this.bot.api.sendDocument(chatId, new InputFile(local)));
-    }
+    return this.enqueue(chatId, async () => {
+      if (/^https?:\/\//i.test(source)) {
+        await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, source));
+        return;
+      }
+      const local = path.resolve(source);
+      if (!fs.existsSync(local)) throw new Error(`MEDIA file not found: ${local}`);
+      const stat = fs.statSync(local);
+      if (stat.size > MEDIA_MAX_BYTES) throw new Error("file exceeds 20MB limit");
+      const lower = local.toLowerCase();
+      const isImage = /\.(jpe?g|png|webp|gif|heic)$/.test(lower);
+      if (isImage) {
+        await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, new InputFile(local)));
+      } else {
+        await this.sendTelegram(chatId, () => this.bot.api.sendDocument(chatId, new InputFile(local)));
+      }
+    });
   }
 
   async setProfilePhoto(filePath: string): Promise<void> {
@@ -339,12 +354,14 @@ export class TelegramTransport implements Transport {
   }
 
   /** Fetch a managed bot's token (manager bots only; Bot API 9.6).
-   *  Telegram can 400 with "invalid user_id" for a few seconds right after a bot
-   *  is created (eventual consistency) — retry transient-looking failures. */
+   *  Telegram can 400 with "invalid user_id" right after a bot is created
+   *  (eventual consistency) — and that window can outlast several seconds
+   *  (observed: a bot that at 20s was still rejected wired fine ~3 min later).
+   *  So we retry with exponential backoff over ~4.75 minutes total. */
   async getManagedBotToken(botUserId: number): Promise<string> {
     let lastErr: unknown;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      if (attempt > 0) await new Promise((r) => setTimeout(r, 3000 * attempt));
+    for (let attempt = 0; attempt <= MANAGED_BOT_TOKEN_BACKOFF_MS.length; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, MANAGED_BOT_TOKEN_BACKOFF_MS[attempt - 1]));
       const r = await this.bot.api.getManagedBotToken({ user_id: botUserId } as never).catch((e: unknown) => {
         lastErr = e;
         return null;
@@ -383,7 +400,11 @@ export class TelegramTransport implements Transport {
   private async setReaction(chatId: string, messageId: number, emoji: string): Promise<void> {
     if (!this.reactions || Number.isNaN(messageId) || messageId <= 0) return;
     try {
-      await this.bot.api.setMessageReaction(Number(chatId), messageId, [{ type: "reaction", emoji }] as never, { is_big: false });
+      await this.enqueue(chatId, async () => {
+        await this.sendTelegram(chatId, () =>
+          this.bot.api.setMessageReaction(Number(chatId), messageId, [{ type: "emoji", emoji }] as never, { is_big: false })
+        );
+      });
     } catch (e) {
       console.warn("[telegram] reaction failed:", (e as Error).message);
     }
@@ -540,6 +561,10 @@ export class TelegramTransport implements Transport {
   }
 
   private keyboardSent = new Set<string>();
+  /** recent bot-sent card messages per chat, for stale-button sweeping */
+  private cardRing = new Map<string, Array<{ messageId: number; at: number; swept?: boolean }>>();
+  /** how long an untapped inline card keeps its buttons */
+  private cardTtlMs: number;
 
   private static QUICK_KEYBOARD = {
     keyboard: [
@@ -559,21 +584,52 @@ export class TelegramTransport implements Transport {
         return;
       }
       await this.settleIncoming(chatId);
-      // first plain message in a chat attaches the persistent quick-action keyboard
-      if (!this.keyboardSent.has(chatId) && !opts.card) {
-        await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
+      // first plain message in a chat attaches the persistent quick-action keyboard —
+      // only the main bot; subbot chats keep their own clean slate
+      let sentId: number | undefined;
+      if (!this.keyboardSent.has(chatId) && !opts.card && !this.boundAgentId && process.env.PIBOT_QUICK_KEYBOARD !== "0") {
+        const sent = await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
           parse_mode: "HTML",
           reply_markup: TelegramTransport.QUICK_KEYBOARD,
         }));
         this.keyboardSent.add(chatId);
+        sentId = messageIdOf(sent);
       } else {
-        await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
+        const sent = await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
           parse_mode: "HTML",
           reply_markup: keyboard(opts.card),
         }));
+        sentId = messageIdOf(sent);
       }
+      this.recordCardMessage(chatId, sentId, Boolean(opts.card));
+      await this.sweepStaleCards(chatId);
       this.duplicateGuard.markSent(chatId, payload);
     });
+  }
+
+  private recordCardMessage(chatId: string, messageId: number | undefined, isCard: boolean): void {
+    if (!messageId) return;
+    const ring = this.cardRing.get(chatId) ?? [];
+    ring.push({ messageId, at: Date.now(), swept: !isCard });
+    while (ring.length > 24) ring.shift();
+    this.cardRing.set(chatId, ring);
+  }
+
+  /** Untapped inline cards keep their buttons forever in Telegram — strip them after the TTL. */
+  private async sweepStaleCards(chatId: string): Promise<void> {
+    const ring = this.cardRing.get(chatId) ?? [];
+    const now = Date.now();
+    let cleared = 0;
+    for (const entry of ring) {
+      if (entry.swept) continue;
+      if (now - entry.at < this.cardTtlMs) continue;
+      if (cleared >= 3) break; // at most a few edits per push
+      entry.swept = true;
+      cleared += 1;
+      try {
+        await this.sendTelegram(chatId, () => this.bot.api.editMessageReplyMarkup(chatId, entry.messageId, { reply_markup: { inline_keyboard: [] } }).catch(() => {}));
+      } catch { /* best effort */ }
+    }
   }
 
   async notifyError(chatId: string, message: string): Promise<void> {
@@ -600,18 +656,23 @@ export class TelegramTransport implements Transport {
     return current;
   }
 
-  private async sendTelegram(chatId: string, send: () => Promise<unknown>): Promise<void> {
+  private async sendTelegram(chatId: string, send: () => Promise<unknown>): Promise<unknown> {
     const waitMs = MIN_CHAT_SEND_GAP_MS - (Date.now() - (this.lastSentAtByChat.get(chatId) ?? 0));
     if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
-    try {
-      await send();
-    } catch (error) {
-      const retryAfterMs = telegramRetryAfterMs(error);
-      if (retryAfterMs == null) throw error;
-      await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
-      await send();
+    let result: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        result = await send();
+        this.lastSentAtByChat.set(chatId, Date.now());
+        return result;
+      } catch (error) {
+        const retryAfterMs = telegramRetryAfterMs(error);
+        if (retryAfterMs == null || attempt === 2) throw error;
+        await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+      }
     }
     this.lastSentAtByChat.set(chatId, Date.now());
+    return result;
   }
 
   setTyping(chatId: string, on: boolean): void {
