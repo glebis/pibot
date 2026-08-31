@@ -232,6 +232,8 @@ export class TelegramTransport implements Transport {
       if (!msg || !this.onMessageCb) return;
       const text = msg.text?.trim();
       if (!text) return;
+      // command dispatch is log-worthy (low volume); plain chat text stays silent
+      if (text.startsWith("/")) console.log(`[telegram] <- ${text.split(/\s+/)[0]} (chat ${msg.chat?.id}, ${this.name})`);
       void this.markIncoming(String(ctx.chat?.id), msg.message_id);
       const reply = replyContextFrom(msg.reply_to_message, this.me?.id);
       // fire-and-forget: agent turns can run long (ask_user blocks) — never stall polling
@@ -553,12 +555,19 @@ export class TelegramTransport implements Transport {
     if (!this.allowed.size && !this.openWhenEmpty) {
       console.warn(`[telegram] no allowlist configured — closed by default (pairing mode). Set TELEGRAM_ALLOWED_CHATS=<chatId> or PIBOT_TELEGRAM_OPEN=1 to allow all.`);
     }
-    void this.bot.start({
-      onStart: (me) => {
-        const allowInfo = this.allowed.size ? [...this.allowed].join(",") : this.openWhenEmpty ? "any (open)" : "none (pairing mode — closed)";
-        console.log(`[telegram] polling as @${me.username} · allowed chats: ${allowInfo}`);
-      },
-    });
+    void this.bot
+      .start({
+        onStart: (me) => {
+          const allowInfo = this.allowed.size ? [...this.allowed].join(",") : this.openWhenEmpty ? "any (open)" : "none (pairing mode — closed)";
+          console.log(`[telegram] polling as @${me.username} · allowed chats: ${allowInfo}`);
+        },
+      })
+      .catch((e) =>
+        // grammy stops polling on source errors (409 conflict, auth, network death) and
+        // settles its start() promise SILENTLY — surfacing it here is the only way a
+        // dead poller is ever visible from the outside.
+        console.error(`[telegram] POLLING STOPPED for bot ${this.name}:`, (e as Error).message)
+      );
   }
 
   async stop(): Promise<void> {
