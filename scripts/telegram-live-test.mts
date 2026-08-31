@@ -215,7 +215,7 @@ function logTail(n = 20): string {
   return daemonLog.slice(-n).join("");
 }
 
-async function spawnDaemon(chatId: string): Promise<boolean> {
+async function spawnDaemon(chatId: string, modelEnv: { PIBOT_DEFAULT_MODEL?: string; PIBOT_MODEL_CASCADE?: string } = {}): Promise<boolean> {
   const token = process.env.TELEGRAM_LIVE_TEST_TOKEN ?? loadPersistedVars().TELEGRAM_LIVE_TEST_TOKEN;
   if (!token) return false;
   const dataDir = path.join(tmpRoot, "data");
@@ -229,6 +229,7 @@ async function spawnDaemon(chatId: string): Promise<boolean> {
       PIBOT_DATA_DIR: dataDir,
       PIBOT_AGENTS_DIR: agentsDir,
       PIBOT_TRANSPORT: "telegram",
+      ...modelEnv,
       TELEGRAM_BOT_TOKEN: token,
       TELEGRAM_ALLOWED_CHATS: chatId,
       PIBOT_WEB: "1",
@@ -291,16 +292,37 @@ async function scenarioUnknownCommand(chatRef: string): Promise<void> {
   record("T2 unknown command reply", Boolean(reply), reply ? reply.text.split("\n")[0].slice(0, 70) : "no reply within 45s");
 }
 
-async function scenarioConsolidateNoop(chatRef: string, artifactsDir: string): Promise<void> {
+let bootDeadlineFrom = Date.now();
+
+async function scenarioSeededConsolidation(chatRef: string, artifactsDir: string, seededEvents: number): Promise<void> {
   const sentTs = Date.now();
   const r = sendTg(chatRef, "/consolidate");
-  if (!r.sent) return record("T3 /consolidate no-op", false, "telethon send failed");
+  if (!r.sent) return record("T7 seeded consolidation round", false, "telethon send failed");
   const ack = await awaitReply(chatRef, /Distilling/i, sentTs, 20_000);
-  if (!ack) return record("T3 /consolidate no-op", false, "no ack within 20s");
-  const report = await awaitReply(chatRef, /no new events to consolidate/, Date.parse(ack.date), 30_000);
-  const blocksWritten = fs.existsSync(path.join(artifactsDir, "blocks.json"));
-  record("T3 /consolidate no-op", Boolean(report), report ? report.text.split("\n")[0].slice(0, 70) : "ack ok, report missing");
-  record("T3b /consolidate determinism", Boolean(report) && !blocksWritten, blocksWritten ? "blocks.json written on an empty log" : "no-op run wrote no blocks");
+  if (!ack) return record("T7 seeded consolidation round", false, "no ack within 20s");
+  const report = await awaitReply(chatRef, /consolidation: \d+ event/, Date.parse(ack.date), 60_000);
+  if (!report) return record("T7 seeded consolidation round", false, `ack ok, no consolidation report within 60s (model down?): ${ack.text}`);
+  const blocksFile = path.join(artifactsDir, "blocks.json");
+  if (!fs.existsSync(blocksFile)) return record("T7 seeded consolidation round", false, report.text + " — but blocks.json missing");
+  let state: { meta?: { lessons?: unknown[] }; blocks?: Array<{ kind: string; from: number; to: number; text: string }> } = {};
+  try { state = JSON.parse(fs.readFileSync(blocksFile, "utf8")); } catch { /* handled */ }
+  const blocks = state.blocks ?? [];
+  const summary = blocks.find((b) => b.kind === "summary");
+  let journalOk = false;
+  try { journalOk = /"consumed":8[},]/m.test(fs.readFileSync(path.join(artifactsDir, "journal.jsonl"), "utf8")); } catch { /* missing */ }
+  record(
+    "T7 seeded consolidation round",
+    blocks.length === 1 && summary !== undefined && summary.from === 0 && summary.to === seededEvents && summary.text.length > 40 && journalOk,
+    `${blocks.length} block(s), events ${summary?.from ?? "?"}–${summary?.to ?? "?"}, ${state.meta?.lessons?.length ?? 0} lesson(s), text ${summary?.text?.length ?? 0}c, journal8=${journalOk}`
+  );
+  // idempotence: a second run must be a no-op on the same cursor
+  const sent2 = Date.now();
+  await sendTg(chatRef, "/consolidate");
+  const again = await awaitReply(chatRef, /no new events to consolidate/, sent2, 30_000);
+  const state2 = JSON.parse(fs.readFileSync(blocksFile, "utf8")) as typeof state;
+  record("T7b consolidation idempotence", Boolean(again) && state2.blocks?.length === 1, again ? "second run: no new events, blocks unchanged" : "no idempotent no-op reply (cursor advanced further?)");
+  const md = fs.existsSync(path.join(artifactsDir, "CONSOLIDATED.md")) ? fs.readFileSync(path.join(artifactsDir, "CONSOLIDATED.md"), "utf8") : "";
+  record("T7c CONSOLIDATED.md rendered", md.includes("## Blocks") && md.includes("Consolidated memory"), "markdown view regenerated from blocks.json");
 }
 
 /** THE deadlock canary: a reply-to-command must settle a reaction on the sent message. */
@@ -337,7 +359,75 @@ async function dashStatus(port: number): Promise<number> {
   });
 }
 
-// ─── main ───────────────────────────────────────────────────────────────────
+/** Assert the 1m heartbeat actually ticks (model must answer; silent by default). */
+async function scenarioHeartbeatTick(agentsDir: string, bootTs: number, withinMs = 120_000): Promise<void> {
+  const file = path.join(agentsDir, "assistant/state/events.jsonl");
+  const deadline = Date.now() + withinMs - (Date.now() - bootTs);
+  while (Date.now() < deadline) {
+    try {
+      const entries = fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { type: string; summary: string });
+      const hb = entries.filter((e) => e.type === "heartbeat");
+      if (hb.length >= 1) return record("T8 heartbeat live tick", true, `${hb.length} tick(s), first: "${hb[0].summary.slice(0, 50)}"`);
+      const skipped = entries.find((e) => e.type === "system" && /heartbeat skipped/i.test(e.summary));
+      if (skipped) return record("T8 heartbeat live tick", false, skipped.summary);
+    } catch { /* not written yet */ }
+    await sleep(5_000);
+  }
+  record("T8 heartbeat live tick", false, `no heartbeat event within ~${Math.round((Date.now() - bootTs) / 1000)}s of boot (quiet hours? model dead?)`);
+}
+
+// ─── seed + model defaults (spawn/full) ───────────────────────────────────
+
+/** Suggest prod-aligned model env for the test daemon from the launchd plist. */
+function suggestedChildModelEnv(): { PIBOT_DEFAULT_MODEL?: string; PIBOT_MODEL_CASCADE?: string } {
+  const plist = path.join(os.homedir(), "Library/LaunchAgents/com.glebkalinin.pibot.plist");
+  const out: { PIBOT_DEFAULT_MODEL?: string; PIBOT_MODEL_CASCADE?: string } = {};
+  for (const key of ["PIBOT_DEFAULT_MODEL", "PIBOT_MODEL_CASCADE"] as const) {
+    try {
+      const r = spawnSync("plutil", ["-extract", `EnvironmentVariables.${key}`, "raw", plist], { encoding: "utf8" });
+      if (r.status === 0 && r.stdout.trim()) out[key] = r.stdout.trim();
+    } catch { /* absent plist */ }
+  }
+  return out;
+}
+
+/**
+ * Pre-seed a deterministic test agent BEFORE boot (spawn/full):
+ * heartbeat every 1m (T8) and a seeded event log of 8 distillable events
+ * (T7 exercises the model-dependent consolidation round end-to-end).
+ */
+function preSeedAgent(agentsDir: string): { seededEvents: number } {
+  const dir = path.join(agentsDir, "assistant");
+  fs.mkdirSync(path.join(dir, "state"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "memory"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "agent.json"), JSON.stringify({
+    name: "assistant",
+    description: "pibot live-test agent",
+    heartbeat: { enabled: true, interval: "1m" },
+  }, null, 2));
+  fs.writeFileSync(
+    path.join(dir, "AGENTS.md"),
+    "You are a minimal test agent. Reply tersely if asked anything; stay otherwise silent.\n"
+  );
+  const now = Date.now();
+  const seed: Array<["message" | "fire" | "system", string]> = [
+    ["message", "Gleb said he prefers terse bullet-point answers, no pleasantries"],
+    ["message", "Gleb runs pibot dev on his Mac; voice notes use local whisperkit"],
+    ["system", "deployed via launchd job com.glebkalinin.pibot; restarts need explicit authorization"],
+    ["message", "Gleb moved to ollama cloud models after local rate-limit issues"],
+    ["fire", "morning-brief fired early; user snoozed it and asked for a later timing"],
+    ["message", "Gleb: voice transcription must stay on-device, never external STT providers"],
+    ["system", "cascade chain configured: glm-5.3-flash:cloud then minimax-m3:cloud"],
+    ["message", "Gleb prefers one-word confirmations for routine schedule changes"],
+  ];
+  const body = seed
+    .map(([type, summary], i) => JSON.stringify({ t: now - (seed.length - i) * 60_000, type, summary }))
+    .join("\n");
+  fs.writeFileSync(path.join(dir, "state", "events.jsonl"), body + "\n", { mode: 0o600 });
+  return { seededEvents: seed.length };
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   const t0 = Date.now();
@@ -386,13 +476,22 @@ async function main(): Promise<void> {
 
     const cliOk = sh(["status"]);
     record("T0a telethon CLI ready", /ready|True|ok/i.test(cliOk.out), cliOk.ok ? "" : cliOk.out.slice(0, 120));
-    const booted = await spawnDaemon(testerChatId);
+    const modelEnv = suggestedChildModelEnv();
+    if (!modelEnv.PIBOT_DEFAULT_MODEL && !process.env.PIBOT_DEFAULT_MODEL) {
+      console.error("no PIBOT_DEFAULT_MODEL resolvable (child env or launchd plist) — the heartbeat/consolidation scenarios need a working model for the test bot.");
+      process.exit(2);
+    }
+    const seeded = preSeedAgent(path.join(tmpRoot, "agents"));
+    record("pre-seed", true, `assistant agent: ${seeded.seededEvents} events + heartbeat@1m`);
+    const bootTs = Date.now();
+    const booted = await spawnDaemon(testerChatId, modelEnv);
     if (!booted) process.exit(1);
     record("T0b daemon boot (isolated env)", true, `lock + pollers up (${Math.round((Date.now() - t0) / 1000)}s)`);
     logSource = () => daemonLog.join("");
     artifactsDir = path.join(tmpRoot, "agents/assistant/memory/consolidated");
     const code = await dashStatus(webPort);
     record("T0c dashboard auth challenge", code === 302 || code === 401, `http ${code}`);
+    bootDeadlineFrom = bootTs;
   } else {
     chatRef = argVal("chat") ?? process.env.TELEGRAM_LIVE_TEST_CHAT ?? "";
     if (!chatRef) {
@@ -409,7 +508,8 @@ async function main(): Promise<void> {
   await scenarioUnknownCommand(chatRef);
 
   if (scenario === "full" && !attach) {
-    await scenarioConsolidateNoop(chatRef, artifactsDir);
+    await scenarioSeededConsolidation(chatRef, artifactsDir, 8);
+    await scenarioHeartbeatTick(path.join(tmpRoot, "agents"), bootDeadlineFrom);
     await scenarioReactionSettle(chatRef, "/status");
   } else if (scenario === "full" && attach) {
     console.log("⚠︎ full scenario requires spawn mode (isolated daemon); running smoke in attach mode");
