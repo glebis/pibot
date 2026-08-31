@@ -186,12 +186,12 @@ Unit mocks can't catch transport-level bugs (a message-outbox self-deadlock ship
 
 ```bash
 npx tsx scripts/telegram-live-test.mts --attach --chat <bot-chat-id>   # post-deploy smoke vs a running bot
-npx tsx scripts/telegram-live-test.mts --chat <test-bot-id>            # full: isolated daemon + dedicated test bot
+npx tsx scripts/telegram-live-test.mts                                  # full: isolated daemon + dedicated test bot
 ```
 
 - **spawn mode** (default) boots an isolated daemon (`PIBOT_DATA_DIR`/`PIBOT_AGENTS_DIR` override, dedicated test-bot token, its own dashboard port) and runs the full scenario set: boot health (lock, pollers, dashboard auth challenge), `/status` round-trip, unknown-command reply, deterministic `/consolidate` no-op, the reaction-settle wedge canary (👀→👍 on the sent command — catches outbox deadlocks), a no-error log soak, and lock cleanup on shutdown.
 - **`--attach` mode** runs read-only smoke against any already-running bot chat (no side-effecting commands) — this is the post-deploy verification step before trusting a restart.
-- One-time setup: create a **test bot** via BotFather (never reuse the production token), `/start` it from your account, then export `TELEGRAM_LIVE_TEST_TOKEN`, `TELEGRAM_LIVE_TEST_CHAT_ID` (your numeric id — DMs with any bot use it) and optionally `TELEGRAM_LIVE_TEST_TG` (telethon CLI path, defaults to the telegram-telethon skill).
+- Missing vars (`TELEGRAM_LIVE_TEST_TOKEN`, `TELEGRAM_LIVE_TEST_CHAT_ID`) are **requested via an AppleScript dialog** — hidden input for the token; plain input with the production allowlist id pre-filled for the chat id — and persisted to `data/telegram-test.env` (0600, gitignored): set once, prompted never again. `--no-prompt` disables the dialog. One-time prerequisites: a **test bot** via BotFather (never reuse the production token), `/start`-ed once from your account. The DM chat target is derived from the token itself, so `--chat` is unnecessary in spawn mode.
 
 ## Roadmap
 

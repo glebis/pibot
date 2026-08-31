@@ -12,14 +12,17 @@
 //     the post-deploy verification gate: run it against the real bot chat
 //     right after a restart, instead of typing test messages by hand.
 //
-// Env:
-//   TELEGRAM_LIVE_TEST_TOKEN    test-bot token (spawn mode, required)
-//   TELEGRAM_LIVE_TEST_CHAT_ID  numeric DM chat id with the test bot (spawn mode)
+// Env (each resolves env → data/telegram-test.env → AppleScript dialog):
+//   TELEGRAM_LIVE_TEST_TOKEN    test-bot token (spawn mode) — asked with hidden input
+//   TELEGRAM_LIVE_TEST_CHAT_ID  your numeric Telegram user id (the spawned test bot
+//                               allowlists it) — asked with plain input, production
+//                               allowlist suggested
 //   TELEGRAM_LIVE_TEST_TG       telethon CLI path (default: skill scripts/tg.py)
+// In spawn mode the DM chat target is derived from the token (<bot-id> peer), so
+// --chat is unnecessary; --no-prompt disables the dialog for non-interactive runs.
 //
-// One-time setup: create a TEST bot via BotFather, /start it from your
-// account, then export TELEGRAM_LIVE_TEST_TOKEN and TELEGRAM_LIVE_TEST_CHAT_ID
-// (your numeric Telegram user id — DMs with any bot use it as the chat id).
+// One-time prerequisites: create a TEST bot via BotFather (never reuse the
+// production token) and /start it from your account once.
 
 import * as fs from "node:fs";
 import * as http from "node:http";
@@ -47,9 +50,78 @@ const hasFlag = (name: string) => args.includes(`--${name}`);
 
 const attach = hasFlag("attach");
 const scenario = argVal("scenario") ?? (attach ? "smoke" : "full");
-const chat = argVal("chat") ?? process.env.TELEGRAM_LIVE_TEST_CHAT_ID ?? process.env.TELEGRAM_LIVE_TEST_CHAT;
+const noPrompt = hasFlag("no-prompt");
 const webPort = parseInt(argVal("web-port") || "7871", 10);
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-live-"));
+
+// ─── test-env resolution (prompt via AppleScript dialog when missing) ───
+
+/** Gitignored runtime store — data/ is tracked-never, file mode 0600. */
+const testEnvFile = path.join(process.cwd(), "data", "telegram-test.env");
+
+function loadPersistedVars(): Record<string, string> {
+  try {
+    return Object.fromEntries(
+      fs
+        .readFileSync(testEnvFile, "utf8")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.includes("="))
+        .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()])
+    );
+  } catch {
+    return {};
+  }
+}
+
+function persistVar(key: string, value: string): void {
+  const vars = loadPersistedVars();
+  vars[key] = value;
+  fs.mkdirSync(path.dirname(testEnvFile), { recursive: true });
+  fs.writeFileSync(testEnvFile, Object.entries(vars).map(([k, v]) => `${k}=${v}`).join("\n") + "\n", { mode: 0o600 });
+}
+
+/** Pops a native dialog for the user to type the value. Never logs the result. */
+function requestVarViaAppleScript(prompt: string, opts: { hidden?: boolean; def?: string } = {}): string | undefined {
+  const scriptText =
+    `display dialog ${JSON.stringify(prompt)} default answer ${JSON.stringify(opts.def ?? "")}` +
+    (opts.hidden ? " with hidden answer" : "") +
+    ` with title "pibot telegram live-test" buttons {"Cancel", "Save"} default button "Save"`;
+  const r = spawnSync("osascript", ["-e", scriptText], { timeout: 180_000, encoding: "utf8" });
+  if (r.status !== 0) return undefined; // cancelled or no GUI session
+  const m = /text returned:([\s\S]*?)\s*$/.exec(r.stdout);
+  return m ? m[1] : undefined;
+}
+
+/** Suggest a default chat id from the production launchd plist's allowlist, when present. */
+function suggestedChatId(): string {
+  const plist = path.join(os.homedir(), "Library/LaunchAgents/com.glebkalinin.pibot.plist");
+  try {
+    const r = spawnSync("plutil", ["-extract", "EnvironmentVariables.TELEGRAM_ALLOWED_CHATS", "raw", plist], { encoding: "utf8" });
+    return r.status === 0 ? r.stdout.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+/** env → persisted file → AppleScript prompt (unless --no-prompt). Persists prompted values. */
+function resolveTestVar(envName: string, opts: { prompt: string; hidden?: boolean; def?: string }): string | undefined {
+  const fromEnv = process.env[envName];
+  if (fromEnv) return fromEnv.trim();
+  const persisted = loadPersistedVars()[envName];
+  if (persisted) return persisted.trim();
+  if (noPrompt) return undefined;
+  const value = requestVarViaAppleScript(opts.prompt, { hidden: opts.hidden, def: opts.def });
+  if (value && value.trim()) {
+    persistVar(envName, value.trim());
+    return value.trim();
+  }
+  return undefined;
+}
+
+function maskToken(t: string): string {
+  return `${t.slice(0, String(t).indexOf(":") < 0 ? 4 : String(t).indexOf(":") + 1)}…(masked)`;
+}
 
 // ─── telethon CLI driver ────────────────────────────────────────────────────
 
@@ -79,7 +151,10 @@ function sendTg(chatRef: string, text: string): { sent: boolean; id?: number } {
 }
 
 function recentJson(chatRef: string, limit = 8): TgMessage[] {
-  const r = sh(["recent", "--chat-id", chatRef.startsWith("-") || /^\d+$/.test(chatRef) ? chatRef : "", "--chat", chatRef, "--json", "--limit", String(limit)].filter((x, i, a) => x !== "" && a[i - 1] !== x));
+  const a = ["recent", "--json", "--limit", String(limit)];
+  if (/^-?\d+$/.test(chatRef)) a.push("--chat-id", chatRef);
+  else a.push("--chat", chatRef);
+  const r = sh(a);
   if (!r.ok) return [];
   try {
     return JSON.parse(r.out) as TgMessage[];
@@ -141,7 +216,7 @@ function logTail(n = 20): string {
 }
 
 async function spawnDaemon(chatId: string): Promise<boolean> {
-  const token = process.env.TELEGRAM_LIVE_TEST_TOKEN;
+  const token = process.env.TELEGRAM_LIVE_TEST_TOKEN ?? loadPersistedVars().TELEGRAM_LIVE_TEST_TOKEN;
   if (!token) return false;
   const dataDir = path.join(tmpRoot, "data");
   const agentsDir = path.join(tmpRoot, "agents");
@@ -265,25 +340,53 @@ async function dashStatus(port: number): Promise<number> {
 // ─── main ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const chatRef = chat;
-  if (!chatRef) {
-    console.error("usage: --chat <test-bot-@username|DM chat id>  (or TELEGRAM_LIVE_TEST_CHAT_ID)");
-    process.exit(2);
-  }
   const t0 = Date.now();
-  console.log(`🧪 telegram live-test — ${attach ? "ATTACH (read-only smoke vs a running bot)" : "spawn (isolated daemon)"} · chat=${chatRef} · scenario=${scenario}`);
-
-  let logSource: () => string;
+  let chatRef: string;
   let artifactsDir = "";
+  let logSource: () => string;
 
   if (!attach) {
-    if (!process.env.TELEGRAM_LIVE_TEST_TOKEN) {
-      console.error("TELEGRAM_LIVE_TEST_TOKEN is required for spawn mode (a dedicated TEST bot — never the production token).");
+    // Spawn mode: creds resolve env → data/telegram-test.env → AppleScript prompt.
+    // The DM chat target is derived from the token (its bot id — the same peer
+    // telethon used when you /start'ed the bot); the bot's allowlist needs YOUR
+    // numeric id instead.
+    const token = resolveTestVar("TELEGRAM_LIVE_TEST_TOKEN", {
+      prompt: "Test-bot token (from BotFather — a TEST bot, never the production one):",
+      hidden: true,
+    });
+    if (!token || !/^\d+:/.test(token)) {
+      console.error("TELEGRAM_LIVE_TEST_TOKEN required (cancelled or malformed — format <bot-id>:<secret>). Create a test bot with BotFather.");
       process.exit(2);
     }
+    process.env.TELEGRAM_LIVE_TEST_TOKEN = token;
+    const testerChatId = resolveTestVar("TELEGRAM_LIVE_TEST_CHAT_ID", {
+      prompt: "Tester DM chat id (numeric — DMs with any bot use your own user id):",
+      def: suggestedChatId(),
+    });
+    if (!testerChatId || !/^-?\d+$/.test(testerChatId)) {
+      console.error("TELEGRAM_LIVE_TEST_CHAT_ID must be your numeric Telegram user id (the spawned test bot allowlists it). Got: " + JSON.stringify(testerChatId ?? null));
+      process.exit(2);
+    }
+    const botPeer = token.split(":")[0];
+    // resolve the test bot's @username via getMe — telethon can't address a raw bot id without a cached entity
+    let botUsername = "";
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+      const j = (await res.json()) as { ok?: boolean; result?: { username?: string } };
+      if (j.ok && j.result?.username) botUsername = j.result.username;
+    } catch {
+      /* handled below */
+    }
+    if (!botUsername) {
+      console.error("could not reach Telegram getMe for the test bot — check the token / network.");
+      process.exit(2);
+    }
+    chatRef = `@${botUsername}`;
+    console.log(`🧪 spawn · token ${maskToken(token)} · tester chat id ${testerChatId} · scenarios target @${botUsername} · creds in data/telegram-test.env (0600, gitignored)`);
+
     const cliOk = sh(["status"]);
     record("T0a telethon CLI ready", /ready|True|ok/i.test(cliOk.out), cliOk.ok ? "" : cliOk.out.slice(0, 120));
-    const booted = await spawnDaemon(chatRef);
+    const booted = await spawnDaemon(testerChatId);
     if (!booted) process.exit(1);
     record("T0b daemon boot (isolated env)", true, `lock + pollers up (${Math.round((Date.now() - t0) / 1000)}s)`);
     logSource = () => daemonLog.join("");
@@ -291,6 +394,11 @@ async function main(): Promise<void> {
     const code = await dashStatus(webPort);
     record("T0c dashboard auth challenge", code === 302 || code === 401, `http ${code}`);
   } else {
+    chatRef = argVal("chat") ?? process.env.TELEGRAM_LIVE_TEST_CHAT ?? "";
+    if (!chatRef) {
+      console.error("attach mode needs --chat <bot chat id or @username> (read-only smoke scenarios)");
+      process.exit(2);
+    }
     const prodLog = path.join(REPO_ROOT, "data", "daemon.log");
     const sizeAtStart = fs.existsSync(prodLog) ? fs.statSync(prodLog).size : 0;
     logSource = () => (fs.existsSync(prodLog) ? fs.readFileSync(prodLog, "utf8").slice(sizeAtStart) : "");
