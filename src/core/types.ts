@@ -5,7 +5,7 @@ export interface ChatRef {
   chatId: string;
 }
 
-export type ScheduleKind = "reminder" | "task" | "note" | "subject" | "heartbeat" | "morning-brief" | "attend-pass" | "promise" | "evolution" | "cascade-probe" | "custom";
+export type ScheduleKind = "reminder" | "task" | "note" | "subject" | "heartbeat" | "morning-brief" | "attend-pass" | "promise" | "evolution" | "consolidation" | "cascade-probe" | "custom";
 
 export interface ScheduleRepeat {
   /** Fire again this many ms after each fire */
@@ -165,6 +165,10 @@ export interface AgentManifest {
   heartbeat?: HeartbeatConfig;
   /** goal-driven skill self-evolution (Hermes-style propose → gate → eval → apply) */
   evolution?: { enabled?: boolean; interval?: string; model?: string };
+  /** event-log → durable-memory consolidation (Skill Forge blueprint). Evolution
+   *  cycles distill events first unless disabled here; the dedicated scheduler
+   *  job requires explicit enable. */
+  consolidation?: { enabled?: boolean; interval?: string; model?: string };
   /** "repo": this agent develops the pibot source itself — its session cwd is the
    *  repo root instead of its own agent dir (used by the built-in pibot-dev agent). */
   workspace?: "agent-dir" | "repo";

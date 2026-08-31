@@ -22,6 +22,7 @@ import { applyCorrections, composeBias, loadDictionary } from "./dictionary.js";
 import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { classifyModelError, ModelCascade } from "./cascade.js";
+import type { ConsolidationEngine } from "./consolidation.js";
 import { devAgentEnabled, DEV_AGENT_ID, scaffoldDevAgent } from "./dev-agent.js";
 
 /** A pending sub-bot creation request expires after this long — long enough for
@@ -91,6 +92,7 @@ export class PiBot implements HeartbeatHost {
       events: EventLog;
       transports: Transport[];
       evolution?: EvolutionEngine;
+      consolidation?: ConsolidationEngine;
       modelRuntime?: import("@earendil-works/pi-coding-agent").ModelRuntime;
       secrets: import("./secrets.js").SecretStore;
       /** model cascade / triage: primary → fallbacks → deterministic */
@@ -196,6 +198,7 @@ export class PiBot implements HeartbeatHost {
       this.ensureHeartbeatJob(agent);
       this.ensureMorningBriefJob(agent);
       if (agent.manifest.evolution?.enabled) this.ensureEvolutionJob(agent);
+      if (agent.manifest.consolidation?.enabled) this.ensureConsolidationJob(agent);
     }
     this.ensureCascadeProbeJob();
     // attend surfacing: one pass/day within its active hours, on the default agent
@@ -1013,6 +1016,7 @@ export class PiBot implements HeartbeatHost {
       pendingSubBots: this.pendingSubBots,
       wizardChats: this.wizardChats,
       evolution: this.deps.evolution,
+      consolidation: this.deps.consolidation,
       heartbeat: this.deps.heartbeat,
       telegram: this,
       currentAgent: (ck) => this.currentAgent(ck),
@@ -1308,6 +1312,28 @@ export class PiBot implements HeartbeatHost {
     });
   }
 
+  /** Opt-in dedicated rhythm: distill the event log into durable memory */
+  private ensureConsolidationJob(agent: LoadedAgent): void {
+    const cfg = agent.manifest.consolidation;
+    if (!cfg?.enabled) return;
+    const everyMs = parseDuration(cfg.interval ?? "24h");
+    this.deps.scheduler.ensure({
+      id: `consol:${agent.id}`,
+      agentId: agent.id,
+      chat: { transport: "internal", chatId: "consolidation" },
+      title: "event consolidation",
+      kind: "consolidation",
+      dueAt: Date.now() + (everyMs ?? 24 * 3600e3),
+      repeat: { everyMs: everyMs ?? 24 * 3600e3 },
+      wake: "normal",
+      delivery: "direct",
+      status: "pending",
+      createdAt: Date.now(),
+      firedCount: 0,
+      internal: true,
+    });
+  }
+
   private ensureEvolutionJob(agent: LoadedAgent): void {
     const ev = agent.manifest.evolution;
     if (!ev?.enabled) return;
@@ -1402,6 +1428,11 @@ export class PiBot implements HeartbeatHost {
       if (report.staged) {
         await this.deliverToAgent(job.agentId, `🧬 Evolution staged **${report.skill}** for your review: ${report.summary}`);
       }
+      return;
+    }
+    if (job.kind === "consolidation") {
+      // background memory work: no announcements; the journal + dashboard carry the record
+      await this.deps.consolidation?.consolidate(job.agentId);
       return;
     }
     this.deps.events.log(job.agentId, "fire", `${job.title} (${job.kind})`);

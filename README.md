@@ -98,7 +98,18 @@ Every agent's manifest sets a rhythm (`interval`, cheap `model`, `quietHours`). 
 
 **Adaptive wakeups (self-paced rhythm, from Ouroboros's `set_next_wakeup`):** the heartbeat decision can also include `wakeup` ("10m"…"12h") — the agent compresses the next gap when something is brewing and stretches it when everything is quiet, instead of firing on a fixed drumbeat. Hard bounds come from the global clamp (5m–12h), narrowed per-agent via manifest `heartbeat.minInterval` / `heartbeat.maxInterval` (editable in the dashboard). Skipped ticks (quiet hours, snooze, backoff) always fall back to the base rhythm.
 
-**Maintenance rotation (one item per wakeup):** each tick's digest ends with a maintenance panel — freshness of `memory/MEMORY.md`, `AGENTS.md`, memory notes, and the last maintenance entry (Ouroboros CONSCIOUSNESS.md pattern). The agent services **at most one** stale item per tick and rotates, recording what it did via the `maintain` field: a one-line durable note appended to `memory/maintenance.jsonl` (also logged as a `maintenance` event, visible to you in the dashboard event tail). Everything fresh → silence + longer wakeup; maintenance never breaks a tick.
+**Maintenance rotation (one item per wakeup):** each tick's digest ends with a maintenance panel — freshness of `memory/MEMORY.md`, `AGENTS.md`, memory notes, event consolidation, and the last maintenance entry (Ouroboros CONSCIOUSNESS.md pattern). The agent services **at most one** stale item per tick and rotates, recording what it did via the `maintain` field: a one-line durable note appended to `memory/maintenance.jsonl` (also logged as a `maintenance` event, visible to you in the dashboard event tail). Everything fresh → silence + longer wakeup; maintenance never breaks a tick. One verb runs host-side machinery: `maintain: "consolidate events"` triggers the consolidation pipeline for real.
+
+## Event consolidation (Skill Forge blueprint)
+
+The event log is ephemeral (bounded, redacted JSONL). The consolidation pipeline distills it into **durable memory** per agent (adapted from Ouroboros's `consolidator.py` + `memory.py`):
+
+- **Block-based memory** — `memory/consolidated/blocks.json` holds summary/gap/era blocks; `CONSOLIDATED.md` and `journal.jsonl` are regenerated views + run records.
+- **Advance-only cursor** — meta records the last-consumed `events.jsonl` offset; a model failure never advances it (nothing is ever lost to a bad run).
+- **Gap blocks** — event-log rotation (head trimming) is reconciled by timestamp and recorded as an explicit gap block: lost/skipped events are never silently dropped.
+- **Cheap-model distillation** — unconsolidated events are summarized into dense blocks; durable lessons are promoted into `memory/notes/` (memory-plugin-compatible) with an index inside `CONSOLIDATED.md`.
+- **Eras** — older blocks compress into era blocks once the count grows (deterministic fallback keeps every record if the model is down).
+- **Triggers** — evolution cycles distill first (unless `consolidation.enabled: false`) and feed the distilled view into skill proposals; heartbeats can service it via the maintenance verb; the opt-in scheduler job (`consolidation.enabled: true`, `interval`, `model`) runs it on its own rhythm; `/consolidate [status]` runs it manually.
 
 ## Self-evolution (Hermes-style, pibot-native)
 
@@ -131,6 +142,7 @@ src/
     heartbeat.ts          ephemeral cheap-model ticks (speak/escalate/note)
     bot.ts                command routing, cards, fire delivery, time envelope
     evolution.ts          goal-driven skill evolution (staging + probes + gates)
+    consolidation.ts      event log → durable memory (blocks, gaps, eras, lessons)
     events.ts             per-agent event log (feeds heartbeat + evolution)
   plugins/                shared agent plugins
     scheduler-plugin.ts   schedule_create/list/cancel, snooze, promise_make/keep
@@ -170,7 +182,7 @@ npm run evolve -- assistant "goal text"   # CLI evolution cycle
 
 ## Roadmap
 
-- Skill Forge pattern-mining from event/session history (from `pi-skill-evolution`)
+- Skill Forge pattern-mining beyond the event log: mine session transcripts and staged-skill outcomes (the event-log distillation foundation ships in `consolidation.ts`)
 - Multi-strategy mutation archive (compress/quality/radical, from `@artale/pi-evolve`)
 - Rich image-generation previews and provider-specific adapters beyond bot avatars
 - Stronger process-level sandboxing for agent-private extensions

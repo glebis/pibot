@@ -10,6 +10,7 @@ import { PiBot } from "./core/bot.js";
 import { EventLog } from "./core/events.js";
 import { ModelCascade } from "./core/cascade.js";
 import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
+import { ConsolidationEngine, createLlmConsolidationIO } from "./core/consolidation.js";
 import { HeartbeatEngine } from "./core/heartbeat.js";
 import { Scheduler } from "./core/scheduler.js";
 import { createWebApp } from "./web.js";
@@ -91,6 +92,27 @@ async function main(): Promise<void> {
     ),
   );
 
+  // event-log → durable-memory consolidation (Skill Forge blueprint). Cheap model,
+  // cascade-aware: manifest fallbacks → global tail, like heartbeat and evolution.
+  const consolidation = new ConsolidationEngine({
+    agents,
+    events,
+    io: createLlmConsolidationIO({
+      agents,
+      modelRuntime,
+      modelFor: (agent) => {
+        const configured = agent.manifest.consolidation?.model ?? config.heartbeatModel;
+        const wanted = configured && configured !== "same" ? configured : agent.manifest.model;
+        const chain = cascade.chainFor({ model: wanted, cascade: agent.manifest.cascade, providers: agent.manifest.providers });
+        const spec = cascade.firstHealthy(chain);
+        if (!spec) throw new Error(`no permitted consolidation model available for ${agent.id}`);
+        const model = agents.resolveModel(spec);
+        if (!model) throw new Error(`permitted consolidation model unavailable: ${spec}`);
+        return model;
+      },
+    }),
+  });
+
   const heartbeat = new HeartbeatEngine({
     agents,
     scheduler,
@@ -104,6 +126,7 @@ async function main(): Promise<void> {
     },
     cascade,
     statePath: path.join(config.dataDir, "heartbeat-state.json"),
+    consolidation,
   });
 
   const evolution = new EvolutionEngine({
@@ -111,6 +134,7 @@ async function main(): Promise<void> {
     modelRuntime,
     events,
     dataDir: config.dataDir,
+    consolidation,
     host: { announce: (agentId, text) => bot.deliverToAgent(agentId, text) },
     io: createLlmEvolutionIO({
       agents,
@@ -140,7 +164,7 @@ async function main(): Promise<void> {
       : [new CliTransport()];
 
   const providerManager = new ProviderManager(modelRuntime);
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir) });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir) });
 
   await bot.start();
   scheduler.rearm();

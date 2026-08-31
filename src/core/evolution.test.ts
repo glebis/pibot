@@ -83,6 +83,39 @@ describe("EvolutionEngine", () => {
     engine = new EvolutionEngine({ agents, modelRuntime: {} as never, events, dataDir: dir, host: { announce: async (id, t) => { announced.push(`${id}:${t}`); } }, io });
   });
 
+  it("consolidates events before proposing and feeds the distilled view to the proposal", async () => {
+    const consolidation = { consolidate: vi.fn(async () => ({ agentId: "assistant", ok: true, summary: "ok" })) };
+    const engine2 = new EvolutionEngine({ agents, modelRuntime: {} as never, events, dataDir: dir, host: { announce: async () => {} }, io, consolidation });
+    // pre-seed a consolidated digest for the proposer to see
+    const consolDir = path.join(dir, "assistant", "memory", "consolidated");
+    fs.mkdirSync(consolDir, { recursive: true });
+    fs.writeFileSync(path.join(consolDir, "CONSOLIDATED.md"), "# Consolidated memory\n\nThe user iterates on pibot weekly.\n");
+    const captured: unknown[] = [];
+    (io.propose as ReturnType<typeof vi.fn>).mockImplementation(async (ctx: unknown) => {
+      captured.push((ctx as { consolidatedMemory?: string }).consolidatedMemory);
+      return makeProposal();
+    });
+    await engine2.evolve("assistant", "mornings");
+    expect(consolidation.consolidate).toHaveBeenCalledWith("assistant");
+    expect(captured[0]).toContain("iterates on pibot weekly");
+  });
+
+  it("skips consolidation when the manifest disables it", async () => {
+    fs.writeFileSync(path.join(dir, "assistant", "agent.json"), JSON.stringify({ name: "assistant", consolidation: { enabled: false } }));
+    await agents.discover();
+    const consolidation = { consolidate: vi.fn(async () => ({ agentId: "assistant", ok: true, summary: "ok" })) };
+    const engine2 = new EvolutionEngine({ agents, modelRuntime: {} as never, events, dataDir: dir, host: { announce: async () => {} }, io, consolidation });
+    await engine2.evolve("assistant", "mornings");
+    expect(consolidation.consolidate).not.toHaveBeenCalled();
+  });
+
+  it("survives a failing consolidation engine", async () => {
+    const consolidation = { consolidate: vi.fn(async () => { throw new Error("boom"); }) };
+    const engine2 = new EvolutionEngine({ agents, modelRuntime: {} as never, events, dataDir: dir, host: { announce: async () => {} }, io, consolidation });
+    const report = await engine2.evolve("assistant", "mornings");
+    expect(report.ok).toBe(true); // evolution continues, consolidation never blocks
+  });
+
   afterEach(() => {
     fs.rmSync(dir, { recursive: true, force: true });
   });

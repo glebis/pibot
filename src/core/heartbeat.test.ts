@@ -63,13 +63,14 @@ function makeEngine(
   over: Partial<HeartbeatHost> = {},
   cascade?: import("./cascade.js").ModelCascade,
   statePath?: string,
+  consolidation?: { consolidate(agentId: string): Promise<unknown> },
 ) {
   const agents = { getAgent: vi.fn((id: string) => (id === agent.id ? agent : undefined)), heartbeatModel: vi.fn(() => undefined), resolveModel: vi.fn(() => undefined) } as unknown as import("./agent-manager.js").AgentManager;
   const scheduler = { snoozeState: vi.fn(() => null), list: vi.fn(() => []) } as unknown as import("./scheduler.js").Scheduler;
   const events = { log: vi.fn(), tail: vi.fn(() => []) } as unknown as import("./events.js").EventLog;
   const host: HeartbeatHost = { deliverToAgent: vi.fn(async () => {}), escalateToAgent: vi.fn(async () => {}), lastUserMessageAt: vi.fn(() => 0), ...over };
   const modelRuntime = {} as PiAgent.ModelRuntime;
-  const engineOptions = { agents, scheduler, modelRuntime, events, vaultDir: dir, host, cascade, statePath };
+  const engineOptions = { agents, scheduler, modelRuntime, events, vaultDir: dir, host, cascade, statePath, consolidation };
   const engine = new HeartbeatEngine(engineOptions as ConstructorParameters<typeof HeartbeatEngine>[0]);
   return { engine, agents, scheduler, events, host };
 }
@@ -389,6 +390,29 @@ describe("HeartbeatEngine backoff", () => {
       expect(calls.some((c) => c[1] === "maintenance" && c[2].includes("voice notes"))).toBe(true);
     });
 
+    it("services a stale-events item by running the consolidation engine", async () => {
+      const agent = makeAgent(dir);
+      const consolidation = { consolidate: vi.fn(async () => ({ agentId: agent.id, ok: true, summary: "ok" })) };
+      const { engine, events } = makeEngine(agent, dir, {}, undefined, undefined, consolidation);
+      queueActs([{ maintain: "consolidate events" }]);
+      await engine.tick(agent.id);
+      expect(consolidation.consolidate).toHaveBeenCalledWith(agent.id);
+      const calls = (events.log as ReturnType<typeof vi.fn>).mock.calls as Array<[string, string, string]>;
+      expect(calls.some((c) => c[1] === "maintenance" && c[2].includes("consolidate events"))).toBe(true);
+      // the durable journal still gets the note
+      expect(fs.existsSync(path.join(dir, "memory", "maintenance.jsonl"))).toBe(true);
+    });
+
+    it("consolidation failures never break the tick", async () => {
+      const agent = makeAgent(dir);
+      const consolidation = { consolidate: vi.fn(async () => { throw new Error("io down"); }) };
+      const { engine, events } = makeEngine(agent, dir, {}, undefined, undefined, consolidation);
+      queueActs([{ maintain: "consolidate events" }]);
+      await engine.tick(agent.id);
+      const calls = (events.log as ReturnType<typeof vi.fn>).mock.calls as Array<[string, string, string]>;
+      expect(calls.some((c) => c[1] === "system" && c[2].includes("io down"))).toBe(true);
+    });
+
     it("maintain alone does not deliver or escalate", async () => {
       const agent = makeAgent(dir);
       const { engine, host } = makeEngine(agent, dir);
@@ -448,6 +472,16 @@ describe("HeartbeatEngine backoff", () => {
       expect(panel).toContain("last maintenance");
       expect(panel).toContain("consolidated calendar lessons");
       expect(panel).toMatch(/5h ago/);
+    });
+
+    it("shows the events-consolidation freshness line", () => {
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toContain("events consolidation");
+      expect(panel).toContain('maintain: "consolidate events"');
+      // a manifest disabling consolidation hides the line
+      fs.writeFileSync(path.join(dir, "agent.json"), JSON.stringify({ name: "x", consolidation: { enabled: false } }));
+      const panel2 = buildMaintenancePanel(dir);
+      expect(panel2).not.toContain("events consolidation");
     });
 
     it("handles empty agents without crashing", () => {

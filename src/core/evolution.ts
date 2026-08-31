@@ -15,6 +15,7 @@ import {
 import { Type } from "typebox";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import { closeBacklogItems, loadBacklogItems, topBacklogItem } from "./backlog.js";
+import { readConsolidatedDigest, type ConsolidationEngine } from "./consolidation.js";
 import type { EventLog } from "./events.js";
 import { buildHeartbeatDigest } from "./heartbeat.js";
 import { errorMessage, readJson, truncate, writeJsonAtomic } from "./util.js";
@@ -109,6 +110,8 @@ export interface ProposalContext {
   goal?: string;
   /** skills already proposed recently — the proposer must not repeat them */
   recentProposals?: string[];
+  /** distilled event history (consolidation output) — feeds pattern-mining proposals */
+  consolidatedMemory?: string;
 }
 
 export interface EvolutionIO {
@@ -150,6 +153,9 @@ export class EvolutionEngine {
       modelRuntime: ModelRuntime;
       events: EventLog;
       dataDir: string;
+      /** event-log consolidation (Skill Forge blueprint) — runs before each cycle;
+       *  its output feeds the proposal context. Omit to disable. */
+      consolidation?: Pick<ConsolidationEngine, "consolidate">;
       host: { announce(agentId: string, text: string): Promise<void> };
       io: EvolutionIO;
     }
@@ -225,6 +231,19 @@ export class EvolutionEngine {
     const digest = buildHeartbeatDigest(agent, { list: () => [] }, this.deps.events);
     const recentProposals = extractRecentProposals(this.deps.events.tail(agentId, 40));
 
+    // consolidation first: distill new events into durable memory, then let the
+    // proposal see the distilled view (Skill Forge pattern-mining input)
+    let consolidatedMemory: string | undefined;
+    if (this.deps.consolidation && agent.manifest.consolidation?.enabled !== false) {
+      try {
+        const report = await this.deps.consolidation.consolidate(agentId);
+        if (report.ok) consolidatedMemory = readConsolidatedDigest(agent.dir) || undefined;
+      } catch (e) {
+        // consolidation never blocks an evolution cycle
+        this.deps.events.log(agentId, "system", `evolution: consolidation skipped: ${errorMessage(e)}`);
+      }
+    }
+
     // goal-less cycles target the top-ranked open improvement-backlog item
     const sourcedBacklog = goal ? undefined : topBacklogItem(agent.dir);
     const effectiveGoal = goal ?? sourcedBacklog?.summary;
@@ -233,7 +252,7 @@ export class EvolutionEngine {
     // 2. propose
     let proposal: EvolutionProposal;
     try {
-      proposal = await this.deps.io.propose({ agent, digest, existingSkills, goal: effectiveGoal, recentProposals });
+      proposal = await this.deps.io.propose({ agent, digest, existingSkills, goal: effectiveGoal, recentProposals, consolidatedMemory });
     } catch (e) {
       this.deps.events.log(agentId, "system", `evolution propose failed: ${errorMessage(e)}`);
       return { agentId, ok: false, summary: `propose failed: ${errorMessage(e)}`, errors: [errorMessage(e)] };
@@ -483,12 +502,13 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
             ctx.goal ? `Goal: ${ctx.goal}` : `Goal: (none given — derive the highest-value improvement from recent activity)`,
             ``,
             `# State digest\n${ctx.digest}`,
+            ctx.consolidatedMemory ? `# Distilled memory (older, consolidated history)\n${ctx.consolidatedMemory}` : ``,
             ``,
             `# Existing skills\n${skills}`,
             ``,
             `Propose exactly one skill (create new, or patch existing).`,
             nudge ?? `Call the evolution_propose tool exactly once — text-only replies are discarded.`,
-          ].join("\n");
+          ].filter(Boolean).join("\n");
         await session.prompt(ask());
         const merr = sessionError(session);
         if (merr) throw new Error(merr);
@@ -574,6 +594,7 @@ const PROPOSE_SYSTEM = `You are the evolution engine of a personal agent compani
 
 Rules:
 - Derive the proposal from the goal (if given) and from friction visible in recent events (snoozes, missed fires, repeated asks, corrections).
+- If a "Distilled memory" section is present, mine it for durable patterns: repeated workflows, recurring frictions, and preferences are the best skill candidates.
 - Skills are markdown files with steps: name, trigger-style description ("Use when …"), concise actionable body. Max 15KB.
 - Prefer small, sharp skills over encyclopedic ones. One skill = one workflow.
 - For patch mode: find-text must EXACTLY match a snippet of the existing skill.

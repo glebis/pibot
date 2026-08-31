@@ -3,6 +3,7 @@
 // independent of the routing/wiring in bot.ts.
 
 import { listSkillDirs, type AgentManager, type LoadedAgent } from "./agent-manager.js";
+import type { ConsolidationEngine } from "./consolidation.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { QuestionBus } from "./questions.js";
@@ -22,6 +23,7 @@ const HELP = [
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
   `/cascade — model fallback health  ·  /cascade probe|retry|clear`,
   `/providers — cloud providers, keys & subscription logins`,
+  `/consolidate [status] — distill the event log into durable memory`,
   `/status — what's running`,
 ].join("\n");
 
@@ -35,6 +37,7 @@ export interface CommandContext {
   pendingSubBots: Map<string, string>;
   wizardChats: Set<string>;
   evolution?: EvolutionEngine;
+  consolidation?: ConsolidationEngine;
   heartbeat: { tick: (agentId: string, opts?: { brief?: boolean }) => Promise<void>; noteUserMessage?: (agentId: string) => void };
   telegram?: {
     managerMode(): boolean;
@@ -219,6 +222,23 @@ export function createCommandHandler(ctx: CommandContext) {
         const agent = deps.agents.getAgent(agentId);
         const skills = agent ? listSkillDirs(path.join(agent.dir, "skills")) : [];
         await reply(skills.length ? skills.map((s) => `• **${s.name}** — ${s.description}`).join("\n") : `No skills yet for **${agentId}**. /evolve can create some.`);
+        return;
+      }
+
+      case "consolidate": {
+        if (!deps.consolidation) {
+          await reply("Consolidation engine not wired.");
+          return;
+        }
+        if (!agentId) return void (await reply("No agent selected."));
+        const sub = arg.split(/\s+/)[0];
+        if (sub === "status") {
+          await reply(deps.consolidation.statusText(agentId));
+          return;
+        }
+        await reply("🧠 Distilling the event log into durable memory…");
+        const report = await deps.consolidation.consolidate(agentId);
+        await reply(`${report.ok ? "🧠" : "⛔"} ${report.summary}`);
         return;
       }
 

@@ -15,6 +15,7 @@ import {
 import { Type } from "typebox";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
 import type { ModelCascade } from "./cascade.js";
+import { consolidationPanelLine } from "./consolidation.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
@@ -138,6 +139,8 @@ export function buildMaintenancePanel(agentDir: string, now = Date.now()): strin
     `- persona (AGENTS.md): ${personaAge ? `updated ${personaAge}` : "(missing)"} — one paragraph on how you changed lately keeps it alive`,
     `- notes (memory/notes): ${notes} — durable facts, decisions, preferences`,
   ];
+  const consolidationLine = consolidationPanelLine(agentDir, now);
+  if (consolidationLine) lines.push(consolidationLine);
   if (journalAge) {
     let last = "";
     let age = journalAge;
@@ -219,6 +222,8 @@ export class HeartbeatEngine {
       cascade?: ModelCascade;
       /** private fingerprint/counter state; omitted for in-memory-only operation */
       statePath?: string;
+      /** event-log consolidation engine — powers the "consolidate events" maintenance verb */
+      consolidation?: { consolidate(agentId: string): Promise<unknown> };
     }
   ) {
     this.persistedState = deps.statePath
@@ -354,14 +359,26 @@ export class HeartbeatEngine {
 
     if (!opts.brief && act.maintain) {
       const raw = act.maintain.trim();
-      const backlogCandidate = /^backlog:?\s*/i.exec(raw);
-      if (backlogCandidate && raw.slice(backlogCandidate[0].length).trim()) {
-        // heartbeat backlog hook: "backlog: <improvement summary>"
-        appendBacklogItems(agent.dir, [{ summary: raw.slice(backlogCandidate[0].length), source: "heartbeat" }]);
-        this.deps.events.log(agent.id, "maintenance", act.maintain);
-      } else {
+      if (/^consolidat/i.test(raw)) {
+        // maintenance rotation: this stale item is serviced by actually running
+        // the consolidation pipeline (the panel advertises the verb)
+        try {
+          await this.deps.consolidation?.consolidate(agent.id);
+        } catch (e) {
+          this.deps.events.log(agent.id, "system", `consolidation (heartbeat) failed: ${errorMessage(e)}`);
+        }
         recordMaintenanceNote(agent.dir, act.maintain);
         this.deps.events.log(agent.id, "maintenance", act.maintain);
+      } else {
+        const backlogCandidate = /^backlog:?\s*/i.exec(raw);
+        if (backlogCandidate && raw.slice(backlogCandidate[0].length).trim()) {
+          // heartbeat backlog hook: "backlog: <improvement summary>"
+          appendBacklogItems(agent.dir, [{ summary: raw.slice(backlogCandidate[0].length), source: "heartbeat" }]);
+          this.deps.events.log(agent.id, "maintenance", act.maintain);
+        } else {
+          recordMaintenanceNote(agent.dir, act.maintain);
+          this.deps.events.log(agent.id, "maintenance", act.maintain);
+        }
       }
     }
 
