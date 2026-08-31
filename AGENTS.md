@@ -43,7 +43,8 @@ Treat cascade, session, and event files as private: they can contain user messag
 ### Deployment and runtime health
 
 - Commit, push, deploy, or restart only with explicit user authorization. Preserve unrelated work and stage exact paths only.
-- Restart the existing launchd job at most once per authorized deployment. Afterward verify one active job with a successful exit state, one dashboard listener bound to loopback, an authentication challenge for unauthenticated dashboard access, every configured Telegram poller connected, and no immediate fatal, replay, or delivery error.
+- Before trusting a deployed transport change, run the Telegram live-test harness in attach mode (`npx tsx scripts/telegram-live-test.mts --attach --chat <bot-chat-id>`; full setup in the README "Telegram live-test harness" section) — it verifies the real send/receive round-trip, reactions, and a clean daemon log without touching production agents. A restart is only a health check away from silent outbox wedges; the harness is the gate.
+- Restart the existing launchd job at most once per authorized deployment. Afterward verify one active job with a successful exit state, one dashboard listener bound to loopback, an authentication challenge for unauthenticated dashboard access, every configured Telegram poller connected, and no immediate fatal, replay, or delivery error. The live-test harness automates the transport portion of this checklist.
 - The launchd wrapper and its runtime child may both appear in process listings; determine duplicate service instances from the launchd job, PiBot lock, listeners, and poller conflicts rather than raw process count alone.
 
 ### Agents, bots, capabilities, and providers

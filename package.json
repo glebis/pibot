@@ -15,7 +15,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "evolve": "tsx scripts/evolve.ts"
+    "evolve": "tsx scripts/evolve.ts",
+    "test:telegram": "tsx scripts/telegram-live-test.mts"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.84.4",

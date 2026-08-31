@@ -180,6 +180,19 @@ npm run evolve -- assistant "goal text"   # CLI evolution cycle
 
 `.git/hooks/pre-commit` runs typecheck + tests before every commit (TDD gate).
 
+### Telegram live-test harness (end-to-end, autonomous)
+
+Unit mocks can't catch transport-level bugs (a message-outbox self-deadlock shipped exactly that way behind 419 passing tests). The live harness drives a bot through the real Telegram round-trip — send a command as a user, await the reply, assert reactions and the daemon log:
+
+```bash
+npx tsx scripts/telegram-live-test.mts --attach --chat <bot-chat-id>   # post-deploy smoke vs a running bot
+npx tsx scripts/telegram-live-test.mts --chat <test-bot-id>            # full: isolated daemon + dedicated test bot
+```
+
+- **spawn mode** (default) boots an isolated daemon (`PIBOT_DATA_DIR`/`PIBOT_AGENTS_DIR` override, dedicated test-bot token, its own dashboard port) and runs the full scenario set: boot health (lock, pollers, dashboard auth challenge), `/status` round-trip, unknown-command reply, deterministic `/consolidate` no-op, the reaction-settle wedge canary (👀→👍 on the sent command — catches outbox deadlocks), a no-error log soak, and lock cleanup on shutdown.
+- **`--attach` mode** runs read-only smoke against any already-running bot chat (no side-effecting commands) — this is the post-deploy verification step before trusting a restart.
+- One-time setup: create a **test bot** via BotFather (never reuse the production token), `/start` it from your account, then export `TELEGRAM_LIVE_TEST_TOKEN`, `TELEGRAM_LIVE_TEST_CHAT_ID` (your numeric id — DMs with any bot use it) and optionally `TELEGRAM_LIVE_TEST_TG` (telethon CLI path, defaults to the telegram-telethon skill).
+
 ## Roadmap
 
 - Skill Forge pattern-mining beyond the event log: mine session transcripts and staged-skill outcomes (the event-log distillation foundation ships in `consolidation.ts`)
