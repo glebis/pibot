@@ -24,6 +24,32 @@ import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJs
 import { classifyModelError, ModelCascade } from "./cascade.js";
 import { devAgentEnabled, DEV_AGENT_ID, scaffoldDevAgent } from "./dev-agent.js";
 
+/** A pending sub-bot creation request expires after this long — long enough for
+ *  a user to get around to BotFather, short enough to not catch stale updates. */
+const PENDING_SUBBOT_TTL_MS = 24 * 3600e3;
+
+export interface PersistedBotState {
+  chats?: Record<string, string>;
+  agentChats?: Record<string, string[]>;
+  /** agentId → timestamp (ms) the pending request was armed at */
+  pendingSubBots?: Record<string, number>;
+}
+
+/** Parse + TTL-prune persisted pending sub-bot requests (pure; unit-tested). */
+export function parsePendingSubBots(
+  raw: PersistedBotState["pendingSubBots"],
+  now = Date.now()
+): Map<string, number> {
+  const out = new Map<string, number>();
+  if (!raw || typeof raw !== "object") return out;
+  for (const [agentId, ts] of Object.entries(raw)) {
+    if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) continue;
+    if (now - ts > PENDING_SUBBOT_TTL_MS) continue;
+    out.set(agentId, ts);
+  }
+  return out;
+}
+
 export class PiBot implements HeartbeatHost {
   private transports = new Map<string, Transport>();
   private wired = new Set<string>();
@@ -32,6 +58,8 @@ export class PiBot implements HeartbeatHost {
   private wizardChats = new Set<string>(); // chats running /newagent interview
   private commandHandler: ((t: Transport, chatId: string, text: string) => Promise<void>) | null = null;
   private pendingSubBots = new Map<string, string>(); // chatKey → agentId awaiting its sub-bot creation
+  /** agentId → armed-at timestamp for pendingSubBots; mirrored into state.json */
+  private pendingSubBotsArmed = new Map<string, number>();
   private lastUserMessage = new Map<string, number>(); // agentId → last real user message
   private subBots = new Map<string, { token: string; username?: string }>(); // agentId → token
   /** model spec currently bound to each persistent session ("" = not yet bound) */
@@ -99,9 +127,19 @@ export class PiBot implements HeartbeatHost {
     // token rotation for an already-wired sub-bot: re-attach with the fresh token
     for (const [agentId, sub] of Object.entries(this.deps.secrets.get().telegram?.subBots ?? {})) {
       if (sub.username && info.botUsername && sub.username.toLowerCase() === info.botUsername.toLowerCase()) {
-        const token = await (t as import("../transports/telegram.js").TelegramTransport).getManagedBotToken(info.botId);
-        const r = await this.attachSubBot(agentId, token);
-        this.deps.events.log(agentId, "system", `sub-bot token rotated → ${r.ok ? "re-attached" : r.error}`);
+        try {
+          const token = await (t as import("../transports/telegram.js").TelegramTransport).getManagedBotToken(info.botId);
+          const r = await this.attachSubBot(agentId, token);
+          this.deps.events.log(agentId, "system", `sub-bot token rotated → ${r.ok ? "re-attached" : r.error}`);
+          if (!r.ok) {
+            // the running transport keeps polling with the old token until Telegram
+            // rejects it — surface the problem instead of failing silently
+            await this.deliverToAgent(agentId, `⚠︎ Token rotation for **${botName}** failed: ${r.error}\nThe current bot keeps running until Telegram rejects the old token. Try again via the dashboard.`).catch(() => {});
+          }
+        } catch (e) {
+          this.deps.events.log(agentId, "system", `sub-bot token rotation failed for ${botName}: ${errorMessage(e)}`);
+          await this.deliverToAgent(agentId, `⚠︎ Couldn't fetch the rotated token for **${botName}**: ${errorMessage(e)}\nThe current bot keeps running until Telegram rejects the old token.`).catch(() => {});
+        }
         return;
       }
     }
@@ -118,7 +156,7 @@ export class PiBot implements HeartbeatHost {
       const tg = t as import("../transports/telegram.js").TelegramTransport;
       const token = await tg.getManagedBotToken(info.botId);
       const r = await this.attachSubBot(agentId, token);
-      this.pendingSubBots.delete(agentId);
+      this.disarmPendingSubBot(agentId);
       // managed sub-bots are private: only the manager's owner can use them
       await tg.setManagedBotAccessSettings(info.botId, true).catch((e) => console.error("[telegram] access restriction failed:", errorMessage(e)));
       if (r.ok) {
@@ -126,10 +164,17 @@ export class PiBot implements HeartbeatHost {
         await this.deliverToAgent(agentId, `🟢 My own Telegram bot is live: **${r.botName}** — its own chat, its own identity, restricted to you.`);
       } else {
         this.deps.events.log(agentId, "system", `sub-bot wiring failed: ${r.error}`);
+        await this.deliverToAgent(agentId, `⚠︎ Bot **${botName}** was created but wiring failed: ${r.error}. Retry from the dashboard (request sub-bot creation again).`).catch(() => {});
       }
     } catch (e) {
+      // keep the request armed: a later managed_bot update (e.g. token regenerated in
+      // @BotFather) completes the wiring without a fresh creation flow
       console.error(`[telegram] managed bot token fetch failed for ${botName}: ${(e as Error).message}`);
       this.deps.events.log("system", "system", `managed bot token fetch failed: ${errorMessage(e)}`);
+      await this.deliverToAgent(
+        agentId,
+        `⚠︎ Telegram didn't hand me the token for **${botName}** yet (its servers propagate creator records slowly).\nThe request stays armed — regenerate the bot's token in @BotFather (or re-run the creation request) and I'll wire it automatically.`
+      ).catch(() => {});
     }
   }
 
@@ -157,9 +202,36 @@ export class PiBot implements HeartbeatHost {
     const defaultAgent = this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId();
     if (defaultAgent) this.ensureAttendPassJob(defaultAgent);
 
-    const state = readJson<{ chats?: Record<string, string>; agentChats?: Record<string, string[]> }>(this.statePath, {});
+    const state = readJson<PersistedBotState>(this.statePath, {});
     for (const [ck, agentId] of Object.entries(state.chats ?? {})) this.chatAgent.set(ck, agentId);
     for (const [agentId, cks] of Object.entries(state.agentChats ?? {})) this.agentChats.set(agentId, new Set(cks));
+
+    // restore pending sub-bot creation requests (TTL-pruned) so a token
+    // re-issue in @BotFather completes the wiring after a restart
+    let pendingRestored = false;
+    for (const [agentId, ts] of parsePendingSubBots(state.pendingSubBots)) {
+      if (!this.managerMode()) {
+        this.deps.events.log(agentId, "system", "dropped lingering sub-bot creation request — manager mode is off");
+        continue;
+      }
+      this.pendingSubBots.set(agentId, agentId);
+      this.pendingSubBotsArmed.set(agentId, ts);
+      pendingRestored = true;
+      const age = Math.round((Date.now() - ts) / 60e3);
+      console.log(`[pibot] sub-bot creation request for ${agentId} still pending (armed ${age}m ago)`);
+    }
+    let pendingDropped = false;
+    for (const [agentId, ts] of Object.entries(state.pendingSubBots ?? {})) {
+      if (!this.pendingSubBotsArmed.has(agentId)) pendingDropped = true;
+      void ts;
+    }
+    if (pendingDropped) {
+      this.persistState();
+      this.deps.events.log("system", "system", "pruned expired sub-bot creation request(s) from persisted state");
+    }
+    if (pendingRestored || pendingDropped) {
+      for (const agentId of this.pendingSubBots.keys()) console.log(`[pibot] pending sub-bot wiring for ${agentId} remains armed`);
+    }
 
     for (const t of this.transports.values()) await t.start();
     console.log(`[pibot] running · agents: ${this.deps.agents.list().map((a) => a.id).join(", ")} · transport: ${[...this.transports.keys()].join("+")}`);
@@ -235,6 +307,44 @@ export class PiBot implements HeartbeatHost {
     return true;
   }
 
+  /**
+   * Attach every configured sub-bot at boot, retrying transient failures
+   * (a network blip at boot would otherwise leave a bot silent until the next
+   * restart). Failures are logged loudly and reported in one aggregate line.
+   */
+  async attachConfiguredSubBots(opts: { attempts?: number; delayMs?: number } = {}): Promise<{ attached: string[]; failed: string[] }> {
+    const attempts = Math.max(1, opts.attempts ?? 3);
+    const delayMs = opts.delayMs ?? 5_000;
+    const subs = this.deps.secrets.get().telegram?.subBots ?? {};
+    const attached: string[] = [];
+    const failed: string[] = [];
+    for (const [agentId, sub] of Object.entries(subs)) {
+      if (!sub.token) continue;
+      let lastError = "unknown error";
+      let ok = false;
+      for (let a = 1; a <= attempts && !ok; a++) {
+        if (a > 1) await new Promise((r) => setTimeout(r, delayMs));
+        const r = await this.attachSubBot(agentId, sub.token);
+        ok = r.ok;
+        if (ok) break;
+        lastError = r.error ?? lastError;
+      }
+      const name = sub.username ? `@${sub.username}` : agentId;
+      if (ok) {
+        attached.push(agentId);
+        console.log(`[pibot] sub-bot for ${agentId} → ${name}`);
+      } else {
+        failed.push(agentId);
+        console.error(`[pibot] sub-bot for ${agentId} (${name}) failed after ${attempts} attempts: ${lastError}`);
+        this.deps.events.log(agentId, "system", `sub-bot attach failed after ${attempts} attempts: ${lastError}`);
+      }
+    }
+    if (failed.length) {
+      console.error(`[pibot] sub-bots still offline at boot: ${failed.join(", ")} — re-attach via dashboard or restart`);
+    }
+    return { attached, failed };
+  }
+
   /** Deep link that lets the chat owner create a managed sub-bot for an agent */
   subBotDeepLink(agentId: string, username: string, displayName?: string): string {
     const name = encodeURIComponent(displayName ?? agentId);
@@ -253,7 +363,9 @@ export class PiBot implements HeartbeatHost {
 
   managerMode(): boolean {
     const t = this.transports.get("telegram");
-    return t instanceof TelegramTransport ? t.managerMode() : false;
+    // duck-typed so any transport that implements managed-bot mode (incl. test fakes) counts
+    const m = (t as { managerMode?: () => boolean } | undefined)?.managerMode;
+    return typeof m === "function" ? m.call(t) : false;
   }
 
   managerUsername(): string | undefined {
@@ -325,7 +437,23 @@ export class PiBot implements HeartbeatHost {
     for (const [k, v] of this.chatAgent) chats[k] = v;
     const agentChats: Record<string, string[]> = {};
     for (const [k, v] of this.agentChats) agentChats[k] = [...v];
-    writeJsonAtomic(this.statePath, { chats, agentChats });
+    const pendingSubBots: Record<string, number> = {};
+    for (const [k, ts] of this.pendingSubBotsArmed) pendingSubBots[k] = ts;
+    writeJsonAtomic(this.statePath, { chats, agentChats, pendingSubBots } as PersistedBotState);
+  }
+
+  /** Arm a pending sub-bot creation for agentId (durable across restarts). */
+  private armPendingSubBot(agentId: string): void {
+    this.pendingSubBots.set(agentId, agentId);
+    this.pendingSubBotsArmed.set(agentId, Date.now());
+    this.persistState();
+  }
+
+  private disarmPendingSubBot(agentId: string): void {
+    if (!this.pendingSubBots.has(agentId) && !this.pendingSubBotsArmed.has(agentId)) return;
+    this.pendingSubBots.delete(agentId);
+    this.pendingSubBotsArmed.delete(agentId);
+    this.persistState();
   }
 
   private async sessionFor(t: Transport, chatId: string, agentId: string, ck: string): Promise<AgentSession> {
@@ -1041,7 +1169,7 @@ export class PiBot implements HeartbeatHost {
         text: `Give **${agent.id}** its own Telegram identity? Tap — Telegram will create the bot and I'll wire it automatically.`,
         card: { text: "", buttons: [{ label: `Create @${suggestedUsername} bot`, action: `url:${this.subBotDeepLink(agent.id, suggestedUsername, agent.id)}`, url: this.subBotDeepLink(agent.id, suggestedUsername, agent.id) }] },
       });
-      this.pendingSubBots.set(agent.id, agent.id);
+      this.armPendingSubBot(agent.id);
       return;
     }
 
@@ -1071,7 +1199,7 @@ export class PiBot implements HeartbeatHost {
     if (!agent) throw new Error(`unknown agent "${agentId}"`);
     if (!this.managerMode()) throw new Error("manager mode is off — enable bot management mode for @pimother_bot in BotFather's mini app");
     const suggestedUsername = suggestedSubBotUsername(agentId, this.telegramUsername());
-    this.pendingSubBots.set(agentId, agentId);
+    this.armPendingSubBot(agentId);
     const link = this.subBotDeepLink(agentId, suggestedUsername, agentId);
     const card = {
       text: `🧬 Create **@${suggestedUsername}** for ${agentId}:`,

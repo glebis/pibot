@@ -282,18 +282,18 @@ export class EvolutionEngine {
         this.deps.events.log(agentId, "system", `evolution: risky pattern detected in "${proposal.skillName}", requires manual promote`);
       } else {
         // 6a. auto-promote with git checkpoint — close the backlog items the skill lands
-      const promoted = this.promoteCandidate(agent, proposal.skillName, candidateContent, proposal.rationale);
-      if (promoted) this.closeBacklogIds(agent, closesIds);
-      return {
-        agentId,
-        ok: true,
-        summary: `${proposal.mode === "create" ? "Created" : "Patched"} skill "${proposal.skillName}" (probes ${scores.join(", ")}) — ${proposal.rationale}`,
-        skill: proposal.skillName,
-        staged: false,
-        promoted,
-        scores,
-        rationale: proposal.rationale,
-      };
+        const promoted = this.promoteCandidate(agent, proposal.skillName, candidateContent, proposal.rationale);
+        if (promoted) this.closeBacklogIds(agent, closesIds);
+        return {
+          agentId,
+          ok: true,
+          summary: `${proposal.mode === "create" ? "Created" : "Patched"} skill "${proposal.skillName}" (probes ${scores.join(", ")}) — ${proposal.rationale}`,
+          skill: proposal.skillName,
+          staged: false,
+          promoted,
+          scores,
+          rationale: proposal.rationale,
+        };
       }
     }
 

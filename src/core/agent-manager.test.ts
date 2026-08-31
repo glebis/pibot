@@ -60,6 +60,25 @@ describe("AgentManager scaffolding", () => {
     expect(fs.statSync(path.join(dir, "coach")).mode & 0o777).toBe(0o700);
   });
 
+  it("createAgent scaffolds the memory baseline (MEMORY.md + notes dir)", async () => {
+    mgr.createAgent("alpha");
+    expect(fs.existsSync(path.join(dir, "alpha", "memory", "MEMORY.md"))).toBe(true);
+    expect(fs.existsSync(path.join(dir, "alpha", "memory", "notes"))).toBe(true);
+    expect(fs.statSync(path.join(dir, "alpha", "memory", "MEMORY.md")).mode & 0o777).toBe(0o600);
+  });
+
+  it("discover backfills the memory baseline for legacy agents without touching existing memory", async () => {
+    const agentDir = path.join(dir, "legacy");
+    fs.mkdirSync(path.join(agentDir, "memory"), { recursive: true });
+    fs.writeFileSync(path.join(agentDir, "memory", "MEMORY.md"), "# my curated memory");
+    fs.writeFileSync(path.join(agentDir, "agent.json"), JSON.stringify({ name: "legacy" }));
+
+    await mgr.discover();
+
+    expect(fs.existsSync(path.join(agentDir, "memory", "notes"))).toBe(true);
+    expect(fs.readFileSync(path.join(agentDir, "memory", "MEMORY.md"), "utf8")).toBe("# my curated memory");
+  });
+
   it("rejects invalid and duplicate names", () => {
     expect(mgr.createAgent("Bad Name!")).toMatch(/2–32 chars/);
     mgr.createAgent("ok-name");

@@ -70,6 +70,7 @@ export class AgentManager {
       const manifest = { ...defaultManifest(e.name), ...readJson<Partial<AgentManifest>>(path.join(dir, "agent.json"), {}) };
       manifest.name = manifest.name || e.name;
       this.agents.set(e.name, { id: e.name, dir, manifest });
+      this.ensureMemoryBaseline(dir); // fix up agents created before the scaffold existed
     }
   }
 
@@ -105,8 +106,34 @@ export class AgentManager {
     }
     const manifest = { ...defaultManifest(name), name };
     writeJsonAtomic(path.join(dir, "agent.json"), manifest);
+    this.ensureMemoryBaseline(dir);
     this.agents.set(name, { id: name, dir, manifest });
     return undefined;
+  }
+
+  /**
+   * Guarantee the memory baseline (memory/MEMORY.md + memory/notes/) exists.
+   * Both the heartbeat digest ("# Memory digest") and the maintenance panel
+   * read MEMORY.md — without this scaffold young agents have no durable memory
+   * file at all and the maintenance rotation has nothing to service. Idempotent;
+   * never overwrites existing content.
+   */
+  private ensureMemoryBaseline(dir: string): void {
+    try {
+      const memoryDir = path.join(dir, "memory");
+      const notesDir = path.join(memoryDir, "notes");
+      ensureDir(notesDir);
+      const memoryFile = path.join(memoryDir, "MEMORY.md");
+      if (!fs.existsSync(memoryFile)) {
+        fs.writeFileSync(
+          memoryFile,
+          ["# Long-term memory", "", "Durable facts, preferences, decisions and people — distilled over time.", "Agents keep this current (heartbeat maintenance rotation checks its freshness).", ""].join("\n"),
+          { mode: 0o600 }
+        );
+      }
+    } catch {
+      /* best effort — a missing scaffold must never break agent creation or discovery */
+    }
   }
 
   // ── sessions ──────────────────────────────────────────────────────────────
