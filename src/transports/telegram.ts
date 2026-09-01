@@ -66,6 +66,7 @@ const BOT_COMMANDS = [
   { command: "help", description: "What pibot can do" },
   { command: "status", description: "Rhythm, snooze, next item" },
   { command: "agents", description: "List your agents" },
+  { command: "new", description: "Fresh session for the current agent" },
   { command: "agent", description: "Switch agent: /agent coach" },
   { command: "newagent", description: "Create an agent: /newagent coach <persona>" },
   { command: "schedules", description: "Pending scheduled items" },

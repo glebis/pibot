@@ -1045,6 +1045,12 @@ export class PiBot implements HeartbeatHost {
       telegram: this,
       currentAgent: (ck) => this.currentAgent(ck),
       chatKey: (t, chatId) => this.chatKey(t, chatId),
+      resetSession: async (agentId, ck) => {
+        const { transport, chatId } = this.splitChatKey(ck);
+        await this.deps.agents.resetSession(agentId, ck, { transport, chatId }, this.deps.scheduler);
+        // the fresh session object must be re-subscribed or its replies never reach the chat
+        this.wired.delete(`${agentId}::${ck}`);
+      },
       rememberChat: (agentId, c) => this.rememberChat(agentId, c),
       ensureHeartbeatJob: (a) => this.ensureHeartbeatJob(a as never),
       ensureEvolutionJob: (a) => this.ensureEvolutionJob(a as never),

@@ -130,6 +130,7 @@ function fakeAgentManager(promptSpy = vi.fn()) {
   } as unknown as AgentSession;
   const agents = {
     createAgent: vi.fn(() => undefined),
+    resetSession: vi.fn(async () => {}),
     discover: vi.fn(async () => {}),
     getOrCreateSession: vi.fn(async (..._args: unknown[]) => fakeSession),
     resolveModel: vi.fn(() => undefined),
@@ -184,7 +185,7 @@ function makeBot() {
     prepare: vi.fn(async (media: IncomingMedia) => ({ ok: true, filePath: media.filePath, durationSec: media.durationSec ?? 1, cleanup: vi.fn(async () => {}) })),
   };
   const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never, audioMedia: audioMedia as never });
-  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt, audioMedia, emitSessionEvent };
+  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt, audioMedia, emitSessionEvent, resetSession: agents.resetSession };
 }
 
 describe("PiBot commands", () => {
@@ -472,6 +473,14 @@ describe("PiBot commands", () => {
     // unknown agent handled gracefully — toast, not a push
     const toast = await t.transport.act("agt:ghost");
     expect(String(toast)).toContain("doesn't exist");
+  });
+
+  it("/new starts a fresh session for the chat's agent and keeps state", async () => {
+    await t.transport.say("/new");
+    expect(t.resetSession).toHaveBeenCalledWith("assistant", "mock:42", { transport: "mock", chatId: "42" }, expect.anything());
+    expect(t.transport.lastText()).toContain("Fresh session for **assistant**");
+    await t.transport.say("/newagent ghost persona"); // unrelated commands unaffected
+    expect(t.resetSession).toHaveBeenCalledTimes(1);
   });
 
   it("posts an interactive card on agent creation (direct path)", async () => {

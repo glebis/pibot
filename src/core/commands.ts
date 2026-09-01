@@ -17,7 +17,7 @@ import type { LoadedAgentShape } from "./agent-shapes.js";
 const HELP = [
   `**pibot** — your agents. Talk normally; ask to schedule anything ("remind me to stretch in 20m", "daily standup note at 9am").`,
   ``,
-  `/agents — list agents  ·  /agent <name> — switch  ·  /newagent — guided wizard`,
+  `/agents — list agents  ·  /agent <name> — switch  ·  /new — fresh session  ·  /newagent — guided wizard`,
   `/schedules — active and paused items  ·  /cancel <id>  ·  /resume <id>  ·  /new — fresh session`,
   `/handoff <agent> [note] — move this conversation (with a task brief) to another agent`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
@@ -49,6 +49,7 @@ export interface CommandContext {
   };
   currentAgent(ck: string): string | undefined;
   chatKey(t: Transport, chatId: string): string;
+  resetSession(agentId: string, ck: string): Promise<void>;
   rememberChat(agentId: string, ck: string): void;
   ensureHeartbeatJob(agent: LoadedAgentShape): void;
   ensureEvolutionJob(agent: LoadedAgentShape): void;
@@ -165,6 +166,13 @@ export function createCommandHandler(ctx: CommandContext) {
         const note = arg.slice(target.length).trim() || undefined;
         const r = await deps.handoff(t, chatId, agentId, target, note);
         await reply(r.ok ? `🤝 Handed to **${target}** — your next message reaches them.\n\n${truncate(r.ack, 300)}` : `⚠︎ ${r.error}`);
+        return;
+      }
+
+      case "new": {
+        if (!agentId) return void (await reply("No agent selected for this chat."));
+        await ctx.resetSession(agentId, ck);
+        await reply(`🆕 Fresh session for **${agentId}** — memory, files, and schedules kept; the conversation starts clean.`);
         return;
       }
 
