@@ -12,6 +12,22 @@ import type { Config } from "../config.js";
 import type { ModelCascade } from "./cascade.js";
 import type { PushOptions, ReplyContext, Schedule, Transport, IncomingMedia } from "./types.js";
 
+// The /newagent wizard runs the LLM-backed ambiguity gate before creating the
+// agent. With no modelRuntime stub the SDK falls back to the machine's real
+// providers — the test then depends on live model latency (vi.waitFor 1s). The
+// gate itself is covered in agent-factory.test.ts; stub it deterministically here.
+vi.mock("./ambiguity.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./ambiguity.js")>();
+  return {
+    ...actual,
+    scorePersonaAmbiguity: vi.fn(async () => ({
+      score: 0,
+      questions: [],
+      dimensions: { goal: 1, constraints: 1, success: 1 },
+    })),
+  };
+});
+
 // model cascade stub — chain empty, everything healthy
 function makeCascadeStub() {
   return {
