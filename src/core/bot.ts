@@ -1643,6 +1643,22 @@ export class PiBot implements HeartbeatHost {
     }
   }
 
+  /**
+   * Daemon-level incident push (disk guard, environment failures) — fan out to
+   * every known chat on every live transport. Not a heartbeat: these are rare,
+   * owner-relevant incidents worth interrupting for.
+   */
+  async notifyOwnerEvent(text: string): Promise<void> {
+    const cks = new Set<string>();
+    for (const s of this.agentChats.values()) for (const ck of s) cks.add(ck);
+    for (const ck of this.chatAgent.keys()) cks.add(ck);
+    for (const ck of cks) {
+      const { transport, chatId } = this.splitChatKey(ck);
+      const t = this.transports.get(transport);
+      if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] notify failed:", e));
+    }
+  }
+
   async deliverToAgent(agentId: string, text: string) {    const cks = this.agentChats.get(agentId) ?? new Set<string>();
     const all = [...cks];
     const dedicated = all.filter((ck) => {

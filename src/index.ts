@@ -9,6 +9,7 @@ import { AgentManager } from "./core/agent-manager.js";
 import { PiBot } from "./core/bot.js";
 import { EventLog } from "./core/events.js";
 import { ModelCascade } from "./core/cascade.js";
+import { installDiskGuard } from "./core/disk-guard.js";
 import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
 import { ConsolidationEngine, createLlmConsolidationIO } from "./core/consolidation.js";
 import { HeartbeatEngine } from "./core/heartbeat.js";
@@ -24,6 +25,14 @@ async function main(): Promise<void> {
   const config = loadConfig();
   ensureDir(config.dataDir);
   hardenRuntimeDataDir(config.dataDir);
+
+  // disk guard: catch ENOSPC anywhere in the daemon (process events, swallowed
+  // catches via errorMessage, low-water watcher) and auto-run the disk-cleanup
+  // skill's safe preset. Owner-authorized: includes --empty-trash; --no-quit
+  // means running apps are never auto-quit. Durable 30-min cooldown in data/.
+  const diskGuard = process.env.PIBOT_DISK_GUARD === "0"
+    ? null
+    : installDiskGuard({ dataDir: config.dataDir, log: (m) => console.log(m) });
 
   // rotate the daemon log if it grows past 5 MB
   const daemonLog = path.join(config.dataDir, "daemon.log");
@@ -166,6 +175,7 @@ async function main(): Promise<void> {
 
   const providerManager = new ProviderManager(modelRuntime);
   bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir) });
+  diskGuard?.setNotify((text) => void bot.notifyOwnerEvent(text));
 
   await bot.start();
   scheduler.rearm();

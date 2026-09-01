@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { noteDiskError } from "./disk-guard.js";
 import type { ScheduleRepeat } from "./types.js";
 
 // ─── ids / json io ──────────────────────────────────────────────────────────
@@ -289,6 +290,7 @@ export function inQuietHours(qh: { from: string; to: string } | undefined, now =
 // ─── misc ───────────────────────────────────────────────────────────────────
 
 export function errorMessage(e: unknown): string {
+  noteDiskError(e); // harness tripwire: ENOSPC anywhere triggers the disk guard (no-op until installed)
   if (e instanceof Error) return e.message;
   return String(e);
 }

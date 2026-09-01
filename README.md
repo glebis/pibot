@@ -150,6 +150,7 @@ src/
     evolution.ts          goal-driven skill evolution (staging + probes + gates)
     consolidation.ts      event log → durable memory (blocks, gaps, eras, lessons)
     events.ts             per-agent event log (feeds heartbeat + evolution)
+    disk-guard.ts         ENOSPC tripwire → auto disk-cleanup (safe preset)
   plugins/                shared agent plugins
     scheduler-plugin.ts   schedule_create/list/cancel, snooze, promise_make/keep
     memory-plugin.ts      memory_save / memory_recall
@@ -175,6 +176,28 @@ Set `PIBOT_DEV_AGENT=1` to scaffold the built-in **`pibot-dev`** agent: it devel
 echo 'PIBOT_DEV_AGENT=1' >> .env   # enable at next restart
 git revert <commit>                # rollback any staged change
 ```
+
+## Disk guard (ENOSPC auto-cleanup)
+
+When the daemon hits `ENOSPC: no space left on device` — via process-level
+`uncaughtException`/`unhandledRejection`, errors swallowed by inner catches (funnelled
+through `errorMessage`), or a low-water watcher (free space < 2 GiB, checked at boot and
+every 10 min) — it automatically reclaims space with the owner's disk-cleanup skill:
+
+```bash
+python3 ~/.claude/skills/disk-cleanup/scripts/clean.py --preset safe --go --no-quit --empty-trash --json
+```
+
+Only risk:`safe` targets run (regenerable caches — the script's own preflight and risk
+gating apply; `trash` CLI, never `rm`). `--no-quit` means running apps are never
+auto-quit — targets that need their app closed are skipped. `--empty-trash` is
+owner-authorized: it permanently empties the whole Trash, without it trashed bytes would
+free nothing. Medium/never targets are never automatic; if space is still low afterwards
+the owner gets a Telegram push with the exact manual escalation command.
+
+A durable cooldown (`data/disk-guard.json`, 30 min) prevents cleanup loops and cannot be
+bypassed by restarting. `PIBOT_DISK_CLEANUP_DIR` moves the skill dir; `PIBOT_DISK_GUARD=0`
+disables the guard entirely.
 
 ## Testing
 
