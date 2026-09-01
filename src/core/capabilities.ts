@@ -7,6 +7,7 @@ import { attendPlugin, ATTEND_CLI } from "../plugins/attend-plugin.js";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
 import { delegatePlugin, DELEGATE_CLIS } from "../plugins/delegate-plugin.js";
 import { devToolsPlugin } from "../plugins/dev-tools-plugin.js";
+import { herdrPlugin } from "../plugins/herdr-plugin.js";
 import { gmailPlugin } from "../plugins/gmail-plugin.js";
 import { knowledgePlugin } from "../plugins/knowledge-plugin.js";
 import { linearPlugin } from "../plugins/linear-plugin.js";
@@ -180,6 +181,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     prompt: "delegate_cli runs a selected local coding CLI with its own permissions; give it a self-contained task.",
     available: () => installedDelegateClis().length > 0,
     create: (ctx) => delegatePlugin({ allowed: installedDelegateClis(), cwd: ctx.workspace, agentId: ctx.agent.id }),
+  },
+  {
+    id: "herdr", defaultEnabled: false, tools: ["herdr_dispatch", "herdr_read", "herdr_wait"],
+    prompt: "herdr_dispatch spawns a subagent (claude/codex/pi/opencode) in a new tab of the owner's herdr terminal; the brief must be fully self-contained (absolute paths, do-not-touch constraints, output location) and must never contain secrets. herdr_read and herdr_wait observe a dispatched pane. Spawned subagents run with their own permissions in the owner's visible herdr UI.",
+    available: () => executableAvailable("herdr"),
+    create: () => herdrPlugin(),
   },
   {
     id: "developer", defaultEnabled: false, tools: DEV_TOOLS,
