@@ -521,8 +521,10 @@ export class PiBot implements HeartbeatHost {
   private onSessionEvent(t: Transport, chatId: string, agentId: string, ev: AgentSessionEvent): void {
     if (ev.type === "agent_start") {
       t.setTyping?.(chatId, true);
+      t.setWorking?.(chatId, true);
     } else if (ev.type === "agent_end") {
       t.setTyping?.(chatId, false);
+      t.setWorking?.(chatId, false);
       const messages = (ev as { messages?: unknown[] }).messages ?? [];
       const key = `${agentId}::${this.chatKey(t, chatId)}`;
       const terminalAssistant = lastAssistantMessage(messages);

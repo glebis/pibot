@@ -258,6 +258,9 @@ export class TelegramTransport implements Transport {
   private mediaDir: string;
   private reactions: boolean;
   private processingIds = new Map<string, number[]>();
+  private workTimers = new Map<string, ReturnType<typeof setInterval>>();
+  private static WORK_CYCLE = ["🤔", "👀", "🔥"];
+  private static WORK_MAX_MS = 180_000;
 
   constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string; openWhenEmpty?: boolean; mediaDir?: string; reactions?: boolean } = {}) {
     this.bot = new Bot(token);
@@ -636,6 +639,8 @@ export class TelegramTransport implements Transport {
   }
 
   async stop(): Promise<void> {
+    for (const timer of this.workTimers.values()) clearInterval(timer);
+    this.workTimers.clear();
     await this.bot.stop();
   }
 
@@ -766,6 +771,29 @@ export class TelegramTransport implements Transport {
       }
     }
     throw new Error("telegram send exhausted retries");
+  }
+
+  /** While a turn runs: cycle the processing reaction + refresh the typing indicator. */
+  setWorking(chatId: string, on: boolean): void {
+    const existing = this.workTimers.get(chatId);
+    if (existing) { clearInterval(existing); this.workTimers.delete(chatId); }
+    if (!on || !this.reactions) return;
+    const started = Date.now();
+    const list = this.processingIds.get(chatId) ?? [];
+    const lastId = list[list.length - 1];
+    if (!lastId) return;
+    let i = 0;
+    const timer = setInterval(() => {
+      if (!this.processingIds.get(chatId)?.length || Date.now() - started > TelegramTransport.WORK_MAX_MS) {
+        clearInterval(timer);
+        this.workTimers.delete(chatId);
+        return;
+      }
+      i = (i + 1) % TelegramTransport.WORK_CYCLE.length;
+      void this.setReaction(chatId, lastId, TelegramTransport.WORK_CYCLE[i]);
+      void this.bot.api.sendChatAction(chatId, "typing").catch(() => {});
+    }, 6_000);
+    this.workTimers.set(chatId, timer);
   }
 
   setTyping(chatId: string, on: boolean): void {
