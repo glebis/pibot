@@ -30,11 +30,20 @@ import { devAgentEnabled, DEV_AGENT_ID, scaffoldDevAgent } from "./dev-agent.js"
  *  a user to get around to BotFather, short enough to not catch stale updates. */
 const PENDING_SUBBOT_TTL_MS = 24 * 3600e3;
 
+/** How often the sub-bot wiring re-probe runs while requests are armed. Telegram's
+ *  creator-record propagation can outlast the initial in-handler retry window
+ *  (observed: still "invalid user_id" after ~5 min, fetchable ~10 min later),
+ *  and no new managed_bot update arrives by itself — so we poll. */
+const SUBBOT_PROBE_EVERY_MS = 3 * 60e3;
+
 export interface PersistedBotState {
   chats?: Record<string, string>;
   agentChats?: Record<string, string[]>;
   /** agentId → timestamp (ms) the pending request was armed at */
   pendingSubBots?: Record<string, number>;
+  /** agentId → managed-bot user id, learned from the failed wiring's managed_bot
+   *  update — lets the re-probe fetch the token without a new Telegram event */
+  pendingSubBotIds?: Record<string, number>;
 }
 
 /** Parse + TTL-prune persisted pending sub-bot requests (pure; unit-tested). */
@@ -60,6 +69,7 @@ export class PiBot implements HeartbeatHost {
   private wizardChats = new Set<string>(); // chats running /newagent interview
   private commandHandler: ((t: Transport, chatId: string, text: string) => Promise<void>) | null = null;
   private pendingSubBots = new Map<string, string>(); // chatKey → agentId awaiting its sub-bot creation
+  private pendingSubBotIds = new Map<string, number>(); // agentId → managed-bot user id (drives the wiring re-probe)
   /** agentId → armed-at timestamp for pendingSubBots; mirrored into state.json */
   private pendingSubBotsArmed = new Map<string, number>();
   private lastUserMessage = new Map<string, number>(); // agentId → last real user message
@@ -170,13 +180,20 @@ export class PiBot implements HeartbeatHost {
         await this.deliverToAgent(agentId, `⚠︎ Bot **${botName}** was created but wiring failed: ${r.error}. Retry from the dashboard (request sub-bot creation again).`).catch(() => {});
       }
     } catch (e) {
-      // keep the request armed: a later managed_bot update (e.g. token regenerated in
-      // @BotFather) completes the wiring without a fresh creation flow
+      // keep the request armed: the wiring re-probe keeps fetching the token on
+      // its own cadence (Telegram's creator records propagate slowly), and a later
+      // managed_bot update (e.g. token regenerated in @BotFather) also completes it
       console.error(`[telegram] managed bot token fetch failed for ${botName}: ${(e as Error).message}`);
       this.deps.events.log("system", "system", `managed bot token fetch failed: ${errorMessage(e)}`);
+      if (info.botId > 0) {
+        this.pendingSubBotIds.set(agentId, info.botId);
+        this.ensureSubBotProbeJob();
+        this.persistState();
+        console.log(`[pibot] sub-bot wiring for ${agentId} stays armed — re-probing every ${SUBBOT_PROBE_EVERY_MS / 60e3}m for the token`);
+      }
       await this.deliverToAgent(
         agentId,
-        `⚠︎ Telegram didn't hand me the token for **${botName}** yet (its servers propagate creator records slowly).\nThe request stays armed — regenerate the bot's token in @BotFather (or re-run the creation request) and I'll wire it automatically.`
+        `⚠︎ Telegram didn't hand me the token for **${botName}** yet (its servers propagate creator records slowly).\nThe request stays armed — I'll keep retrying automatically; regenerating the token in @BotFather also completes the wiring.`
       ).catch(() => {});
     }
   }
@@ -236,6 +253,10 @@ export class PiBot implements HeartbeatHost {
     if (pendingRestored || pendingDropped) {
       for (const agentId of this.pendingSubBots.keys()) console.log(`[pibot] pending sub-bot wiring for ${agentId} remains armed`);
     }
+    for (const [agentId, botId] of Object.entries(state.pendingSubBotIds ?? {})) {
+      if (this.pendingSubBots.has(agentId) && Number.isFinite(botId) && botId > 0) this.pendingSubBotIds.set(agentId, botId);
+    }
+    if (this.pendingSubBots.size) this.ensureSubBotProbeJob();
 
     for (const t of this.transports.values()) await t.start();
     console.log(`[pibot] running · agents: ${this.deps.agents.list().map((a) => a.id).join(", ")} · transport: ${[...this.transports.keys()].join("+")}`);
@@ -443,7 +464,9 @@ export class PiBot implements HeartbeatHost {
     for (const [k, v] of this.agentChats) agentChats[k] = [...v];
     const pendingSubBots: Record<string, number> = {};
     for (const [k, ts] of this.pendingSubBotsArmed) pendingSubBots[k] = ts;
-    writeJsonAtomic(this.statePath, { chats, agentChats, pendingSubBots } as PersistedBotState);
+    const pendingSubBotIds: Record<string, number> = {};
+    for (const [k, botId] of this.pendingSubBotIds) if (this.pendingSubBots.has(k)) pendingSubBotIds[k] = botId;
+    writeJsonAtomic(this.statePath, { chats, agentChats, pendingSubBots, pendingSubBotIds } as PersistedBotState);
   }
 
   /** Arm a pending sub-bot creation for agentId (durable across restarts). */
@@ -1357,6 +1380,84 @@ export class PiBot implements HeartbeatHost {
     });
   }
 
+  /** While sub-bot creation requests are armed, poll Telegram for their tokens —
+   *  creator records propagate slowly and no new managed_bot update arrives by
+   *  itself, so without this the wiring would wait for a manual token rotation. */
+  private ensureSubBotProbeJob(): void {
+    this.deps.scheduler.ensure({
+      id: "subbot:probe",
+      agentId: "system",
+      chat: { transport: "internal", chatId: "subbot" },
+      title: "sub-bot wiring probe",
+      kind: "subbot-probe",
+      dueAt: Date.now() + SUBBOT_PROBE_EVERY_MS,
+      repeat: { everyMs: SUBBOT_PROBE_EVERY_MS },
+      wake: "normal",
+      delivery: "direct",
+      status: "pending",
+      createdAt: Date.now(),
+      firedCount: 0,
+      internal: true,
+    });
+  }
+
+  /** Self-heal for armed sub-bot creation requests: fetch the token for the
+   *  learned bot id, wire it live (attach + owner-restrict), disarm, notify.
+   *  Silent while tokens are still unavailable — no user spam per probe. */
+  private async reprobePendingSubBots(): Promise<void> {
+    for (const agentId of [...this.pendingSubBots.keys()]) {
+      const armedAt = this.pendingSubBotsArmed.get(agentId);
+      if (armedAt != null && Date.now() - armedAt > PENDING_SUBBOT_TTL_MS) {
+        this.disarmPendingSubBot(agentId);
+        this.pendingSubBotIds.delete(agentId);
+        this.deps.events.log(agentId, "system", "sub-bot creation request expired — gave up waiting for Telegram's token");
+      }
+    }
+    if (!this.pendingSubBots.size) {
+      this.pendingSubBotIds.clear();
+      this.deps.scheduler.cancel("subbot:probe");
+      this.persistState();
+      return;
+    }
+    const tg = this.transports.get("telegram") as import("../transports/telegram.js").TelegramTransport | undefined;
+    if (!tg?.managerMode?.()) return; // can't fetch without manager mode; TTL prunes eventually
+    for (const agentId of [...this.pendingSubBotIds.keys()]) {
+      const botId = this.pendingSubBotIds.get(agentId)!;
+      if (!this.pendingSubBots.has(agentId) || !(botId > 0)) {
+        this.pendingSubBotIds.delete(agentId);
+        continue;
+      }
+      if (this.transports.has(`telegram:${agentId}`)) {
+        // wired by another path (dashboard/manual) — just clear the request
+        this.disarmPendingSubBot(agentId);
+        this.pendingSubBotIds.delete(agentId);
+        continue;
+      }
+      try {
+        const token = await tg.getManagedBotToken(botId, { attempts: 1 });
+        const r = await this.attachSubBot(agentId, token);
+        this.disarmPendingSubBot(agentId);
+        this.pendingSubBotIds.delete(agentId);
+        if (r.ok) {
+          // managed sub-bots are private: only the manager's owner can use them
+          await tg.setManagedBotAccessSettings(botId, true).catch((e) => console.error("[telegram] access restriction failed:", errorMessage(e)));
+          this.deps.events.log(agentId, "system", `sub-bot wired by re-probe: ${r.botName} (restricted to owner)`);
+          await this.deliverToAgent(agentId, `🟢 My own Telegram bot is live: **${r.botName}** — its own chat, its own identity, restricted to you.`).catch(() => {});
+        } else {
+          this.deps.events.log(agentId, "system", `sub-bot re-probe wiring failed: ${r.error}`);
+          await this.deliverToAgent(agentId, `⚠︎ Bot wiring failed: ${r.error}. I'll keep retrying — or re-attach from the dashboard.`).catch(() => {});
+        }
+      } catch {
+        // token not ready yet — stays armed; the next probe retries
+      }
+    }
+    if (!this.pendingSubBots.size) {
+      this.pendingSubBotIds.clear();
+      this.deps.scheduler.cancel("subbot:probe");
+      this.persistState();
+    }
+  }
+
   /** Cheap periodic probe: retries downed providers + replays queued messages */
   private ensureCascadeProbeJob(): void {
     if (!this.deps.cascade) return;
@@ -1410,6 +1511,10 @@ export class PiBot implements HeartbeatHost {
     }
     if (job.kind === "cascade-probe") {
       await this.runCascadeRecovery();
+      return;
+    }
+    if (job.kind === "subbot-probe") {
+      await this.reprobePendingSubBots();
       return;
     }
     if (job.kind === "attend-pass") {

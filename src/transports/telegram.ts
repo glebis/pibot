@@ -166,6 +166,48 @@ export function telegramMediaSpec(message: TelegramMediaInput): TelegramMediaSpe
   return null;
 }
 
+/** Message fields that mark a Telegram `message` update as a service message
+ *  (chat lifecycle, payments, sharing, managed-bot events, …) rather than user
+ *  content. Kept in sync with grammY's ServiceMessage types. */
+const SERVICE_MESSAGE_FIELDS = [
+  // managed-bot lifecycle (Bot API 9.6)
+  "managed_bot_created",
+  // chat lifecycle
+  "new_chat_members", "left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo",
+  "group_chat_created", "supergroup_chat_created", "channel_chat_created",
+  "migrate_to_chat_id", "migrate_from_chat_id", "pinned_message",
+  "chat_owner_left", "chat_owner_changed", "community_chat_added", "community_chat_removed", "community_chat_joined",
+  "boost_added", "chat_background_set", "message_auto_delete_timer_changed",
+  // forum topics
+  "forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
+  "general_forum_topic_hidden", "general_forum_topic_unhidden",
+  // payments
+  "invoice", "successful_payment", "refunded_payment", "paid_message_price_changed", "direct_message_price_changed",
+  "suggested_post_info", "suggested_post_approved", "suggested_post_approval_failed", "suggested_post_declined",
+  "suggested_post_paid", "suggested_post_refunded",
+  // sharing / access
+  "users_shared", "chat_shared", "connected_website", "write_access_allowed", "passport_data",
+  "proximity_alert_triggered", "web_app_data",
+  // gifts & giveaways
+  "gift", "unique_gift", "gift_upgrade_sent", "giveaway_created", "giveaway", "giveaway_winners", "giveaway_completed",
+  // polls & checklists
+  "poll_option_added", "poll_option_deleted", "checklist_tasks_done", "checklist_tasks_added",
+  // video chats
+  "video_chat_scheduled", "video_chat_started", "video_chat_ended", "video_chat_participants_invited",
+] as const;
+
+/** Pure service-message detection (unit-testable without a live bot). Service
+ *  messages carry no user content, so the fallback "can't process this" reply
+ *  must stay silent for them. Returns the matching service field name. */
+export function serviceMessageKind(m: unknown): string | undefined {
+  if (!m || typeof m !== "object") return undefined;
+  const rec = m as Record<string, unknown>;
+  for (const field of SERVICE_MESSAGE_FIELDS) {
+    if (rec[field] !== undefined) return field;
+  }
+  return undefined;
+}
+
 export function assertCallbackData(action: string): string {
   if (action.length <= 64) return action;
   if (process.env.NODE_ENV !== "production") {
@@ -249,6 +291,20 @@ export class TelegramTransport implements Transport {
     this.bot.on("message", async (ctx) => {
       if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
       const m = ctx.message;
+      // Service messages (managed-bot creation, chat events, payments, …) are
+      // Telegram bookkeeping, not user content — never fall through to the
+      // "can't process" reply.
+      const service = serviceMessageKind(m);
+      if (service) {
+        if (service === "managed_bot_created") {
+          const created = (m as { managed_bot_created?: { bot?: { id?: number; username?: string; first_name?: string } } }).managed_bot_created;
+          const bot = created?.bot;
+          console.log(`[telegram] managed-bot lifecycle: bot created — @${bot?.username ?? "?"} (id ${bot?.id ?? "?"}${bot?.first_name ? `, "${bot.first_name}"` : ""}) by user ${m?.from?.id ?? "?"} (chat ${m?.chat?.id}, ${this.name})`);
+        } else {
+          console.log(`[telegram] service message ignored: ${service} (chat ${m?.chat?.id}, ${this.name})`);
+        }
+        return;
+      }
       const kind = m?.sticker ? "stickers" : m?.video ? "videos" : m?.animation ? "animations" : "this media type";
       void this.push(String(ctx.chat?.id ?? ""), { text: `I can't process ${kind} yet — send text, a voice note, a photo, or a document.` }).catch(() => {});
     });
@@ -364,11 +420,14 @@ export class TelegramTransport implements Transport {
    *  Telegram can 400 with "invalid user_id" right after a bot is created
    *  (eventual consistency) — and that window can outlast several seconds
    *  (observed: a bot that at 20s was still rejected wired fine ~3 min later).
-   *  So we retry with exponential backoff over ~4.75 minutes total. */
-  async getManagedBotToken(botUserId: number): Promise<string> {
+   *  So we retry with exponential backoff over ~4.75 minutes total.
+   *  `opts.attempts` caps the tries (1 = single shot — used by the pending-sub-bot
+   *  re-probe, which retries on its own cadence instead of blocking one call). */
+  async getManagedBotToken(botUserId: number, opts: { attempts?: number } = {}): Promise<string> {
+    const attempts = Math.max(1, opts.attempts ?? MANAGED_BOT_TOKEN_BACKOFF_MS.length + 1);
     let lastErr: unknown;
-    for (let attempt = 0; attempt <= MANAGED_BOT_TOKEN_BACKOFF_MS.length; attempt++) {
-      if (attempt > 0) await new Promise((r) => setTimeout(r, MANAGED_BOT_TOKEN_BACKOFF_MS[attempt - 1]));
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, MANAGED_BOT_TOKEN_BACKOFF_MS[Math.min(attempt - 1, MANAGED_BOT_TOKEN_BACKOFF_MS.length - 1)]));
       const r = await this.bot.api.getManagedBotToken({ user_id: botUserId } as never).catch((e: unknown) => {
         lastErr = e;
         return null;

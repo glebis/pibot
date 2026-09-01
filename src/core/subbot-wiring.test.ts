@@ -60,7 +60,7 @@ class FakeTelegramTransport implements Transport {
   pushed: Array<{ chatId: string; opts: PushOptions }> = [];
   messageCb: ((text: string, chatId: string) => Promise<void>) | null = null;
   managedCb: ((info: ManagedInfo) => Promise<void>) | null = null;
-  tokenFetch = vi.fn(async () => {
+  tokenFetch = vi.fn(async (): Promise<string> => {
     throw new Error("Call to 'getManagedBotToken' failed! (400: Bad Request: invalid user_id specified)");
   });
 
@@ -89,9 +89,7 @@ class FakeTelegramTransport implements Transport {
   async getManagedBotToken(): Promise<string> {
     return this.tokenFetch();
   }
-  setManagedBotAccessSettings(): Promise<unknown> {
-    return Promise.resolve({});
-  }
+  setManagedBotAccessSettings = vi.fn(async (): Promise<unknown> => ({}));
   async fire(info: ManagedInfo): Promise<void> {
     await this.managedBotCb?.(info);
   }
@@ -131,6 +129,7 @@ function makeWiringBot(dir: string, transport: FakeTelegramTransport) {
     create: vi.fn((job: Record<string, unknown>) => ({ id: "sc_x", ...job })),
     list: vi.fn(() => []),
     snoozeState: vi.fn(() => null),
+    cancel: vi.fn(),
   } as unknown as Scheduler;
   const heartbeat = { tick: vi.fn(async () => {}), takeNextWakeup: vi.fn(() => null) } as unknown as HeartbeatEngine;
   const cascade = {
@@ -151,7 +150,7 @@ function makeWiringBot(dir: string, transport: FakeTelegramTransport) {
     secrets: { get: () => ({ telegram: { subBots: {} } }), save: async () => {} } as never,
     cascade,
   });
-  return { bot, events };
+  return { bot, events, scheduler };
 }
 
 describe("managed sub-bot wiring", () => {
@@ -223,4 +222,86 @@ describe("managed sub-bot wiring", () => {
     const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
     expect(state.pendingSubBots ?? {}).toEqual({});
   });
+
+  it("a failed token fetch persists the bot id and arms the wiring re-probe", async () => {
+    const now = Date.now();
+    fs.writeFileSync(
+      path.join(dir, "state.json"),
+      JSON.stringify({
+        chats: { "telegram:42": "assistant" },
+        agentChats: { assistant: ["telegram:42"] },
+        pendingSubBots: { assistant: now - 60e3 },
+      })
+    );
+
+    const tg = new FakeTelegramTransport();
+    const { bot, scheduler } = makeWiringBot(dir, tg);
+    await bot.start();
+    await tg.fire({ creatorId: "161427550", botId: 8802922531, botUsername: "pimother_assistant_bot" });
+
+    // the learned bot id survives a restart so the re-probe can fetch without a new event
+    const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+    expect(state.pendingSubBotIds.assistant).toBe(8802922531);
+    expect(state.pendingSubBots.assistant).toBeGreaterThan(0);
+    expect(scheduler.ensure).toHaveBeenCalledWith(expect.objectContaining({ id: "subbot:probe", kind: "subbot-probe" }));
+  });
+
+  it("re-probe stays silent and keeps the request armed while the token is unavailable", async () => {
+    const now = Date.now();
+    fs.writeFileSync(
+      path.join(dir, "state.json"),
+      JSON.stringify({
+        chats: { "telegram:42": "assistant" },
+        agentChats: { assistant: ["telegram:42"] },
+        pendingSubBots: { assistant: now - 60e3 },
+        pendingSubBotIds: { assistant: 8802922531 },
+      })
+    );
+
+    const tg = new FakeTelegramTransport();
+    const { bot } = makeWiringBot(dir, tg);
+    await bot.start();
+    const pushesBefore = tg.pushed.length;
+
+    await bot.deliverFire({ kind: "subbot-probe", agentId: "system" } as never, false);
+
+    expect(tg.pushed.length).toBe(pushesBefore); // no per-probe user spam
+    const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+    expect(state.pendingSubBots.assistant).toBeGreaterThan(0); // still armed
+  });
+
+  it("re-probe wires the bot live once Telegram hands over the token", async () => {
+    const now = Date.now();
+    fs.writeFileSync(
+      path.join(dir, "state.json"),
+      JSON.stringify({
+        chats: { "telegram:42": "assistant" },
+        agentChats: { assistant: ["telegram:42"] },
+        pendingSubBots: { assistant: now - 60e3 },
+        pendingSubBotIds: { assistant: 8802922531 },
+      })
+    );
+
+    const tg = new FakeTelegramTransport();
+    const { bot } = makeWiringBot(dir, tg);
+    await bot.start();
+    const attach = vi.fn(async () => ({ ok: true, botName: "@pimother_assistant_bot" }));
+    (bot as unknown as { attachSubBot: unknown }).attachSubBot = attach;
+    tg.tokenFetch.mockResolvedValue("8802922531:AAE-fake-token");
+
+    await bot.deliverFire({ kind: "subbot-probe", agentId: "system" } as never, false);
+
+    expect(attach).toHaveBeenCalledWith("assistant", "8802922531:AAE-fake-token");
+    expect(tg.setManagedBotAccessSettings).toHaveBeenCalledWith(8802922531, true);
+    expect(tg.lastText()).toContain("🟢");
+    const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+    expect(state.pendingSubBots ?? {}).toEqual({}); // disarmed
+    expect(state.pendingSubBotIds ?? {}).toEqual({});
+    expect(schedulerCancelCalled(bot)).toBe(true); // probe job cancels itself when nothing is pending
+  });
 });
+
+function schedulerCancelCalled(bot: PiBot): boolean {
+  const calls = (bot as unknown as { deps: { scheduler: { cancel: ReturnType<typeof vi.fn> } } }).deps.scheduler.cancel.mock.calls;
+  return calls.some((args) => args[0] === "subbot:probe");
+}
