@@ -7,7 +7,7 @@ export interface Config {
   transport: "telegram" | "cli";
   dataDir: string;
   agentsDir: string;
-  /** the owner's Obsidian vault — read-only ground truth for all agents */
+  /** the owner's Obsidian vault — ground truth for all agents; read-only unless an agent opts in to the "vault-file" capability */
   vaultDir: string;
   defaultAgentId?: string;
   heartbeatModel?: string;

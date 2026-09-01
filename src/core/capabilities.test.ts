@@ -50,6 +50,7 @@ describe("capability registry", () => {
     const expected = new Map<string, string[]>([
       ["agent-comms", ["agent_message", "agent_ask", "agent_list", "handoff"]],
       ["knowledge", ["knowledge_share", "knowledge_read"]],
+      ["vault-file", ["vault_read", "vault_write"]],
       ["attend", ["attend_enqueue", "attend_list", "attend_mark"]],
       ["telegram-responder", ["inbox_pending", "followups_open", "draft_reply"]],
       ["delegate", ["delegate_cli"]],

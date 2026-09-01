@@ -15,6 +15,7 @@ import { memoryPlugin } from "../plugins/memory-plugin.js";
 import { questionPlugin } from "../plugins/question-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
 import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
+import { vaultPlugin } from "../plugins/vault-plugin.js";
 import { speechPlugin } from "../plugins/speech-plugin.js";
 import { dictionaryPlugin } from "../plugins/dictionary-plugin.js";
 import { resolveResponderDb, tgResponderPlugin } from "../plugins/tg-responder-plugin.js";
@@ -155,6 +156,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     id: "knowledge", defaultEnabled: false, tools: ["knowledge_share", "knowledge_read"],
     prompt: "knowledge_share contributes a durable fact to shared knowledge; knowledge_read reads that shared layer.",
     create: (ctx) => knowledgePlugin({ sharedFile: path.join(ctx.vaultDir, "pibot", "SHARED-FINDINGS.md"), agentId: ctx.agent.id }),
+  },
+  {
+    id: "vault-file", defaultEnabled: false, tools: ["vault_read", "vault_write"],
+    prompt: "vault_read and vault_write read and write files strictly inside the owner's Obsidian vault — the ground truth for personal context. Read freely; write only with owner intent or when following an established vault convention (e.g. Sources/ and Daily notes — match the existing note format exactly). Resolved paths must stay inside the vault; nothing outside it is accessible.",
+    available: (ctx) => fs.existsSync(ctx.vaultDir),
+    create: (ctx) => vaultPlugin({ vaultDir: ctx.vaultDir }),
   },
   {
     id: "agent-comms", defaultEnabled: true, tools: ["agent_message", "agent_ask", "agent_list", "handoff"],
