@@ -591,7 +591,10 @@ export class TelegramTransport implements Transport {
       [{ text: "☀️ Wake" }, { text: "📋 Status" }],
     ],
     resize_keyboard: true,
-    is_persistent: true,
+    // not persistent: an always-expanded keyboard pinned above the input reads as
+    // clutter ("buttons always open") — non-persistent collapses when the user
+    // taps the text field and stays reachable via the chevron.
+    is_persistent: false,
   };
 
   async push(chatId: string, opts: PushOptions): Promise<void> {

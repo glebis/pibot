@@ -190,6 +190,26 @@ describe("Telegram speech delivery", () => {
   });
 });
 
+describe("quick-action keyboard", () => {
+  it("attaches once on the first plain push of a main-bot chat and is NOT persistent", async () => {
+    const t = new TelegramTransport("123:test", ["42"]); // no boundAgentId = main bot
+    const marks: Array<{ is_persistent?: boolean } | undefined> = [];
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendMessage: async (_cid: string, _text: string, extra?: { reply_markup?: { is_persistent?: boolean } }) => {
+          marks.push(extra?.reply_markup);
+          return { message_id: 1 };
+        },
+      },
+    };
+    await t.push("42", { text: "first plain reply" });
+    await t.push("42", { text: "second reply — keyboard must not re-attach" });
+    expect(marks.length).toBe(2);
+    expect(marks[0]?.is_persistent).toBe(false); // never pinned open
+    expect(marks[1]).toBeUndefined(); // attached only once per chat
+  });
+});
+
 describe("push settle deadlock guard", () => {
   it("a reply that settles a marked message must not self-deadlock the outbox", async () => {
     const t = new TelegramTransport("123:test", ["42"]);
