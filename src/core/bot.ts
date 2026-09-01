@@ -1749,19 +1749,21 @@ export class PiBot implements HeartbeatHost {
   }
 
   /**
-   * Daemon-level incident push (disk guard, environment failures) — fan out to
-   * every known chat on every live transport. Not a heartbeat: these are rare,
-   * owner-relevant incidents worth interrupting for.
+   * Daemon-level incident push (disk guard, environment failures). Rare,
+   * owner-relevant — but one copy in the owner's main chat, not a broadcast
+   * across every board (owner-reported as noise when it hit all chats).
    */
   async notifyOwnerEvent(text: string): Promise<void> {
-    const cks = new Set<string>();
-    for (const s of this.agentChats.values()) for (const ck of s) cks.add(ck);
-    for (const ck of this.chatAgent.keys()) cks.add(ck);
-    for (const ck of cks) {
-      const { transport, chatId } = this.splitChatKey(ck);
-      const t = this.transports.get(transport);
-      if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] notify failed:", e));
+    const defaultAgentId = this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId();
+    const owned = [...this.chatAgent.entries()].filter(([, agentId]) => agentId === defaultAgentId);
+    const target = owned[0]?.[0];
+    if (!target) {
+      this.deps.events.log("system", "system", `incident suppressed — no main chat bound (text kept in log): ${truncate(text, 120)}`);
+      return;
     }
+    const { transport, chatId } = this.splitChatKey(target);
+    const t = this.transports.get(transport);
+    if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] notify failed:", e));
   }
 
   async deliverToAgent(agentId: string, text: string) {    const cks = this.agentChats.get(agentId) ?? new Set<string>();
