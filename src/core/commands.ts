@@ -19,7 +19,7 @@ const HELP = [
   ``,
   `/agents — list agents  ·  /agent <name> — switch  ·  /newagent — guided wizard`,
   `/schedules — active and paused items  ·  /cancel <id>  ·  /resume <id>  ·  /new — fresh session`,
-  `/handoff <agent> — move this conversation (with context) to another agent`,
+  `/handoff <agent> [note] — move this conversation (with a task brief) to another agent`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
   `/cascade — model fallback health  ·  /cascade probe|retry|clear`,
   `/providers — cloud providers, keys & subscription logins`,
@@ -54,6 +54,7 @@ export interface CommandContext {
   ensureEvolutionJob(agent: LoadedAgentShape): void;
   ensureMorningBriefJob(agent: LoadedAgentShape): void;
   deliverToAgent(agentId: string, text: string): Promise<void>;
+  handoff?(t: Transport, chatId: string, fromAgent: string, toAgent: string, note?: string): Promise<{ ok: true; ack: string } | { ok: false; error: string }>;
   questions: Pick<QuestionBus, "cancelPending">;
   wizard: { runNewAgentWizard(t: Transport, chatId: string): Promise<void> };
   cascade?: {
@@ -150,6 +151,20 @@ export function createCommandHandler(ctx: CommandContext) {
             ],
           },
         });
+        return;
+      }
+
+      case "handoff": {
+        if (!agentId) return void (await reply("No agent selected."));
+        if (!deps.handoff) return void (await reply("Handoff is not wired in this build."));
+        const target = arg.split(/\s+/)[0]?.toLowerCase() ?? "";
+        if (!target) {
+          await reply("Usage: /handoff <agent> [note] — move this conversation (with a task brief) to another agent. /agents for the list.");
+          return;
+        }
+        const note = arg.slice(target.length).trim() || undefined;
+        const r = await deps.handoff(t, chatId, agentId, target, note);
+        await reply(r.ok ? `🤝 Handed to **${target}** — your next message reaches them.\n\n${truncate(r.ack, 300)}` : `⚠︎ ${r.error}`);
         return;
       }
 

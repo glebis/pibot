@@ -29,7 +29,9 @@ The host process (`src/`) runs a **scheduler** (JSON-backed timer wheel with sno
 }
 ```
 
-Available ids are `avatar`, `speech`, `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `attend`, `telegram-responder`, `delegate`, `developer`, and `remote-workshop`. Avatar, Calendar, and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
+Available ids are `avatar`, `speech`, `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `attend`, `telegram-responder`, `delegate`, `herdr`, `developer`, and `remote-workshop`. Avatar, Calendar, and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
+
+The `herdr` capability (requires the `herdr` CLI and a running herdr instance) lets an agent run subagents in new tabs of the owner's herdr UI: `herdr_dispatch` spawns claude/codex/pi/opencode in a fresh tab with a self-contained brief, waits for `done`, and returns the transcript (`--detach` returns immediately; `herdr_read` and `herdr_wait` observe the pane afterwards). The target workspace resolves from the invoking herdr pane, `$PIBOT_HERDR_WORKSPACE`, or an explicit `workspace` argument; briefs are passed as temp files and never carry secrets.
 
 `providers` is a per-agent model-provider allowlist. Without it, only models named directly in `model`/`cascade` are used; global and authenticated-provider fallback discovery is disabled.
 
@@ -78,7 +80,11 @@ The dashboard provides:
 agent CRUD, manifest editor (model/heartbeat/evolution/quiet hours), persona + memory editors,
 schedule table with cancel, snooze/wake, staged-skill review (promote/reject), run-evolution, event tail.
 
-Chat commands: `/help` `/agents` `/agent <name>` `/newagent <name> <persona>` `/schedules` `/snooze 2h` `/wake` `/status` `/skills` `/evolve [goal]` `/evolve status|promote|reject`
+Chat commands: `/help` `/agents` `/agent <name>` `/newagent <name> <persona>` `/handoff <agent> [note]` `/schedules` `/snooze 2h` `/wake` `/status` `/skills` `/evolve [goal]` `/evolve status|promote|reject`
+
+### Handoff between agents
+
+Agents can delegate among themselves (`agent_message` / `agent_ask` / `agent_list`), and a conversation can move between agents with full context: `/handoff <agent> [note]` or an agent calling its `handoff` tool packages the thread into a **task brief** (task, context, artifacts, done, next step — distilled by a cheap ephemeral model, raw transcript fallback) and delivers it to the target's session in the same chat, which is then rebound so the user's next message reaches the target. In a dedicated sub-bot chat the chat stays pinned to its agent — there the brief lands in the target's inter-agent pair session instead. External delegation is opt-in per agent: `delegate` (claude/codex/gemini CLIs) and `herdr` (subagents in herdr tabs).
 
 ## Scheduling & the one-button flow
 

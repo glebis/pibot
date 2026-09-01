@@ -104,6 +104,7 @@ class MockTransport implements Transport {
 function fakeAgentManager(promptSpy = vi.fn()) {
   const sessionListeners: Array<(event: unknown) => void> = [];
   const fakeSession = {
+    agent: { state: { messages: [] } },
     prompt: promptSpy.mockResolvedValue(undefined),
     setModel: vi.fn(async () => {}),
     subscribe: vi.fn((listener: (event: unknown) => void) => {
@@ -114,7 +115,9 @@ function fakeAgentManager(promptSpy = vi.fn()) {
   const agents = {
     createAgent: vi.fn(() => undefined),
     discover: vi.fn(async () => {}),
-    getOrCreateSession: vi.fn(async () => fakeSession),
+    getOrCreateSession: vi.fn(async (..._args: unknown[]) => fakeSession),
+    resolveModel: vi.fn(() => undefined),
+    sessions: new Map(),
     getAgent: vi.fn((id: string) =>
       id === "assistant" || id === "fitness"
         ? { id, dir: `/tmp/fake-${id}`, manifest: { name: id, description: "d", heartbeat: { enabled: true, interval: "45m" }, evolution: { enabled: true, interval: "6h" } } }
@@ -382,6 +385,61 @@ describe("PiBot commands", () => {
   it("rejects switching to unknown agents", async () => {
     await t.transport.say("/agent ghost");
     expect(t.transport.lastText()).toContain("No agent");
+  });
+
+  it("hands the conversation to another agent with /handoff", async () => {
+    await t.transport.say("we are planning the tax report");
+    await t.transport.say("/handoff fitness deadline is friday");
+    expect(t.transport.lastText()).toContain("Handed to **fitness**");
+    // the target's chat session received the handoff envelope with a brief section
+    const handoffPrompt = t.promptSpy.mock.calls.map((c) => String(c[0])).find((p) => p.includes('[handoff from "assistant"]'));
+    expect(handoffPrompt).toBeTruthy();
+    expect(handoffPrompt).toContain("# Handoff brief");
+    expect(handoffPrompt).toContain("deadline is friday");
+    // the chat is rebound: the next plain message goes to the target agent
+    await t.transport.say("continue");
+    const lastCall = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
+    expect(lastCall[0]).toBe("fitness");
+    expect(lastCall[1]).toBe("mock:42");
+  });
+
+  it("/handoff rejects self and unknown targets", async () => {
+    await t.transport.say("/handoff assistant");
+    expect(t.transport.lastText()).toContain("already talking");
+    await t.transport.say("/handoff ghost");
+    expect(t.transport.lastText()).toContain('No agent "ghost"');
+  });
+
+  it("agent-initiated handoff moves the chat to the target", async () => {
+    await t.transport.say("hello"); // create the sender's chat session (carries the comms hooks)
+    const hookCall = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => c[5] && typeof (c[5] as { handoffContext?: unknown }).handoffContext === "function"
+    );
+    expect(hookCall).toBeTruthy();
+    const hooks = hookCall![5] as { handoffContext: (from: string, to: string, note?: string) => Promise<string> };
+    const ack = await hooks.handoffContext("assistant", "fitness", "take over the thread");
+    expect(ack).toBe("Ready.");
+    // the target's chat session received the brief + the chat rebound
+    const handoffPrompt = t.promptSpy.mock.calls.map((c) => String(c[0])).find((p) => p.includes('[handoff from "assistant"]'));
+    expect(handoffPrompt).toContain("take over the thread");
+    expect((t.bot as unknown as { chatAgent: Map<string, string> }).chatAgent.get("mock:42")).toBe("fitness");
+  });
+
+  it("agent-initiated handoff falls back to the pair session for sub-bot chats", async () => {
+    const subBot = new MockTransport("telegram:assistant", "assistant");
+    t.bot.addTransport(subBot);
+    await subBot.say("hello"); // create the sender's sub-bot chat session
+    const hookCall = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => c[5] && typeof (c[5] as { handoffContext?: unknown }).handoffContext === "function"
+    );
+    expect(hookCall).toBeTruthy();
+    const hooks = hookCall![5] as { handoffContext: (from: string, to: string, note?: string) => Promise<string> };
+    await hooks.handoffContext("assistant", "fitness");
+    // the target was prompted in its pair session (agent::…), not the user's chat
+    const pairPrompt = t.promptSpy.mock.calls.map((c) => String(c[0])).find((p) => p.includes("[agent-message from") && p.includes("handoff"));
+    expect(pairPrompt).toBeTruthy();
+    // the user's sub-bot chat stays with the bound agent
+    expect((t.bot as unknown as { chatAgent: Map<string, string> }).chatAgent.get("telegram:assistant:42")).toBe("assistant");
   });
 
   it("switches agents via the born-card action and confirms in the toast", async () => {

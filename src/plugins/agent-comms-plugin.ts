@@ -93,7 +93,7 @@ export function agentCommsPlugin(deps: AgentCommsPluginDeps): InlineExtension {
         name: "handoff",
         label: "Handoff to agent",
         description:
-          "Hand this conversation's context to another agent: your recent thread + a note are delivered to them, and they continue from there. Use when a sibling is better placed to continue.",
+          "Hand this conversation to another agent: they receive a distilled task brief (task, context, artifacts, next step) built from your thread. In a shared chat the conversation itself moves — the user's next message reaches them. In your own sub-bot chat only the context moves; tell the user how to reach the target.",
         parameters: Type.Object({
           to: Type.String({ description: "Target agent id" }),
           note: Type.Optional(Type.String({ description: "One-line summary of what matters right now" })),

@@ -17,6 +17,7 @@ import type { Card, ChatRef, IncomingMedia, ReplyContext, Schedule, Transport } 
 import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
+import { buildHandoffEnvelope, composeHandoffBrief } from "./handoff-brief.js";
 import { SttService, type SttPolicy } from "./stt.js";
 import { applyCorrections, composeBias, loadDictionary } from "./dictionary.js";
 import { AudioMediaProcessor } from "./audio-media.js";
@@ -1026,6 +1027,7 @@ export class PiBot implements HeartbeatHost {
       ensureEvolutionJob: (a) => this.ensureEvolutionJob(a as never),
       ensureMorningBriefJob: (a) => this.ensureMorningBriefJob(a as never),
       deliverToAgent: (id, text) => this.deliverToAgent(id, text),
+      handoff: (t, chatId, fromAgent, toAgent, note) => this.runHandoff(t, chatId, fromAgent, toAgent, note),
       questions: this.questions,
       wizard: this,
       cascade: {
@@ -1490,36 +1492,43 @@ export class PiBot implements HeartbeatHost {
     );
   }
 
-  /** Compact transcript tail for handoffs: last N user/assistant turns */
-  private transcriptTail(session: AgentSession, turns = 12): string {
+  /** Compact transcript tail for handoffs: last N user/assistant turns, each truncated to `width` chars */
+  private transcriptTail(session: AgentSession, turns = 12, width = 220): string {
     const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
     const turnsOut: string[] = [];
     for (const m of msgs) {
       if (m.role !== "user" && m.role !== "assistant") continue;
       const text = (m.content ?? []).filter((b) => b?.type === "text" && b.text).map((b) => b.text).join(" ").trim();
       if (!text) continue;
-      turnsOut.push(`${m.role === "user" ? "user" : "agent"}: ${truncate(text.replace(/\n+/g, " "), 220)}`);
+      turnsOut.push(`${m.role === "user" ? "user" : "agent"}: ${truncate(text.replace(/\n+/g, " "), width)}`);
     }
     return turnsOut.slice(-turns).join("\n") || "(no prior conversation)";
   }
 
-  /** Handoff: move a conversation (with its context) from one agent to another, in the same chat */
-  private async runHandoff(t: Transport, chatId: string, fromAgent: string, toAgent: string, note?: string): Promise<void> {
+  /**
+   * Handoff: move a conversation (with its context) from one agent to another, in the same chat.
+   * The context is packaged as a task brief (model-distilled, raw excerpt fallback) so the target
+   * can execute without re-asking the user. Returns the target's ack, or a failure reason.
+   */
+  private async runHandoff(t: Transport, chatId: string, fromAgent: string, toAgent: string, note?: string): Promise<{ ok: true; ack: string } | { ok: false; error: string }> {
     const ck = this.chatKey(t, chatId);
-    if (!this.deps.agents.getAgent(toAgent)) {
-      await t.push(chatId, { text: `No agent "${toAgent}". /agents for the list.` });
-      return;
-    }
+    if (toAgent === fromAgent) return { ok: false, error: "That's you — you're already talking to them." };
+    if (!this.deps.agents.getAgent(toAgent)) return { ok: false, error: `No agent "${toAgent}". /agents for the list.` };
     // context from the CURRENT session
     const fromSession = await this.sessionFor(t, chatId, fromAgent, ck);
-    const tail = this.transcriptTail(fromSession, 12);
-    // deliver into the TARGET's session for this chat — its history now carries the context
+    const excerpt = this.transcriptTail(fromSession, 30, 700);
+    const { brief } = await composeHandoffBrief(excerpt, {
+      modelRuntime: this.deps.modelRuntime,
+      model: this.deps.agents.resolveModel(process.env.PIBOT_DEFAULT_MODEL),
+    });
     const targetSession = await this.sessionFor(t, chatId, toAgent, ck);
-    await targetSession.prompt(envelope(
-      `[handoff from "${fromAgent}"] The user is moving this conversation to you. Continue where this left off — acknowledge in one short line, then pick up the thread.\n\n# Recent context\n${tail}${note ? `\n\n# Note from ${fromAgent}\n${note}` : ""}`
-    ));
+    if ((targetSession as { isStreaming?: boolean }).isStreaming) return { ok: false, error: `**${toAgent}** is mid-turn — try again in a moment.` };
+    await targetSession.prompt(envelope(buildHandoffEnvelope(fromAgent, brief, note)));
+    const ack = extractAssistantTextFromSession(targetSession) ?? "Ready.";
+    // the chat now belongs to the target — the user's next message reaches them
     this.rememberChat(toAgent, ck);
-    this.deps.events.log(toAgent, "system", `handoff from ${fromAgent} (${truncate(tail, 80)})`);
+    this.deps.events.log(toAgent, "system", `handoff from ${fromAgent} (${truncate(brief, 80)})`);
+    return { ok: true, ack };
   }
 
   // ── agent-to-agent messaging ─────────────────────────────────────────────
@@ -1553,16 +1562,31 @@ export class PiBot implements HeartbeatHost {
     return reply || "(no reply)";
   }
 
-  /** Agent-initiated handoff: package the sender's transcript tail + deliver to the target's pair session */
+  /** Agent-initiated handoff: move the sender's conversation to the target when the sender owns a rebindable (non-subbot) chat; otherwise deliver the brief into the target's pair session. */
   async handoffContext(fromAgent: string, toAgent: string, note?: string): Promise<string> {
     const fromCk = [...(this.agentChats.get(fromAgent) ?? [])][0];
+    if (fromCk) {
+      const { transport: transportName, chatId } = this.splitChatKey(fromCk);
+      const t = this.transports.get(transportName);
+      // Sub-bot chats are pinned to their agent — rebinding wouldn't change who
+      // answers, so the brief goes to the target's pair session instead.
+      if (t && !t.boundAgentId) {
+        const r = await this.runHandoff(t, chatId, fromAgent, toAgent, note);
+        if (r.ok) return r.ack;
+        throw new Error(r.error);
+      }
+    }
     let tail = "(no recent context)";
     if (fromCk) {
       const fromSession = this.cachedSessions.get(`${fromAgent}::${fromCk}`);
-      if (fromSession) tail = this.transcriptTail(fromSession, 12);
+      if (fromSession) tail = this.transcriptTail(fromSession, 30, 700);
     }
+    const { brief } = await composeHandoffBrief(tail, {
+      modelRuntime: this.deps.modelRuntime,
+      model: this.deps.agents.resolveModel(process.env.PIBOT_DEFAULT_MODEL),
+    });
     return this.agentTurn(toAgent, fromAgent,
-      `[handoff from "${fromAgent}"] The user is moving this thread to you.${note ? ` Note: ${note}` : ""}\n\n# Context from ${fromAgent}\n${tail}\n\nAcknowledge briefly and continue.`,
+      `[handoff from "${fromAgent}"] The user may move this thread to you.${note ? ` Note: ${note}` : ""}\n\n# Context from ${fromAgent}\n${brief}\n\nAcknowledge briefly and continue.`,
       10 * 60e3
     );
   }
