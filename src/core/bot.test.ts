@@ -422,7 +422,9 @@ describe("PiBot card actions", () => {
     await t.transport.act("scd:sc1:+10m");
     expect(t.scheduler.reschedule).toHaveBeenCalledWith("sc1", expect.any(Number));
     expect(t.transport.lastText()).toContain("stretch");
-    expect(t.transport.lastText()).toContain("in 10 min");
+    // fmtWhen floors to whole minutes — the render can land 1ms past the mock's
+    // dueAt snapshot and legitimately show 9 instead of 10
+    expect(t.transport.lastText()).toMatch(/in (9|10) min/);
 
     await t.transport.act("scd:sc1:ok");
     expect(t.transport.lastText()).toContain("Locked in");
