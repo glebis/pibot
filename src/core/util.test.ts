@@ -157,6 +157,11 @@ describe("fmtWhen", () => {
     expect(fmtWhen(NOW + 4500e3, NOW)).toBe("in 1h 15m");
   });
 
+  it("does not round minutes up to 60 at hour boundaries", () => {
+    expect(fmtWhen(NOW + 59.5 * 60e3, NOW)).toBe("in 59 min");
+    expect(fmtWhen(NOW + 23 * 3600e3 + 59.5 * 60e3, NOW)).toBe("in 23h 59m");
+  });
+
   it("formats absolute times beyond a day", () => {
     const s = fmtWhen(NOW + 3 * 86400e3, NOW);
     expect(s).toMatch(/^on /);

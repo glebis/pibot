@@ -215,6 +215,70 @@ describe("Scheduler", () => {
     s.stop();
   });
 
+  it("keeps a job cancelled when the cancel lands during a slow delivery", async () => {
+    let started!: () => void;
+    let release!: () => void;
+    const startedP = new Promise<void>((r) => { started = r; });
+    const releaseP = new Promise<void>((r) => { release = r; });
+    const fireCb = vi.fn(async () => { started(); await releaseP; });
+    const s = new Scheduler(dataDir, fireCb);
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000, repeat: { dailyAt: "08:30" } }) });
+    job.dueAt = Date.now() - 1; // overdue: fire manually
+    const overdueDueAt = job.dueAt;
+
+    const running = (s as unknown as { fire: (j: Schedule) => Promise<void> }).fire(job);
+    await startedP;
+    expect(s.cancel(job.id)?.status).toBe("cancelled");
+    release();
+    await running;
+
+    // the cancel must win: no done-marking, no next-occurrence re-arm, no refire
+    expect(s.get(job.id)?.status).toBe("cancelled");
+    expect(job.firedCount).toBe(0);
+    expect(job.dueAt).toBe(overdueDueAt); // success path must not advance a cancelled job
+    expect(fireCb).toHaveBeenCalledTimes(1);
+    s.flush();
+    s.stop();
+
+    let refired = 0;
+    const restarted = new Scheduler(dataDir, () => { refired += 1; });
+    expect(restarted.get(job.id)?.status).toBe("cancelled");
+    restarted.rearm();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(refired).toBe(0);
+    restarted.stop();
+  });
+
+  it("does not resurrect a cancelled job from a failing in-flight delivery", async () => {
+    let started!: () => void;
+    let release!: () => void;
+    const startedP = new Promise<void>((r) => { started = r; });
+    const releaseP = new Promise<void>((_resolve, reject) => { release = () => reject(new Error("chat not found")); });
+    const s = new Scheduler(dataDir, async () => { started(); await releaseP; });
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000, repeat: { dailyAt: "08:30" } }) });
+    job.dueAt = Date.now() - 1;
+
+    const running = (s as unknown as { fire: (j: Schedule) => Promise<void> }).fire(job);
+    await startedP;
+    s.cancel(job.id);
+    release();
+    await running;
+
+    // old behavior: the failure path reset status to pending and re-armed a retry
+    expect(s.get(job.id)?.status).toBe("cancelled");
+    expect((job as Schedule & { deliveryAttempts?: number }).deliveryAttempts ?? 0).toBe(0);
+    expect(job.dueAt).toBeLessThan(Date.now()); // retry ladder must not rewrite dueAt either
+    s.flush();
+    s.stop();
+
+    let refired = 0;
+    const restarted = new Scheduler(dataDir, () => { refired += 1; });
+    restarted.rearm();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(refired).toBe(0);
+    restarted.stop();
+  });
+
   it("reschedules jobs", async () => {
     const s = new Scheduler(dataDir, () => {});
     const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000 }) });

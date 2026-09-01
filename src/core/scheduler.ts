@@ -306,10 +306,18 @@ export class Scheduler {
       // important: fire despite snooze
     }
 
+    // Delivery can take minutes (agent-composed messages, transport timeouts).
+    // Snapshot the due time so a cancel/reschedule that lands mid-flight is respected
+    // instead of being clobbered by the post-delivery bookkeeping below.
+    const dueAtAtFire = job.dueAt;
     try {
       await this.fireCb(job, Boolean(sn && now < sn.until && job.wake === "important"));
     } catch (e) {
       console.error("[scheduler] fire handler error:", e);
+      // Never resurrect a job from a stale failure path: if it was cancelled
+      // while delivery was in flight, keep the cancelled state (Aug 2026:
+      // cancelled "morning brief" resurrected itself from a retry and re-fired).
+      if (job.status !== "pending") { this.save(); return; }
       job.deliveryAttempts = (job.deliveryAttempts ?? 0) + 1;
       job.lastDeliveryError = errorMessage(e).slice(0, 300);
       let noticeKind: ScheduleFailureNotice["kind"] | null = null;
@@ -321,8 +329,7 @@ export class Scheduler {
           job.pauseReason = `Paused after ${job.consecutiveFailures} consecutive failed occurrences.`;
           noticeKind = "paused";
         } else {
-          job.dueAt = this.nextFire(job, Date.now()) ?? Date.now() + MIN_AGENT_REPEAT_MS;
-          job.status = "pending";
+          if (job.dueAt === dueAtAtFire) job.dueAt = this.nextFire(job, Date.now()) ?? Date.now() + MIN_AGENT_REPEAT_MS;
           if (job.consecutiveFailures === 1) noticeKind = "first-failure";
         }
       } else if (!job.repeat && job.deliveryAttempts >= MAX_CONSECUTIVE_FAILURES) {
@@ -330,8 +337,9 @@ export class Scheduler {
         job.pauseReason = `Paused after ${job.deliveryAttempts} failed delivery attempts.`;
         noticeKind = "paused";
       } else {
-        job.dueAt = Date.now() + Math.min(5 * 60_000, 10_000 * 2 ** Math.min(job.deliveryAttempts - 1, 5));
-        job.status = "pending";
+        if (job.dueAt === dueAtAtFire) {
+          job.dueAt = Date.now() + Math.min(5 * 60_000, 10_000 * 2 ** Math.min(job.deliveryAttempts - 1, 5));
+        }
         if (!job.repeat && job.deliveryAttempts === 1) noticeKind = "first-failure";
       }
       this.save();
@@ -339,6 +347,9 @@ export class Scheduler {
       if (noticeKind) await this.notifyFailure(job, { kind: noticeKind, error: job.lastDeliveryError });
       return;
     }
+
+    // Respect a cancel (or reschedule) that landed while delivery was in flight
+    if (job.status !== "pending") { this.save(); return; }
 
     job.firedCount += 1;
     job.deliveryAttempts = 0;
@@ -348,7 +359,7 @@ export class Scheduler {
     if (job.repeat) {
       const next = this.nextFire(job, now);
       if (next != null && next > now) {
-        job.dueAt = next;
+        if (job.dueAt === dueAtAtFire) job.dueAt = next; // keep a mid-flight reschedule
         this.save();
         this.rearm(job.id);
       } else {

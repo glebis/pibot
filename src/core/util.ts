@@ -240,10 +240,10 @@ export function fmtWhen(ms: number, now = Date.now()): string {
   const d = new Date(ms);
   const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   if (diff < 60e3) return `in ${Math.round(diff / 1e3)}s`;
-  if (diff < 3600e3) return `in ${Math.round(diff / 60e3)} min`;
+  if (diff < 3600e3) return `in ${Math.floor(diff / 60e3)} min`;
   if (diff < 86400e3) {
     const h = Math.floor(diff / 3600e3);
-    const m = Math.round((diff % 3600e3) / 60e3);
+    const m = Math.floor((diff % 3600e3) / 60e3);
     return h > 0 ? `in ${h}h ${m}m` : `in ${m}m`;
   }
   const sameYear = d.getFullYear() === new Date(now).getFullYear();
