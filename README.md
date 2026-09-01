@@ -191,12 +191,12 @@ npm run evolve -- assistant "goal text"   # CLI evolution cycle
 Unit mocks can't catch transport-level bugs (a message-outbox self-deadlock shipped exactly that way behind 419 passing tests). The live harness drives a bot through the real Telegram round-trip — send a command as a user, await the reply, assert reactions and the daemon log:
 
 ```bash
-npx tsx scripts/telegram-live-test.mts --attach --chat <bot-chat-id>   # post-deploy smoke vs a running bot
+npx tsx scripts/telegram-live-test.mts --attach --chat @thebot   # post-deploy smoke vs a running bot (DM: use the bot's @username)
 npx tsx scripts/telegram-live-test.mts                                  # full: isolated daemon + dedicated test bot
 ```
 
 - **spawn mode** (default) boots an isolated daemon (`PIBOT_DATA_DIR`/`PIBOT_AGENTS_DIR` override, dedicated test-bot token, its own dashboard port) with a **pre-seeded test agent** (heartbeat@1m + 8 distillable events) and runs the full scenario set: boot health (lock, pollers, dashboard auth challenge), `/status` round-trip, unknown-command reply, **seeded consolidation round** (model distills the 8 events → blocks.json + journal + rendered CONSOLIDATED.md), consolidation idempotence (second call is a no-op), **live heartbeat tick** (1m interval, silent-rule asserted), the reaction-settle wedge canary (👀→👍 on the sent command — catches outbox deadlocks), a no-error log soak, and lock cleanup on shutdown.
-- **`--attach` mode** runs read-only smoke against any already-running bot chat (no side-effecting commands) — this is the post-deploy verification step before trusting a restart.
+- **`--attach` mode** runs read-only smoke against any already-running bot chat (no side-effecting commands) — this is the post-deploy verification step before trusting a restart. It sends through **your user account**, so target the bot's **@username**: a numeric id is resolved as a peer of yours, and your own numeric (allowlist) id lands the smoke commands in Saved Messages where the bot never sees them.
 - Missing vars (`TELEGRAM_LIVE_TEST_TOKEN`, `TELEGRAM_LIVE_TEST_CHAT_ID`) are **requested via an AppleScript dialog** — hidden input for the token; plain input with the production allowlist id pre-filled for the chat id — and persisted to `data/telegram-test.env` (0600, gitignored): set once, prompted never again. `--no-prompt` disables the dialog. One-time prerequisites: a **test bot** via BotFather (never reuse the production token), `/start`-ed once from your account. The DM chat target is derived from the token itself, so `--chat` is unnecessary in spawn mode.
 
 ## Roadmap

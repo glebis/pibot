@@ -498,6 +498,12 @@ async function main(): Promise<void> {
       console.error("attach mode needs --chat <bot chat id or @username> (read-only smoke scenarios)");
       process.exit(2);
     }
+    if (/^-?\d+$/.test(chatRef)) {
+      console.warn(
+        `[harness] numeric --chat "${chatRef}" resolves as a peer of YOUR user account — for a DM pass the bot's @username instead. ` +
+        `Your own numeric (allowlist) id would deliver the smoke commands to Saved Messages, and the bot never sees them.`
+      );
+    }
     const prodLog = path.join(REPO_ROOT, "data", "daemon.log");
     const sizeAtStart = fs.existsSync(prodLog) ? fs.statSync(prodLog).size : 0;
     logSource = () => (fs.existsSync(prodLog) ? fs.readFileSync(prodLog, "utf8").slice(sizeAtStart) : "");
