@@ -1590,8 +1590,36 @@ export class PiBot implements HeartbeatHost {
     return this.lastUserMessage.get(agentId) ?? 0;
   }
 
-  async deliverToAgent(agentId: string, text: string) {
-    const cks = this.agentChats.get(agentId) ?? new Set<string>();
+  /**
+   * Delivery-failure notices must NEVER land in a session bound to the failing
+   * chat: the agent reading that notice would re-create the schedule with the
+   * same broken chat id, and the failure loops daily (the "chat not found"
+   * phantom-ping loop of 2026-08/09). Notify via the agent's real owned chats,
+   * excluding the one that just failed; suppress when there is none.
+   */
+  async notifyScheduleFailure(job: Schedule, text: string): Promise<void> {
+    const failing = `${job.chat.transport}:${job.chat.chatId}`;
+    const owned = [...(this.agentChats.get(job.agentId) ?? [])].filter((ck) => {
+      if (ck === `${job.chat.transport}:${job.chat.chatId}`) return false; // the failing chat — never the notice target
+      const { transport } = this.splitChatKey(ck);
+      return this.transports.has(transport) && this.chatAgent.get(ck) === job.agentId;
+    });
+    if (!owned.length) {
+      this.deps.events.log(
+        job.agentId,
+        "system",
+        `schedule failure notice suppressed — no real chat owned by this agent (failed chat excluded): schedule ${job.id} "${job.title}" — ${truncate(text, 160)}`
+      );
+      return;
+    }
+    for (const ck of owned) {
+      const { transport, chatId } = this.splitChatKey(ck);
+      const t = this.transports.get(transport);
+      if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] deliver failed:", e));
+    }
+  }
+
+  async deliverToAgent(agentId: string, text: string) {    const cks = this.agentChats.get(agentId) ?? new Set<string>();
     const all = [...cks];
     const dedicated = all.filter((ck) => {
       const { transport } = this.splitChatKey(ck);

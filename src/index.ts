@@ -84,12 +84,13 @@ async function main(): Promise<void> {
   const scheduler = new Scheduler(
     config.dataDir,
     (job, snoozed) => bot.deliverFire(job, snoozed),
-    (job, event) => bot.deliverToAgent(
-      job.agentId,
-      event.kind === "paused"
-        ? `Scheduled item "${job.title}" was automatically paused. ${job.pauseReason ?? "Repeated delivery failures."} Last error: ${event.error}. Fix the delivery problem, then resume schedule ${job.id}.`
-        : `Scheduled item "${job.title}" could not be delivered. It will retry without sending repeated notices. Last error: ${event.error}.`,
-    ),
+    (job, event) =>
+      bot.notifyScheduleFailure(
+        job,
+        event.kind === "paused"
+          ? `Scheduled item "${job.title}" was automatically paused. ${job.pauseReason ?? "Repeated delivery failures."} Last error: ${event.error}. Fix the delivery problem, then resume schedule ${job.id}.`
+          : `Scheduled item "${job.title}" could not be delivered. It will retry without sending repeated notices. Last error: ${event.error}.`,
+      ),
   );
 
   // event-log → durable-memory consolidation (Skill Forge blueprint). Cheap model,

@@ -982,3 +982,55 @@ describe("voice transcript echo", () => {
     }
   });
 });
+
+describe("schedule failure notices", () => {
+  it("excludes the failing chat from the notice target — no phantom-session recreation loop", async () => {
+    const { bot, transport } = makeBot();
+    const b = bot as unknown as {
+      agentChats: Map<string, Set<string>>;
+      chatAgent: Map<string, string>;
+      transports: Map<string, Transport>;
+    };
+    const phantom = new MockTransport("telegram");
+    b.transports.set("telegram", phantom);
+    // assistant "owns" the phantom chat (telegram:123) and one real chat
+    b.agentChats.set("assistant", new Set(["telegram:123", "telegram:161427550"]));
+    b.chatAgent.set("telegram:123", "assistant");
+    b.chatAgent.set("telegram:161427550", "assistant");
+
+    const job = {
+      id: "sc_x",
+      agentId: "assistant",
+      chat: { transport: "telegram", chatId: "123" },
+      title: "morning brief",
+    } as unknown as Schedule;
+    await bot.notifyScheduleFailure(job, "could not be delivered");
+
+    expect(phantom.pushed.some((p) => p.chatId === "123")).toBe(false); // nothing into the failing chat
+    expect(phantom.pushed.some((p) => p.chatId === "161427550")).toBe(true); // the real chat gets it
+  });
+
+  it("suppresses the notice when the agent owns no real chat", async () => {
+    const { bot, events } = makeBot();
+    const b = bot as unknown as {
+      agentChats: Map<string, Set<string>>;
+      chatAgent: Map<string, string>;
+      transports: Map<string, Transport>;
+    };
+    const phantom = new MockTransport("telegram");
+    b.transports.set("telegram", phantom);
+    b.agentChats.set("assistant", new Set(["telegram:123"]));
+    b.chatAgent.set("telegram:123", "assistant");
+
+    const job = {
+      id: "sc_x",
+      agentId: "assistant",
+      chat: { transport: "telegram", chatId: "123" },
+      title: "morning brief",
+    } as unknown as Schedule;
+    await bot.notifyScheduleFailure(job, "could not be delivered");
+
+    expect(phantom.pushed.length).toBe(0); // no notice into the phantom
+    expect((events.log as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[2]).includes("suppressed"))).toBe(true);
+  });
+});
