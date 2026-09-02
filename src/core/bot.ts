@@ -970,6 +970,13 @@ export class PiBot implements HeartbeatHost {
       return;
     }
 
+    if (action.startsWith("bdshow:")) {
+      const id = action.slice(7);
+      void this.bdRun(["show", id])
+        .then((out) => t.push(chatId, { text: truncate(out, 1500) }))
+        .catch((e) => t.notifyError(chatId, errorMessage(e)));
+      return "📋 pulling it up…";
+    }
     if (action.startsWith("q:")) {
       const answer = this.questions.resolveCallback(action); // stale/unknown ids → null
       this.deps.events.log("system", "system", `question tap: ${action} → ${answer ? `resolved: ${answer.choice}` : "stale (ignored)"}`);
@@ -1050,9 +1057,7 @@ export class PiBot implements HeartbeatHost {
       telegram: this,
       currentAgent: (ck) => this.currentAgent(ck),
       chatKey: (t, chatId) => this.chatKey(t, chatId),
-      runBd: this.deps.runBd ?? ((args: string[]) => new Promise((resolve, reject) => {
-        execFile("bd", args, { cwd: process.cwd(), timeout: 20_000 }, (err, stdout) => (err ? reject(err) : resolve(stdout.toString())));
-      })),
+      runBd: (args) => this.bdRun(args),
       resetSession: async (agentId, ck) => {
         const { transport, chatId } = this.splitChatKey(ck);
         await this.deps.agents.resetSession(agentId, ck, { transport, chatId }, this.deps.scheduler);
@@ -1778,6 +1783,14 @@ export class PiBot implements HeartbeatHost {
     const { transport, chatId } = this.splitChatKey(target);
     const t = this.transports.get(transport);
     if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] notify failed:", e));
+  }
+
+  /** bd CLI runner (repo cwd) — shared by the /issue wizard and bdshow cards */
+  private bdRun(args: string[]): Promise<string> {
+    if (this.deps.runBd) return this.deps.runBd(args);
+    return new Promise((resolve, reject) => {
+      execFile("bd", args, { cwd: process.cwd(), timeout: 20_000 }, (err, stdout) => (err ? reject(err) : resolve(stdout.toString())));
+    });
   }
 
   async deliverToAgent(agentId: string, text: string) {    const cks = this.agentChats.get(agentId) ?? new Set<string>();

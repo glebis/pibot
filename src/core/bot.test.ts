@@ -491,7 +491,7 @@ describe("PiBot commands", () => {
     await vi.waitFor(() => expect(t.transport.lastCard()).toBeDefined());
     await t.transport.say("no flicker");
     await vi.waitFor(() => expect(t.runBd).toHaveBeenCalled());
-    const args = t.runBd.mock.calls[0][0] as string[];
+    const args = (t.runBd.mock.calls[0] as unknown as string[][])?.[0] ?? [];
     expect(args[0]).toBe("create");
     expect(args.map((a) => a.toLowerCase())).toContain("buttons flicker when tapped twice");
     expect(t.transport.lastText()).toContain("Filed as **pibot-test**");
