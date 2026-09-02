@@ -58,7 +58,7 @@ cp .env.example .env             # add TELEGRAM_BOT_TOKEN for the real thing
 npm start                        # telegram bot
 ```
 
-The **web dashboard** runs at `http://127.0.0.1:7860` (disable: `PIBOT_WEB=0`, port: `PIBOT_WEB_PORT`). It is always locked: set `PIBOT_WEB_TOKEN` for the first login, then enrol a passkey. First-passkey enrolment requires that token-authenticated session.
+The **web dashboard** runs at `http://localhost:7860` (disable: `PIBOT_WEB=0`, port: `PIBOT_WEB_PORT`). Always open it via `localhost`, not `127.0.0.1` — Touch ID / passkeys are bound to the `localhost` domain, and browsers reject the raw IP with "This is an invalid domain." (browser navigations from `127.0.0.1` are redirected automatically). It is always locked: set `PIBOT_WEB_TOKEN` for the first login, then enrol a passkey. First-passkey enrolment requires that token-authenticated session.
 
 ### Voice notes & media
 Beyond text, the bot accepts Telegram **voice**, **audio**, **video notes**, and audio documents (locally validated and transcribed → routed like typed text), plus **photos/documents** (agent gets the local file path + caption). Unsupported media is declined instead of dropped. Video-note audio is extracted locally; the video itself is never passed into the agent context.

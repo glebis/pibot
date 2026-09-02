@@ -240,10 +240,27 @@ export function createWebApp(deps: WebDeps): Hono {
     return accept.includes("application/json") || c.req.header("content-type")?.includes("application/json") || false;
   }
 
+  // WebAuthn RP ID is a domain ("localhost" by default) and must match the page host. Browsers
+  // reject Touch ID on the raw IP with "This is an invalid domain." — an IP can never be an RP
+  // ID. Send browser navigations from http://127.0.0.1:<port> to the localhost name instead.
+  // Non-HTML requests (curl / API clients) keep hitting the IP directly, as the README documents.
+  app.use("*", async (c, next) => {
+    const method = (c.req.method ?? "GET").toUpperCase();
+    const host = (c.req.header("host") ?? "").split(":")[0].toLowerCase();
+    // Only redirect idempotent navigations — a 302 on POST would drop the form body.
+    if ((method === "GET" || method === "HEAD") && host === "127.0.0.1" && rpId === "localhost" && (c.req.header("accept") ?? "").includes("text/html")) {
+      const url = new URL(c.req.url);
+      const port = webPort === 80 ? "" : `:${webPort}`;
+      return c.redirect(`http://localhost${port}${url.pathname}${url.search}`);
+    }
+    return next();
+  });
+
   // ── auth pages (open) ──
   app.get("/auth", (c) => {
     const hasCreds = authStore.hasCredentials();
     const hasToken = !!webToken;
+    const authed = isAuthenticated(c);
     const body = `
 <h2>🔐 Unlock dashboard</h2>
 <div class="card">
@@ -254,10 +271,10 @@ export function createWebApp(deps: WebDeps): Hono {
   </div>
   ${hasCreds ? `<p class="muted">${authStore.credentials.length} passkey enrolled — this is the admin. Use Touch ID above to unlock.</p>` : `<p class="muted">No passkey yet — unlock with PIBOT_WEB_TOKEN before enrolling this Mac.</p>`}
   ${!hasCreds && !hasToken ? `<div class="flash warn">Dashboard is locked. Set PIBOT_WEB_TOKEN and restart to enrol the first passkey.</div>` : ""}
-  ${!hasCreds && hasToken ? `<div id="enroll" style="margin-top:14px">
+  ${!hasCreds && hasToken && authed ? `<div id="enroll" style="margin-top:14px">
     <button id="btn-enroll" class="btn ghost">➕ Enroll this Mac (Touch ID)</button>
     <span id="enroll-msg" class="muted" style="margin-left:10px"></span>
-  </div>` : hasCreds ? `<div id="enroll" style="margin-top:14px" class="muted">Enrolled — single admin. To re-enroll, remove <span class="mono">data/web-auth.json</span> and restart.</div>` : ""}
+  </div>` : !hasCreds && hasToken ? `<p class="muted">➕ Enroll unlocks after you sign in with the token below.</p>` : hasCreds ? `<div id="enroll" style="margin-top:14px" class="muted">Enrolled — single admin. To re-enroll, remove <span class="mono">data/web-auth.json</span> and restart.</div>` : ""}
 </div>
 ${hasToken ? `<div class="card">
   <h2 style="margin-top:0">Token fallback</h2>
@@ -267,7 +284,7 @@ ${hasToken ? `<div class="card">
     <input type="password" name="token" placeholder="paste bearer token" required>
     <button type="submit">Unlock with token</button>
   </form>
-  <p class="muted">Or: <span class="mono">curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:${esc(String(webPort))}/</span></p>
+  <p class="muted">Or: <span class="mono">curl -H "Authorization: Bearer $TOKEN" http://localhost:${esc(String(webPort))}/</span></p>
 </div>` : ""}
 <div class="card"><a href="/">← Back to dashboard</a></div>
 <script>

@@ -467,6 +467,35 @@ describe("web auth — Touch ID + Bearer + CSRF", () => {
     expect(html).toContain("navigator.credentials");
   });
 
+  it("browser navigation from 127.0.0.1 redirects to localhost (WebAuthn needs a domain RP ID)", async () => {
+    makeApp();
+    const nav = await app.request("/auth?msg=hi", {
+      headers: { Host: "127.0.0.1:7860", Accept: "text/html,application/xhtml+xml" },
+    });
+    expect(nav.status).toBe(302);
+    expect(nav.headers.get("location")).toBe("http://localhost:7860/auth?msg=hi");
+    // non-browser requests (curl default Accept, API clients) stay on the IP
+    const curl = await app.request("/auth", {
+      headers: { Host: "127.0.0.1:7860", Accept: "*/*" },
+    });
+    expect(curl.status).toBe(200);
+    // POSTs are never redirected — a 302 would drop the form body (403 = CSRF rejection in handler)
+    const form = new URLSearchParams({ _csrf: "nope", token: "x" });
+    const post = await app.request("/auth/token", { method: "POST", body: form, headers: { Host: "127.0.0.1:7860", Accept: "text/html" } });
+    expect(post.status).toBe(403);
+    expect(post.headers.get("location")).toBeNull();
+  });
+
+  it("/auth hides the Enroll button until the visitor is authenticated", async () => {
+    makeApp({ webToken: "bootstrap-secret" });
+    const locked = await app.request("/auth");
+    expect(await locked.text()).not.toContain("Enroll this Mac");
+    const store = (app as any)._authStore;
+    const cookie = store.makeCookie(store.createSession());
+    const authed = await app.request("/auth", { headers: { Cookie: cookie } });
+    expect(await authed.text()).toContain("Enroll this Mac");
+  });
+
   it("WebAuthn authentication stays open but first-passkey registration requires the configured bearer", async () => {
     makeApp({ webToken: "bootstrap-secret" });
     const r1 = await app.request("/auth/webauthn/auth-options");
