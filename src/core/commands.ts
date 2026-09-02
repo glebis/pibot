@@ -17,7 +17,7 @@ import type { LoadedAgentShape } from "./agent-shapes.js";
 const HELP = [
   `**pibot** — your agents. Talk normally; ask to schedule anything ("remind me to stretch in 20m", "daily standup note at 9am").`,
   ``,
-  `/agents — list agents  ·  /agent <name> — switch  ·  /new — fresh session  ·  /newagent — guided wizard`,
+  `/agents — list agents  ·  /agent <name> — switch  ·  /new — fresh session  ·  /issue — file a tracked issue  ·  /newagent — guided wizard`,
   `/schedules — active and paused items  ·  /cancel <id>  ·  /resume <id>  ·  /new — fresh session`,
   `/handoff <agent> [note] — move this conversation (with a task brief) to another agent`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
@@ -50,13 +50,15 @@ export interface CommandContext {
   currentAgent(ck: string): string | undefined;
   chatKey(t: Transport, chatId: string): string;
   resetSession(agentId: string, ck: string): Promise<void>;
+  /** run the bd CLI (repo cwd) — used by the /issue intake wizard */
+  runBd?: (args: string[]) => Promise<string>;
   rememberChat(agentId: string, ck: string): void;
   ensureHeartbeatJob(agent: LoadedAgentShape): void;
   ensureEvolutionJob(agent: LoadedAgentShape): void;
   ensureMorningBriefJob(agent: LoadedAgentShape): void;
   deliverToAgent(agentId: string, text: string): Promise<void>;
   handoff?(t: Transport, chatId: string, fromAgent: string, toAgent: string, note?: string): Promise<{ ok: true; ack: string } | { ok: false; error: string }>;
-  questions: Pick<QuestionBus, "cancelPending">;
+  questions: Pick<QuestionBus, "cancelPending" | "ask">;
   wizard: { runNewAgentWizard(t: Transport, chatId: string): Promise<void> };
   cascade?: {
     status(agentId?: string): string;
@@ -166,6 +168,40 @@ export function createCommandHandler(ctx: CommandContext) {
         const note = arg.slice(target.length).trim() || undefined;
         const r = await deps.handoff(t, chatId, agentId, target, note);
         await reply(r.ok ? `🤝 Handed to **${target}** — your next message reaches them.\n\n${truncate(r.ack, 300)}` : `⚠︎ ${r.error}`);
+        return;
+      }
+
+      case "issue": {
+        let title = arg.trim();
+        if (!title) {
+          const a = await ctx.questions.ask(agentId ?? "", { transport: t.name, chatId }, { text: "📋 What's the issue? One line that says what's wrong or missing.", options: [] });
+          title = (a?.choice ?? "").trim();
+          if (!title) return;
+        }
+        const pain = await ctx.questions.ask(agentId ?? "", { transport: t.name, chatId }, { text: "Why — what's the pain or context?", options: [] });
+        const scope = await ctx.questions.ask(agentId ?? "", { transport: t.name, chatId }, { text: "Where does it apply? (this bot / an agent by name / host-level)", options: [] });
+        const prio = await ctx.questions.ask(agentId ?? "", { transport: t.name, chatId }, { text: "Priority?", options: ["P1 — now", "P2 — soon", "P3 — backlog"] });
+        const done = await ctx.questions.ask(agentId ?? "", { transport: t.name, chatId }, { text: "Done when — what should happen when it works?", options: [] });
+        const priority = prio?.index === 0 ? 1 : prio?.index === 2 ? 3 : 2;
+        if (!ctx.runBd) {
+          await reply("Issue filing is unavailable in this build (no bd runner wired).");
+          return;
+        }
+        const description = [
+          pain?.choice ? `Pain/context: ${pain.choice}` : "",
+          scope?.choice ? `Scope: ${scope.choice}` : "",
+          done?.choice ? `Done when: ${done.choice}` : "",
+        ].filter(Boolean).join("\n");
+        try {
+          const out = await ctx.runBd(["create", "--title", title, "--type", "feature", "--priority", String(priority), "--description", description || "(no description)"]);
+          const id = out.match(/\b[a-z]+-[a-z0-9]+\b/i)?.[0] ?? "created";
+          await t.push(chatId, {
+            text: `📋 Filed as **${id}**\n— ${title}\n— priority ${priority}`,
+            card: { text: "", buttons: [{ label: "👀 show it", action: `bdshow:${id}` }] },
+          });
+        } catch (e) {
+          await reply(`Couldn't file the issue: ${e instanceof Error ? e.message : String(e)}`);
+        }
         return;
       }
 

@@ -25,6 +25,7 @@ import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJs
 import { classifyModelError, ModelCascade } from "./cascade.js";
 import type { ConsolidationEngine } from "./consolidation.js";
 import { devAgentEnabled, DEV_AGENT_ID, scaffoldDevAgent } from "./dev-agent.js";
+import { execFile } from "node:child_process";
 
 /** A pending sub-bot creation request expires after this long — long enough for
  *  a user to get around to BotFather, short enough to not catch stale updates. */
@@ -112,6 +113,8 @@ export class PiBot implements HeartbeatHost {
       providers?: import("./providers.js").ProviderManager;
       /** speech-to-text for voice notes (optional; voice degrades without it) */
       stt?: SttService;
+      /** bd CLI runner for the /issue intake wizard (defaults to execFile in the repo cwd) */
+      runBd?: (args: string[]) => Promise<string>;
       /** local media probing/extraction and private cleanup */
       audioMedia?: AudioMediaProcessor;
     }
@@ -1047,6 +1050,9 @@ export class PiBot implements HeartbeatHost {
       telegram: this,
       currentAgent: (ck) => this.currentAgent(ck),
       chatKey: (t, chatId) => this.chatKey(t, chatId),
+      runBd: this.deps.runBd ?? ((args: string[]) => new Promise((resolve, reject) => {
+        execFile("bd", args, { cwd: process.cwd(), timeout: 20_000 }, (err, stdout) => (err ? reject(err) : resolve(stdout.toString())));
+      })),
       resetSession: async (agentId, ck) => {
         const { transport, chatId } = this.splitChatKey(ck);
         await this.deps.agents.resetSession(agentId, ck, { transport, chatId }, this.deps.scheduler);

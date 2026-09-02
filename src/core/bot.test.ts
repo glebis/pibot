@@ -184,8 +184,9 @@ function makeBot() {
   const audioMedia = {
     prepare: vi.fn(async (media: IncomingMedia) => ({ ok: true, filePath: media.filePath, durationSec: media.durationSec ?? 1, cleanup: vi.fn(async () => {}) })),
   };
-  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never, audioMedia: audioMedia as never });
-  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt, audioMedia, emitSessionEvent, resetSession: agents.resetSession };
+  const runBd = vi.fn(async () => "✓ Created issue: pibot-test (P2)");
+  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never, audioMedia: audioMedia as never, runBd: runBd as never });
+  return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt, audioMedia, emitSessionEvent, resetSession: agents.resetSession, runBd };
 }
 
 describe("PiBot commands", () => {
@@ -473,6 +474,27 @@ describe("PiBot commands", () => {
     // unknown agent handled gracefully — toast, not a push
     const toast = await t.transport.act("agt:ghost");
     expect(String(toast)).toContain("doesn't exist");
+  });
+
+  it("/issue walks the standard questionnaire and files a bd issue", async () => {
+    void t.transport.say("/issue Buttons flicker when tapped twice"); // title from arg — the wizard chain blocks this promise
+    // pain (free text)
+    await vi.waitFor(() => expect(t.transport.lastCard()).toBeDefined());
+    await t.transport.say("it flickers when I tap fast");
+    // scope
+    await vi.waitFor(() => expect(t.transport.lastCard()).toBeDefined());
+    await t.transport.say("this bot");
+    // priority — buttons
+    await vi.waitFor(() => expect(t.transport.lastCard()).toBeDefined());
+    await t.transport.act(t.transport.lastCard()![0].action); // P1 — now
+    // done-when
+    await vi.waitFor(() => expect(t.transport.lastCard()).toBeDefined());
+    await t.transport.say("no flicker");
+    await vi.waitFor(() => expect(t.runBd).toHaveBeenCalled());
+    const args = t.runBd.mock.calls[0][0] as string[];
+    expect(args[0]).toBe("create");
+    expect(args.map((a) => a.toLowerCase())).toContain("buttons flicker when tapped twice");
+    expect(t.transport.lastText()).toContain("Filed as **pibot-test**");
   });
 
   it("/new starts a fresh session for the chat's agent and keeps state", async () => {
