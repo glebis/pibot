@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="1380" viewBox="0 0 960 1380" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif">
+  <rect width="960" height="1380" fill="#0b1220"/>
+  <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker></defs>
+  <text x="60" y="60" font-size="26" font-weight="700" fill="#f1f5f9">skill-evolution pipeline — pibot</text>
+  <text x="60" y="88" font-size="13.5" fill="#94a3b8">how a proposed skill becomes live — and where the /evolve status cap landed · Sep 2, 2026 · b4659a5</text>
+  <rect x="50" y="846" width="860" height="350" rx="14" fill="#14102b" stroke="#8b5cf6" stroke-width="1.4"/>
+  <text x="80" y="880" font-size="13" font-weight="700" fill="#c4b5fd" letter-spacing="1.5">HUMAN REVIEW — CHAT NAVIGATION</text>
+  <rect x="70" y="118" width="470" height="58" rx="10" fill="#111a2e" stroke="#38bdf8" stroke-width="1.2"/>
+  <text x="90" y="141" font-size="14" font-weight="600" fill="#7dd3fc">TRIGGER 1 — /evolve &lt;goal&gt;</text>
+  <text x="90" y="161" font-size="12" fill="#94a3b8">owner command · force=true, skips budget</text>
+  <rect x="600" y="118" width="290" height="58" rx="10" fill="#111a2e" stroke="#38bdf8" stroke-width="1.2"/>
+  <text x="620" y="141" font-size="14" font-weight="600" fill="#7dd3fc">TRIGGER 2 — heartbeat job</text>
+  <text x="620" y="161" font-size="12" fill="#94a3b8">manifest interval · budget 4 runs/day</text>
+  <rect x="70" y="206" width="820" height="50" rx="10" fill="#111a2e" stroke="#475569" stroke-width="1.2"/>
+  <text x="90" y="229" font-size="14" font-weight="600" fill="#e2e8f0">GOAL</text>
+  <text x="90" y="249" font-size="12" fill="#94a3b8">explicit &lt;goal&gt; — else the top open improvement-backlog item (heartbeat keeps that backlog fed)</text>
+  <rect x="70" y="284" width="470" height="58" rx="10" fill="#111a2e" stroke="#334155" stroke-width="1.2"/>
+  <text x="90" y="307" font-size="14" font-weight="600" fill="#e2e8f0">① COLLECT</text>
+  <text x="90" y="327" font-size="12" fill="#94a3b8">live skills · heartbeat digest · recent proposals · consolidated memory</text>
+  <rect x="70" y="368" width="470" height="58" rx="10" fill="#111a2e" stroke="#334155" stroke-width="1.2"/>
+  <text x="90" y="391" font-size="14" font-weight="600" fill="#e2e8f0">② PROPOSE</text>
+  <text x="90" y="411" font-size="12" fill="#94a3b8">cheap-model ephemeral session → create | patch + eval probes</text>
+  <rect x="70" y="454" width="470" height="78" rx="10" fill="#111a2e" stroke="#f59e0b" stroke-width="1.2"/>
+  <text x="90" y="477" font-size="14" font-weight="600" fill="#fbbf24">③ GATES</text>
+  <text x="90" y="497" font-size="12" fill="#94a3b8">name &amp; structure validation · patch target exists / no create collision</text>
+  <text x="90" y="515" font-size="12" fill="#94a3b8">probes required · stagnation guard: same skill proposed ×3 → reject</text>
+  <rect x="600" y="462" width="290" height="62" rx="10" fill="#1a1116" stroke="#ef4444" stroke-width="1.2"/>
+  <text x="620" y="485" font-size="14" font-weight="600" fill="#f87171">⛔ REJECTED</text>
+  <text x="620" y="505" font-size="12" fill="#94a3b8">logged to events · nothing staged</text>
+  <rect x="70" y="560" width="470" height="58" rx="10" fill="#111a2e" stroke="#334155" stroke-width="1.2"/>
+  <text x="90" y="583" font-size="14" font-weight="600" fill="#e2e8f0">④ STAGE</text>
+  <text x="90" y="603" font-size="12" fill="#94a3b8">agents/&lt;id&gt;/skills/.staging/&lt;skill&gt;/SKILL.md + backlog sidecar</text>
+  <rect x="70" y="646" width="470" height="58" rx="10" fill="#111a2e" stroke="#334155" stroke-width="1.2"/>
+  <text x="90" y="669" font-size="14" font-weight="600" fill="#e2e8f0">⑤ EVAL PROBES</text>
+  <text x="90" y="689" font-size="12" fill="#94a3b8">run ≤ 2 probes against the staged dir → judge scores each 1–5</text>
+  <rect x="70" y="732" width="470" height="58" rx="10" fill="#111a2e" stroke="#f59e0b" stroke-width="1.2"/>
+  <text x="90" y="755" font-size="14" font-weight="600" fill="#fbbf24">⑥ DECISION</text>
+  <text x="90" y="775" font-size="12" fill="#94a3b8">avg probe score ≥ 4  AND  no risky pattern?</text>
+  <rect x="600" y="700" width="290" height="124" rx="10" fill="#0f1a15" stroke="#10b981" stroke-width="1.2"/>
+  <text x="620" y="723" font-size="14" font-weight="600" fill="#34d399">✅ AUTO-PROMOTE</text>
+  <text x="620" y="743" font-size="12" fill="#a7f3d0">write live SKILL.md (+ .bak)</text>
+  <text x="620" y="761" font-size="12" fill="#a7f3d0">git checkpoint · announce in chat</text>
+  <text x="620" y="779" font-size="12" fill="#a7f3d0">close backlog items (sidecar)</text>
+  <rect x="90" y="1128" width="380" height="40" rx="8" fill="#0f1a15" stroke="#10b981" stroke-width="1.2"/>
+  <text x="110" y="1151" font-size="14" font-weight="600" fill="#34d399">✅ accept → promote (same path as auto)</text>
+  <rect x="490" y="1128" width="380" height="40" rx="8" fill="#1a1116" stroke="#ef4444" stroke-width="1.2"/>
+  <text x="510" y="1151" font-size="14" font-weight="600" fill="#f87171">✖ reject → staging dir removed</text>
+  <rect x="770" y="992" width="100" height="24" rx="12" fill="#8b5cf6"/>
+  <text x="782" y="1008.5" font-size="11.5" font-weight="700" fill="#ffffff">NEW · b4659a5</text>
+  <path d="M 305 176 L 305 204" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#arr)"/>
+  <path d="M 745 176 L 745 192 L 480 192 L 480 204" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#arr)"/>
+  <path d="M 305 256 L 305 282" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#arr)"/>
+  <path d="M 305 342 L 305 366" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#arr)"/>
+  <path d="M 305 426 L 305 452" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#arr)"/>
+  <path d="M 540 493 L 598 493" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="554" y="486" font-size="11" fill="#64748b">fail</text>
+  <path d="M 305 532 L 305 558" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="317" y="550" font-size="11" fill="#64748b">pass</text>
+  <path d="M 305 618 L 305 644" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#arr)"/>
+  <path d="M 305 704 L 305 730" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#arr)"/>
+  <path d="M 540 761 L 598 761" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="554" y="754" font-size="11" fill="#64748b">yes</text>
+  <path d="M 305 790 L 305 844" fill="none" stroke="#8b5cf6" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="317" y="824" font-size="11" fill="#a78bfa">no — low scores or risky pattern → needs a human yes</text>
+  <text x="90" y="920" font-size="13" fill="#cbd5e1">scheduled staging → review card pushed to the owner chat immediately (bot.ts)</text>
+  <text x="90" y="964" font-size="13" fill="#cbd5e1">/evolve status → scans staged candidates across ALL agents</text>
+  <text x="90" y="1008" font-size="13" font-weight="600" fill="#e9d5ff">renders ≤ 10 review cards · mints tokens only for shown · “…and N more staged — re-run /evolve status”</text>
+  <text x="90" y="1052" font-size="13" fill="#cbd5e1">card buttons: ✅ promote → live+git+backlog · ✖ reject → rm staging · 📄 peek → full text</text>
+  <text x="90" y="1096" font-size="13" fill="#cbd5e1">tokens: opaque, 64-byte callback-safe, 24 h TTL, dropped on decision → taps are idempotent</text>
+  <text x="620" y="799" font-size="12" fill="#94a3b8">risky = exec, fetch, eval, child_process,</text>
+  <text x="620" y="815" font-size="12" fill="#94a3b8">process.env, rm -rf, prompt-injection…</text>
+  <text x="60" y="1166" font-size="13" font-weight="700" fill="#64748b" letter-spacing="1.5">WHERE IT LIVES</text>
+  <text x="60" y="1190" font-size="12.5" font-family="Menlo, monospace" fill="#7dd3fc">src/core/evolution.ts</text>
+  <text x="260" y="1190" font-size="12.5" fill="#94a3b8">the cycle: collect → propose → gates → stage → probes → promote/stage</text>
+  <text x="60" y="1214" font-size="12.5" font-family="Menlo, monospace" fill="#7dd3fc">src/core/commands.ts</text>
+  <text x="260" y="1214" font-size="12.5" fill="#94a3b8">/evolve status cards ← EVOLVE_STATUS_MAX_CARDS = 10 (the cap)</text>
+  <text x="60" y="1238" font-size="12.5" font-family="Menlo, monospace" fill="#7dd3fc">src/core/bot.ts</text>
+  <text x="260" y="1238" font-size="12.5" fill="#94a3b8">evo:&lt;token&gt;:y|n|peek callbacks · scheduled stage → card</text>
+  <text x="60" y="1262" font-size="12.5" font-family="Menlo, monospace" fill="#7dd3fc">src/core/bot.test.ts</text>
+  <text x="260" y="1262" font-size="12.5" fill="#94a3b8">cap test: 10 cards + batch note, tokens minted 10×</text>
+</svg>

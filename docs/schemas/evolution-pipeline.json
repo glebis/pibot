@@ -1,0 +1,89 @@
+{
+  "title": "skill-evolution pipeline — pibot",
+  "subtitle": "how a proposed skill becomes live — and where the /evolve status cap landed · Sep 2, 2026 · b4659a5",
+  "width": 960,
+  "height": 1380,
+  "panels": [
+    { "x": 50, "y": 846, "w": 860, "h": 350, "label": "HUMAN REVIEW — CHAT NAVIGATION", "tone": "review" }
+  ],
+  "nodes": [
+    { "id": "trigger-manual", "tone": "trigger", "x": 70, "y": 118, "w": 470, "h": 58,
+      "title": "TRIGGER 1 — /evolve <goal>",
+      "lines": ["owner command · force=true, skips budget"] },
+    { "id": "trigger-heartbeat", "tone": "trigger", "x": 600, "y": 118, "w": 290, "h": 58,
+      "title": "TRIGGER 2 — heartbeat job",
+      "lines": ["manifest interval · budget 4 runs/day"] },
+    { "id": "goal", "tone": "goal", "x": 70, "y": 206, "w": 820, "h": 50,
+      "title": "GOAL",
+      "lines": ["explicit <goal> — else the top open improvement-backlog item (heartbeat keeps that backlog fed)"] },
+    { "id": "collect", "tone": "neutral", "x": 70, "y": 284, "w": 470, "h": 58,
+      "title": "① COLLECT",
+      "lines": ["live skills · heartbeat digest · recent proposals · consolidated memory"] },
+    { "id": "propose", "tone": "neutral", "x": 70, "y": 368, "w": 470, "h": 58,
+      "title": "② PROPOSE",
+      "lines": ["cheap-model ephemeral session → create | patch + eval probes"] },
+    { "id": "gates", "tone": "gate", "x": 70, "y": 454, "w": 470, "h": 78,
+      "title": "③ GATES",
+      "lines": [
+        "name & structure validation · patch target exists / no create collision",
+        "probes required · stagnation guard: same skill proposed ×3 → reject"
+      ] },
+    { "id": "rejected", "tone": "reject", "x": 600, "y": 462, "w": 290, "h": 62,
+      "title": "⛔ REJECTED",
+      "lines": ["logged to events · nothing staged"] },
+    { "id": "stage", "tone": "neutral", "x": 70, "y": 560, "w": 470, "h": 58,
+      "title": "④ STAGE",
+      "lines": ["agents/<id>/skills/.staging/<skill>/SKILL.md + backlog sidecar"] },
+    { "id": "probes", "tone": "neutral", "x": 70, "y": 646, "w": 470, "h": 58,
+      "title": "⑤ EVAL PROBES",
+      "lines": ["run ≤ 2 probes against the staged dir → judge scores each 1–5"] },
+    { "id": "decision", "tone": "amberText", "x": 70, "y": 732, "w": 470, "h": 58,
+      "title": "⑥ DECISION",
+      "lines": ["avg probe score ≥ 4  AND  no risky pattern?"] },
+    { "id": "autopromote", "tone": "promote", "x": 600, "y": 700, "w": 290, "h": 124,
+      "title": "✅ AUTO-PROMOTE",
+      "lines": [
+        "write live SKILL.md (+ .bak)",
+        "git checkpoint · announce in chat",
+        "close backlog items (sidecar)"
+      ] },
+    { "id": "review-accept", "tone": "promote", "x": 90, "y": 1128, "w": 380, "h": 40, "rx": 8,
+      "title": "✅ accept → promote (same path as auto)" },
+    { "id": "review-reject", "tone": "reject", "x": 490, "y": 1128, "w": 380, "h": 40, "rx": 8,
+      "title": "✖ reject → staging dir removed" },
+    { "id": "badge-new", "kind": "pill", "tone": "review", "x": 770, "y": 992, "w": 100, "h": 24,
+      "title": "NEW · b4659a5" }
+  ],
+  "edges": [
+    { "points": [[305, 176], [305, 204]] },
+    { "points": [[745, 176], [745, 192], [480, 192], [480, 204]] },
+    { "points": [[305, 256], [305, 282]] },
+    { "points": [[305, 342], [305, 366]] },
+    { "points": [[305, 426], [305, 452]] },
+    { "points": [[540, 493], [598, 493]], "label": "fail", "labelAt": [554, 486] },
+    { "points": [[305, 532], [305, 558]], "label": "pass", "labelAt": [317, 550] },
+    { "points": [[305, 618], [305, 644]] },
+    { "points": [[305, 704], [305, 730]] },
+    { "points": [[540, 761], [598, 761]], "label": "yes", "labelAt": [554, 754] },
+    { "points": [[305, 790], [305, 844]], "color": "#8b5cf6",
+      "label": "no — low scores or risky pattern → needs a human yes",
+      "labelAt": [317, 824], "labelColor": "#a78bfa" }
+  ],
+  "notes": [
+    { "x": 90, "y": 920, "text": "scheduled staging → review card pushed to the owner chat immediately (bot.ts)" },
+    { "x": 90, "y": 964, "text": "/evolve status → scans staged candidates across ALL agents" },
+    { "x": 90, "y": 1008, "bold": true, "color": "#e9d5ff",
+      "text": "renders ≤ 10 review cards · mints tokens only for shown · “…and N more staged — re-run /evolve status”" },
+    { "x": 90, "y": 1052, "text": "card buttons: ✅ promote → live+git+backlog · ✖ reject → rm staging · 📄 peek → full text" },
+    { "x": 90, "y": 1096, "text": "tokens: opaque, 64-byte callback-safe, 24 h TTL, dropped on decision → taps are idempotent" },
+    { "x": 620, "y": 799, "size": 12, "color": "#94a3b8", "text": "risky = exec, fetch, eval, child_process," },
+    { "x": 620, "y": 815, "size": 12, "color": "#94a3b8", "text": "process.env, rm -rf, prompt-injection…" }
+  ],
+  "footerLabel": "WHERE IT LIVES",
+  "footer": [
+    { "path": "src/core/evolution.ts", "desc": "the cycle: collect → propose → gates → stage → probes → promote/stage" },
+    { "path": "src/core/commands.ts", "desc": "/evolve status cards ← EVOLVE_STATUS_MAX_CARDS = 10 (the cap)" },
+    { "path": "src/core/bot.ts", "desc": "evo:<token>:y|n|peek callbacks · scheduled stage → card" },
+    { "path": "src/core/bot.test.ts", "desc": "cap test: 10 cards + batch note, tokens minted 10×" }
+  ]
+}
