@@ -4,8 +4,9 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "./agent-manager.js";
 import { appendBacklogItems, loadBacklogItems } from "./backlog.js";
-import { applyPatch, containsRiskyPattern, EvolutionEngine, extractRecentProposals, validateSkillFile, validateSkillName, type EvolutionIO, type EvolutionProposal } from "./evolution.js";
+import { applyPatch, containsRiskyPattern, EvolutionEngine, extractRecentProposals, lastProbeScores, validateSkillFile, validateSkillName, type EvolutionIO, type EvolutionProposal } from "./evolution.js";
 import { EventLog } from "./events.js";
+import { writeJsonAtomic } from "./util.js";
 
 function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "pibot-evo-"));
@@ -146,6 +147,54 @@ describe("EvolutionEngine", () => {
     expect(engine.promote("assistant", "morning-brief")).toBe(true);
     expect(engine.staged("assistant")).toHaveLength(0);
     expect(fs.existsSync(path.join(dir, "assistant", "skills", "morning-brief", "SKILL.md"))).toBe(true);
+  });
+
+  it("stagedDetail exposes content, mode, scores and sidecar ids for review", async () => {
+    (io.judge as ReturnType<typeof vi.fn>).mockResolvedValue(2); // stays staged
+    await engine.evolve("assistant", "mornings");
+    const detail = engine.stagedDetail("assistant");
+    expect(detail).toHaveLength(1);
+    expect(detail[0].name).toBe("morning-brief");
+    expect(detail[0].mode).toBe("create");
+    expect(detail[0].description).toContain("briefing");
+    expect(detail[0].preview).toContain("Morning brief");
+    expect(detail[0].content).toContain("## Steps");
+    expect(detail[0].scores).toEqual([2]);
+    expect(detail[0].stagedAt).toBeGreaterThan(0);
+  });
+
+  it("stagedDetail detects patch mode and reads the backlog sidecar", () => {
+    const liveDir = path.join(dir, "assistant", "skills", "morning-brief");
+    fs.mkdirSync(liveDir, { recursive: true });
+    fs.writeFileSync(path.join(liveDir, "SKILL.md"), "---\nname: morning-brief\ndescription: live\n---\nlive body");
+    const stagedDir = path.join(dir, "assistant", "skills", ".staging", "morning-brief");
+    fs.mkdirSync(stagedDir, { recursive: true });
+    fs.writeFileSync(path.join(stagedDir, "SKILL.md"), "---\nname: morning-brief\ndescription: patched candidate\n---\npatched body");
+    writeJsonAtomic(path.join(stagedDir, ".backlog.json"), { ids: ["bl-1", "bl-2"] }, 0o600);
+    const detail = engine.stagedDetail("assistant");
+    expect(detail).toHaveLength(1);
+    expect(detail[0].mode).toBe("patch");
+    expect(detail[0].description).toBe("patched candidate");
+    expect(detail[0].closesBacklog).toEqual(["bl-1", "bl-2"]);
+  });
+
+  it("stagedContent returns the full candidate for peek, undefined when absent", async () => {
+    (io.judge as ReturnType<typeof vi.fn>).mockResolvedValue(2);
+    await engine.evolve("assistant", "mornings");
+    expect(engine.stagedContent("assistant", "morning-brief")).toContain("Morning brief");
+    expect(engine.stagedContent("assistant", "nope")).toBeUndefined();
+    expect(engine.stagedContent("ghost", "nope")).toBeUndefined();
+  });
+
+  it("review tokens round-trip and die with promote/reject", async () => {
+    (io.judge as ReturnType<typeof vi.fn>).mockResolvedValue(2);
+    await engine.evolve("assistant", "mornings");
+    const tok = engine.reviewToken("assistant", "morning-brief");
+    expect(engine.resolveReviewToken(tok)).toEqual({ agentId: "assistant", skillName: "morning-brief" });
+    expect(engine.reviewToken("assistant", "morning-brief")).toBe(tok); // reused, not re-minted
+    expect(engine.resolveReviewToken("e_unknown")).toBeUndefined();
+    expect(engine.promote("assistant", "morning-brief")).toBe(true);
+    expect(engine.resolveReviewToken(tok)).toBeUndefined(); // consumed by the decision
   });
 
   it("gates reject invalid proposals before staging", async () => {
@@ -379,6 +428,18 @@ describe("extractRecentProposals", () => {
       { type: "message", summary: "hello" },
     ];
     expect(extractRecentProposals(entries)).toEqual(["morning-brief"]);
+  });
+
+  it("lastProbeScores picks the most recent staging event's scores", () => {
+    const entries = [
+      { type: "system", summary: 'evolution: create "morning-brief" staged, probes [1, 2]' },
+      { type: "system", summary: 'evolution: create "morning-brief" staged, probes [3]' },
+      { type: "system", summary: "evolution: promoted skill morning-brief" },
+    ];
+    expect(lastProbeScores(entries, "morning-brief")).toEqual([3]);
+    expect(lastProbeScores(entries, "other")).toBeUndefined();
+    const empty = [{ type: "system", summary: 'evolution: create "x" staged, probes []' }];
+    expect(lastProbeScores(empty, "x")).toEqual([]);
   });
 
 });

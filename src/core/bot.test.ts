@@ -146,7 +146,7 @@ function fakeAgentManager(promptSpy = vi.fn()) {
   return { agents, emitSessionEvent: (event: unknown) => sessionListeners.forEach((listener) => listener(event)) };
 }
 
-function makeBot() {
+function makeBot(evolution?: unknown) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-bot-"));
   const config: Config = {
     transport: "cli",
@@ -185,7 +185,7 @@ function makeBot() {
     prepare: vi.fn(async (media: IncomingMedia) => ({ ok: true, filePath: media.filePath, durationSec: media.durationSec ?? 1, cleanup: vi.fn(async () => {}) })),
   };
   const runBd = vi.fn(async () => "✓ Created issue: pibot-test (P2)");
-  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never, audioMedia: audioMedia as never, runBd: runBd as never });
+  const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never, audioMedia: audioMedia as never, runBd: runBd as never, evolution: evolution as never });
   return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt, audioMedia, emitSessionEvent, resetSession: agents.resetSession, runBd };
 }
 
@@ -239,6 +239,77 @@ describe("PiBot commands", () => {
   it("replies to unknown commands", async () => {
     await t.transport.say("/frobnicate");
     expect(t.transport.lastText()).toContain("Unknown /frobnicate");
+  });
+
+  it("/evolve status renders staged candidates with accept/reject buttons that act on them", async () => {
+    const evolution = {
+      stagedDetail: vi.fn((agentId: string) =>
+        agentId === "assistant"
+          ? [{
+              name: "morning-brief", mode: "create" as const,
+              description: "Use when mornings start.",
+              preview: "# Morning brief\n- greet\n- list schedule",
+              content: "---\nname: morning-brief\ndescription: Use when mornings start.\n---\n\n# Morning brief",
+              closesBacklog: ["bl-1"], scores: [3, 4], stagedAt: Date.now() - 7200e3,
+            }]
+          : []
+      ),
+      reviewToken: vi.fn(() => "tok_abc"),
+      resolveReviewToken: vi.fn((tok: string) => (tok === "tok_abc" ? { agentId: "assistant", skillName: "morning-brief" } : undefined)),
+      promote: vi.fn(() => true),
+      reject: vi.fn(() => true),
+      stagedContent: vi.fn(() => "# Morning brief\n\n- greet"),
+    };
+    const ev = makeBot(evolution);
+    await ev.transport.say("/evolve status");
+    expect(evolution.stagedDetail).toHaveBeenCalledWith("assistant");
+    const cardMsg = ev.transport.pushed.find((p) => p.opts.card);
+    expect(cardMsg?.opts.text).toContain("morning-brief");
+    expect(cardMsg?.opts.text).toContain("assistant");
+    expect(cardMsg?.opts.text).toContain("probes 3, 4");
+    expect(cardMsg?.opts.text).toContain("closes bl-1");
+    expect(cardMsg?.opts.card?.buttons.map((b) => b.action)).toEqual(["evo:tok_abc:y", "evo:tok_abc:n", "evo:tok_abc:peek"]);
+
+    // ✅ Accept via card → promote (toasts come back as the callback answer)
+    await ev.transport.act("evo:tok_abc:y");
+    expect(evolution.promote).toHaveBeenCalledWith("assistant", "morning-brief");
+
+    // ✖ Reject via card → reject
+    await ev.transport.act("evo:tok_abc:n");
+    expect(evolution.reject).toHaveBeenCalledWith("assistant", "morning-brief");
+
+    // 📄 Peek → pushes the full candidate text
+    await ev.transport.act("evo:tok_abc:peek");
+    expect(ev.transport.lastText()).toContain("Morning brief");
+
+    // stale/unknown token → gentle expired toast, no crash
+    expect(await ev.transport.act("evo:gone:n")).toContain("expired");
+  });
+
+  it("/evolve status with nothing staged says so", async () => {
+    const evolution = { stagedDetail: vi.fn(() => []) };
+    const ev = makeBot(evolution);
+    await ev.transport.say("/evolve status");
+    expect(ev.transport.lastText()).toContain("Nothing staged");
+  });
+
+  it("staging via the evolution job delivers a review card automatically", async () => {
+    const evolution = {
+      evolve: vi.fn(async () => ({ agentId: "assistant", ok: true, summary: "Staged \"morning-brief\" for review", skill: "morning-brief", staged: true })),
+      reviewToken: vi.fn(() => "tok_job"),
+    };
+    const ev = makeBot(evolution);
+    await ev.transport.say("remember this chat"); // bind mock:42 → assistant so proactive delivery lands
+    ev.transport.pushed = [];
+    await ev.bot.deliverFire({
+      id: "ev:assistant", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+      title: "evolution", kind: "evolution", dueAt: Date.now(), wake: "normal",
+      delivery: "direct", status: "pending", createdAt: Date.now(), firedCount: 0,
+    }, false);
+    expect(evolution.reviewToken).toHaveBeenCalledWith("assistant", "morning-brief");
+    const cardMsg = ev.transport.pushed.find((p) => p.opts.card);
+    expect(cardMsg?.opts.text).toContain("staged **morning-brief**");
+    expect(cardMsg?.opts.card?.buttons.map((b) => b.action)).toEqual(["evo:tok_job:y", "evo:tok_job:n", "evo:tok_job:peek"]);
   });
 
   it("/snooze snoozes the current agent and /wake resumes", async () => {

@@ -5,7 +5,7 @@ import { listSkillDirs } from "./agent-manager.js";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { TelegramTransport } from "../transports/telegram.js";
 import { attendCli } from "../plugins/attend-plugin.js";
-import { createCommandHandler, type CommandContext } from "./commands.js";
+import { createCommandHandler, evolutionReviewCard, type CommandContext } from "./commands.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
@@ -997,7 +997,26 @@ export class PiBot implements HeartbeatHost {
       void this.setupSubBot(t, chatId, fresh).catch((e) => console.error("[bot] subbot card setup failed:", e));
       return `Setting up ${name}'s Telegram identity…`;
     }
-    if (!action.startsWith("scd:")) return;
+    if (!action.startsWith("evo:") && !action.startsWith("scd:")) return;
+    if (action.startsWith("evo:")) {
+      const [, token, verb] = action.split(":");
+      const ev = this.deps.evolution;
+      if (!ev) return "Evolution engine not wired in this build.";
+      const ref = ev.resolveReviewToken(token);
+      if (!ref) return "That review card expired — /evolve status for the current list.";
+      if (verb === "peek") {
+        const full = ev.stagedContent(ref.agentId, ref.skillName);
+        if (full === undefined) return "Already handled — nothing staged under that name.";
+        await t.push(chatId, { text: truncate(`📄 **${ref.skillName}** — staged candidate\n\n${full}`, 3500) });
+        return "📄 Full text below";
+      }
+      if (verb !== "y" && verb !== "n") return "Unknown action.";
+      const ok = verb === "y" ? ev.promote(ref.agentId, ref.skillName) : ev.reject(ref.agentId, ref.skillName);
+      if (!ok) return "Nothing staged under that name anymore — /evolve status to refresh.";
+      return verb === "y"
+        ? `✅ Promoted **${ref.skillName}** — live on **${ref.agentId}**`
+        : `🗑 Rejected **${ref.skillName}**`;
+    }
     const [, id, verb] = action.split(":");
     const job = this.deps.scheduler.get(id);
     if (!job) {
@@ -1551,8 +1570,10 @@ export class PiBot implements HeartbeatHost {
     }
     if (job.kind === "evolution" && this.deps.evolution) {
       const report = await this.deps.evolution.evolve(job.agentId);
-      if (report.staged) {
-        await this.deliverToAgent(job.agentId, `🧬 Evolution staged **${report.skill}** for your review: ${report.summary}`);
+      if (report.staged && report.skill) {
+        // stage → review card lands in the owner's chat immediately: accept/reject in place
+        const tok = this.deps.evolution.reviewToken(job.agentId, report.skill);
+        await this.deliverToAgent(job.agentId, `🧬 Evolution staged **${report.skill}** for your review: ${report.summary}`, evolutionReviewCard(tok));
       }
       return;
     }
@@ -1793,7 +1814,7 @@ export class PiBot implements HeartbeatHost {
     });
   }
 
-  async deliverToAgent(agentId: string, text: string) {    const cks = this.agentChats.get(agentId) ?? new Set<string>();
+  async deliverToAgent(agentId: string, text: string, card?: Card) {    const cks = this.agentChats.get(agentId) ?? new Set<string>();
     const all = [...cks];
     const dedicated = all.filter((ck) => {
       const { transport } = this.splitChatKey(ck);
@@ -1804,7 +1825,7 @@ export class PiBot implements HeartbeatHost {
       for (const ck of dedicated) {
         const { transport, chatId } = this.splitChatKey(ck);
         const t = this.transports.get(transport);
-        if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] deliver failed:", e));
+        if (t) await t.push(chatId, { text, card }).catch((e) => console.error("[bot] deliver failed:", e));
       }
       return;
     }
@@ -1818,7 +1839,7 @@ export class PiBot implements HeartbeatHost {
     for (const ck of owned) {
       const { transport, chatId } = this.splitChatKey(ck);
       const t = this.transports.get(transport);
-      if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] deliver failed:", e));
+      if (t) await t.push(chatId, { text, card }).catch((e) => console.error("[bot] deliver failed:", e));
     }
   }
 

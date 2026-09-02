@@ -18,7 +18,7 @@ import { closeBacklogItems, loadBacklogItems, topBacklogItem } from "./backlog.j
 import { readConsolidatedDigest, type ConsolidationEngine } from "./consolidation.js";
 import type { EventLog } from "./events.js";
 import { buildHeartbeatDigest } from "./heartbeat.js";
-import { errorMessage, readJson, truncate, writeJsonAtomic } from "./util.js";
+import { errorMessage, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 
 const run = promisify(execFile);
 
@@ -134,6 +134,48 @@ export interface EvolutionReport {
   rationale?: string;
 }
 
+// ─── staged review surface (admin view via chat cards) ─────────────────────
+
+/** Parse `---\nname: …\ndescription: …\n---` frontmatter; body is everything after. */
+export function parseSkillFrontmatter(raw: string): { name: string; description: string; body: string } {
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n?/);
+  if (!m) return { name: "", description: "", body: raw };
+  const fm = m[1];
+  return {
+    name: fm.match(/^name:\s*(.+)$/m)?.[1]?.trim() ?? "",
+    description: fm.match(/^description:\s*(.+)$/m)?.[1]?.trim() ?? "",
+    body: raw.slice(m[0].length),
+  };
+}
+
+/** Probe scores from the most recent staging event for a skill, if any. */
+export function lastProbeScores(entries: Array<{ summary: string }>, skillName: string): number[] | undefined {
+  const re = new RegExp(`evolution: (?:create|patch) ["\u201c]?${skillName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["\u201d]? staged, probes \\[([^\\]]*)\\]`);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const m = entries[i].summary.match(re);
+    if (!m) continue;
+    const scores = m[1].split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isFinite(n));
+    return scores;
+  }
+  return undefined;
+}
+
+export interface StagedCandidate {
+  name: string;
+  /** "patch" when a live skill with this name exists, else "create" */
+  mode: "create" | "patch";
+  description: string;
+  /** first ~500 chars of the candidate body */
+  preview: string;
+  /** full staged SKILL.md content (peek) */
+  content: string;
+  /** improvement-backlog ids this candidate will close on promote */
+  closesBacklog: string[];
+  /** probe scores from the last evolution cycle that staged this skill */
+  scores?: number[];
+  stagedAt: number;
+}
+
 /** Mine the event log for recently proposed skill titles (dedup signal) */
 export function extractRecentProposals(entries: Array<{ type: string; summary: string }>): string[] {
   const out: string[] = [];
@@ -189,6 +231,89 @@ export class EvolutionEngine {
     return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
   }
 
+  /** Rich view of what's staged for an agent — what the admin actually reviews. */
+  stagedDetail(agentId: string): StagedCandidate[] {
+    const agent = this.deps.agents.getAgent(agentId);
+    if (!agent) return [];
+    const out: StagedCandidate[] = [];
+    for (const name of this.staged(agentId)) {
+      const file = path.join(agent.dir, "skills", ".staging", name, "SKILL.md");
+      let raw: string;
+      try {
+        raw = fs.readFileSync(file, "utf8");
+      } catch {
+        continue;
+      }
+      const parsed = parseSkillFrontmatter(raw);
+      let stagedAt = Date.now();
+      try {
+        stagedAt = fs.statSync(file).mtimeMs;
+      } catch {
+        /* racing deletion — fall back to now */
+      }
+      out.push({
+        name,
+        mode: fs.existsSync(path.join(agent.dir, "skills", name, "SKILL.md")) ? "patch" : "create",
+        description: parsed.description,
+        preview: truncate(parsed.body.trim(), 500),
+        content: raw,
+        closesBacklog: readStagingBacklogIds(agent, name),
+        scores: lastProbeScores(this.deps.events.tail(agentId, 60), name),
+        stagedAt,
+      });
+    }
+    return out.sort((a, b) => a.stagedAt - b.stagedAt);
+  }
+
+  /** Full staged SKILL.md content (peek action); undefined when nothing staged under that name. */
+  stagedContent(agentId: string, skillName: string): string | undefined {
+    const agent = this.deps.agents.getAgent(agentId);
+    if (!agent) return undefined;
+    const file = path.join(agent.dir, "skills", ".staging", skillName, "SKILL.md");
+    try {
+      return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // ── review-card tokens (compact callback targets for chat buttons) ──────
+
+  /** Telegram callback_data caps at 64 bytes — cards carry short tokens instead of agent+skill names. */
+  private reviewTokens = new Map<string, { agentId: string; skillName: string; armedAt: number }>();
+  private static readonly REVIEW_TOKEN_TTL_MS = 24 * 3600e3;
+
+  /** Mint (or reuse) a short opaque token for a staged candidate's review card. */
+  reviewToken(agentId: string, skillName: string): string {
+    this.pruneReviewTokens();
+    for (const [tok, v] of this.reviewTokens) {
+      if (v.agentId === agentId && v.skillName === skillName) return tok;
+    }
+    const tok = uid("e", 6);
+    this.reviewTokens.set(tok, { agentId, skillName, armedAt: Date.now() });
+    return tok;
+  }
+
+  /** Resolve a review-card token back to its target; undefined when expired/unknown. */
+  resolveReviewToken(token: string): { agentId: string; skillName: string } | undefined {
+    this.pruneReviewTokens();
+    const v = this.reviewTokens.get(token);
+    return v ? { agentId: v.agentId, skillName: v.skillName } : undefined;
+  }
+
+  private dropReviewTokensFor(agentId: string, skillName: string): void {
+    for (const [tok, v] of this.reviewTokens) {
+      if (v.agentId === agentId && v.skillName === skillName) this.reviewTokens.delete(tok);
+    }
+  }
+
+  private pruneReviewTokens(): void {
+    const now = Date.now();
+    for (const [tok, v] of this.reviewTokens) {
+      if (now - v.armedAt > EvolutionEngine.REVIEW_TOKEN_TTL_MS) this.reviewTokens.delete(tok);
+    }
+  }
+
   /** Manually promote a staged candidate (skips probes, gates still apply) */
   promote(agentId: string, skillName: string): boolean {
     const agent = this.deps.agents.getAgent(agentId);
@@ -200,6 +325,7 @@ export class EvolutionEngine {
     if (!this.promoteCandidate(agent, skillName, fs.readFileSync(stagedFile, "utf8"), "manually promoted from staging")) return false;
     // close-on-commit: the sidecar records which backlog items the skill addresses
     this.closeBacklogIds(agent, backlogIds);
+    this.dropReviewTokensFor(agentId, skillName); // decision made — stale buttons must not re-fire
     return true;
   }
 
@@ -210,6 +336,7 @@ export class EvolutionEngine {
     if (!fs.existsSync(stagedDir)) return false;
     fs.rmSync(stagedDir, { recursive: true, force: true });
     this.deps.events.log(agentId, "system", `evolution: rejected staged skill ${skillName}`);
+    this.dropReviewTokensFor(agentId, skillName);
     return true;
   }
 

@@ -8,7 +8,7 @@ import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { QuestionBus } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
-import type { Schedule, Transport } from "./types.js";
+import type { Schedule, Transport, Card } from "./types.js";
 import type { Config } from "../config.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./util.js";
 import * as path from "node:path";
@@ -19,6 +19,7 @@ const HELP = [
   ``,
   `/agents — list agents  ·  /agent <name> — switch  ·  /new — fresh session  ·  /issue — file a tracked issue  ·  /newagent — guided wizard`,
   `/schedules — active and paused items  ·  /cancel <id>  ·  /resume <id>  ·  /new — fresh session`,
+  `/evolve status — review staged skill proposals (accept/reject from the buttons)  ·  /evolve <goal> — run a cycle`,
   `/handoff <agent> [note] — move this conversation (with a task brief) to another agent`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
   `/cascade — model fallback health  ·  /cascade probe|retry|clear`,
@@ -26,6 +27,28 @@ const HELP = [
   `/consolidate [status] — distill the event log into durable memory`,
   `/status — what's running`,
 ].join("\n");
+
+/** The 3-button accept/reject/peek card for a staged candidate's review token. */
+export function evolutionReviewCard(token: string): Card {
+  return {
+    text: "",
+    buttons: [
+      { label: "✅ Accept", action: `evo:${token}:y` },
+      { label: "✖ Reject", action: `evo:${token}:n` },
+      { label: "📄 Full text", action: `evo:${token}:peek` },
+    ],
+  };
+}
+
+function ago(ms: number, now = Date.now()): string {
+  const s = Math.max(1, Math.round((now - ms) / 1e3));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
 
 export interface CommandContext {
   config: Config;
@@ -255,13 +278,39 @@ export function createCommandHandler(ctx: CommandContext) {
           await reply("Evolution engine not wired.");
           return;
         }
-        if (!agentId) return void (await reply("No agent selected."));
         const sub = arg.split(/\s+/)[0];
         if (sub === "status") {
-          const staged = deps.evolution.staged(agentId);
-          await reply(staged.length ? `Staged: ${staged.map((s) => `**${s}**`).join(", ")}\nPromote: /evolve promote <name>` : "Nothing staged.");
+          // admin review: staged candidates across ALL agents, one tappable card each —
+          // no agent binding required, the review is global
+          let shown = 0;
+          for (const a of deps.agents.list()) {
+            for (const c of deps.evolution.stagedDetail(a.id)) {
+              shown++;
+              const tok = deps.evolution.reviewToken(a.id, c.name);
+              const meta = [
+                c.scores?.length ? `probes ${c.scores.join(", ")}` : "",
+                c.closesBacklog.length ? `closes ${c.closesBacklog.join(", ")}` : "",
+                `staged ${ago(c.stagedAt)}`,
+              ].filter(Boolean).join(" · ");
+              await t.push(chatId, {
+                text: [
+                  `🧬 **${a.id}** staged **${c.name}** (${c.mode})`,
+                  c.description ? `_${c.description}_` : "",
+                  "",
+                  c.preview || "(empty body)",
+                  "",
+                  meta,
+                ].filter(Boolean).join("\n"),
+                card: evolutionReviewCard(tok),
+              });
+            }
+          }
+          if (!shown) {
+            await reply("Nothing staged for review. Candidates land here when probes score <4 or a risky pattern needs a human yes — or run a cycle now: /evolve <goal>");
+          }
           return;
         }
+        if (!agentId) return void (await reply("No agent selected."));
         if (sub === "promote" || sub === "reject") {
           const name = arg.split(/\s+/)[1] ?? "";
           const done = sub === "promote" ? deps.evolution.promote(agentId, name) : deps.evolution.reject(agentId, name);
@@ -272,7 +321,7 @@ export function createCommandHandler(ctx: CommandContext) {
         await reply(`🧬 Running an evolution cycle${goal ? ` — goal: “${goal}”` : " (self-directed)"}. This runs cheap probes, takes a minute…`);
         const report = await deps.evolution.evolve(agentId, goal, { force: true });
         deps.events.log(agentId, "system", `evolution run: ${report.summary}`);
-        await reply(`${report.ok ? "🧬" : "⛔"} ${report.summary}${report.staged ? "\nReview: /evolve status → /evolve promote <name>" : ""}`);
+        await reply(`${report.ok ? "🧬" : "⛔"} ${report.summary}${report.staged ? "\nReview it: /evolve status — accept or reject right from the card." : ""}`);
         return;
       }
 
