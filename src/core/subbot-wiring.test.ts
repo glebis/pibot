@@ -206,6 +206,29 @@ describe("managed sub-bot wiring", () => {
     expect(state.pendingSubBots.assistant).toBeGreaterThan(0);
   });
 
+  it("a restart before getMe completes (manager mode not yet known) keeps the request armed", async () => {
+    const now = Date.now();
+    fs.writeFileSync(
+      path.join(dir, "state.json"),
+      JSON.stringify({
+        chats: { "telegram:42": "assistant" },
+        agentChats: { assistant: ["telegram:42"] },
+        pendingSubBots: { assistant: now - 60e3 },
+      })
+    );
+
+    // Boot race regression: managerMode() reports false while getMe is still
+    // pending — that must NOT drop the armed request (used to drop it for real).
+    const tg = new FakeTelegramTransport();
+    tg.managerOn = false;
+    (tg as { managerModeKnown?: () => boolean | null }).managerModeKnown = () => null;
+    const { bot } = makeWiringBot(dir, tg);
+    await bot.start();
+
+    const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+    expect(state.pendingSubBots.assistant).toBeGreaterThan(0);
+  });
+
   it("expired (≥24h) pending requests are dropped and late updates are ignored", async () => {
     fs.writeFileSync(
       path.join(dir, "state.json"),

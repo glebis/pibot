@@ -609,6 +609,14 @@ export class TelegramTransport implements Transport {
     return Boolean(this.me && (this.me as { can_manage_bots?: boolean }).can_manage_bots);
   }
 
+  /** Tri-state manager-mode: true/false once getMe has completed, null while
+   *  the bot identity is still unknown (boot). Callers distinguishing "off"
+   *  from "not known yet" must use this — a pending getMe is not "off". */
+  managerModeKnown(): boolean | null {
+    if (!this.me) return null;
+    return Boolean(this.me.can_manage_bots);
+  }
+
   botUsername(): string | undefined {
     return this.me?.username;
   }

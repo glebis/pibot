@@ -234,7 +234,12 @@ export class PiBot implements HeartbeatHost {
     // re-issue in @BotFather completes the wiring after a restart
     let pendingRestored = false;
     for (const [agentId, ts] of parsePendingSubBots(state.pendingSubBots)) {
-      if (!this.managerMode()) {
+      // managerMode() is false both when bot management is genuinely off AND
+      // while getMe hasn't completed (transports only start below) — treating
+      // "not known yet" as "off" silently dropped armed requests on every
+      // restart. Only drop when known-off; otherwise arm and let the wiring
+      // re-probe re-check manager mode on its own cadence (TTL prunes if off).
+      if (this.managerModeKnown() === false) {
         this.deps.events.log(agentId, "system", "dropped lingering sub-bot creation request — manager mode is off");
         continue;
       }
@@ -394,6 +399,16 @@ export class PiBot implements HeartbeatHost {
     // duck-typed so any transport that implements managed-bot mode (incl. test fakes) counts
     const m = (t as { managerMode?: () => boolean } | undefined)?.managerMode;
     return typeof m === "function" ? m.call(t) : false;
+  }
+
+  /** Tri-state manager-mode: true/false once the telegram transport knows its
+   *  getMe result, null when not fetched yet (boot race) or unsupported
+   *  transport. Boot-time decisions must treat null as "keep armed", not off. */
+  managerModeKnown(): boolean | null {
+    const t = this.transports.get("telegram");
+    // duck-typed like managerMode() so test fakes without the tri-state default to "unknown"
+    const m = (t as { managerModeKnown?: () => boolean | null } | undefined)?.managerModeKnown;
+    return typeof m === "function" ? m.call(t) : null;
   }
 
   managerUsername(): string | undefined {
