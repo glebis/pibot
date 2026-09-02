@@ -168,7 +168,10 @@ export function createWebApp(deps: WebDeps): Hono {
   (app as any)._csrf = csrfToken;
 
   const webToken = deps.webToken ?? process.env.PIBOT_WEB_TOKEN?.trim() ?? undefined;
-  const rpId = deps.webRpId ?? process.env.PIBOT_WEB_RP_ID?.trim() ?? process.env.PIBOT_WEB_AUTH?.trim() ?? "127.0.0.1";
+  // RP ID must be a registrable DOMAIN — an IP (e.g. "127.0.0.1") is rejected by browsers with
+  // "invalid domain". "localhost" is the only loopback name that works as an RP ID; visit the
+  // dashboard via http://localhost:<port> for Touch ID / passkey registration and login.
+  const rpId = deps.webRpId ?? process.env.PIBOT_WEB_RP_ID?.trim() ?? process.env.PIBOT_WEB_AUTH?.trim() ?? "localhost";
   const webPort = deps.webPort ?? parseInt(process.env.PIBOT_WEB_PORT || "7860", 10);
   const rpName = "pibot dashboard";
   let invalidTokenAttempts: number[] = [];

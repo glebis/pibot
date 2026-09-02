@@ -444,7 +444,7 @@ describe("web auth — Touch ID + Bearer + CSRF", () => {
       host: { announce: async () => {} },
       io: { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() },
     });
-    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, secrets: { get: () => ({}), save: async () => {} }, webToken: opts.webToken, webRpId: "127.0.0.1" } satisfies WebDeps);
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, secrets: { get: () => ({}), save: async () => {} }, webToken: opts.webToken, webRpId: "localhost" } satisfies WebDeps);
     if (opts.hasCred) {
       const store = (app as any)._authStore;
       store.addCredential({ id: "test-cred-id", publicKey: Buffer.from("fake-public-key").toString("base64"), counter: 0 });
