@@ -41,6 +41,9 @@ export function evolutionReviewCard(token: string): Card {
   };
 }
 
+/** /evolve status renders at most this many review cards per invocation (batched, not flooded). */
+export const EVOLVE_STATUS_MAX_CARDS = 10;
+
 function ago(ms: number, now = Date.now()): string {
   const s = Math.max(1, Math.round((now - ms) / 1e3));
   if (s < 60) return `${s}s ago`;
@@ -290,35 +293,36 @@ export function createCommandHandler(ctx: CommandContext) {
           await reply("Evolution engine not wired.");
           return;
         }
+        const evolution = deps.evolution; // captured after the guard — closures below lose TS narrowing
         const sub = arg.split(/\s+/)[0];
         if (sub === "status") {
           // admin review: staged candidates across ALL agents, one tappable card each —
           // no agent binding required, the review is global
-          let shown = 0;
-          for (const a of deps.agents.list()) {
-            for (const c of deps.evolution.stagedDetail(a.id)) {
-              shown++;
-              const tok = deps.evolution.reviewToken(a.id, c.name);
-              const meta = [
-                c.scores?.length ? `probes ${c.scores.join(", ")}` : "",
-                c.closesBacklog.length ? `closes ${c.closesBacklog.join(", ")}` : "",
-                `staged ${ago(c.stagedAt)}`,
-              ].filter(Boolean).join(" · ");
-              await t.push(chatId, {
-                text: [
-                  `🧬 **${a.id}** staged **${c.name}** (${c.mode})`,
-                  c.description ? `_${c.description}_` : "",
-                  "",
-                  c.preview || "(empty body)",
-                  "",
-                  meta,
-                ].filter(Boolean).join("\n"),
-                card: evolutionReviewCard(tok),
-              });
-            }
+          const all = deps.agents.list().flatMap((a) => evolution.stagedDetail(a.id).map((c) => ({ agentId: a.id, c })));
+          const shown = all.slice(0, EVOLVE_STATUS_MAX_CARDS); // cap the flood: a bulk cycle can stage dozens
+          for (const { agentId, c } of shown) {
+            const tok = deps.evolution.reviewToken(agentId, c.name);
+            const meta = [
+              c.scores?.length ? `probes ${c.scores.join(", ")}` : "",
+              c.closesBacklog.length ? `closes ${c.closesBacklog.join(", ")}` : "",
+              `staged ${ago(c.stagedAt)}`,
+            ].filter(Boolean).join(" · ");
+            await t.push(chatId, {
+              text: [
+                `🧬 **${agentId}** staged **${c.name}** (${c.mode})`,
+                c.description ? `_${c.description}_` : "",
+                "",
+                c.preview || "(empty body)",
+                "",
+                meta,
+              ].filter(Boolean).join("\n"),
+              card: evolutionReviewCard(tok),
+            });
           }
-          if (!shown) {
+          if (!all.length) {
             await reply("Nothing staged for review. Candidates land here when probes score <4 or a risky pattern needs a human yes — or run a cycle now: /evolve <goal>");
+          } else if (all.length > shown.length) {
+            await reply(`…and ${all.length - shown.length} more staged. Work through these first, then /evolve status again for the next batch.`);
           }
           return;
         }

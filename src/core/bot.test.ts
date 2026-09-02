@@ -293,6 +293,35 @@ describe("PiBot commands", () => {
     expect(ev.transport.lastText()).toContain("Nothing staged");
   });
 
+  it("/evolve status caps the review batch — 10 cards max, then a batch note", async () => {
+    const mk = (name: string) => ({
+      name, mode: "create" as const,
+      description: "d",
+      preview: "# preview",
+      content: `---\nname: ${name}\n---\n\n# preview`,
+      closesBacklog: [], scores: [4], stagedAt: Date.now(),
+    });
+    const evolution = {
+      stagedDetail: vi.fn((agentId: string) => (agentId === "assistant"
+        ? Array.from({ length: 8 }, (_, i) => mk(`skill-${i + 1}`))
+        : Array.from({ length: 5 }, (_, i) => mk(`fit-${i + 1}`)))),
+      reviewToken: vi.fn((_agentId: string, name: string) => `tok_${name}`),
+    };
+    const ev = makeBot(evolution);
+    (ev.agents.list as ReturnType<typeof vi.fn>).mockReturnValue([
+      { id: "assistant", dir: "/x", manifest: { name: "assistant" } },
+      { id: "fitness", dir: "/y", manifest: { name: "fitness" } },
+    ]);
+    await ev.transport.say("/evolve status");
+    const cards = ev.transport.pushed.filter((p) => p.opts.card);
+    expect(cards).toHaveLength(10);
+    // only shown candidates get tokens minted (unshown ones would expire unused)
+    expect(evolution.reviewToken).toHaveBeenCalledTimes(10);
+    // closing note points at the remainder and the re-run command
+    expect(ev.transport.lastText()).toContain("3 more staged");
+    expect(ev.transport.lastText()).toContain("/evolve status");
+  });
+
   it("/model lists candidates, switches via tap and typed spec, and auto resets", async () => {
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-model-"));
     const manifestPath = path.join(agentDir, "agent.json");
