@@ -633,16 +633,20 @@ export class PiBot implements HeartbeatHost {
         return;
       }
       const corrected = applyCorrections(result.text, dictionary.entries);
-      // transcript echo: the sender immediately sees what we heard (PIBOT_VOICE_ECHO=0 disables)
-      if (process.env.PIBOT_VOICE_ECHO !== "0") {
+      // transcript echo: OPT-IN (PIBOT_VOICE_ECHO=1) — transcripts are prompts,
+      // not chat messages to parrot back at the sender
+      if (process.env.PIBOT_VOICE_ECHO === "1") {
         await t.push(media.chatId, { text: `🎙 ${corrected}` });
       }
       // speech answers pending questions with the bare transcript, exactly like typing
       if (this.questions.answerViaText(this.chatKey(t, media.chatId), result.text)) return;
-      const dur = ` (${Math.round(prepared.durationSec)}s)`;
-      const label = media.kind === "video_note" ? "video note" : media.kind === "voice" ? "voice note" : "audio";
       const body = media.caption ? `${corrected}\n\n(caption: ${media.caption})` : corrected;
-      await this.routeUserTurn(t, media.chatId, `🎙 ${label}${dur} — transcribed via ${result.provider}:\n\n${body}`, undefined, agentId);
+      if (!body.trim()) {
+        await t.push(media.chatId, { text: "🎙 Couldn't make out any words — try again a bit closer?" });
+        return;
+      }
+      // the transcript IS the prompt — bare text, exactly like typing
+      await this.routeUserTurn(t, media.chatId, body, undefined, agentId);
     } finally {
       await prepared.cleanup();
     }

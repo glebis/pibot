@@ -466,8 +466,9 @@ describe("PiBot commands", () => {
     await t.transport.sayMedia({ kind: "voice", durationSec: 12 });
     expect(t.promptSpy).toHaveBeenCalledTimes(1);
     const arg = t.promptSpy.mock.calls[0][0] as string;
-    expect(arg).toContain("🎙 voice note (12s)");
     expect(arg).toContain("spoken words");
+    expect(arg).not.toContain("🎙"); // bare transcript IS the prompt — no transcript-object framing
+    expect(arg).not.toContain("transcribed via");
   });
 
   it("uses the resolved agent speech policy for video-note transcription", async () => {
@@ -479,7 +480,8 @@ describe("PiBot commands", () => {
 
     expect(t.stt.configured).toHaveBeenCalledWith({ providers: ["whisperkit", "groq"], allowExternal: true });
     expect(t.stt.transcribe).toHaveBeenCalledWith("/tmp/note.mp4", { providers: ["whisperkit", "groq"], allowExternal: true });
-    expect(t.promptSpy.mock.calls[0][0]).toContain("video note (9s)");
+    expect(t.promptSpy.mock.calls[0][0]).toContain("spoken words");
+    expect(t.promptSpy.mock.calls[0][0]).not.toContain("video note");
   });
 
   it("does not expose private media paths when validation fails", async () => {
@@ -1211,22 +1213,22 @@ expect(clean).not.toContain("/tmp/d.jpg");
 });
 
 describe("voice transcript echo", () => {
-  it("pushes the corrected transcript to the chat alongside the agent turn", async () => {
+  it("does not echo by default — the transcript goes to the agent, not back to the chat", async () => {
     const t = makeBot();
     fs.writeFileSync(path.join(t.dir, "dictionary.json"), JSON.stringify({ entries: [{ from: "west", to: "WhisperKit" }] }));
     (t.stt.transcribe as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, text: "I tested west today", provider: "whisperkit" });
     await t.transport.sayMedia({ kind: "voice", durationSec: 5 });
-    expect(t.transport.pushed.some((p) => p.opts.text.startsWith("🎙 I tested WhisperKit today"))).toBe(true);
-    expect(t.transport.lastText().endsWith("I tested WhisperKit today")).toBe(true);
+    expect(t.transport.pushed.some((p) => p.opts.text.startsWith("🎙"))).toBe(false);
+    expect(t.promptSpy.mock.calls[0][0]).toContain("I tested WhisperKit today");
     fs.rmSync(t.dir, { recursive: true, force: true });
   });
 
-  it("echo can be disabled with PIBOT_VOICE_ECHO=0", async () => {
-    process.env.PIBOT_VOICE_ECHO = "0";
+  it("echoes only with PIBOT_VOICE_ECHO=1 (opt-in)", async () => {
+    process.env.PIBOT_VOICE_ECHO = "1";
     try {
       const t2 = makeBot();
       await t2.transport.sayMedia({ kind: "voice", durationSec: 5 });
-      expect(t2.transport.pushed.some((p) => p.opts.text.startsWith("🎙"))).toBe(false);
+      expect(t2.transport.pushed.some((p) => p.opts.text.startsWith("🎙 spoken words"))).toBe(true);
       fs.rmSync(t2.dir, { recursive: true, force: true });
     } finally {
       delete process.env.PIBOT_VOICE_ECHO;
