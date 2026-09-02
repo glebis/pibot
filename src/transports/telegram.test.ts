@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { InputFile } from "grammy";
 import type { InputProfilePhoto } from "grammy/types";
-import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec } from "./telegram.js";
+import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec, serviceMessageKind } from "./telegram.js";
 
 describe("TelegramDuplicateGuard", () => {
   it("suppresses an identical payload to the same chat inside the window", () => {
@@ -41,6 +41,28 @@ describe("telegramRetryAfterMs", () => {
     expect(telegramRetryAfterMs({ error_code: 429, parameters: { retry_after: 3 } })).toBe(3_000);
     expect(telegramRetryAfterMs({ error_code: 500, parameters: { retry_after: 3 } })).toBeNull();
     expect(telegramRetryAfterMs(new Error("offline"))).toBeNull();
+  });
+});
+
+describe("serviceMessageKind", () => {
+  it("detects managed-bot creation service messages (t.me/newbot flow)", () => {
+    expect(serviceMessageKind({ message_id: 7, managed_bot_created: { bot: { id: 9, username: "sub_bot", first_name: "Sub" } } })).toBe("managed_bot_created");
+  });
+
+  it("detects other service messages (chat lifecycle, payments)", () => {
+    expect(serviceMessageKind({ message_id: 8, group_chat_created: true })).toBe("group_chat_created");
+    expect(serviceMessageKind({ message_id: 9, new_chat_members: [{ id: 1, first_name: "x" }] })).toBe("new_chat_members");
+    expect(serviceMessageKind({ message_id: 10, successful_payment: {} })).toBe("successful_payment");
+    expect(serviceMessageKind({ message_id: 11, pinned_message: { message_id: 1 } })).toBe("pinned_message");
+  });
+
+  it("does not misclassify user content or unprocessable media as service messages", () => {
+    expect(serviceMessageKind({ message_id: 12, text: "hello" })).toBeUndefined();
+    expect(serviceMessageKind({ message_id: 13, voice: { file_id: "f", duration: 1 } })).toBeUndefined();
+    expect(serviceMessageKind({ message_id: 14, photo: [{ file_id: "f" }] })).toBeUndefined();
+    expect(serviceMessageKind({ message_id: 15, sticker: { file_id: "f" } })).toBeUndefined();
+    expect(serviceMessageKind({ message_id: 16, video: { file_id: "f" } })).toBeUndefined();
+    expect(serviceMessageKind(undefined)).toBeUndefined();
   });
 });
 
