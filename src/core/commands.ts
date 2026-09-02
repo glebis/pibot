@@ -19,6 +19,7 @@ const HELP = [
   ``,
   `/agents — list agents  ·  /agent <name> — switch  ·  /new — fresh session  ·  /issue — file a tracked issue  ·  /newagent — guided wizard`,
   `/schedules — active and paused items  ·  /cancel <id>  ·  /resume <id>  ·  /new — fresh session`,
+  `/model — pick this agent's model (tap)  ·  /model <spec|auto>`,
   `/evolve status — review staged skill proposals (accept/reject from the buttons)  ·  /evolve <goal> — run a cycle`,
   `/handoff <agent> [note] — move this conversation (with a task brief) to another agent`,
   `/snooze <2h|until 18:00> — pause the whole rhythm  ·  /wake`,
@@ -88,6 +89,17 @@ export interface CommandContext {
     probe(): Promise<string>;
     retry(): Promise<string>;
     clear(): string;
+  };
+  /** manual per-agent model switching (/model) */
+  model?: {
+    /** the agent's current override (undefined = auto) */
+    current(agentId: string): string | undefined;
+    /** permitted candidate specs (policy-enforced cascade chain), with breaker state */
+    candidates(agentId: string): Array<{ spec: string; open: boolean }>;
+    /** persist the override (undefined = auto) and rebind live sessions */
+    switchTo(agentId: string, spec: string | undefined): Promise<string>;
+    /** short button token for a candidate (Telegram callback_data is 64-byte-capped) */
+    token(agentId: string, spec: string): string;
   };
   providers?: {
     statusText(): Promise<string>;
@@ -398,6 +410,42 @@ export function createCommandHandler(ctx: CommandContext) {
             `pending: ${pending.filter((j) => !j.internal).length} · paused: ${paused.length}${next && !next.internal ? ` · next: “${next.title}” ${fmtWhen(next.dueAt)}` : ""}`,
           ].join("\n")
         );
+        return;
+      }
+
+      case "model": {
+        const model = deps.model;
+        if (!model) {
+          await reply("Model switching is not wired in this build.");
+          return;
+        }
+        if (!agentId) {
+          await reply("No agent selected. /agent <name> first — /model changes that agent's model.");
+          return;
+        }
+        if (!arg) {
+          // picker: current model + one tappable button per permitted candidate
+          const cur = model.current(agentId);
+          const cands = model.candidates(agentId);
+          const buttons = cands.map((c) => ({
+            label: `${c.spec === cur ? "● " : ""}${c.open ? "⚠️ " : ""}${c.spec}`,
+            action: `mdl:${model.token(agentId, c.spec)}`,
+          }));
+          if (cur) buttons.push({ label: "↺ auto", action: `mdl:${model.token(agentId, "")}` });
+          await t.push(chatId, {
+            text: [
+              `🧠 **${agentId}** model: ${cur ? `\`${cur}\`` : "auto — first healthy in the cascade"}`,
+              cands.length ? "Tap to switch:" : "No candidate models available (provider policy or catalog empty). /providers to check.",
+            ].join("\n"),
+            card: buttons.length ? { text: "", buttons } : undefined,
+          });
+          return;
+        }
+        if (arg === "auto" || arg === "off") {
+          await reply(await model.switchTo(agentId, undefined));
+          return;
+        }
+        await reply(await model.switchTo(agentId, arg));
         return;
       }
 

@@ -293,6 +293,50 @@ describe("PiBot commands", () => {
     expect(ev.transport.lastText()).toContain("Nothing staged");
   });
 
+  it("/model lists candidates, switches via tap and typed spec, and auto resets", async () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-model-"));
+    const manifestPath = path.join(agentDir, "agent.json");
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      if (id !== "assistant") return undefined;
+      const manifest = fs.existsSync(manifestPath)
+        ? JSON.parse(fs.readFileSync(manifestPath, "utf8"))
+        : { name: "assistant", description: "d", heartbeat: { enabled: true, interval: "45m" }, evolution: { enabled: true, interval: "6h" } };
+      return { id, dir: agentDir, manifest };
+    });
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/a:cloud", "ollama/b:cloud"]);
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "a" } as never);
+    (t.cascade.isOpen as ReturnType<typeof vi.fn>).mockReturnValue(false);
+
+    // picker: current is auto, one button per candidate
+    await t.transport.say("/model");
+    expect(t.transport.lastText()).toContain("auto — first healthy");
+    const card = t.transport.lastCard();
+    expect(card?.map((b) => b.label)).toEqual(["ollama/a:cloud", "ollama/b:cloud"]);
+
+    // tap a candidate → persisted to agent.json + toast confirmation
+    expect(await t.transport.act(card![0].action)).toContain("will use **ollama/a:cloud**");
+    expect(JSON.parse(fs.readFileSync(manifestPath, "utf8")).model).toBe("ollama/a:cloud");
+
+    // picker marks current, offers auto
+    await t.transport.say("/model");
+    expect(t.transport.lastText()).toContain("`ollama/a:cloud`");
+    expect(t.transport.lastCard()?.some((b) => b.label === "↺ auto")).toBe(true);
+
+    // auto reset
+    const autoBtn = t.transport.lastCard()!.find((b) => b.label === "↺ auto")!;
+    expect(await t.transport.act(autoBtn.action)).toContain("back to **auto**");
+    expect(JSON.parse(fs.readFileSync(manifestPath, "utf8")).model).toBeUndefined();
+
+    // typed spec outside the permitted chain is refused
+    await t.transport.say("/model openai/gpt-x");
+    expect(t.transport.lastText()).toContain("not in assistant's permitted chain");
+
+    // stale picker token → gentle expired toast
+    expect(await t.transport.act("mdl:m_deadbeef")).toContain("expired");
+
+    fs.rmSync(agentDir, { recursive: true, force: true });
+  });
+
   it("staging via the evolution job delivers a review card automatically", async () => {
     const evolution = {
       evolve: vi.fn(async () => ({ agentId: "assistant", ok: true, summary: "Staged \"morning-brief\" for review", skill: "morning-brief", staged: true })),

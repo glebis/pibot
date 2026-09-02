@@ -997,7 +997,13 @@ export class PiBot implements HeartbeatHost {
       void this.setupSubBot(t, chatId, fresh).catch((e) => console.error("[bot] subbot card setup failed:", e));
       return `Setting up ${name}'s Telegram identity…`;
     }
-    if (!action.startsWith("evo:") && !action.startsWith("scd:")) return;
+    if (!action.startsWith("evo:") && !action.startsWith("mdl:") && !action.startsWith("scd:")) return;
+    if (action.startsWith("mdl:")) {
+      const [, token] = action.split(":");
+      const ref = this.resolveModelToken(token);
+      if (!ref) return "That model picker expired — /model for the current list.";
+      return await this.switchModel(ref.agentId, ref.spec || undefined);
+    }
     if (action.startsWith("evo:")) {
       const [, token, verb] = action.split(":");
       const ev = this.deps.evolution;
@@ -1059,6 +1065,69 @@ export class PiBot implements HeartbeatHost {
     return this.commandHandler(t, chatId, text);
   }
 
+  // ── manual model switching (/model) ───────────────────────────────
+
+  /** Short-lived button tokens for model candidates — callback_data caps at 64 bytes. */
+  private modelTokens = new Map<string, { agentId: string; spec: string; armedAt: number }>();
+  private static readonly MODEL_TOKEN_TTL_MS = 24 * 3600e3;
+
+  private mintModelToken(agentId: string, spec: string): string {
+    const now = Date.now();
+    for (const [tok, v] of this.modelTokens) {
+      if (now - v.armedAt > PiBot.MODEL_TOKEN_TTL_MS) {
+        this.modelTokens.delete(tok);
+        continue;
+      }
+      if (v.agentId === agentId && v.spec === spec) return tok;
+    }
+    const tok = uid("m", 6);
+    this.modelTokens.set(tok, { agentId, spec, armedAt: now });
+    return tok;
+  }
+
+  private resolveModelToken(token: string): { agentId: string; spec: string } | undefined {
+    const now = Date.now();
+    for (const [tok, v] of this.modelTokens) {
+      if (now - v.armedAt > PiBot.MODEL_TOKEN_TTL_MS) this.modelTokens.delete(tok);
+    }
+    const v = this.modelTokens.get(token);
+    return v ? { agentId: v.agentId, spec: v.spec } : undefined;
+  }
+
+  /**
+   * Set (spec) or clear (undefined → auto) an agent's model override: persists to
+   * agent.json like the dashboard form, then drops live session bindings so the next
+   * prompt binds to the new head of the cascade. Only chain members (provider-policy
+   * allowed, catalog-resolvable) are accepted.
+   */
+  async switchModel(agentId: string, spec: string | undefined): Promise<string> {
+    const agent = this.deps.agents.getAgent(agentId);
+    if (!agent) return `No agent "${agentId}". /agents for the list.`;
+    const cascade = this.deps.cascade;
+    if (spec) {
+      const chain = cascade?.chainFor(agent.manifest) ?? [];
+      if (!chain.includes(spec)) {
+        return `⚠︎ "${spec}" is not in ${agentId}'s permitted chain (provider policy). /model lists what's allowed.`;
+      }
+      if (!cascade?.resolveModel(spec)) return `⚠︎ "${spec}" isn't in the model catalog on this machine.`;
+    }
+    writeJsonAtomic(path.join(agent.dir, "agent.json"), { ...agent.manifest, model: spec || undefined });
+    await this.deps.agents.discover(); // reload manifests
+    let dropped = 0;
+    for (const wkey of [...this.sessionSpec.keys()]) {
+      if (wkey.startsWith(`${agentId}::`)) {
+        this.sessionSpec.delete(wkey);
+        dropped++;
+      }
+    }
+    this.deps.events.log(agentId, "system", `model switch via /model: ${spec || "auto"}${dropped ? ` — ${dropped} live session(s) rebound` : ""}`);
+    if (!spec) return `↺ **${agentId}** back to **auto** — first healthy model in the cascade.`;
+    return [
+      `🧠 **${agentId}** will use **${spec}** from the next message on.`,
+      cascade?.isOpen(spec) ? "⚠️ Heads up: that model's breaker is open right now — the cascade may fail over." : "",
+    ].filter(Boolean).join("\n");
+  }
+
   /** @internal narrow surface for the command layer */
   private commandContext(): CommandContext {
     return {
@@ -1107,6 +1176,17 @@ export class PiBot implements HeartbeatHost {
         },
       },
       providers: this.deps.providers,
+      model: {
+        current: (agentId) => this.deps.agents.getAgent(agentId)?.manifest.model,
+        candidates: (agentId) => {
+          const agent = this.deps.agents.getAgent(agentId);
+          const cascade = this.deps.cascade;
+          if (!agent || !cascade) return [];
+          return cascade.chainFor(agent.manifest).map((spec) => ({ spec, open: cascade.isOpen(spec) }));
+        },
+        switchTo: (agentId, spec) => this.switchModel(agentId, spec),
+        token: (agentId, spec) => this.mintModelToken(agentId, spec),
+      },
     };
   }
 
