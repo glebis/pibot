@@ -22,10 +22,14 @@ import { errorMessage, readJson, truncate, uid, writeJsonAtomic } from "./util.j
 
 // ─── error classification ───────────────────────────────────────────────────
 
-export type ModelErrorClass = "auth" | "rate-limit" | "transient" | "context" | "unknown";
+export type ModelErrorClass = "auth" | "credits" | "rate-limit" | "transient" | "context" | "unknown";
 
 const RX = {
-  auth: /\b(401|403)\b|invalid[ _-]?(api[ _-])?key|unauthor|forbidden|incorrect api key|no auth credentials|credits?|spending limit|billing|quota|exhausted|payment/i,
+  // credit/billing exhaustion: the account (not one model) can't pay for requests.
+  // checked before rate-limit/auth so provider-specific billing wording wins over
+  // generic 429/401 status codes.
+  credits: /\b402\b|payment required|credit balance|insufficient[ _-]?(credits?|balance|quota|funds)|out of credits?|credits?[^.\n]{0,24}exhausted|exceeded your current quota|spending limit|billing/i,
+  auth: /\b(401|403)\b|invalid[ _-]?(api[ _-])?key|unauthor|forbidden|incorrect api key|no auth credentials|quota|exhausted|payment/i,
   rateLimit: /\b429\b|rate[ _-]?limit|too many requests|overloaded|capacity|resource_exhausted|tokens per (minute|day)/i,
   context: /\bcontext\b.{0,40}(window|length|overflow|too (big|long|large|many|much))|too many.{0,20}tokens|maximum .{0,20}(context|tokens)|prompt ?is ?too ?long|context_length_exceeded|request too large/i,
   transient: /\b5\d\d\b|internal server error|bad gateway|service unavailable|gateway timeout|timeout|timed? ?out|econn|enotfound|ehostunreach|enetunreach|etimedout|eai_again|fetch failed|network|socket|dns|connection (error|refused|reset|closed|terminated)|temporaril|temporar/i,
@@ -34,8 +38,10 @@ const RX = {
 /** Classify a model/transport error message into a triage class. */
 export function classifyModelError(message: string): ModelErrorClass {
   const m = message ?? "";
-  // order matters: rate-limit mentions counting tokens; auth messages may mention quota; context is a model mismatch, not an outage
+  // order matters: credit/billing markers are specific and beat bare status codes;
+  // rate-limit mentions counting tokens; auth messages may mention quota; context is a model mismatch, not an outage
   if (RX.context.test(m)) return "context";
+  if (RX.credits.test(m)) return "credits";
   if (RX.rateLimit.test(m)) return "rate-limit";
   if (RX.auth.test(m)) return "auth";
   if (RX.transient.test(m)) return "transient";
@@ -44,12 +50,19 @@ export function classifyModelError(message: string): ModelErrorClass {
 
 /** How long a failing model is skipped after an error of each class. */
 export const COOLDOWN_MS: Record<ModelErrorClass, number> = {
-  auth: 4 * 3600e3, // credits/keys rarely self-heal mid-session
+  auth: 4 * 3600e3, // bad keys rarely self-heal mid-session
+  credits: 60 * 60e3, // exhaustion heals by top-up, not time — the recovery probe catches it early
   "rate-limit": 90e3,
   transient: 45e3,
   context: 30 * 60e3, // compaction usually recovers these; don't hammer meanwhile
   unknown: 10 * 60e3,
 };
+
+/** "provider/model" → "provider" ("" when the spec has no provider prefix). */
+export function specProvider(spec: string): string {
+  const slash = spec.indexOf("/");
+  return slash > 0 ? spec.slice(0, slash).trim().toLowerCase() : "";
+}
 
 // ─── state ──────────────────────────────────────────────────────────────────
 
@@ -77,9 +90,18 @@ export interface DeadLetter {
   automaticReplayBlocked?: boolean;
 }
 
+/** A credits failure proves the account (all models of one provider) can't pay. */
+export interface ProviderCreditHold {
+  until: number;
+  lastError?: string;
+  lastAt?: number;
+}
+
 export interface CascadeState {
   entries: Record<string, CascadeEntry>;
   deadLetters: DeadLetter[];
+  /** provider → credit hold; set when a credits error shows the account itself is exhausted */
+  providerCreditHolds?: Record<string, ProviderCreditHold>;
 }
 
 export interface ModelSpec {
@@ -111,6 +133,7 @@ export class ModelCascade {
     this.state = readJson<CascadeState>(deps.statePath, { entries: {}, deadLetters: [] });
     if (!this.state.entries) this.state.entries = {};
     if (!this.state.deadLetters) this.state.deadLetters = [];
+    if (!this.state.providerCreditHolds) this.state.providerCreditHolds = {};
   }
 
   // ── chain building ────────────────────────────────────────────────────────
@@ -186,6 +209,14 @@ export class ModelCascade {
       failures: (prev?.failures ?? 0) + 1,
       lastSuccessAt: prev?.lastSuccessAt,
     };
+    // credits exhaustion is per account: block every model of this provider,
+    // not just the one that happened to answer the request
+    if (cls === "credits") {
+      const provider = specProvider(spec);
+      if (provider) {
+        this.state.providerCreditHolds![provider] = { until: now + COOLDOWN_MS[cls], lastError: truncate(err, 300), lastAt: now };
+      }
+    }
     this.persist();
     this.deps.log?.(`[cascade] ${spec} failed (${cls}, cooldown ${Math.round(COOLDOWN_MS[cls] / 1e3)}s): ${truncate(err, 140)}`);
     return cls;
@@ -198,7 +229,25 @@ export class ModelCascade {
     e.openUntil = 0;
     e.lastSuccessAt = now;
     this.state.entries[key] = e;
+    const provider = specProvider(spec);
+    if (provider && this.state.providerCreditHolds?.[provider]) {
+      delete this.state.providerCreditHolds[provider]; // a paid request went through — account works again
+    }
     this.persist();
+  }
+
+  /** Active credit hold for a provider, if any. */
+  providerHold(provider: string, now = Date.now()): ProviderCreditHold | undefined {
+    const h = this.state.providerCreditHolds?.[provider];
+    return h && h.until > now ? h : undefined;
+  }
+
+  /** Providers currently blocked for credit exhaustion (sorted). */
+  creditBlockedProviders(now = Date.now()): string[] {
+    return Object.entries(this.state.providerCreditHolds ?? {})
+      .filter(([, h]) => h.until > now)
+      .map(([p]) => p)
+      .sort();
   }
 
   /**
@@ -212,6 +261,9 @@ export class ModelCascade {
       const key = spec.trim().toLowerCase();
       if (key === failedKey) continue;
       if (this.isOpen(spec, now)) continue;
+      // same account, same credits — a credits hold rules out the provider's siblings too
+      const provider = specProvider(spec);
+      if (provider && this.providerHold(provider, now)) continue;
       if (!this.resolveModel(spec)) continue;
       return spec;
     }
@@ -272,7 +324,12 @@ export class ModelCascade {
         n++;
       }
     }
-    if (n) this.persist();
+    let held = false;
+    for (const p of Object.keys(this.state.providerCreditHolds ?? {})) {
+      if (this.providerHold(p, now)) held = true;
+      delete this.state.providerCreditHolds![p];
+    }
+    if (n || held) this.persist();
     return n;
   }
 
@@ -311,8 +368,15 @@ export class ModelCascade {
     const lines: string[] = [];
     for (const spec of chain) {
       const e = this.entry(spec);
-      if (!e) {
+      const hold = this.providerHold(specProvider(spec), now);
+      if (!e && hold) {
+        const mins = Math.ceil((hold.until - now) / 60e3);
+        lines.push(`✕ ${spec} — out of credits (provider hold, retry in ~${mins}m)`);
+      } else if (!e) {
         lines.push(`· ${spec} — untested`);
+      } else if (hold && e.openUntil <= now) {
+        const mins = Math.ceil((hold.until - now) / 60e3);
+        lines.push(`✕ ${spec} — out of credits (provider hold, retry in ~${mins}m)`);
       } else if (e.openUntil > now) {
         const mins = Math.ceil((e.openUntil - now) / 60e3);
         lines.push(`✕ ${spec} — down (${e.lastErrorClass ?? "error"}) retry in ~${mins}m — ${truncate(e.lastError ?? "", 80)}`);

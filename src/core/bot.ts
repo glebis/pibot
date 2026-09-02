@@ -22,7 +22,8 @@ import { SttService, type SttPolicy } from "./stt.js";
 import { applyCorrections, composeBias, loadDictionary } from "./dictionary.js";
 import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
-import { classifyModelError, ModelCascade } from "./cascade.js";
+import { classifyModelError, ModelCascade, specProvider } from "./cascade.js";
+import type { ModelErrorClass } from "./cascade.js";
 import type { ConsolidationEngine } from "./consolidation.js";
 import { devAgentEnabled, DEV_AGENT_ID, scaffoldDevAgent } from "./dev-agent.js";
 import { execFile } from "node:child_process";
@@ -722,6 +723,7 @@ export class PiBot implements HeartbeatHost {
   ): Promise<void> {
     const cascade = this.deps.cascade;
     const attempts: string[] = [];
+    const failures: Array<{ spec: string; cls: ModelErrorClass }> = [];
     if (!cascade) {
       await session.prompt(envelope(text), { streamingBehavior: "followUp" });
       return;
@@ -796,7 +798,7 @@ export class PiBot implements HeartbeatHost {
       landed = thrown === null; // prompt resolved → the user msg is in history; retries use the note
       lastError = err;
       attempts.push(spec || "(auto)");
-      if (spec) cascade.noteFailure(spec, err);
+      if (spec) failures.push({ spec, cls: cascade.noteFailure(spec, err) });
       this.deps.events.log(agentId, "system", `model error on ${spec || "(auto)"} [${classifyModelError(err)}]: ${truncate(err, 160)}`);
 
       const next = cascade.nextCandidate(chain, spec || undefined);
@@ -831,10 +833,36 @@ export class PiBot implements HeartbeatHost {
     }
     const dl = cascade.queueDead({ agentId, transport: t.name, chatId, text, createdAt: Date.now(), attempts, lastError });
     this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — queued ${dl.id} (${cascade.deadLetterCount()} pending)`);
-    await t.notifyError(
-      chatId,
-      `🪫 **${agentId}** couldn't reach any model just now (${attempts.join(" → ")}).\nYour message is saved — I'll process it automatically once a provider recovers. /cascade for details.`
-    );
+    await t.notifyError(chatId, this.cascadeDownNotice(agentId, attempts, failures, cascade));
+  }
+
+  /**
+   * Deterministic user notice for a fully-down cascade — same failures always
+   * produce the same text (pure templates, never model-generated). The class of
+   * the turn's failures picks the variant: credits → top-up instructions,
+   * auth → key/billing, otherwise the generic outage text.
+   */
+  private cascadeDownNotice(
+    agentId: string,
+    attempts: string[],
+    failures: Array<{ spec: string; cls: ModelErrorClass }>,
+    cascade: ModelCascade,
+  ): string {
+    const providersOf = (cls: ModelErrorClass) =>
+      [...new Set(failures.filter((f) => f.cls === cls).map((f) => specProvider(f.spec)))].filter(Boolean);
+    const creditProvs = providersOf("credits");
+    const authProvs = providersOf("auth");
+    if (creditProvs.length || (!failures.length && (cascade.creditBlockedProviders?.() ?? []).length)) {
+      // credits exhaustion is the durable, actionable fact — even when it was only
+      // one of several providers tried this turn; with no attempts this turn the
+      // cascade's own credit holds describe the outage.
+      const provs = (creditProvs.length ? creditProvs : (cascade.creditBlockedProviders?.() ?? [])).join(", ");
+      return `🪫 **${agentId}** ran out of API credits (${provs}).\nYour message is saved — top up at the provider console and it will be processed automatically once credits return. /cascade for details.`;
+    }
+    if (authProvs.length) {
+      return `🔑 **${agentId}** couldn't authenticate with any provider (${authProvs.join(", ")}).\nCheck the API keys / billing for these providers. Your message is saved — I'll retry automatically. /cascade for details.`;
+    }
+    return `🪫 **${agentId}** couldn't reach any model just now (${attempts.join(" → ")}).\nYour message is saved — I'll process it automatically once a provider recovers. /cascade for details.`;
   }
 
   /** Periodic probe (scheduler job): when a model recovers, flush the dead-letter queue. */
@@ -938,6 +966,8 @@ export class PiBot implements HeartbeatHost {
     const chain = cascade.chainFor(agent?.manifest ?? {});
     const lines = [`model cascade for **${agent?.manifest.name ?? "(no agents)"}**:`];
     lines.push(...(chain.length ? cascade.statusLines(chain) : ["(no configured models)"]));
+    const creditProvs = cascade.creditBlockedProviders();
+    if (creditProvs.length) lines.push(`out of credits: ${creditProvs.join(", ")} — top up at the provider console; probes run every 5 min`);
     const queued = cascade.deadLetterCount();
     lines.push(`queued messages: ${queued || "none"}`);
     lines.push("_primary → manifest cascade → PIBOT_MODEL_CASCADE → every authenticated model; breakers auto-expire._");
@@ -1190,8 +1220,10 @@ export class PiBot implements HeartbeatHost {
           return `probe:\n${probe}`;
         },
         clear: () => {
+          const creditHolds = this.deps.cascade?.creditBlockedProviders?.().length ?? 0;
           const n = this.deps.cascade?.clearBreakers() ?? 0;
-          return n ? `Reopened ${n} model(s) — they'll be tried again immediately.` : "No models are marked down.";
+          if (!n && !creditHolds) return "No models are marked down.";
+          return `Reopened ${n} model(s)${creditHolds ? ` and lifted ${creditHolds} provider credit hold(s)` : ""} — they'll be tried again immediately.`;
         },
       },
       providers: this.deps.providers,

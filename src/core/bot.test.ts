@@ -38,6 +38,7 @@ function makeCascadeStub() {
     isOpen: vi.fn(() => false),
     noteFailure: vi.fn(() => "unknown" as const),
     noteSuccess: vi.fn(),
+    creditBlockedProviders: vi.fn(() => [] as string[]),
     queueDead: vi.fn((dl: Record<string, unknown>) => ({ id: "dl_test", ...dl })),
     deadLetterCount: vi.fn(() => 0),
     deadLetters: vi.fn(() => [] as never[]),
@@ -936,6 +937,37 @@ describe("cascade dead-letter loop guards", () => {
     expect(t.cascade.queueDead).toHaveBeenCalledTimes(1);
     expect(t.cascade.queueDead).toHaveBeenCalledWith(expect.objectContaining({ text: "hello there", agentId: "assistant" }));
     expect(t.transport.lastText()).toContain("couldn't reach any model");
+  });
+
+  it("credit exhaustion produces a deterministic top-up notice naming the provider", async () => {
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["anthropic/claude"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("anthropic/claude");
+    (t.cascade.noteFailure as ReturnType<typeof vi.fn>).mockReturnValue("credits");
+    await t.transport.say("hello there");
+    expect(t.cascade.queueDead).toHaveBeenCalledTimes(1);
+    const text = t.transport.lastText();
+    expect(text).toContain("ran out of API credits");
+    expect(text).toContain("top up at the provider console");
+    expect(text).toContain("anthropic");
+    expect(text).not.toContain("couldn't reach any model");
+  });
+
+  it("auth exhaustion produces a distinct deterministic key/billing notice", async () => {
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["anthropic/claude"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("anthropic/claude");
+    (t.cascade.noteFailure as ReturnType<typeof vi.fn>).mockReturnValue("auth");
+    await t.transport.say("hello there");
+    const text = t.transport.lastText();
+    expect(text).toContain("couldn't authenticate with any provider");
+    expect(text).toContain("Check the API keys / billing");
+    expect(text).not.toContain("ran out of API credits");
+  });
+
+  it("credit holds from earlier turns still yield the credits notice when the chain is already down", async () => {
+    (t.cascade.creditBlockedProviders as ReturnType<typeof vi.fn>).mockReturnValue(["anthropic"]);
+    await t.transport.say("hello there");
+    const text = t.transport.lastText();
+    expect(text).toContain("ran out of API credits (anthropic)");
   });
 
   it("never queues host-generated prompts — they re-fire instead of compounding", async () => {
