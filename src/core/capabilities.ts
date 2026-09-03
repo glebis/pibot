@@ -7,6 +7,7 @@ import { attendPlugin, ATTEND_CLI } from "../plugins/attend-plugin.js";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
 import { delegatePlugin, DELEGATE_CLIS } from "../plugins/delegate-plugin.js";
 import { devToolsPlugin } from "../plugins/dev-tools-plugin.js";
+import { execPlugin } from "../plugins/exec-plugin.js";
 import { herdrPlugin } from "../plugins/herdr-plugin.js";
 import { gmailPlugin } from "../plugins/gmail-plugin.js";
 import { knowledgePlugin } from "../plugins/knowledge-plugin.js";
@@ -188,6 +189,11 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     prompt: "delegate_cli runs a selected local coding CLI with its own permissions; give it a self-contained task.",
     available: () => installedDelegateClis().length > 0,
     create: (ctx) => delegatePlugin({ allowed: installedDelegateClis(), cwd: ctx.workspace, agentId: ctx.agent.id }),
+  },
+  {
+    id: "exec", defaultEnabled: false, tools: ["exec_run"],
+    prompt: "exec_run runs commands from this agent's vetted exec allowlist: pass argv (array of strings, command first). NO shell — no pipes, redirections or substitutions; binaries are resolved and pinned, denied arguments (e.g. yt-dlp --exec, osascript -e) are refused, output is truncated and runs are time-capped. Use it for the vetted tooling (yt-dlp, whisperkit-cli, the youtube-transcript skill script, afplay, osascript wrappers); anything else is refused.",
+    create: (ctx) => execPlugin({ workspace: ctx.workspace, agentDir: ctx.agent.dir }),
   },
   {
     id: "herdr", defaultEnabled: false, tools: ["herdr_dispatch", "herdr_read", "herdr_wait"],

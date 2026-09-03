@@ -51,6 +51,7 @@ describe("capability registry", () => {
       ["agent-comms", ["agent_message", "agent_ask", "agent_list", "handoff"]],
       ["knowledge", ["knowledge_share", "knowledge_read"]],
       ["vault-file", ["vault_read", "vault_write"]],
+      ["exec", ["exec_run"]],
       ["attend", ["attend_enqueue", "attend_list", "attend_mark"]],
       ["telegram-responder", ["inbox_pending", "followups_open", "draft_reply"]],
       ["delegate", ["delegate_cli"]],
