@@ -101,6 +101,18 @@ describe("exec plugin allowlist resolution", () => {
     expect(ok.error).toBeUndefined();
   });
 
+  it("tries sibling entries when a constraint fails — two ssh pins coexist", async () => {
+    const plain = path.join(agentDir, "bin/fake-plain");
+    const allowSsh: ExecAllowEntry[] = [
+      { bin: plain, pin: ["pibot-mini"] },
+      { bin: plain, pin: ["pibot-mini-alt"] },
+    ];
+    const ok = await resolveExec([plain, "pibot-mini-alt", "echo", "hi"], { workspace: agentDir, agentDir }, allowSsh);
+    expect(ok.error).toBeUndefined();
+    const refused = await resolveExec([plain, "evil-host"], { workspace: agentDir, agentDir }, allowSsh);
+    expect(refused.error).toMatch(/pinned/);
+  });
+
   it("refuses unknown binaries without throwing", async () => {
     const r = await resolveExec(["definitely-not-a-real-binary-xyz"], { workspace: agentDir, agentDir }, allow);
     expect(r.error).toMatch(/not on this agent's exec allowlist|command not found/);

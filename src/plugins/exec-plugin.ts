@@ -39,6 +39,10 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/youtube-transcript/scripts/extract_transcript.py")] },
   { bin: "afplay" },
   { bin: "osascript", denyArgRe: [/^-e$/, /^-i$/] },
+  // ssh pinned to the fleet-configured mini aliases only (remote commands are the point;
+  // freedom inside the remote command is inherent to ssh and covered by the pin on destination)
+  { bin: "ssh", pin: ["pibot-mini"] },
+  { bin: "ssh", pin: ["pibot-mini-alt"] },
 ];
 
 export interface ExecPluginDeps {
@@ -67,6 +71,7 @@ function looksLikeShell(arg: string): boolean {
 
 export async function resolveExec(argv: string[], deps: ExecPluginDeps, allowlist: ExecAllowEntry[]): Promise<{ argv: string[]; cwd: string; error?: string }> {
   const cwd = path.resolve(deps.workspace);
+  let constraintFailure: string | undefined;
   if (!Array.isArray(argv) || argv.length === 0 || typeof argv[0] !== "string" || argv[0].trim() === "") {
     return { argv: [], cwd, error: "argv must be a non-empty array with the command as the first element" };
   }
@@ -96,7 +101,8 @@ export async function resolveExec(argv: string[], deps: ExecPluginDeps, allowlis
     if (entry.pin && entry.pin.length > 0) {
       const pinned = entry.pin.map(resolveTilde);
       if (entryArgs.length < pinned.length || pinned.some((p, i) => resolveTilde(entryArgs[i]) !== p)) {
-        return { argv: [], cwd, error: `refused: ${entry.bin} is pinned to ${pinned.join(" ")} — other invocations are not allowlisted` };
+        constraintFailure = `refused: ${entry.bin} is pinned to ${pinned.join(" ")} — other invocations are not allowlisted`;
+        continue;
       }
       rest = entryArgs.slice(pinned.length);
     }
@@ -105,12 +111,13 @@ export async function resolveExec(argv: string[], deps: ExecPluginDeps, allowlis
       const first = resolveTilde(rest[0]);
       const probe = fs.existsSync(first) ? fs.realpathSync(first) : path.resolve(first);
       if (probe !== under && !probe.startsWith(under + path.sep)) {
-        return { argv: [], cwd, error: `refused: ${entry.bin} script must live under ${under}` };
+        constraintFailure = `refused: ${entry.bin} script must live under ${under}`;
+        continue;
       }
     }
     return { argv: [resolvedBin, ...entryArgs], cwd };
   }
-  return { argv: [], cwd, error: `refused: "${requested}" is not on this agent's exec allowlist` };
+  return { argv: [], cwd, error: constraintFailure ?? `refused: "${requested}" is not on this agent's exec allowlist` };
 }
 
 export function execPlugin(deps: ExecPluginDeps): InlineExtension {
