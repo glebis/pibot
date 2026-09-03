@@ -237,9 +237,10 @@ describe("PiBot commands", () => {
     }, false)).rejects.toThrow("offline");
   });
 
-  it("replies to unknown commands", async () => {
+  it("stays silent on unknown commands", async () => {
+    const before = t.transport.pushed.length;
     await t.transport.say("/frobnicate");
-    expect(t.transport.lastText()).toContain("Unknown /frobnicate");
+    expect(t.transport.pushed.length).toBe(before); // no reply at all — typo noise stays quiet
   });
 
   it("/evolve status renders staged candidates with accept/reject buttons that act on them", async () => {
