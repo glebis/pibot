@@ -2002,7 +2002,9 @@ export class PiBot implements HeartbeatHost {
   }
 
   private primaryChat(job: Pick<Schedule, "agentId" | "chat">): string | null {
-    if (job.chat && job.chat.transport !== "internal") return `${job.chat.transport}:${job.chat.chatId}`;
+    // "internal" and "agent" are synthetic delivery markers, not transport names —
+    // resolve agent-delivered jobs through the agent's remembered chat instead.
+    if (job.chat && job.chat.transport !== "internal" && job.chat.transport !== "agent") return `${job.chat.transport}:${job.chat.chatId}`;
     const cks = this.agentChats.get(job.agentId);
     return cks && cks.size ? [...cks][0] : null;
   }

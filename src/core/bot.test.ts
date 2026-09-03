@@ -726,6 +726,23 @@ describe("PiBot fire delivery", () => {
     expect(arg).toContain("compose me");
   });
 
+  it("agent delivery with the synthetic 'agent' transport resolves the agent's remembered chat", async () => {
+    const t = makeBot();
+    // agent→chat bindings persist in state.json; simulate a restored binding
+    (t.bot as unknown as { agentChats: Map<string, Set<string>> }).agentChats.set("assistant", new Set(["mock:42"]));
+    await t.bot.deliverFire(
+      {
+        id: "sc3", agentId: "assistant", chat: { transport: "agent", chatId: "42" },
+        title: "wake me to compose", kind: "task", dueAt: Date.now(), wake: "normal",
+        delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    expect(t.promptSpy).toHaveBeenCalledTimes(1);
+    const arg = t.promptSpy.mock.calls[0][0] as string;
+    expect(arg).toContain("wake me to compose");
+  });
+
   it("heartbeat jobs tick the heartbeat engine", async () => {
     const t = makeBot();
     await t.bot.deliverFire(
