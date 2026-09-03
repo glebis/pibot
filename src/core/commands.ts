@@ -515,9 +515,7 @@ export function createCommandHandler(ctx: CommandContext) {
         return;
 
       default:
-        // unknown commands stay silent — typo/autocomplete noise doesn't deserve a reply
-        deps.events.log(agentId ?? "system", "system", `ignored unknown command /${cmd} (${t.name}:${chatId})`);
-        return;
+        await reply(`Unknown /${cmd} — try /help`);
     }
   };
 }
