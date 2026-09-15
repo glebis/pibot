@@ -260,26 +260,26 @@ export function providerRowHtml(p: ProviderStatus, state: LoginState | undefined
   const buttons: string[] = [];
   if (state?.phase !== "active") {
     if (p.canLoginOauth) {
-      buttons.push(`<form method="post" action="/providers/${p.id}/login" class="inline">${csrfInput}<input type="hidden" name="type" value="oauth"><button type="submit" class="btn">🔐 ${esc(p.loginLabel ?? `Sign in to ${esc(p.name)}`)}</button></form>`);
+      buttons.push(`<form method="post" action="/providers/${p.id}/login" class="inline" data-swap="#provider-${p.id}">${csrfInput}<input type="hidden" name="type" value="oauth"><button type="submit" class="btn">🔐 ${esc(p.loginLabel ?? `Sign in to ${esc(p.name)}`)}</button></form>`);
     }
     if (p.canLoginApiKey) {
-      buttons.push(`<form method="post" action="/providers/${p.id}/login" class="inline">${csrfInput}<input type="hidden" name="type" value="api_key"><input type="text" name="value" placeholder="API key" autocomplete="off" style="width:220px"><button type="submit" class="btn ghost">🔑 Set API key</button></form>`);
+      buttons.push(`<form method="post" action="/providers/${p.id}/login" class="inline" data-swap="#provider-${p.id}">${csrfInput}<input type="hidden" name="type" value="api_key"><input type="text" name="value" placeholder="API key" autocomplete="off" style="width:220px"><button type="submit" class="btn ghost">🔑 Set API key</button></form>`);
     }
     if (p.configured) {
-      buttons.push(`<form method="post" action="/providers/${p.id}/logout" class="inline">${csrfInput}<button type="submit" class="danger mini">Disconnect</button></form>`);
+      buttons.push(`<form method="post" action="/providers/${p.id}/logout" class="inline" data-swap="#provider-${p.id}">${csrfInput}<button type="submit" class="danger mini" data-arm>Disconnect</button></form>`);
     }
   }
   const status = p.configured
     ? `🟢 <strong>${esc(p.name)}</strong> ${badges} <span class="muted">${esc(String(p.models))} model${p.models === 1 ? "" : "s"}</span>`
     : `<span class="pill">⚪ ${esc(p.name)}</span> <span class="muted">not configured${p.models ? ` — ${esc(String(p.models))} models once connected` : ""}</span>`;
-  return `<div class="card"><div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">${status}</div>${buttons.length ? `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">${buttons.join("")}</div>` : ""}${flow}</div>`;
+  return `<div class="card" id="provider-${p.id}"><div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">${status}</div>${buttons.length ? `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">${buttons.join("")}</div>` : ""}${flow}</div>`;
 }
 
 function renderFlow(pending: PendingPrompt, providerId: string, csrfInput: string): string {
   const field = pending.type === "select"
     ? `<select name="value">${(pending.options ?? []).map((o) => `<option value="${esc(o.id)}">${esc(o.label)}</option>`).join("")}</select>`
     : `<input type="${pending.type === "secret" ? "password" : "text"}" name="value" placeholder="${esc(pending.placeholder ?? "")}" autocomplete="off" style="width:260px">`;
-  return `<form method="post" action="/providers/${providerId}/answer" style="margin-top:8px">${csrfInput}
+  return `<form method="post" action="/providers/${providerId}/answer" style="margin-top:8px" data-swap="#provider-${providerId}">${csrfInput}
     <label>${esc(pending.message)}</label> ${field}
     <button type="submit" class="btn">Continue</button>
   </form>`;
@@ -297,7 +297,7 @@ export function renderFlowEvents(providerId: string, state: LoginState, csrfInpu
       ? renderFlow(state.prompt, providerId, csrfInput)
       : `<p class="muted">Waiting for provider…</p>`;
     return `${evLines ? `<p>${evLines}</p>` : ""}${promptHtml}
-      <form method="post" action="/providers/${providerId}/cancel" class="inline" style="margin-top:6px">${csrfInput}<button type="submit" class="mini ghost">Cancel</button></form>`;
+      <form method="post" action="/providers/${providerId}/cancel" class="inline" style="margin-top:6px" data-swap="#provider-${providerId}">${csrfInput}<button type="submit" class="mini ghost">Cancel</button></form>`;
   }
   if (state.phase === "done") return `<p class="flash">🟢 ${esc(state.message)}</p>`;
   if (state.phase === "failed") return `<p class="flash warn">⛔ ${esc(state.message)} — <a href="/providers">retry</a></p>`;

@@ -97,6 +97,8 @@ function page(title: string, body: string, flash?: string): string {
   button.mini { padding: 3px 10px; font-size: 12px; margin: 0; }
   .flash { background: #10321c; border: 1px solid #1d5c33; color: #9fe0b5; border-radius: 8px; padding: 10px 14px; margin: 0 0 20px; }
   .flash.warn { background: #332a10; border-color: #5c4d1d; color: #e0cd9f; }
+  .inline-flash { margin: 10px 0 0; }
+  button.armed { background: #b91c1c; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th { text-align: left; color: #8a94a3; font-weight: 500; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid #22262d; }
   td { padding: 8px; border-bottom: 1px solid #1a1e24; vertical-align: top; }
@@ -109,9 +111,184 @@ function page(title: string, body: string, flash?: string): string {
 </style></head><body><main>
 <h1>🤖 pibot config</h1>
 <p class="sub">agents · rhythm · schedules · evolution${flash ? "" : ""}</p>
-${flash ? `<div class="flash">${esc(flash)}</div>` : ""}
+${flash ? `<div class="flash" id="page-flash">${esc(flash)}</div>` : ""}
 ${body}
-</main></body></html>`;
+</main>
+<script>
+(function () {
+  "use strict";
+  var SK = "pibot-scroll", SY = "pibot-scroll-y";
+
+  function baseline(form) {
+    var els = form.querySelectorAll("input, textarea, select");
+    for (var i = 0; i < els.length; i++) {
+      if (els[i].type === "hidden") continue;
+      els[i].dataset.base = els[i].value;
+    }
+    delete form.dataset.dirty;
+  }
+  function recheck(form) {
+    var els = form.querySelectorAll("input, textarea, select");
+    for (var i = 0; i < els.length; i++) {
+      if (els[i].type === "hidden") continue;
+      if (els[i].dataset.base !== undefined && els[i].value !== els[i].dataset.base) { form.dataset.dirty = "1"; return; }
+    }
+    delete form.dataset.dirty;
+  }
+  document.addEventListener("input", function (ev) {
+    var f = ev.target.closest ? ev.target.closest("form") : null;
+    if (f) recheck(f);
+  });
+  window.addEventListener("beforeunload", function (ev) {
+    if (document.querySelector("form[data-dirty]")) { ev.preventDefault(); ev.returnValue = ""; }
+  });
+
+  function makeFlash(cls, text) {
+    var el = document.createElement("div");
+    el.className = "inline-flash " + cls;
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.textContent = text;
+    return el;
+  }
+  function showFlash(afterEl, cls, text) {
+    if (!afterEl || !afterEl.parentElement) return;
+    var sib = afterEl.parentElement.querySelector(".inline-flash");
+    if (sib) sib.remove();
+    afterEl.insertAdjacentElement("afterend", makeFlash(cls, text));
+  }
+  function restoreButton(b) {
+    if (b && b.dataset.label !== undefined) b.textContent = b.dataset.label;
+    if (b) b.disabled = false;
+  }
+  function abs(u) { try { return new URL(u, location.href); } catch (e) { return null; } }
+  function findForm(doc, form) {
+    var u = abs(form.getAttribute("action") || form.action);
+    if (!u) return null;
+    var all = doc.querySelectorAll("form");
+    for (var i = 0; i < all.length; i++) {
+      var fu = abs(all[i].getAttribute("action") || "");
+      if (fu && fu.pathname === u.pathname && fu.search === u.search) return all[i];
+    }
+    return null;
+  }
+  function refreshStagedBanner(doc) {
+    var live = document.getElementById("staged-banner");
+    if (!live) return;
+    var fresh = doc ? doc.getElementById("staged-banner") : null;
+    if (fresh) live.replaceWith(document.importNode(fresh, true));
+    else live.remove();
+  }
+
+  document.addEventListener("submit", function (ev) {
+    var form = ev.target;
+    if (!form || form.nodeName !== "FORM" || (form.getAttribute("method") || "").toLowerCase() !== "post") return;
+    if (ev.defaultPrevented || form.dataset.enhance === "off") return;
+    var u = abs(form.getAttribute("action") || form.action);
+    if (!u || u.origin !== location.origin) return;
+    ev.preventDefault();
+    var submitter = ev.submitter || null;
+    var action = (submitter && submitter.getAttribute("formaction")) || form.getAttribute("action") || form.action;
+    var body = new FormData(form);
+    if (submitter && submitter.name) body.append(submitter.name, submitter.value);
+    var busy = submitter || form.querySelector("button[type=submit]");
+    if (busy && !busy.disabled) { busy.dataset.label = busy.textContent; busy.textContent = "\u2026"; busy.disabled = true; }
+    else { busy = null; }
+    var ctrl = window.AbortController ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 60000) : null;
+    fetch(action, { method: "POST", body: body, credentials: "same-origin", signal: ctrl ? ctrl.signal : undefined })
+      .then(function (res) {
+        return res.text().then(function (t) {
+          return { url: res.url, ok: res.ok, status: res.status, type: res.headers.get("content-type") || "", text: t };
+        });
+      })
+      .then(function (r) { if (timer) clearTimeout(timer); apply(r, form, action, busy); })
+      .catch(function (err) {
+        if (timer) clearTimeout(timer);
+        restoreButton(busy);
+        var msg = err && err.name === "AbortError" ? "timed out — the action may still have gone through; reload to check" : (err && err.message ? err.message : "network error");
+        showFlash(form, "flash warn", "\u26D5 " + msg);
+      });
+  });
+
+  function apply(r, form, action, busy) {
+    var isHtml = (r.type || "").indexOf("text/html") !== -1;
+    if (!isHtml || !r.ok) {
+      restoreButton(busy);
+      showFlash(form, "flash warn", "\u26D5 " + (r.ok ? r.text.slice(0, 200) : "HTTP " + r.status + " \u2014 " + r.text.slice(0, 180)));
+      return;
+    }
+    var doc = new DOMParser().parseFromString(r.text, "text/html");
+    var flashEl = doc.getElementById("page-flash");
+    var flash = flashEl ? { cls: flashEl.className, text: flashEl.textContent.trim() } : null;
+
+    var swapSel = form.dataset.swap;
+    if (swapSel) {
+      var target = document.querySelector(swapSel);
+      var freshSwap = doc.querySelector(swapSel);
+      if (target && freshSwap) {
+        var imp2 = document.importNode(freshSwap, true);
+        target.replaceWith(imp2);
+        if (flash) showFlash(imp2, flash.cls, flash.text); else showFlash(imp2, "flash", "\u2713 applied");
+        refreshStagedBanner(doc);
+        return;
+      }
+      if (target && !freshSwap) {
+        target.insertAdjacentElement("beforebegin", makeFlash(flash ? flash.cls : "flash", flash ? flash.text : "\u2713 applied"));
+        target.remove();
+        refreshStagedBanner(doc);
+        return;
+      }
+    }
+    var fresh = findForm(doc, form);
+    if (fresh) {
+      var imp = document.importNode(fresh, true);
+      form.replaceWith(imp);
+      baseline(imp);
+      if (flash) showFlash(imp, flash.cls, flash.text); else showFlash(imp, "flash", "\u2713 applied");
+      refreshStagedBanner(doc);
+      return;
+    }
+    var dest = abs(r.url || action);
+    if (dest && dest.pathname !== location.pathname) { location.href = r.url; return; }
+    try {
+      sessionStorage.setItem(SK, location.pathname + location.search);
+      sessionStorage.setItem(SY, String(window.scrollY));
+    } catch (e) {}
+    location.replace(r.url);
+  }
+
+  document.addEventListener("click", function (ev) {
+    var b = ev.target.closest ? ev.target.closest("button[data-arm]") : null;
+    if (!b) return;
+    if (b.dataset.armed) { delete b.dataset.armed; return; }
+    ev.preventDefault();
+    b.dataset.armed = "1";
+    b.dataset.label = b.textContent;
+    b.textContent = "Sure?";
+    b.classList.add("armed");
+    setTimeout(function () {
+      if (!b.isConnected || !b.dataset.armed) return;
+      delete b.dataset.armed;
+      b.textContent = b.dataset.label;
+      b.classList.remove("armed");
+    }, 4000);
+  });
+
+  try {
+    if (sessionStorage.getItem(SK) === location.pathname + location.search) {
+      var y = parseInt(sessionStorage.getItem(SY) || "0", 10);
+      if (y) window.scrollTo(0, y);
+      sessionStorage.removeItem(SK);
+      sessionStorage.removeItem(SY);
+    }
+  } catch (e) {}
+
+  var forms = document.querySelectorAll("form");
+  for (var fi = 0; fi < forms.length; fi++) baseline(forms[fi]);
+})();
+</script>
+</body></html>`;
 }
 
 function manifestForm(agent: LoadedAgent, csrf: string): string {
@@ -696,13 +873,13 @@ ${hasToken ? `<div class="card">
         (j: Schedule) => `<tr>
   <td class="mono">${esc(j.id)}</td><td><strong>${j.status === "paused" ? "PAUSED · " : ""}${esc(j.title)}</strong>${j.detail ? `<br><span class="muted">${esc(truncate(j.detail, 120))}</span>` : ""}${j.status === "paused" && j.lastDeliveryError ? `<br><span class="muted">Last error: ${esc(j.lastDeliveryError)}</span>` : ""}</td>
   <td>${esc(fmtWhen(j.dueAt))}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " ⚡" : ""}<br><span class="muted">${esc(j.kind)} · ${esc(j.delivery)}</span></td>
-  <td>${j.status === "paused" ? `<form method="post" action="/schedules/${esc(j.id)}/resume">${csrfField()}<button class="mini" type="submit">Resume</button></form>` : ""}<form method="post" action="/schedules/${esc(j.id)}/cancel">${csrfField()}<button class="danger mini" type="submit">Cancel</button></form></td>
+  <td>${j.status === "paused" ? `<form method="post" action="/schedules/${esc(j.id)}/resume" data-swap="#schedules-card">${csrfField()}<button class="mini" type="submit">Resume</button></form>` : ""}<form method="post" action="/schedules/${esc(j.id)}/cancel" data-swap="#schedules-card">${csrfField()}<button class="danger mini" type="submit" data-arm>Cancel</button></form></td>
 </tr>`
       )
       .join("\n") || `<tr><td colspan="4" class="muted">Nothing pending.</td></tr>`;
 
     const body = `
-${staged.length ? `<div class="flash warn">🧬 Staged for review: ${staged.map((s) => `<strong>${esc(s)}</strong>`).join(", ")}</div>` : ""}
+${staged.length ? `<div class="flash warn" id="staged-banner">🧬 Staged for review: ${staged.map((s) => `<strong>${esc(s)}</strong>`).join(", ")}</div>` : ""}
 <div class="row">
   <div class="card"><span class="pill ${m.heartbeat?.enabled ? "on" : ""}">heartbeat ${esc(m.heartbeat?.interval ?? "off")}</span>
   <span class="pill ${m.evolution?.enabled ? "on" : ""}">evolution ${esc(m.evolution?.interval ?? "off")}</span>
@@ -737,7 +914,7 @@ ${manifestForm(agent, csrfToken)}
     <div style="flex:0"><button type="submit" class="ghost" formaction="/agents/${esc(agent.id)}/wake">☀️ Wake</button></div>
   </div>
 </form>
-<div class="card" style="padding:0">
+<div class="card" style="padding:0" id="schedules-card">
 <table>
   <tr><th>id</th><th>item</th><th>due</th><th></th></tr>
   ${scheduleRows}
@@ -745,20 +922,20 @@ ${manifestForm(agent, csrfToken)}
 </div>
 
 <h2>Skills</h2>
-<div class="card">
+<div class="card" id="skills-card">
   ${skills.length ? skills.map((s) => `<div><strong>${esc(s.name)}</strong> <span class="muted">${esc(s.description)}</span></div>`).join("") : '<span class="muted">No skills yet.</span>'}
-  ${staged.length ? `<div style="margin-top:12px"><strong>Staged:</strong> ${staged.map((s) => `<span class="pill on">${esc(s)}</span> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/promote">${csrfField()}<button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/reject">${csrfField()}<button class="mini danger" type="submit">reject</button></form>`).join(" · ")}</div>` : ""}
+  ${staged.length ? `<div style="margin-top:12px"><strong>Staged:</strong> ${staged.map((s) => `<span class="pill on">${esc(s)}</span> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/promote" data-swap="#skills-card">${csrfField()}<button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/reject" data-swap="#skills-card">${csrfField()}<button class="mini danger" type="submit">reject</button></form>`).join(" · ")}</div>` : ""}
 </div>
 
 <h2>Telegram sub-bot <span class="muted">(its own @identity)</span></h2>
-<div class="card">
+<div class="card" id="subbot-card">
   ${deps.telegram?.subBotFor(agent.id)?.username
     ? `<span class="pill on">🟢 @${esc(deps.telegram.subBotFor(agent.id)!.username)}</span>
-       <form method="post" action="/agents/${esc(agent.id)}/subbot/detach" class="inline">${csrfField()}<button class="danger mini" type="submit">Detach</button></form>`
+       <form method="post" action="/agents/${esc(agent.id)}/subbot/detach" class="inline" data-swap="#subbot-card">${csrfField()}<button class="danger mini" type="submit" data-arm>Detach</button></form>`
     : `<span class="pill">⚪ shared bot only</span>`}
   ${deps.telegram?.managerMode()
     ? `<p class="muted">Manager mode is ON — tap the button below in Telegram, or use the link here.</p>
-       <form method="post" action="/agents/${esc(agent.id)}/subbot/request" class="inline">
+       <form method="post" action="/agents/${esc(agent.id)}/subbot/request" class="inline" data-swap="#subbot-card">
          ${csrfField()}
          <button class="ghost" type="submit">Send creation link to my chats →</button>
        </form>
@@ -974,7 +1151,7 @@ ${manifestForm(agent, csrfToken)}
   <button type="submit">${enabled ? "Test & reconnect" : "Test & connect"}</button>
 </form>
 ${enabled
-  ? `<form method="post" action="/telegram/disable">${csrfField()}<button type="submit" class="danger">Disconnect bot</button></form>`
+  ? `<form method="post" action="/telegram/disable" id="tg-disable" data-swap="#tg-disable">${csrfField()}<button type="submit" class="danger" data-arm>Disconnect bot</button></form>`
   : ""}`;
     return c.html(page("telegram", body, c.req.query("msg")));
   });
