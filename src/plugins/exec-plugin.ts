@@ -37,6 +37,7 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
   { bin: "yt-dlp", denyArgRe: [/^--exec/, /^--postprocessor-args/, /^--ppa/] },
   { bin: "whisperkit-cli" },
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/youtube-transcript/scripts/extract_transcript.py")] },
+  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/fathom/scripts/fetch.py")] },
   { bin: "afplay" },
   { bin: "osascript", denyArgRe: [/^-e$/, /^-i$/] },
   // ssh pinned to the fleet-configured mini aliases only (remote commands are the point;
