@@ -212,6 +212,91 @@ describe("Telegram speech delivery", () => {
   });
 });
 
+describe("rich message auto-routing (Bot API 10.1+)", () => {
+  function richTransport(): { t: TelegramTransport; calls: string[]; richPayloads: Array<{ markdown: string }> } {
+    const t = new TelegramTransport("123:test", ["42"]);
+    const calls: string[] = [];
+    const richPayloads: Array<{ markdown: string }> = [];
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendRichMessage: async (_cid: string, payload: { markdown: string }) => {
+          calls.push("sendRichMessage");
+          richPayloads.push(payload);
+          return { message_id: 5 };
+        },
+        sendMessage: async () => {
+          calls.push("sendMessage");
+          return { message_id: 6 };
+        },
+      },
+    };
+    return { t, calls, richPayloads };
+  }
+
+  it("headings route through sendRichMessage with the raw markdown", async () => {
+    const { t, calls, richPayloads } = richTransport();
+    await t.push("42", { text: "## Status\n\nAll green." });
+    expect(calls).toEqual(["sendRichMessage"]);
+    expect(richPayloads[0]?.markdown).toContain("## Status");
+  });
+
+  it("table blocks route through sendRichMessage", async () => {
+    const { t, calls } = richTransport();
+    await t.push("42", { text: "agents:\n\n| agent | bot |\n| --- | --- |\n| knower | @pimother_knower_bot |" });
+    expect(calls).toEqual(["sendRichMessage"]);
+  });
+
+  it("plain content stays on the classic entity path", async () => {
+    const { t, calls } = richTransport();
+    await t.push("42", { text: "Label: value\nAnother line — no tables here." });
+    expect(calls).toEqual(["sendMessage"]);
+  });
+
+  it("card pushes stay classic even when the text looks rich", async () => {
+    const { t, calls } = richTransport();
+    await t.push("42", { text: "## pick one", card: { text: "", buttons: [{ label: "go", action: "agt:x" }] } });
+    expect(calls).toEqual(["sendMessage"]);
+  });
+
+  it("404 from a legacy server falls back to classic entities", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    const calls: string[] = [];
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendRichMessage: async () => {
+          calls.push("sendRichMessage");
+          throw Object.assign(new Error("Not Found"), { error_code: 404 });
+        },
+        sendMessage: async () => {
+          calls.push("sendMessage");
+          return { message_id: 7 };
+        },
+      },
+    };
+    await t.push("42", { text: "## Status\n\nAll green." });
+    expect(calls).toEqual(["sendRichMessage", "sendMessage"]); // no double-send, no throw
+  });
+
+  it("unexpected sendRichMessage errors surface instead of falling back", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    const calls: string[] = [];
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendRichMessage: async () => {
+          calls.push("sendRichMessage");
+          throw Object.assign(new Error("Bad Request: chat not found"), { error_code: 400 });
+        },
+        sendMessage: async () => {
+          calls.push("sendMessage");
+          return { message_id: 9 };
+        },
+      },
+    };
+    await expect(t.push("42", { text: "## Status" })).rejects.toThrow(/chat not found/);
+    expect(calls).toEqual(["sendRichMessage"]); // 400s are real failures — never silently re-sent
+  });
+});
+
 describe("quick-action keyboard", () => {
   it("attaches once on the first plain push of a main-bot chat and is NOT persistent", async () => {
     const t = new TelegramTransport("123:test", ["42"]); // no boundAgentId = main bot

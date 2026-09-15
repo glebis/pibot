@@ -77,6 +77,23 @@ const BOT_COMMANDS = [
   { command: "promises", description: "Open promises" },
 ];
 
+/** Rich-message detection: constructs the classic HTML entities cannot render (tables, ATX headings). */
+export function isRichTelegramContent(text: string): boolean {
+  if (/^#{1,6} \S/m.test(text)) return true;
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length - 1; i++) {
+    // table-ish: two consecutive lines with two or more pipe characters each
+    if ((lines[i].match(/\|/g) ?? []).length >= 2 && (lines[i + 1].match(/\|/g) ?? []).length >= 2) return true;
+  }
+  return false;
+}
+
+/** Legacy/self-hosted Bot API servers (< 10.1) reject the method with HTTP 404 — everything else must surface. */
+function isRichUnsupported(e: unknown): boolean {
+  const err = e as { error_code?: number; message?: string };
+  return err?.error_code === 404 || /method not found|method is not available/i.test(String(err?.message ?? ""));
+}
+
 function toTelegramHtml(text: string): string {
   // Minimal, safe markdown→HTML: **bold**, *italic*, `code`. Everything else escaped.
   const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -682,7 +699,20 @@ export class TelegramTransport implements Transport {
       // first plain message in a chat attaches the persistent quick-action keyboard —
       // only the main bot; subbot chats keep their own clean slate
       let sentId: number | undefined;
-      if (!this.keyboardSent.has(chatId) && !opts.card && !this.boundAgentId && process.env.PIBOT_QUICK_KEYBOARD !== "0") {
+      // rich content (tables, headings) routes through sendRichMessage (Bot API 10.1+);
+      // legacy/self-hosted servers that 404 the method fall back to classic entities
+      if (!opts.card && isRichTelegramContent(text)) {
+        try {
+          sentId = messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendRichMessage(chatId, { markdown: text })));
+        } catch (e) {
+          if (!isRichUnsupported(e)) throw e;
+          const sent = await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
+            parse_mode: "HTML",
+            reply_markup: keyboard(opts.card),
+          }));
+          sentId = messageIdOf(sent);
+        }
+      } else if (!this.keyboardSent.has(chatId) && !opts.card && !this.boundAgentId && process.env.PIBOT_QUICK_KEYBOARD !== "0") {
         const sent = await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
           parse_mode: "HTML",
           reply_markup: TelegramTransport.QUICK_KEYBOARD,
