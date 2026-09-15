@@ -135,6 +135,8 @@ export interface HeartbeatConfig {
   /** "same" | model id like "anthropic/claude-haiku-4-5" */
   model?: string;
   quietHours?: { from: string; to: string };
+  /** Opt in to the daily morning brief when this agent is not the default agent (default: false — one bot briefs) */
+  morningBrief?: boolean;
   /** Adaptive wakeups: shortest gap the agent may request for its next beat (default "5m") */
   minInterval?: string;
   /** Longest gap the agent may stretch its next beat to (default "12h") */

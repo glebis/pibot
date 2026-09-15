@@ -1485,9 +1485,17 @@ export class PiBot implements HeartbeatHost {
 
   private pendingAttend = new Map<string, string>(); // chatKey → attend item id
 
+  private pruneBriefJob(agentId: string): void {
+    if (this.deps.scheduler.get(`brief:${agentId}`)) this.deps.scheduler.cancel(`brief:${agentId}`);
+  }
+
   private ensureMorningBriefJob(agent: LoadedAgent): void {
     const hb = agent.manifest.heartbeat;
-    if (!hb?.enabled) return;
+    // one morning voice: only the default agent briefs, unless an agent explicitly opts in.
+    // non-qualifying agents get their persisted brief job pruned (pre-gate state must not keep firing).
+    const defaultAgent = this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId();
+    if (!hb?.enabled) { this.pruneBriefJob(agent.id); return; }
+    if (agent.id !== defaultAgent && hb.morningBrief !== true) { this.pruneBriefJob(agent.id); return; }
     const at = hb.quietHours?.to ?? "08:00";
     this.deps.scheduler.ensure({
       id: `brief:${agent.id}`,

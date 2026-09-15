@@ -128,6 +128,7 @@ function makeWiringBot(dir: string, transport: FakeTelegramTransport) {
     ensure: vi.fn(),
     create: vi.fn((job: Record<string, unknown>) => ({ id: "sc_x", ...job })),
     list: vi.fn(() => []),
+    get: vi.fn(() => undefined),
     snoozeState: vi.fn(() => null),
     cancel: vi.fn(),
   } as unknown as Scheduler;

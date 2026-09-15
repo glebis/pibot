@@ -1285,6 +1285,54 @@ describe("voice transcript echo", () => {
   });
 });
 
+describe("morning brief scheduling — one bot only", () => {
+  function runBriefEnsure(t: ReturnType<typeof makeBot>, agents: unknown[]): void {
+    const b = t.bot as unknown as { ensureMorningBriefJob(a: unknown): void };
+    for (const a of agents) b.ensureMorningBriefJob(a);
+  }
+
+  it("schedules the brief only for the default agent and prunes stale brief jobs of others", () => {
+    const t = makeBot();
+    const agents = [
+      { id: "assistant", dir: "/x", manifest: { name: "assistant", heartbeat: { enabled: true, interval: "45m" } } },
+      { id: "coach", dir: "/y", manifest: { name: "coach", heartbeat: { enabled: true, interval: "30m" } } },
+    ];
+    (t.agents.list as ReturnType<typeof vi.fn>).mockReturnValue(agents);
+    (t.scheduler.get as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "brief:coach" ? { id, kind: "morning-brief" } : undefined);
+    runBriefEnsure(t, agents);
+    const ensured = ((t.scheduler.ensure as ReturnType<typeof vi.fn>).mock.calls as Array<Array<unknown>>).map((c) => (c[0] as { id: string }).id);
+    expect(ensured).toContain("brief:assistant");
+    expect(ensured).not.toContain("brief:coach");
+    expect(t.scheduler.cancel).toHaveBeenCalledWith("brief:coach");
+  });
+
+  it("a non-default agent can opt in via manifest.heartbeat.morningBrief", () => {
+    const t = makeBot();
+    const agents = [
+      { id: "assistant", dir: "/x", manifest: { name: "assistant", heartbeat: { enabled: true, interval: "45m" } } },
+      { id: "coach", dir: "/y", manifest: { name: "coach", heartbeat: { enabled: true, interval: "30m", morningBrief: true } } },
+    ];
+    (t.agents.list as ReturnType<typeof vi.fn>).mockReturnValue(agents);
+    runBriefEnsure(t, agents);
+    const ensured = ((t.scheduler.ensure as ReturnType<typeof vi.fn>).mock.calls as Array<Array<unknown>>).map((c) => (c[0] as { id: string }).id);
+    expect(ensured).toContain("brief:coach");
+    expect(t.scheduler.cancel).not.toHaveBeenCalled();
+  });
+
+  it("prunes stale brief jobs even when the agent's heartbeat is disabled", () => {
+    const t = makeBot();
+    const agents = [
+      { id: "coach", dir: "/y", manifest: { name: "coach", heartbeat: { enabled: false, interval: "30m" } } },
+    ];
+    (t.agents.list as ReturnType<typeof vi.fn>).mockReturnValue(agents);
+    (t.scheduler.get as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "brief:coach" ? { id, kind: "morning-brief" } : undefined);
+    runBriefEnsure(t, agents);
+    expect(t.scheduler.cancel).toHaveBeenCalledWith("brief:coach");
+  });
+});
+
 describe("schedule failure notices", () => {
   it("excludes the failing chat from the notice target — no phantom-session recreation loop", async () => {
     const { bot, transport } = makeBot();
