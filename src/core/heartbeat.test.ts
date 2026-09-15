@@ -43,7 +43,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   };
 });
 
-import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine } from "./heartbeat.js";
+import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine, recordMaintenanceNote, verifyMemoryClaim } from "./heartbeat.js";
 import { appendBacklogItems, loadBacklogItems } from "./backlog.js";
 import type { LoadedAgent } from "./agent-manager.js";
 import type { HeartbeatHost } from "./heartbeat.js";
@@ -492,6 +492,61 @@ describe("HeartbeatEngine backoff", () => {
       } finally {
         fs.rmSync(empty, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe("ghost-write verification", () => {
+    let dir: string;
+    beforeEach(() => {
+      dir = tmpAgentDir();
+    });
+    afterEach(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("verifyMemoryClaim: fresh mtime verifies; stale or missing file flags a ghost write", () => {
+      const mem = path.join(dir, "memory");
+      // claim with no file behind it — the Aug 30 signature
+      expect(verifyMemoryClaim(dir, "memory: seeded MEMORY.md (was missing)")?.verified).toBe(false);
+      fs.mkdirSync(mem, { recursive: true });
+      fs.writeFileSync(path.join(mem, "MEMORY.md"), "x");
+      expect(verifyMemoryClaim(dir, "memory: refreshed MEMORY.md (was stale)")?.verified).toBe(true);
+      const old = new Date(Date.now() - 14 * 86_400e3);
+      fs.utimesSync(path.join(mem, "MEMORY.md"), old, old);
+      const ghost = verifyMemoryClaim(dir, "memory: refreshed MEMORY.md (was 14d stale)");
+      expect(ghost?.verified).toBe(false);
+      expect(ghost?.detail).toMatch(/ghost write/);
+    });
+
+    it("verifyMemoryClaim: ignores notes without a MEMORY.md write claim", () => {
+      expect(verifyMemoryClaim(dir, "memory: consolidated calendar lessons")).toBeNull();
+      expect(verifyMemoryClaim(dir, "memory: MEMORY.md reads nicely today")).toBeNull();
+    });
+
+    it("recordMaintenanceNote appends a verification entry for ghost claims", () => {
+      fs.mkdirSync(path.join(dir, "memory"), { recursive: true });
+      recordMaintenanceNote(dir, "memory: seeded MEMORY.md (was missing)");
+      const lines = fs.readFileSync(path.join(dir, "memory", "maintenance.jsonl"), "utf8").trim().split("\n");
+      expect(lines).toHaveLength(2);
+      const v = JSON.parse(lines[1]) as { type: string; verified: boolean };
+      expect(v.type).toBe("verify");
+      expect(v.verified).toBe(false);
+    });
+
+    it("panel surfaces an unverified claim in the last-maintenance line", () => {
+      fs.mkdirSync(path.join(dir, "memory"), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "memory", "maintenance.jsonl"),
+        JSON.stringify({ ts: new Date().toISOString(), type: "verify", claim: "memory: refreshed MEMORY.md (was 14d stale)", verified: false, detail: "ghost" }) + "\n",
+      );
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toContain("UNVERIFIED");
+      expect(panel).toContain("refreshed MEMORY.md");
+    });
+
+    it("panel memory line carries the memory_save hint", () => {
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toContain("memory_save does NOT refresh this line");
     });
   });
 });

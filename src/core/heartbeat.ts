@@ -102,10 +102,49 @@ function fileAge(p: string, now: number): string | null {
 export function recordMaintenanceNote(agentDir: string, note: string): void {
   try {
     ensureDir(path.join(agentDir, "memory"));
-    const entry = JSON.stringify({ ts: new Date().toISOString(), note: truncate(note.trim(), 300) });
-    fs.appendFileSync(path.join(agentDir, MAINTENANCE_JOURNAL), entry + "\n");
+    const now = Date.now();
+    const entry = JSON.stringify({ ts: new Date(now).toISOString(), note: truncate(note.trim(), 300) });
+    const verification = verifyMemoryClaim(agentDir, note, now);
+    const lines = verification ? `${entry}\n${JSON.stringify(verification)}\n` : `${entry}\n`;
+    fs.appendFileSync(path.join(agentDir, MAINTENANCE_JOURNAL), lines);
   } catch {
     /* best effort — maintenance must never break a tick */
+  }
+}
+
+/** A maintenance note that claims a MEMORY.md write ("seeded", "refreshed"…). */
+const MEMORY_CLAIM_RE = /\bMEMORY\.md\b/i;
+const CLAIM_VERB_RE = /\b(seed(ed)?|refresh(ed)?|updat(ed)?|writ(ten|es)?|wrot(e)?|rewrot(e|e)|rebuilt?|restore(d)?|recreated?)\b/i;
+/** Same-turn writes may precede the claim by minutes in a long heartbeat turn. */
+const CLAIM_GRACE_MS = 10 * 60e3;
+
+export interface MaintenanceVerification {
+  ts: string;
+  type: "verify";
+  claim: string;
+  verified: boolean;
+  detail: string;
+}
+
+/**
+ * Ghost-write guard: when a maintenance note claims MEMORY.md was just written,
+ * check the filesystem agrees. The Aug 30 "seed" and Sep 14 "post-Berlin
+ * refresh" incidents both journaled claims with no write tool call behind them —
+ * a journal entry alone is not evidence. Verified = MEMORY.md's mtime is younger
+ * than CLAIM_GRACE_MS. Returns null for notes that make no MEMORY.md claim.
+ */
+export function verifyMemoryClaim(agentDir: string, note: string, now = Date.now()): MaintenanceVerification | null {
+  const trimmed = note.trim();
+  if (!MEMORY_CLAIM_RE.test(trimmed) || !CLAIM_VERB_RE.test(trimmed)) return null;
+  const base = { ts: new Date(now).toISOString(), type: "verify" as const, claim: truncate(trimmed, 160) };
+  try {
+    const mtimeMs = fs.statSync(path.join(agentDir, "memory", "MEMORY.md")).mtimeMs;
+    if (now - mtimeMs <= CLAIM_GRACE_MS) {
+      return { ...base, verified: true, detail: `MEMORY.md mtime ${ageAgo(mtimeMs, now)}` };
+    }
+    return { ...base, verified: false, detail: `MEMORY.md untouched (${ageAgo(mtimeMs, now)}) — ghost write?` };
+  } catch {
+    return { ...base, verified: false, detail: "MEMORY.md missing — ghost write?" };
   }
 }
 
@@ -135,7 +174,7 @@ export function buildMaintenancePanel(agentDir: string, now = Date.now()): strin
 
   const lines = [
     "# Maintenance (service AT MOST ONE stale item per tick — rotate, never everything at once)",
-    `- memory (memory/MEMORY.md): ${memoryAge ? `updated ${memoryAge}` : "(missing)"} — the durable memory your digest carries`,
+    `- memory (memory/MEMORY.md): ${memoryAge ? `updated ${memoryAge}` : "(missing)"} — durable memory your digest carries; memory_save does NOT refresh this line (write with file tools)`,
     `- persona (AGENTS.md): ${personaAge ? `updated ${personaAge}` : "(missing)"} — one paragraph on how you changed lately keeps it alive`,
     `- notes (memory/notes): ${notes} — durable facts, decisions, preferences`,
   ];
@@ -146,9 +185,10 @@ export function buildMaintenancePanel(agentDir: string, now = Date.now()): strin
     let age = journalAge;
     try {
       const lines = fs.readFileSync(path.join(agentDir, MAINTENANCE_JOURNAL), "utf8").trim().split("\n").filter(Boolean);
-      const entry = JSON.parse(lines[lines.length - 1]) as { ts?: string; note?: string };
+      const entry = JSON.parse(lines[lines.length - 1]) as { ts?: string; note?: string; type?: string; claim?: string; verified?: boolean };
       if (entry.ts) age = ageAgo(Date.parse(entry.ts), now);
-      if (entry.note) last = ` — "${truncate(entry.note, 80)}"`;
+      const lastText = entry.type === "verify" ? `${entry.verified ? "verified" : "UNVERIFIED"}: ${entry.claim ?? ""}` : entry.note ?? "";
+      if (lastText) last = ` — "${truncate(lastText, 80)}"`;
     } catch {
       /* unreadable journal — show file age only */
     }
