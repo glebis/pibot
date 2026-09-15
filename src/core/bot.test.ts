@@ -712,6 +712,8 @@ describe("PiBot fire delivery", () => {
 
   it("agent delivery prompts the agent instead", async () => {
     const t = makeBot();
+    await t.transport.say("remember this chat"); // bind mock:42 → assistant (delivery needs an owned chat)
+    t.promptSpy.mockClear();
     await t.bot.deliverFire(
       {
         id: "sc2", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
@@ -728,8 +730,9 @@ describe("PiBot fire delivery", () => {
 
   it("agent delivery with the synthetic 'agent' transport resolves the agent's remembered chat", async () => {
     const t = makeBot();
-    // agent→chat bindings persist in state.json; simulate a restored binding
+    // agent→chat bindings persist in state.json; simulate a restored binding (both maps)
     (t.bot as unknown as { agentChats: Map<string, Set<string>> }).agentChats.set("assistant", new Set(["mock:42"]));
+    (t.bot as unknown as { chatAgent: Map<string, string> }).chatAgent.set("mock:42", "assistant");
     await t.bot.deliverFire(
       {
         id: "sc3", agentId: "assistant", chat: { transport: "agent", chatId: "42" },
@@ -789,9 +792,11 @@ describe("PiBot fire delivery", () => {
         ? { id: "creator", dir: "/tmp/fake-creator", manifest: { name: "creator", heartbeat: { enabled: true, interval: "20m" } } }
         : { id: "assistant", dir: "/tmp/fake-assistant", manifest: { name: "assistant" } }
     );
-    // creator historically spoke in the main chat…
-    await t.transport.say("/agent creator");
-    await t.transport.say("/agent assistant"); // …main chat is pibot-dev's again
+    // creator carries a stale memory of the main chat (rebind cleanup normally
+    // prunes these — this simulates the historical state the guard defends against)
+    const b = t.bot as unknown as { agentChats: Map<string, Set<string>>; chatAgent: Map<string, string> };
+    b.agentChats.set("creator", new Set(["mock:42"]));
+    b.chatAgent.set("mock:42", "assistant"); // main chat owned by assistant now
     t.transport.pushed.length = 0;
 
     await t.bot.deliverToAgent("creator", "Opinions loaded, red pen ready.");
@@ -1282,6 +1287,60 @@ describe("voice transcript echo", () => {
     } finally {
       delete process.env.PIBOT_VOICE_ECHO;
     }
+  });
+});
+
+describe("chat routing ownership", () => {
+  type RoutingBot = {
+    agentChats: Map<string, Set<string>>;
+    chatAgent: Map<string, string>;
+    transports: Map<string, Transport>;
+    primaryChat(job: { agentId: string; chat?: { transport: string; chatId: string } }): string | null;
+    rememberChat(agentId: string, ck: string): void;
+    reconcileChatMemories(): void;
+  };
+  const bot = (t: ReturnType<typeof makeBot>) => t.bot as unknown as RoutingBot;
+
+  it("primaryChat routes internal jobs to a chat the agent owns, never a rebound memory", () => {
+    const t = makeBot();
+    const b = bot(t);
+    b.transports.set("telegram", { name: "telegram" } as unknown as Transport);
+    b.transports.set("telegram:coach", { name: "telegram:coach", boundAgentId: "coach" } as unknown as Transport);
+    b.chatAgent.set("telegram:161427550", "assistant"); // main chat rebound to assistant
+    b.agentChats.set("coach", new Set(["telegram:161427550", "telegram:coach:161427550"]));
+    expect(b.primaryChat({ agentId: "coach", chat: { transport: "internal", chatId: "brief" } })).toBe("telegram:coach:161427550");
+    // captured concrete chat the agent no longer owns → falls back to the owned one
+    expect(b.primaryChat({ agentId: "coach", chat: { transport: "telegram", chatId: "161427550" } })).toBe("telegram:coach:161427550");
+    // still-owned captured chat → honored
+    expect(b.primaryChat({ agentId: "coach", chat: { transport: "telegram:coach", chatId: "161427550" } })).toBe("telegram:coach:161427550");
+    // nothing owned at all → null (caller suppresses instead of misdelivering)
+    b.agentChats.delete("coach");
+    expect(b.primaryChat({ agentId: "coach", chat: { transport: "internal", chatId: "brief" } })).toBeNull();
+  });
+
+  it("rebinding a chat drops it from the previous owner's memory", () => {
+    const t = makeBot();
+    const b = bot(t);
+    b.chatAgent.set("telegram:161427550", "assistant");
+    b.agentChats.set("assistant", new Set(["telegram:161427550"]));
+    b.rememberChat("knower", "telegram:161427550");
+    expect(b.chatAgent.get("telegram:161427550")).toBe("knower");
+    expect(b.agentChats.get("assistant")?.has("telegram:161427550")).toBe(false);
+    expect(b.agentChats.get("knower")?.has("telegram:161427550")).toBe(true);
+  });
+
+  it("boot reconcile prunes stale memories and keeps owned ones", () => {
+    const t = makeBot();
+    const b = bot(t);
+    b.transports.set("telegram:creator", { name: "telegram:creator", boundAgentId: "creator" } as unknown as Transport);
+    b.chatAgent.set("telegram:161427550", "knower");
+    b.agentChats.set("focuscoach", new Set(["telegram:161427550"]));
+    b.agentChats.set("creator", new Set(["telegram:creator:161427550"]));
+    b.agentChats.set("knower", new Set(["telegram:161427550"]));
+    b.reconcileChatMemories();
+    expect(b.agentChats.get("focuscoach")).toBeUndefined();
+    expect(b.agentChats.get("creator")?.has("telegram:creator:161427550")).toBe(true);
+    expect(b.agentChats.get("knower")?.has("telegram:161427550")).toBe(true);
   });
 });
 

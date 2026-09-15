@@ -230,6 +230,7 @@ export class PiBot implements HeartbeatHost {
     const state = readJson<PersistedBotState>(this.statePath, {});
     for (const [ck, agentId] of Object.entries(state.chats ?? {})) this.chatAgent.set(ck, agentId);
     for (const [agentId, cks] of Object.entries(state.agentChats ?? {})) this.agentChats.set(agentId, new Set(cks));
+    this.reconcileChatMemories();
 
     // restore pending sub-bot creation requests (TTL-pruned) so a token
     // re-issue in @BotFather completes the wiring after a restart
@@ -470,6 +471,15 @@ export class PiBot implements HeartbeatHost {
   }
 
   private rememberChat(agentId: string, ck: string): void {
+    // a chat belongs to one interactive agent at a time — drop it from the previous
+    // owner's memory so stale remembered chats can't become delivery targets
+    const previous = this.chatAgent.get(ck);
+    if (previous && previous !== agentId) {
+      const idx = ck.lastIndexOf(":");
+      if (this.transports.get(ck.slice(0, idx))?.boundAgentId !== previous) {
+        this.agentChats.get(previous)?.delete(ck);
+      }
+    }
     this.chatAgent.set(ck, agentId);
     if (!this.agentChats.has(agentId)) this.agentChats.set(agentId, new Set());
     this.agentChats.get(agentId)!.add(ck);
@@ -1636,6 +1646,21 @@ export class PiBot implements HeartbeatHost {
   }
 
   /** Cheap periodic probe: retries downed providers + replays queued messages */
+  /** Boot-time consistency: drop remembered chats an agent neither owns interactively
+   *  nor via a dedicated transport — leftovers of rebinds that primaryChat/deliverFire
+   *  could otherwise target as delivery destinations. */
+  private reconcileChatMemories(): void {
+    for (const [agentId, cks] of [...this.agentChats]) {
+      for (const ck of [...cks]) {
+        if (!this.agentOwnsChat(agentId, ck)) {
+          cks.delete(ck);
+          this.deps.events.log(agentId, "system", `pruned stale chat memory ${ck} (no longer owned by this agent)`);
+        }
+      }
+      if (!cks.size) this.agentChats.delete(agentId);
+    }
+  }
+
   private ensureCascadeProbeJob(): void {
     if (!this.deps.cascade) return;
     this.deps.scheduler.ensure({
@@ -1997,6 +2022,12 @@ export class PiBot implements HeartbeatHost {
     await this.promptAgent(t, ck.slice(idx + 1), agentId, `[heartbeat] ${instruction}`);
   }
 
+  /** Does this agent own the chat: dedicated identity or current interactive binding? */
+  private agentOwnsChat(agentId: string, ck: string): boolean {
+    const idx = ck.lastIndexOf(":");
+    return this.transports.get(ck.slice(0, idx))?.boundAgentId === agentId || this.chatAgent.get(ck) === agentId;
+  }
+
   /** The agent's home chat: a bound subbot chat, else a chat where it is the currently bound agent. */
   private agentOwnedChat(agentId: string): string | null {
     for (const ck of this.agentChats.get(agentId) ?? []) {
@@ -2011,10 +2042,13 @@ export class PiBot implements HeartbeatHost {
 
   private primaryChat(job: Pick<Schedule, "agentId" | "chat">): string | null {
     // "internal" and "agent" are synthetic delivery markers, not transport names —
-    // resolve agent-delivered jobs through the agent's remembered chat instead.
-    if (job.chat && job.chat.transport !== "internal" && job.chat.transport !== "agent") return `${job.chat.transport}:${job.chat.chatId}`;
-    const cks = this.agentChats.get(job.agentId);
-    return cks && cks.size ? [...cks][0] : null;
+    // resolve agent-delivered jobs through a chat the agent still OWNS: never the
+    // arbitrary first memory (that chat may have rebound to another agent since).
+    if (job.chat && job.chat.transport !== "internal" && job.chat.transport !== "agent") {
+      const ck = `${job.chat.transport}:${job.chat.chatId}`;
+      if (this.agentOwnsChat(job.agentId, ck)) return ck; // captured chat stays valid only while owned
+    }
+    return this.agentOwnedChat(job.agentId);
   }
 }
 
