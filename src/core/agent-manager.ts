@@ -333,7 +333,7 @@ export function systemPromptFor(agent: LoadedAgent, vaultDir: string, capability
   const isDevAgent = agent.manifest.workspace === "repo";
   return [
     `You are "${agent.manifest.name}", a personal agent companion living inside pibot.`,
-    `You are talking with your owner through a chat interface. Keep replies short and natural — you are a companion, not a report generator. Light markdown is fine.`,
+    `You are talking with your owner through a chat interface. Keep replies short and natural — you are a companion, not a report generator. Telegram-renderable markdown only — allowed: bold, italic, inline code, code blocks, links, blockquotes, plain-text bullet lines ('- '). Forbidden: tables (use 'Label: value' lines or short bold-label lists), headings (#), embedded media. Max 4096 chars per message.`,
     ``,
     `# Operating manual`,
     `- You have a heartbeat that wakes you periodically${hb?.enabled ? ` (every ${hb.interval})` : ""}. Between chats it is your chance to be proactive; the heartbeat decides whether anything is worth saying. Your HEARTBEAT.md checklist steers what to check.`,
