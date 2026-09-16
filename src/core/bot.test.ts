@@ -1384,6 +1384,42 @@ expect(clean).not.toContain("/tmp/d.jpg");
   });
 });
 
+describe("MEDIA delivery observability", () => {
+  const assistantWithMedia = {
+    role: "assistant",
+    content: [{ type: "text", text: "Files attached.\n\nMEDIA: /tmp/creator/linked.srt" }],
+  };
+  function primeTurn(t: ReturnType<typeof makeBot>) {
+    (t.promptSpy as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      t.emitSessionEvent({ type: "message_end", message: assistantWithMedia });
+      t.emitSessionEvent({ type: "turn_end", message: assistantWithMedia, toolResults: [] });
+      t.emitSessionEvent({ type: "agent_end", messages: [assistantWithMedia], willRetry: false });
+    });
+  }
+
+  it("records a dropped-media event when the transport cannot send media", async () => {
+    const t = makeBot();
+    primeTurn(t);
+    await t.transport.say("attach test");
+    expect(t.transport.pushed.map((p) => p.opts.text)).toEqual(["Files attached."]);
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "system", expect.stringContaining("media dropped"));
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "system", expect.stringContaining("/tmp/creator/linked.srt"));
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("logs successful media sends with file, transport and chat", async () => {
+    const t = makeBot();
+    const sendMedia = vi.fn(async () => {});
+    (t.transport as unknown as { sendMedia?: unknown }).sendMedia = sendMedia;
+    primeTurn(t);
+    await t.transport.say("attach test");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sendMedia).toHaveBeenCalledWith("42", "/tmp/creator/linked.srt");
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "media", expect.stringContaining("sent /tmp/creator/linked.srt"));
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+});
+
 describe("voice transcript echo", () => {
   it("does not echo by default — the transcript goes to the agent, not back to the chat", async () => {
     const t = makeBot();

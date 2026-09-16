@@ -95,7 +95,7 @@ export class PiBot implements HeartbeatHost {
     notify: (chatKey, text) => {
       const { transport, chatId } = this.splitChatKey(chatKey);
       const t = this.transports.get(transport);
-      if (t) void t.push(chatId, { text }).catch(() => {});
+      if (t) void t.push(chatId, { text }).catch((e) => console.error("[bot] notify push failed:", e));
     },
   });
   private statePath: string;
@@ -614,8 +614,17 @@ export class PiBot implements HeartbeatHost {
         if (text) {
           const { text: cleanText, media } = splitMediaLines(text);
           for (const source of media) {
-            if (!t.sendMedia) continue;
-            void t.sendMedia(chatId, source).catch((e) => console.error("[bot] media send failed:", e));
+            if (!t.sendMedia) {
+              // Silent skip here made MEDIA attachments vanish without a trace
+              // (Sep 16: creator's SRT/VTT never reached the owner while the
+              // text pushed fine). Record the drop where the agent can see it.
+              this.deps.events.log(agentId, "system", `media dropped: transport "${t.name}" has no sendMedia — file: ${truncate(source, 120)}`);
+              continue;
+            }
+            void t.sendMedia(chatId, source).then(
+              () => this.deps.events.log(agentId, "media", `sent ${truncate(source, 140)} via ${t.name} → ${chatId}`),
+              (e) => console.error("[bot] media send failed:", e),
+            );
           }
           if (!cleanText.trim()) return;
           const delivery = t.push(chatId, { text: cleanText });

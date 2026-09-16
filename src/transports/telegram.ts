@@ -692,7 +692,7 @@ export class TelegramTransport implements Transport {
       const text = truncate(opts.text, TG_LIMIT) + (opts.text.length > TG_LIMIT ? "\n\n…(truncated)" : "");
       const payload = JSON.stringify({ text, card: opts.card ?? null });
       if (!this.duplicateGuard.shouldSend(chatId, payload)) {
-        console.warn(`[telegram] suppressed duplicate send to chat ${chatId}`);
+        console.warn(`[telegram] (${this.name}) suppressed duplicate send to chat ${chatId}: ${payload.slice(0, 140)}`);
         return;
       }
       await this.settleIncoming(chatId);
