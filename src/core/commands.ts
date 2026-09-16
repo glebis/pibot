@@ -11,6 +11,7 @@ import type { Scheduler } from "./scheduler.js";
 import type { Schedule, Transport, Card } from "./types.js";
 import type { Config } from "../config.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./util.js";
+import { parseCommitDue } from "./proactive-store.js";
 import * as path from "node:path";
 import type { LoadedAgentShape } from "./agent-shapes.js";
 
@@ -19,6 +20,7 @@ const HELP = [
   ``,
   `/agents — list agents  ·  /agent <name> — switch  ·  /new — fresh session  ·  /issue — file a tracked issue  ·  /newagent — guided wizard`,
   `/schedules — active and paused items  ·  /cancel <id>  ·  /resume <id>  ·  /new — fresh session`,
+  `/commit <text> by <when> — track a commitment (pre-check + deadline loop)`,
   `/model — pick this agent's model (tap)  ·  /model <spec|auto>`,
   `/evolve status — review staged skill proposals (accept/reject from the buttons)  ·  /evolve <goal> — run a cycle`,
   `/handoff <agent> [note] — move this conversation (with a task brief) to another agent`,
@@ -65,6 +67,8 @@ export interface CommandContext {
   wizardChats: Set<string>;
   evolution?: EvolutionEngine;
   consolidation?: ConsolidationEngine;
+  /** measurable commitment loop (proactive pilot); absent when not wired */
+  commitments?: { captureExplicit(agentId: string, chat: { transport: string; chatId: string }, text: string, dueAt: number): { commitment?: { id: string }; reply: string } };
   heartbeat: { tick: (agentId: string, opts?: { brief?: boolean }) => Promise<void>; noteUserMessage?: (agentId: string) => void };
   telegram?: {
     managerMode(): boolean;
@@ -162,6 +166,25 @@ export function createCommandHandler(ctx: CommandContext) {
           await reply("Nothing to cancel. Use /cancel <schedule-id> for a scheduled item.");
         }
         return;
+
+      case "commit": {
+        if (!deps.commitments) {
+          await reply("The proactive pilot isn't wired for this build.");
+          return;
+        }
+        if (!agentId) {
+          await reply("No agent selected. /agent <name> first.");
+          return;
+        }
+        const parsed = parseCommitDue(arg);
+        if (!parsed) {
+          await reply('Usage: /commit <text> by <when> — e.g. /commit send invoice by friday 18:00. `when` accepts "in 3d", weekday, ISO date.');
+          return;
+        }
+        const r = deps.commitments.captureExplicit(agentId, { transport: t.name, chatId }, parsed.text, parsed.dueAt);
+        await reply(r.reply);
+        return;
+      }
 
       case "newagent": {
         if (!arg) {

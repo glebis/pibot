@@ -68,7 +68,7 @@ function makeEngine(
   const agents = { getAgent: vi.fn((id: string) => (id === agent.id ? agent : undefined)), heartbeatModel: vi.fn(() => undefined), resolveModel: vi.fn(() => undefined) } as unknown as import("./agent-manager.js").AgentManager;
   const scheduler = { snoozeState: vi.fn(() => null), list: vi.fn(() => []) } as unknown as import("./scheduler.js").Scheduler;
   const events = { log: vi.fn(), tail: vi.fn(() => []) } as unknown as import("./events.js").EventLog;
-  const host: HeartbeatHost = { deliverToAgent: vi.fn(async () => {}), escalateToAgent: vi.fn(async () => {}), lastUserMessageAt: vi.fn(() => 0), ...over };
+  const host: HeartbeatHost = { deliverToAgent: vi.fn(async () => true), escalateToAgent: vi.fn(async () => {}), lastUserMessageAt: vi.fn(() => 0), ...over };
   const modelRuntime = {} as PiAgent.ModelRuntime;
   const engineOptions = { agents, scheduler, modelRuntime, events, vaultDir: dir, host, cascade, statePath, consolidation };
   const engine = new HeartbeatEngine(engineOptions as ConstructorParameters<typeof HeartbeatEngine>[0]);
@@ -180,7 +180,7 @@ describe("HeartbeatEngine backoff", () => {
     it("persists anti-repeat state owner-only across engine recreation without surfacing silent or note-only acts", async () => {
       const agent = makeAgent(dir);
       const statePath = path.join(dir, "private", "heartbeat-state.json");
-      const deliver = vi.fn(async () => {});
+      const deliver = vi.fn(async () => true);
       const host = { deliverToAgent: deliver };
 
       queueActs([{ speak: "Submit the signed form today." }]);

@@ -8,6 +8,7 @@ import { EventLog } from "./core/events.js";
 import { EvolutionEngine, type EvolutionIO } from "./core/evolution.js";
 import { Scheduler } from "./core/scheduler.js";
 import { loadSettings, saveSettings } from "./config.js";
+import { ProactiveStore } from "./core/proactive-store.js";
 import { createWebApp, type TelegramControl, type WebDeps } from "./web.js";
 
 function fakeControl(over: Partial<TelegramControl> = {}): TelegramControl & { enableSpy: ReturnType<typeof vi.fn> } {
@@ -741,5 +742,95 @@ describe("web auth — Touch ID + Bearer + CSRF", () => {
     const res = await app.request("/", { headers: { Cookie: "pibot_session=x.y" } });
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toContain("/auth");
+  });
+});
+
+describe("proactive analytics page", () => {
+  let dir: string;
+  let app: ReturnType<typeof createWebApp>;
+  let store: ProactiveStore;
+  let scheduler: Scheduler;
+  let io: EvolutionIO;
+
+  beforeEach(() => {
+    dir = tmpDir();
+    const agents = new AgentManager(dir, { getModels: () => [] } as unknown as ModelRuntime);
+    agents.createAgent("assistant", "You are a test companion.");
+    scheduler = new Scheduler(path.join(dir, "data"), () => {});
+    store = new ProactiveStore(path.join(dir, "data"));
+    const events = new EventLog(dir);
+    io = { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() };
+    const evolution = new EvolutionEngine({
+      agents,
+      modelRuntime: {} as ModelRuntime,
+      events,
+      dataDir: dir,
+      host: { announce: async () => {} },
+      io,
+    });
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, proactiveStore: store, webToken: "dashboard-test-token", secrets: { get: () => ({}), save: async () => {} } } satisfies WebDeps);
+    authenticateTestApp(app);
+  });
+
+  afterEach(() => {
+    scheduler.stop();
+    try { (app as any)._authStore?.stop?.(); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("renders metrics, filters and the commitment drill-down", async () => {
+    const now = Date.now();
+    const c = store.createCommitment({ agentId: "assistant", chat: { transport: "telegram", chatId: "42" }, text: "send invoice to Anna", dueAt: now + 86_400e3, origin: "explicit", status: "completed", closedAt: now - 3600e3, rating: "up" });
+    store.appendEvent({ agentId: "assistant", loop: "pilot", stage: "delivered", commitmentId: c.id, outcome: "precheck", ts: now - 7200e3 });
+    store.appendEvent({ agentId: "assistant", loop: "pilot", stage: "seen", commitmentId: c.id, ts: now - 7000e3 });
+    store.appendEvent({ agentId: "assistant", loop: "pilot", stage: "acted", commitmentId: c.id, outcome: "deadline:done", ts: now - 3600e3 });
+
+    const res = await app.request("/analytics?days=14");
+    const html = await res.text();
+    expect(res.status).toBe(200);
+    for (const label of ["delivered", "seen %", "acted %", "completion %", "helpful %", "noise %"]) {
+      expect(html.toLowerCase()).toContain(label);
+    }
+    expect(html).toContain("send invoice to Anna");
+    expect(html).toContain(c.id);
+    expect(html).toContain("<details>"); // event-level drill-down
+    expect(html).toContain("deadline:done");
+    // origin split
+    expect(html).toContain("explicit 1");
+  });
+
+  it("honors agent and loop filters in links and content", async () => {
+    const now = Date.now();
+    store.appendEvent({ agentId: "assistant", loop: "heartbeat", stage: "delivered", ts: now - 3600e3 });
+    const res = await app.request("/analytics?days=7&loop=heartbeat");
+    const html = await res.text();
+    expect(res.status).toBe(200);
+    expect(html).toContain("heartbeat");
+    const resPilot = await app.request("/analytics?days=7&loop=pilot");
+    expect(resPilot.status).toBe(200);
+  });
+
+  it("shows the analytics link on the overview page", async () => {
+    const res = await app.request("/");
+    const html = await res.text();
+    expect(html).toContain("/analytics");
+  });
+
+  it("saves the pilot toggle through the manifest form", async () => {
+    const form = new FormData();
+    form.set("hb_enabled", "on");
+    form.set("hb_interval", "45m");
+    form.set("hb_min", "5m");
+    form.set("hb_max", "12h");
+    form.set("ev_interval", "6h");
+    form.set("pilot_enabled", "on");
+    form.set("pilot_budget", "4");
+    withCsrf(form, app);
+    const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form });
+    expect(res.status).toBe(302);
+    const raw = fs.readFileSync(path.join(dir, "assistant", "agent.json"), "utf8");
+    const manifest = JSON.parse(raw);
+    expect(manifest.proactive?.pilot).toBe(true);
+    expect(manifest.proactive?.dailyBudget).toBe(4);
   });
 });

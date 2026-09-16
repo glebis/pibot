@@ -29,8 +29,8 @@ const MIN_WAKEUP_MS = 5 * 60e3;
 const MAX_WAKEUP_MS = 12 * 3600e3;
 
 export interface HeartbeatHost {
-  /** Heartbeat wants to say something short to the user */
-  deliverToAgent(agentId: string, text: string, opts?: { origin?: "heartbeat" }): Promise<void>;
+  /** Heartbeat wants to say something short to the user; true when a push resolved */
+  deliverToAgent(agentId: string, text: string, opts?: { origin?: "heartbeat" }): Promise<boolean>;
   /** Heartbeat flags something that needs the full agent brain */
   escalateToAgent(agentId: string, instruction: string): Promise<void>;
   /** timestamp (ms) of the last message the user actually sent to this agent */

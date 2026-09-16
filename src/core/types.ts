@@ -5,7 +5,7 @@ export interface ChatRef {
   chatId: string;
 }
 
-export type ScheduleKind = "reminder" | "task" | "note" | "subject" | "heartbeat" | "morning-brief" | "attend-pass" | "promise" | "evolution" | "consolidation" | "cascade-probe" | "subbot-probe" | "custom";
+export type ScheduleKind = "reminder" | "task" | "note" | "subject" | "heartbeat" | "morning-brief" | "attend-pass" | "promise" | "commitment" | "evolution" | "consolidation" | "cascade-probe" | "subbot-probe" | "custom";
 
 export interface ScheduleRepeat {
   /** Fire again this many ms after each fire */
@@ -184,6 +184,15 @@ export interface AgentManifest {
   /** "repo": this agent develops the pibot source itself — its session cwd is the
    *  repo root instead of its own agent dir (used by the built-in pibot-dev agent). */
   workspace?: "agent-dir" | "repo";
+  /** Proactive-message governance. pilot: enable the measurable commitment
+   *  follow-through loop (/commit + measurable pre-checks). dailyBudget caps
+   *  proactive pilot deliveries per agent per day. precheckLead is how long
+   *  before the deadline the pre-check fires (default "24h"). */
+  proactive?: {
+    pilot?: boolean;
+    dailyBudget?: number;
+    precheckLead?: string;
+  };
   /** inter-agent communication surface. taskAcks: when this agent accepts/declines/
    *  completes a task handed to it (by a sibling agent or the owner), a passive
    *  confirmation line lands in its bot chat. Default: on. */

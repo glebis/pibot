@@ -31,6 +31,19 @@ describe("capability registry", () => {
     expect(def.create).toHaveBeenCalledWith(baseContext);
   });
 
+  it("exposes the commitments capability only when the engine is wired and the pilot is on", () => {
+    const definition = CAPABILITY_REGISTRY.find((item) => item.id === "commitments");
+    expect(definition?.tools).toEqual(["commitment_capture", "commitment_list", "commitment_cancel"]);
+    const off = resolveCapabilities({ ...baseContext, commitments: { captureInferred: () => ({ reply: "" }) } } as unknown as CapabilityContext, [definition!]);
+    expect(off.ids).toEqual([]); // pilot off → not advertised
+    const on = resolveCapabilities(
+      { ...baseContext, agent: { id: "a1", dir: "/tmp/a1", manifest: { name: "a1", proactive: { pilot: true } } }, commitments: { captureInferred: () => ({ reply: "" }) } } as unknown as CapabilityContext,
+      [definition!]
+    );
+    expect(on.ids).toEqual(["commitments"]);
+    expect(on.tools).toContain("commitment_capture");
+  });
+
   it("does not advertise or allow a selected capability whose runtime dependency is unavailable", () => {
     const result = resolveCapabilities(baseContext, [capability({ available: () => false })], ["sample"]);
     expect(result.ids).toEqual([]);

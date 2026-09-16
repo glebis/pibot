@@ -27,6 +27,8 @@ import type { Scheduler } from "./scheduler.js";
 import type { AgentManifest, ChatRef } from "./types.js";
 import type { AvatarArtifactStore, AvatarProviderRegistry } from "./avatar.js";
 import type { SpeechArtifactStore, SpeechKind, SpeechProviderRegistry } from "./speech.js";
+import type { CommitmentPluginEngine } from "../plugins/commitment-plugin.js";
+import { commitmentPlugin } from "../plugins/commitment-plugin.js";
 
 export interface CapabilityAgent { id: string; dir: string; manifest: AgentManifest }
 export interface CapabilityContext {
@@ -53,9 +55,11 @@ export interface CapabilityContext {
   dictionary?: {
     dataDir: string;
   };
+  /** measurable commitment loop (proactive pilot) — present when the engine is wired */
+  commitments?: CommitmentPluginEngine;
 }
 
-/** One auditable source for a plugin's factory, exposed tools and prompt contract. */
+export type { CommitmentPluginEngine };
 export interface CapabilityDefinition {
   id: string;
   defaultEnabled: boolean;
@@ -128,6 +132,13 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     tools: ["schedule_create", "schedule_list", "schedule_cancel", "schedule_resume", "snooze", "promise_make", "promise_keep"],
     prompt: "REMINDERS ARE NEVER DISCUSSIONS: when the owner asks for a reminder, call schedule_create immediately with exactly what they said, then confirm in one line—do not look up context, reinterpret, or ask for confirmation. schedule_list, schedule_cancel, schedule_resume, snooze, promise_make and promise_keep manage commitments; recurring items must be at least 15 minutes apart and each agent may have at most 20 active items. A repeatedly failing item pauses automatically; explain the last error and use schedule_resume only after the delivery problem is fixed. Important items still fire through snooze. `when` accepts forms like `in 20m`, `tomorrow 9am`, `daily at 08:00`, `every 2h`, or `friday 18:00`; kind is reminder, task, note, subject, or custom; `delivery: direct` sends a host ping and `delivery: agent` wakes the agent to compose it; reserve `wake: important` for hard commitments.",
     create: (ctx) => schedulerPlugin({ scheduler: ctx.scheduler, agentId: ctx.agent.id, chat: ctx.chat, getQuietHours: () => ctx.agent.manifest.heartbeat?.quietHours }),
+  },
+  {
+    id: "commitments", defaultEnabled: true,
+    tools: ["commitment_capture", "commitment_list", "commitment_cancel"],
+    prompt: "commitment_capture proposes a measurable follow-through item when the owner states a concrete deliverable with a time bound — the owner confirms it via a card before tracking starts. commitment_list and commitment_cancel manage tracked items.",
+    available: (ctx) => Boolean(ctx.commitments && ctx.agent.manifest.proactive?.pilot),
+    create: (ctx) => commitmentPlugin({ agentId: ctx.agent.id, chat: ctx.chat, engine: ctx.commitments! }),
   },
   {
     id: "memory", defaultEnabled: true, tools: ["memory_save", "memory_recall"],

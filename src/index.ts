@@ -12,6 +12,8 @@ import { ModelCascade } from "./core/cascade.js";
 import { installDiskGuard } from "./core/disk-guard.js";
 import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
 import { ConsolidationEngine, createLlmConsolidationIO } from "./core/consolidation.js";
+import { ProactiveStore } from "./core/proactive-store.js";
+import { CommitmentEngine } from "./core/commitments.js";
 import { HeartbeatEngine } from "./core/heartbeat.js";
 import { Scheduler } from "./core/scheduler.js";
 import { createWebApp } from "./web.js";
@@ -123,6 +125,21 @@ async function main(): Promise<void> {
     }),
   });
 
+  // measurable commitment loop (proactive pilot): metadata-only store + engine.
+  // The engine reaches the bot through the same late-bound ref pattern.
+  const proactiveStore = new ProactiveStore(config.dataDir);
+  const commitments = new CommitmentEngine({
+    agents,
+    scheduler,
+    events,
+    store: proactiveStore,
+    bot: {
+      deliverToAgent: (agentId, text, card) => bot.deliverToAgent(agentId, text, undefined, card),
+      pushChat: (chat, text, card) => bot.pushChatRef(chat, text, card),
+    },
+  });
+  agents.commitments = commitments;
+
   const heartbeat = new HeartbeatEngine({
     agents,
     scheduler,
@@ -145,7 +162,9 @@ async function main(): Promise<void> {
     events,
     dataDir: config.dataDir,
     consolidation,
-    host: { announce: (agentId, text) => bot.deliverToAgent(agentId, text) },
+    host: { announce: async (agentId, text) => {
+      await bot.deliverToAgent(agentId, text);
+    } },
     io: createLlmEvolutionIO({
       agents,
       modelRuntime,
@@ -174,7 +193,7 @@ async function main(): Promise<void> {
       : [new CliTransport()];
 
   const providerManager = new ProviderManager(modelRuntime);
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir) });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, commitments, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir) });
   diskGuard?.setNotify((text) => void bot.notifyOwnerEvent(text));
 
   await bot.start();
@@ -185,6 +204,8 @@ async function main(): Promise<void> {
   if (process.env.PIBOT_WEB !== "0") {
     const webApp = createWebApp({
       agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
+      proactiveStore,
+      commitments: { syncGovernance: (agentId) => commitments.syncPilotGovernance(agentId) },
       webToken: config.webToken, webRpId: config.webRpId, webPort,
       providers: providerManager,
       // same cascade control facade the /cascade chat command uses

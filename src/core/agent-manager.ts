@@ -15,7 +15,7 @@ import type { CommsHooks } from "../plugins/agent-comms-plugin.js";
 import type { TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
 import { AvatarArtifactStore, createDefaultAvatarProviders } from "./avatar.js";
 import { createDefaultSpeechProviders, SpeechArtifactStore, type SpeechKind } from "./speech.js";
-import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext, type CapabilityDefinition } from "./capabilities.js";
+import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext, type CapabilityDefinition, type CommitmentPluginEngine } from "./capabilities.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
 import { ensureDir, errorMessage, readJson, truncate, writeJsonAtomic } from "./util.js";
@@ -29,6 +29,8 @@ export interface LoadedAgent {
 export class AgentManager {
   private agents = new Map<string, LoadedAgent>();
   private sessions = new Map<string, AgentSession>(); // `${agentId}::${chatKey}` → session
+  /** measurable commitment loop (proactive pilot); set by the host after wiring */
+  commitments?: CommitmentPluginEngine;
   private agentsDir: string;
   private vaultDir: string;
   private repoRoot: string;
@@ -184,6 +186,7 @@ export class AgentManager {
       comms,
       telegramSend,
       dictionary: { dataDir: this.dataDir },
+      commitments: this.commitments,
       avatar: applyProfilePhoto && chat.transport.startsWith("telegram") && agent.manifest.capabilities?.includes("avatar") ? {
         providers: createDefaultAvatarProviders(),
         store: new AvatarArtifactStore(path.join(agent.dir, "runtime", "avatars")),

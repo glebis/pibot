@@ -8,6 +8,7 @@ import { attendCli } from "../plugins/attend-plugin.js";
 import { createCommandHandler, evolutionReviewCard, type CommandContext } from "./commands.js";
 import { classifyTaskReply, isTaskLike, taskAckLine, taskAcksEnabled } from "./task-acks.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
+import type { CommitmentEngine } from "./commitments.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
@@ -110,6 +111,8 @@ export class PiBot implements HeartbeatHost {
       transports: Transport[];
       evolution?: EvolutionEngine;
       consolidation?: ConsolidationEngine;
+      /** measurable commitment loop (proactive pilot) */
+      commitments?: CommitmentEngine;
       modelRuntime?: import("@earendil-works/pi-coding-agent").ModelRuntime;
       secrets: import("./secrets.js").SecretStore;
       /** model cascade / triage: primary → fallbacks → deterministic */
@@ -1107,6 +1110,9 @@ export class PiBot implements HeartbeatHost {
   /** Returns a short toast string for Telegram callback feedback */
   async handleAction(t: Transport, chatId: string, action: string): Promise<string | void> {
     if (action.startsWith("url:")) return; // URL buttons open in the client; no callback
+    if (action.startsWith("cm:") && this.deps.commitments) {
+      return this.deps.commitments.handleAction(action, chatId);
+    }
 
     if (action.startsWith("snz:")) {
       const dur = action.slice(4);
@@ -1315,7 +1321,9 @@ export class PiBot implements HeartbeatHost {
       ensureHeartbeatJob: (a) => this.ensureHeartbeatJob(a as never),
       ensureEvolutionJob: (a) => this.ensureEvolutionJob(a as never),
       ensureMorningBriefJob: (a) => this.ensureMorningBriefJob(a as never),
-      deliverToAgent: (id, text) => this.deliverToAgent(id, text),
+      deliverToAgent: async (id, text) => {
+        await this.deliverToAgent(id, text);
+      },
       handoff: (t, chatId, fromAgent, toAgent, note) => this.runHandoff(t, chatId, fromAgent, toAgent, note),
       questions: this.questions,
       wizard: this,
@@ -1846,6 +1854,11 @@ export class PiBot implements HeartbeatHost {
       await this.deps.consolidation?.consolidate(job.agentId);
       return;
     }
+    if (job.kind === "commitment" && this.deps.commitments) {
+      // the measurable follow-through loop composes its own card + records delivery
+      await this.deps.commitments.onFire(job);
+      return;
+    }
     this.deps.events.log(job.agentId, "fire", `${job.title} (${job.kind})`);
 
     if (job.delivery === "agent") {
@@ -2117,7 +2130,7 @@ export class PiBot implements HeartbeatHost {
     text: string,
     opts: { origin?: "heartbeat"; replyToMessageId?: number; onlyChat?: string; selfAttributed?: boolean } = {},
     card?: Card,
-  ) {
+  ): Promise<boolean> {
     // heartbeat-originated proactive messages carry an origin tag regardless of transport
     if (opts.origin === "heartbeat") text = `[heartbeat] ${text}`;
     let all = [...(this.agentChats.get(agentId) ?? new Set<string>())];
@@ -2126,28 +2139,50 @@ export class PiBot implements HeartbeatHost {
       const { transport } = this.splitChatKey(ck);
       return this.transports.get(transport)?.boundAgentId === agentId;
     });
+    let delivered = false;
     if (dedicated.length) {
       // Once an agent has its own Telegram identity, proactive output belongs there.
       for (const ck of dedicated) {
         const { transport, chatId } = this.splitChatKey(ck);
         const t = this.transports.get(transport);
-        if (t) await t.push(chatId, { text, card, replyToMessageId: opts.replyToMessageId }).catch((e) => console.error("[bot] deliver failed:", e));
+        if (t) {
+          await t.push(chatId, { text, card, replyToMessageId: opts.replyToMessageId }).then(() => (delivered = true)).catch((e) => console.error("[bot] deliver failed:", e));
+        }
       }
-      return;
+      if (opts.origin === "heartbeat") this.deps.commitments?.deliverHeartbeatSpeak(agentId, delivered);
+      return delivered;
     }
     // No dedicated identity: only chats the agent currently owns (is the bound agent of).
     // Historical bindings don't grant a license to inject sibling chatter into other chats.
     const owned = all.filter((ck) => this.chatAgent.get(ck) === agentId);
     if (all.length && !owned.length) {
       this.deps.events.log(agentId, "system", `proactive message suppressed — no chat currently owned by this agent (bind one: /agent ${agentId} or /subbot ${agentId}). Preview: ${truncate(text, 120)}`);
-      return;
+      if (opts.origin === "heartbeat") this.deps.commitments?.deliverHeartbeatSpeak(agentId, false);
+      return false;
     }
     for (const ck of owned) {
       const { transport, chatId } = this.splitChatKey(ck);
       const t = this.transports.get(transport);
       // shared-bot fallback: attribute the sender (a dedicated identity doesn't need it)
       const shown = t && (t.boundAgentId === agentId || opts.selfAttributed) ? text : `**[${agentId}]** ${text}`;
-      if (t) await t.push(chatId, { text: shown, card, replyToMessageId: opts.replyToMessageId }).catch((e) => console.error("[bot] deliver failed:", e));
+      if (t) {
+        await t.push(chatId, { text: shown, card, replyToMessageId: opts.replyToMessageId }).then(() => (delivered = true)).catch((e) => console.error("[bot] deliver failed:", e));
+      }
+    }
+    if (opts.origin === "heartbeat") this.deps.commitments?.deliverHeartbeatSpeak(agentId, delivered);
+    return delivered;
+  }
+
+  /** Push a card/text to one specific chat ref (the commitment loop's surface). */
+  async pushChatRef(chat: ChatRef, text: string, card?: Card): Promise<boolean> {
+    const t = this.transports.get(chat.transport);
+    if (!t) return false;
+    try {
+      await t.push(chat.chatId, { text, card });
+      return true;
+    } catch (e) {
+      console.error("[bot] pushChatRef failed:", e);
+      return false;
     }
   }
 

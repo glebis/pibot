@@ -6,6 +6,8 @@ import type { AgentManager, LoadedAgent } from "./core/agent-manager.js";
 import { listSkillDirs } from "./core/agent-manager.js";
 import type { EventLog } from "./core/events.js";
 import type { EvolutionEngine } from "./core/evolution.js";
+import type { Commitment, ProactiveLoop, ProactiveStore } from "./core/proactive-store.js";
+import { summarize } from "./core/proactive-store.js";
 import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
 import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
@@ -51,6 +53,10 @@ export interface WebDeps {
     clear(): string;
   };
   dataDir: string;
+  /** proactive pilot store (measurable commitments + metadata events); absent when not wired */
+  proactiveStore?: ProactiveStore;
+  /** pilot governance hook: scorecard job follows the pilot toggle */
+  commitments?: { syncGovernance(agentId: string): void };
   telegram?: TelegramControl;
   secrets?: { get(): import("./config.js").Settings; save(patch: Partial<import("./config.js").Settings>): Promise<void> };
   /** cloud provider status + subscription/API-key logins (subscription providers, like pi) */
@@ -336,6 +342,11 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
   </div>
   <div class="row">
     <div><label class="mono">daily morning brief (non-default agents: opt-in) <input type="checkbox" name="hb_morning_brief" ${hb.morningBrief ? "checked" : ""} style="width:auto"></label></div>
+  </div>
+  <h2 style="border:0;margin-top:18px">Proactive pilot</h2>
+  <div class="row">
+    <div><label class="mono">commitment follow-through loop <input type="checkbox" name="pilot_enabled" ${m.proactive?.pilot ? "checked" : ""} style="width:auto"></label></div>
+    <div><label>daily proactive budget (pilot)</label><input type="number" name="pilot_budget" value="${esc(m.proactive?.dailyBudget ?? 6)}" min="1" max="24"></div>
   </div>
   <h2 style="border:0;margin-top:18px">Comms</h2>
   <div class="row">
@@ -784,7 +795,7 @@ ${hasToken ? `<div class="card">
     <form class="inline" method="post" action="/cascade/clear" data-swap="#cascade-card">${csrfField()}<button class="mini danger" type="submit">clear breakers</button></form>
   </div>
 </div>` : "";
-    return c.html(page("overview", `${authBanner}${cascadeCard}${cards || '<p class="muted">No agents yet.</p>'}
+    return c.html(page("overview", `${deps.proactiveStore ? `<div class="card"><a href="/analytics">📊 Proactive analytics →</a> <span class="muted">commitment follow-through pilot</span></div>` : ""}${authBanner}${cascadeCard}${cards || '<p class="muted">No agents yet.</p>'}
 <h2>Telegram</h2>
 <div class="card">
   ${deps.telegram?.hasTransport("telegram")
@@ -894,6 +905,108 @@ ${hasToken ? `<div class="card">
       });
     }
     return c.redirect(`/agents/${encodeURIComponent(name)}?msg=${encodeURIComponent(`Agent "${name}" created — rhythm armed`)}`);
+  });
+
+  // ── proactive analytics (pilot) ──
+  app.get("/analytics", (c) => {
+    if (!deps.proactiveStore) return c.text("Analytics store not wired", 404);
+    const store = deps.proactiveStore;
+    const now = Date.now();
+    const DAY = 86_400e3;
+    const daysParam = parseInt(c.req.query("days") ?? "14", 10);
+    const days = [7, 14, 30].includes(daysParam) ? daysParam : 14;
+    const agent = c.req.query("agent") || "";
+    const loopRaw = (c.req.query("loop") || "") as ProactiveLoop | "";
+    const loop: ProactiveLoop | undefined = loopRaw === "pilot" || loopRaw === "heartbeat" ? loopRaw : undefined;
+    const since = now - days * DAY;
+
+    const s = summarize(
+      { events: store.events(), commitments: store.commitments() },
+      { since, now, agentId: agent || undefined, loop }
+    );
+    const closed = store
+      .commitments(agent ? { agentId: agent } : undefined)
+      .filter((cm) => cm.createdAt >= since || (cm.closedAt != null && cm.closedAt >= since))
+      .sort((a, b) => (b.closedAt ?? b.createdAt) - (a.closedAt ?? a.createdAt))
+      .slice(0, 40);
+
+    const filterLink = (patch: { days?: number; agent?: string; loop?: string }, label: string, active: boolean): string => {
+      const q = new URLSearchParams();
+      const d = patch.days ?? days;
+      if (d !== 14) q.set("days", String(d));
+      const ag = patch.agent !== undefined ? patch.agent : agent;
+      if (ag) q.set("agent", ag);
+      const lp = patch.loop !== undefined ? patch.loop : loop ?? "";
+      if (lp) q.set("loop", lp);
+      const href = `/analytics${q.size ? `?${q}` : ""}`;
+      return `<a href="${href}" class="pill ${active ? "on" : ""}">${esc(label)}</a>`;
+    };
+
+    const agentLinks = deps.agents
+      .list()
+      .map((a) => filterLink({ agent: a.id }, a.id, agent === a.id))
+      .join(" ");
+
+    const metric = (label: string, value: string, hint?: string): string =>
+      `<td><strong>${esc(value)}</strong>${hint ? `<br><span class="muted">${esc(hint)}</span>` : ""}<br><span class="muted">${esc(label)}</span></td>`;
+
+    const statusPill = (st: Commitment["status"]): string => {
+      const on = st === "completed" || st === "active";
+      const warn = st === "missed" || st === "dismissed";
+      return `<span class="pill ${on ? "on" : ""}" ${warn ? `style="border-color:#5c4d1d;color:#e0cd9f"` : ""}>${esc(st)}</span>`;
+    };
+
+    const commitmentRows = closed
+      .map((cm) => {
+        const evts = store.events({ commitmentId: cm.id }).map((e) => `<tr><td class="mono">${new Date(e.ts).toLocaleTimeString()}</td><td>${esc(e.stage)}</td><td class="mono">${esc(e.outcome ?? "")}</td><td class="mono">${esc(e.loop)}</td><td class="mono">${esc(e.id)}</td></tr>`);
+        return `<tr>
+  <td class="mono">${esc(cm.id)}</td>
+  <td><strong>${esc(cm.text)}</strong>${cm.rating ? `<br><span class="muted">rated 👍/👎: ${cm.rating === "up" ? "👍" : "👎"}</span>` : ""}</td>
+  <td>${esc(cm.origin)} · ${esc(cm.agentId)}</td>
+  <td>${esc(fmtWhen(cm.dueAt, now))}</td>
+  <td>${statusPill(cm.status)}</td>
+  <td><details><summary class="mini">${evts.length} events</summary><table>${evts.join("")}</table></details></td>
+</tr>`;
+      })
+      .join("\n") || `<tr><td colspan="6" class="muted">No commitments in range.</td></tr>`;
+
+    const body = `
+<h2>Filters</h2>
+<div class="card" id="analytics-filters">
+  ${[7, 14, 30].map((d) => filterLink({ days: d }, `${d}d`, days === d)).join(" ")}
+  <span style="margin-left:10px"></span>
+  ${filterLink({ agent: "" }, "all agents", !agent)}
+  ${agentLinks}
+  <span style="margin-left:10px"></span>
+  ${filterLink({ loop: "" }, "all loops", !loop)}
+  ${filterLink({ loop: "pilot" }, "pilot", loop === "pilot")}
+  ${filterLink({ loop: "heartbeat" }, "heartbeat", loop === "heartbeat")}
+</div>
+
+<h2>Metrics</h2>
+<div class="card" style="padding:0"><table><tr>
+  ${metric("delivered", String(s.delivered))}
+  ${metric("seen %", `${s.seenPct}%`)}
+  ${metric("acted %", `${s.actedPct}%`)}
+  ${metric("completion %", `${s.completedPct}%`)}
+  ${metric("helpful %", `${s.helpfulPct}%`)}
+  ${metric("noise %", `${s.noisePct}%`, `${s.ignored} ignored`)}
+</tr></table></div>
+<div class="card">
+  <span class="pill">explicit ${s.explicitCount}</span>
+  <span class="pill">inferred ${s.inferredCount}</span>
+  <span class="pill">inferred confirm rate ${s.confirmRate}%</span>
+</div>
+
+<h2>Commitments <span class="muted">(range, newest first)</span></h2>
+<div class="card" style="padding:0" id="analytics-commitments">
+<table>
+  <tr><th>id</th><th>commitment</th><th>origin · agent</th><th>due</th><th>status</th><th></th></tr>
+  ${commitmentRows}
+</table>
+</div>
+`;
+    return c.html(page("proactive analytics", body, c.req.query("msg")));
   });
 
   // ── agent detail ──
@@ -1053,6 +1166,7 @@ ${manifestForm(agent, csrfToken)}
       providers: str("providers") ? str("providers").split(",").map((provider) => provider.trim()).filter(Boolean) : undefined,
       capabilities: str("capabilities") ? str("capabilities").split(",").map((v) => v.trim()).filter(Boolean) : undefined,
       comms: { ...agent.manifest.comms, taskAcks: on("task_acks") },
+      proactive: { pilot: on("pilot_enabled"), dailyBudget: Math.max(1, parseInt(str("pilot_budget"), 10) || 6) },
       speech: {
         sttProviders: str("stt_providers")
           ? (str("stt_providers").split(",").map((v) => v.trim()).filter(Boolean) as Array<"whisperkit" | "local_whisper" | "groq">)
@@ -1076,6 +1190,7 @@ ${manifestForm(agent, csrfToken)}
     };
     writeJsonAtomic(path.join(agent.dir, "agent.json"), manifest);
     await deps.agents.discover(); // reload manifests
+    deps.commitments?.syncGovernance(agent.id); // scorecard job follows the pilot toggle
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Manifest saved — rhythm changes apply on next restart of jobs (or via chat)")}`);
   });
 
