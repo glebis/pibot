@@ -10,6 +10,7 @@ import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
 import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
 import { taskAcksEnabled } from "./core/task-acks.js";
+import { CAPABILITY_REGISTRY } from "./core/capabilities.js";
 import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
 import { providerRowHtml } from "./core/providers.js";
 import { WebAuthStore } from "./web-auth.js";
@@ -321,6 +322,7 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
       </select></div>
     <div><label>Tools (comma-separated)</label><input type="text" name="tools" value="${esc((m.tools ?? []).join(","))}"></div>
   </div>
+  <div><label>Capabilities (comma-separated; empty = conservative default set — see the Capabilities card for ids)</label><input type="text" name="capabilities" value="${esc((m.capabilities ?? []).join(","))}" placeholder="agent-comms,scheduler,exec"></div>
   <div><label>Allowed model providers (comma-separated; empty disables automatic provider fallback)</label><input type="text" name="providers" value="${esc((m.providers ?? []).join(","))}" placeholder="ollama,anthropic"></div>
   <h2 style="border:0;margin-top:18px">Heartbeat</h2>
   <div class="row">
@@ -988,6 +990,15 @@ ${manifestForm(agent, csrfToken)}
   <button type="submit">Attach sub-bot</button>
 </form>
 
+<h2>Capabilities <span class="muted">(what tools this agent may use)</span></h2>
+<div class="card" id="capabilities-card">
+  ${CAPABILITY_REGISTRY.map((cap) => {
+    const on = (agent.manifest.capabilities ?? []).includes(cap.id) || (cap.defaultEnabled && !agent.manifest.capabilities);
+    const note = cap.prompt ?? "";
+    return `<div><span class="pill ${on ? "on" : ""}">${esc(cap.id)}</span> <span class="muted">${esc(note.slice(0, 110))}${note.length > 110 ? "…" : ""}</span></div>`;
+  }).join("")}
+</div>
+
 <h2>Chat bindings <span class="muted">(who answers where)</span></h2>
 <div class="card" id="bindings-card">
   <div><strong>this agent:</strong> ${ownedChats.map((b) => `<span class="pill ${b.dedicated ? "on" : ""}">${esc(b.chat)}${b.dedicated ? " · dedicated" : " · interactive"}</span>`).join(" ") || '<span class="muted">none bound yet</span>'}</div>
@@ -1035,6 +1046,7 @@ ${manifestForm(agent, csrfToken)}
       thinking: (str("thinking") as AgentManifest["thinking"]) || "off",
       tools: str("tools") ? str("tools").split(",").map((t) => t.trim()).filter(Boolean) : undefined,
       providers: str("providers") ? str("providers").split(",").map((provider) => provider.trim()).filter(Boolean) : undefined,
+      capabilities: str("capabilities") ? str("capabilities").split(",").map((v) => v.trim()).filter(Boolean) : undefined,
       comms: { ...agent.manifest.comms, taskAcks: on("task_acks") },
       speech: {
         sttProviders: str("stt_providers")

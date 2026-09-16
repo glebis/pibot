@@ -398,6 +398,23 @@ describe("web /telegram", () => {
     expect(page).toContain('name="allow_external_stt" checked');
   });
 
+  it("capabilities card lists registry with opt-in state, and the editor persists ids", async () => {
+    boot({ subBotFor: vi.fn(() => undefined), managerMode: vi.fn(() => true) });
+    const page = await (await app.request("/agents/assistant")).text();
+    expect(page).toContain("Capabilities");
+    expect(page).toContain('name="capabilities"');
+    expect(page).toContain("exec");
+
+    const form = new FormData();
+    form.set("_csrf", withCsrf(new FormData(), app).get("_csrf") ?? "");
+    form.set("capabilities", "agent-comms,scheduler,exec");
+    form.set("description", "assistant");
+    const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form, redirect: "manual" });
+    expect(res.status).toBe(302);
+    const after = await (await app.request("/agents/assistant")).text();
+    expect(after).toContain('value="agent-comms,scheduler,exec"');
+  });
+
   it("cascade card stays hidden when cascade is not wired", async () => {
     boot();
     const res = await app.request("/");
