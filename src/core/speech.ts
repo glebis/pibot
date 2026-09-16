@@ -27,6 +27,7 @@ export interface LocalMacSpeechOptions {
   execFileFn?: typeof execFile;
   sayBin?: string | null;
   ffmpegBin?: string | null;
+  existsSyncFn?: (p: string) => boolean;
   timeoutMs?: number;
 }
 
@@ -37,7 +38,8 @@ export class LocalMacSpeechProvider implements SpeechProvider {
   configured(): boolean {
     const say = "sayBin" in this.options ? this.options.sayBin : "/usr/bin/say";
     const ffmpeg = "ffmpegBin" in this.options ? this.options.ffmpegBin : findExecutable("ffmpeg");
-    return Boolean(say && ffmpeg && fs.existsSync(say) && fs.existsSync(ffmpeg));
+    const exists = "existsSyncFn" in this.options ? this.options.existsSyncFn! : fs.existsSync;
+    return Boolean(say && ffmpeg && exists(say) && exists(ffmpeg));
   }
 
   async generate(request: SpeechRequest): Promise<GeneratedSpeech> {

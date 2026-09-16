@@ -30,7 +30,7 @@ function fakeLocalProvider(): { provider: LocalMacSpeechProvider; calls: ReturnT
     queueMicrotask(() => cb(null, "", ""));
   });
   return {
-    provider: new LocalMacSpeechProvider({ execFileFn: calls as unknown as typeof execFile, sayBin: "/usr/bin/say", ffmpegBin: "/opt/homebrew/bin/ffmpeg" }),
+    provider: new LocalMacSpeechProvider({ execFileFn: calls as unknown as typeof execFile, sayBin: "/usr/bin/say", ffmpegBin: "/opt/homebrew/bin/ffmpeg", existsSyncFn: () => true }),
     calls,
   };
 }
