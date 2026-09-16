@@ -342,6 +342,18 @@ describe("web /telegram", () => {
     expect(res.status).toBe(302);
   });
 
+  it("manifest save persists the comms.taskAcks toggle", async () => {
+    boot({ subBotFor: vi.fn(() => undefined), managerMode: vi.fn(() => true) });
+    const form = new FormData();
+    form.set("_csrf", withCsrf(new FormData(), app).get("_csrf") ?? "");
+    form.set("description", "assistant");
+    form.set("task_acks", "on");
+    const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form, redirect: "manual" });
+    expect(res.status).toBe(302);
+    const page = await (await app.request("/agents/assistant")).text();
+    expect(page).toContain('name="task_acks" checked');
+  });
+
   it("cascade card stays hidden when cascade is not wired", async () => {
     boot();
     const res = await app.request("/");

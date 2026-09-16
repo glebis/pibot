@@ -2140,6 +2140,8 @@ export class PiBot implements HeartbeatHost {
     if (this.lastTaskAcks.has(fp)) return;
     this.lastTaskAcks.set(fp, now);
     const line = taskAckLine(ack, agentId, reply, threaded ? undefined : { from: fromAgent });
+    const ackFrom = threaded ? "you" : fromAgent;
+    this.deps.events.log(agentId, "task-ack", `${ack} — ${truncate(taskText, 80)} (reply: ${truncate(reply, 80)})`);
     void this.deliverToAgent(agentId, line, { replyToMessageId: delivery.replyToMessageId, onlyChat: delivery.onlyChat, selfAttributed: true }).catch(() => {});
   }
 

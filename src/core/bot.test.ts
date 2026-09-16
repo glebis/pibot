@@ -1426,6 +1426,7 @@ describe("task ack confirmations", () => {
       "assistant", "knower", "file the Berlin takeaways"
     );
     expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted **knower**'s task: “On it — leave it with me.”"))).toBe(true);
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "task-ack", expect.stringContaining("accepted"));
   });
 
   it("task acks respect the per-agent opt-out", async () => {

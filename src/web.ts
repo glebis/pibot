@@ -9,6 +9,7 @@ import type { EvolutionEngine } from "./core/evolution.js";
 import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
 import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
+import { taskAcksEnabled } from "./core/task-acks.js";
 import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
 import { providerRowHtml } from "./core/providers.js";
 import { WebAuthStore } from "./web-auth.js";
@@ -327,6 +328,10 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
   <div class="row">
     <div><label>Quiet from</label><input type="text" name="hb_from" value="${esc(qh.from)}"></div>
     <div><label>Quiet to</label><input type="text" name="hb_to" value="${esc(qh.to)}"></div>
+  </div>
+  <h2 style="border:0;margin-top:18px">Comms</h2>
+  <div class="row">
+    <div><label class="mono">task confirmations in its bot chat <input type="checkbox" name="task_acks" ${taskAcksEnabled(m) ? "checked" : ""} style="width:auto"></label></div>
   </div>
   <div class="row">
     <div><label>Wakeup min (floor for adaptive wakeups)</label><input type="text" name="hb_min" value="${esc(hb.minInterval ?? "5m")}"></div>
@@ -1006,6 +1011,7 @@ ${manifestForm(agent, csrfToken)}
       thinking: (str("thinking") as AgentManifest["thinking"]) || "off",
       tools: str("tools") ? str("tools").split(",").map((t) => t.trim()).filter(Boolean) : undefined,
       providers: str("providers") ? str("providers").split(",").map((provider) => provider.trim()).filter(Boolean) : undefined,
+      comms: { ...agent.manifest.comms, taskAcks: on("task_acks") },
       heartbeat: {
         enabled: on("hb_enabled"),
         interval: hbInterval,
