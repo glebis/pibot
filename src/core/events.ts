@@ -4,7 +4,7 @@ import { ensureDir, truncate } from "./util.js";
 
 export interface EventEntry {
   t: number;
-  type: "message" | "fire" | "snooze" | "heartbeat" | "system" | "maintenance";
+  type: "message" | "fire" | "snooze" | "heartbeat" | "system" | "maintenance" | "send";
   summary: string;
 }
 

@@ -6,11 +6,12 @@ import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-
 import { TelegramTransport } from "../transports/telegram.js";
 import { attendCli } from "../plugins/attend-plugin.js";
 import { createCommandHandler, evolutionReviewCard, type CommandContext } from "./commands.js";
-import { classifyTaskReply, taskAckLine, taskAcksEnabled } from "./task-acks.js";
+import { classifyTaskReply, isTaskLike, taskAckLine, taskAcksEnabled } from "./task-acks.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
+import type { TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
 import { QuestionBus, type QuestionSpec } from "./questions.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
@@ -551,6 +552,7 @@ export class PiBot implements HeartbeatHost {
           await target.sendAudio(targetChatId, filePath, caption);
         }
       },
+      this.telegramSendHooks(),
     );
     const wkey = `${agentId}::${ck}`;
     if (!this.wired.has(wkey)) {
@@ -603,10 +605,10 @@ export class PiBot implements HeartbeatHost {
     "wake": "/wake",
   };
 
-  async handleIncoming(t: Transport, chatId: string, raw: string, reply?: ReplyContext): Promise<void> {
+  async handleIncoming(t: Transport, chatId: string, raw: string, reply?: ReplyContext, messageId?: number): Promise<void> {
     const text = raw.trim();
     if (!text) return;
-    await this.routeUserTurn(t, chatId, text, reply);
+    await this.routeUserTurn(t, chatId, text, reply, undefined, messageId);
   }
 
   /**
@@ -614,7 +616,7 @@ export class PiBot implements HeartbeatHost {
    * commands, pending questions, then the agent. Media turns re-enter here
    * after transcription/prompt composition.
    */
-  private async routeUserTurn(t: Transport, chatId: string, text: string, reply?: ReplyContext, resolvedAgentId?: string): Promise<void> {
+  private async routeUserTurn(t: Transport, chatId: string, text: string, reply?: ReplyContext, resolvedAgentId?: string, incomingMessageId?: number): Promise<void> {
     const ck = this.chatKey(t, chatId);
     // quick-action keyboard buttons arrive as plain text
     const quick = PiBot.QUICK_ACTIONS[text.toLowerCase()];
@@ -630,7 +632,7 @@ export class PiBot implements HeartbeatHost {
     }
     this.lastUserMessage.set(agentId, Date.now());
     this.deps.heartbeat.noteUserMessage?.(agentId);
-    await this.promptAgent(t, chatId, agentId, text, { reply });
+    await this.promptAgent(t, chatId, agentId, text, { reply, incomingMessageId });
   }
 
   /** Media message from a transport: transcribe voice, reference files, then route as a user turn. */
@@ -697,7 +699,7 @@ export class PiBot implements HeartbeatHost {
     chatId: string,
     agentId: string,
     text: string,
-    opts: { recoveringDeadLetter?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null } = {},
+    opts: { recoveringDeadLetter?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
   ): Promise<void> {
     const ck = this.chatKey(t, chatId);
     this.rememberChat(agentId, ck);
@@ -719,7 +721,7 @@ export class PiBot implements HeartbeatHost {
       // handed to it in its chat (owner assignments), surface a passive line
       if (opts.taskAckFrom !== null) {
         const replyText = extractAssistantTextFromSession(session);
-        if (replyText) this.maybeEmitTaskAck(agentId, opts.taskAckFrom ?? "you", text, replyText);
+        if (replyText) this.maybeEmitTaskAck(agentId, opts.taskAckFrom ?? "you", text, replyText, { replyToMessageId: opts.incomingMessageId, onlyChat: ck });
       }
       await Promise.resolve();
       const delivery = this.pendingPushes.get(`${agentId}::${ck}`);
@@ -1874,6 +1876,36 @@ export class PiBot implements HeartbeatHost {
     };
   }
 
+  /** Host-injected Telegram send hook: the agent posts as its own bot identity. */
+  private telegramSendHooks(): TelegramSendHooks {
+    return {
+      send: (agentId, chat, text) => this.sendAsAgent(agentId, chat, text),
+      chats: (agentId) =>
+        [...(this.agentChats.get(agentId) ?? [])].map((ck) => {
+          const { transport } = this.splitChatKey(ck);
+          const t = this.transports.get(transport);
+          return { chat: ck, dedicated: t?.boundAgentId === agentId, owned: this.chatAgent.get(ck) === agentId };
+        }),
+    };
+  }
+
+  /** Bot-identity send from an agent tool: explicit "transport:chatId" target,
+   *  sender-attributed on shared transports, event-logged for the trail. */
+  async sendAsAgent(agentId: string, chat: string, text: string): Promise<{ sent: number; targets: string[] }> {
+    const idx = chat.lastIndexOf(":");
+    if (idx <= 0 || !chat.slice(0, idx) || !chat.slice(idx + 1)) {
+      throw new Error(`chat must be "transport:chatId" — got "${chat}"`);
+    }
+    const transportName = chat.slice(0, idx);
+    const chatId = chat.slice(idx + 1);
+    const t = this.transports.get(transportName);
+    if (!t) throw new Error(`no transport "${transportName}" — telegram_chats lists reachable targets`);
+    const outbound = t.boundAgentId === agentId ? text : `**[${agentId}]** ${text}`;
+    await t.push(chatId, { text: outbound });
+    this.deps.events.log(agentId, "send", `→ ${chat}: ${truncate(text, 80)}`);
+    return { sent: 1, targets: [chat] };
+  }
+
   private async agentTurn(agentId: string, fromAgent: string, text: string, timeoutMs?: number): Promise<string> {
     const target = this.deps.agents.getAgent(agentId);
     if (!target) throw new Error(`unknown agent "${agentId}"`);
@@ -2001,11 +2033,16 @@ export class PiBot implements HeartbeatHost {
     });
   }
 
-  async deliverToAgent(agentId: string, text: string, opts: { origin?: "heartbeat" } = {}, card?: Card) {
+  async deliverToAgent(
+    agentId: string,
+    text: string,
+    opts: { origin?: "heartbeat"; replyToMessageId?: number; onlyChat?: string; selfAttributed?: boolean } = {},
+    card?: Card,
+  ) {
     // heartbeat-originated proactive messages carry an origin tag regardless of transport
     if (opts.origin === "heartbeat") text = `[heartbeat] ${text}`;
-    const cks = this.agentChats.get(agentId) ?? new Set<string>();
-    const all = [...cks];
+    let all = [...(this.agentChats.get(agentId) ?? new Set<string>())];
+    if (opts.onlyChat) all = all.filter((ck) => ck === opts.onlyChat); // thread-target chat only
     const dedicated = all.filter((ck) => {
       const { transport } = this.splitChatKey(ck);
       return this.transports.get(transport)?.boundAgentId === agentId;
@@ -2015,7 +2052,7 @@ export class PiBot implements HeartbeatHost {
       for (const ck of dedicated) {
         const { transport, chatId } = this.splitChatKey(ck);
         const t = this.transports.get(transport);
-        if (t) await t.push(chatId, { text, card }).catch((e) => console.error("[bot] deliver failed:", e));
+        if (t) await t.push(chatId, { text, card, replyToMessageId: opts.replyToMessageId }).catch((e) => console.error("[bot] deliver failed:", e));
       }
       return;
     }
@@ -2030,7 +2067,8 @@ export class PiBot implements HeartbeatHost {
       const { transport, chatId } = this.splitChatKey(ck);
       const t = this.transports.get(transport);
       // shared-bot fallback: attribute the sender (a dedicated identity doesn't need it)
-      if (t) await t.push(chatId, { text: t.boundAgentId === agentId ? text : `**[${agentId}]** ${text}`, card }).catch((e) => console.error("[bot] deliver failed:", e));
+      const shown = t && (t.boundAgentId === agentId || opts.selfAttributed) ? text : `**[${agentId}]** ${text}`;
+      if (t) await t.push(chatId, { text: shown, card, replyToMessageId: opts.replyToMessageId }).catch((e) => console.error("[bot] deliver failed:", e));
     }
   }
 
@@ -2040,16 +2078,29 @@ export class PiBot implements HeartbeatHost {
    *  acceptance/decline/completion of a handed task, a passive line lands in
    *  the agent's bot chat (deliverToAgent ownership rules apply). Deterministic
    *  lexicon — no match, no line. Deduped per (agent, ack, task) within 10 min. */
-  private maybeEmitTaskAck(agentId: string, fromAgent: string, taskText: string, reply: string): void {
+  private maybeEmitTaskAck(
+    agentId: string,
+    fromAgent: string,
+    taskText: string,
+    reply: string,
+    delivery: { replyToMessageId?: number; onlyChat?: string } = {},
+  ): void {
     if (!taskAcksEnabled(this.deps.agents.getAgent(agentId)?.manifest)) return;
     const ack = classifyTaskReply(reply);
     if (!ack) return;
+    // threaded = answering a specific incoming message (owner chat) — the thread
+    // carries the task context, so no snippet/attribution needed in the line.
+    // unthreaded (sibling tasks): attribution inline + chatter guard (trigger
+    // words like "go"/"ok" handed to an agent are conversation, not tasks).
+    const threaded = delivery.replyToMessageId !== undefined;
+    if (!threaded && !isTaskLike(taskText)) return;
     const fp = `${agentId}|${ack}|${taskText.slice(0, 80)}`;
     const now = Date.now();
     for (const [k, ts] of this.lastTaskAcks) if (now - ts > 10 * 60e3) this.lastTaskAcks.delete(k);
     if (this.lastTaskAcks.has(fp)) return;
     this.lastTaskAcks.set(fp, now);
-    void this.deliverToAgent(agentId, taskAckLine(ack, agentId, fromAgent, taskText)).catch(() => {});
+    const line = taskAckLine(ack, agentId, reply, threaded ? undefined : { from: fromAgent });
+    void this.deliverToAgent(agentId, line, { replyToMessageId: delivery.replyToMessageId, onlyChat: delivery.onlyChat, selfAttributed: true }).catch(() => {});
   }
 
   async escalateToAgent(agentId: string, instruction: string): Promise<void> {

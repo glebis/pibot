@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { agentCommsPlugin, type CommsHooks } from "../plugins/agent-comms-plugin.js";
+import { telegramSendPlugin, type TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
 import { avatarPlugin } from "../plugins/avatar-plugin.js";
 import { attendPlugin, ATTEND_CLI } from "../plugins/attend-plugin.js";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
@@ -36,6 +37,8 @@ export interface CapabilityContext {
   chat: ChatRef;
   ask?: (spec: QuestionSpec) => Promise<QuestionAnswer | null>;
   comms?: CommsHooks;
+  /** host-injected send hook for bot-identity Telegram sends */
+  telegramSend?: TelegramSendHooks;
   avatar?: {
     providers: AvatarProviderRegistry;
     store: AvatarArtifactStore;
@@ -173,6 +176,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     id: "questions", defaultEnabled: true, tools: ["ask_user"],
     prompt: "ask_user renders 2–6 choices as tappable buttons or 7–10 as a poll and returns the owner's answer; include an `unsure` option when the owner may not know.",
     available: (ctx) => Boolean(ctx.ask), create: (ctx) => questionPlugin({ chat: ctx.chat, ask: ctx.ask! }),
+  },
+  {
+    id: "telegram-send", defaultEnabled: false, tools: ["telegram_send", "telegram_chats"],
+    prompt: "telegram_send posts a message as this agent's own bot — to the current chat by default, or an explicit transport:chatId target the bot can reach (its owner's chats, groups/channels where the bot is a member). telegram_chats lists reachable chats. Use for deliberate cross-posts; normal conversation goes through your regular replies. Sends to shared transports carry a sender prefix.",
+    available: (ctx) => Boolean(ctx.telegramSend) && ctx.chat.transport.startsWith("telegram"),
+    create: (ctx) => telegramSendPlugin({ agentId: ctx.agent.id, chat: ctx.chat, hooks: ctx.telegramSend! }),
   },
   {
     id: "attend", defaultEnabled: false, tools: ["attend_enqueue", "attend_list", "attend_mark"],

@@ -12,6 +12,7 @@ import {
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type { CommsHooks } from "../plugins/agent-comms-plugin.js";
+import type { TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
 import { AvatarArtifactStore, createDefaultAvatarProviders } from "./avatar.js";
 import { createDefaultSpeechProviders, SpeechArtifactStore, type SpeechKind } from "./speech.js";
 import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext, type CapabilityDefinition } from "./capabilities.js";
@@ -152,6 +153,7 @@ export class AgentManager {
     comms?: CommsHooks,
     applyProfilePhoto?: (transport: string, filePath: string) => Promise<void>,
     sendSpeech?: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>,
+    telegramSend?: TelegramSendHooks,
   ): Promise<AgentSession> {
     const key = `${agentId}::${chatKey}`;
     const cached = this.sessions.get(key);
@@ -180,6 +182,7 @@ export class AgentManager {
       chat,
       ask,
       comms,
+      telegramSend,
       dictionary: { dataDir: this.dataDir },
       avatar: applyProfilePhoto && chat.transport.startsWith("telegram") && agent.manifest.capabilities?.includes("avatar") ? {
         providers: createDefaultAvatarProviders(),

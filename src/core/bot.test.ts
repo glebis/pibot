@@ -871,6 +871,27 @@ describe("PiBot fire delivery", () => {
     expect(t.transport.lastText()).toBe("**[assistant]** [heartbeat] quiet tick");
   });
 
+  it("sendAsAgent attributes sends on shared transports and logs them", async () => {
+    const t = makeBot();
+    await t.bot.sendAsAgent("assistant", "mock:42", "hello from the tool");
+    expect(t.transport.lastText()).toBe("**[assistant]** hello from the tool");
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "send", expect.stringContaining("mock:42"));
+  });
+
+  it("sendAsAgent skips the prefix on the agent's own bot", async () => {
+    const t = makeBot();
+    const own = new MockTransport("telegram:assistant", "assistant");
+    t.bot.addTransport(own);
+    await t.bot.sendAsAgent("assistant", "telegram:assistant:42", "own-identity post");
+    expect(own.lastText()).toBe("own-identity post");
+  });
+
+  it("sendAsAgent rejects malformed targets and unknown transports", async () => {
+    const t = makeBot();
+    await expect(t.bot.sendAsAgent("assistant", "nonsense", "x")).rejects.toThrow(/transport:chatId/);
+    await expect(t.bot.sendAsAgent("assistant", "nosuch:42", "x")).rejects.toThrow(/no transport/);
+  });
+
   it("resolves per-agent telegram tokens: env overrides manifest overrides persisted settings", async () => {
     const t = makeBot();
     const attach = vi.fn(async () => ({ ok: true, botName: "@pimother_test_bot" }));
@@ -1377,7 +1398,7 @@ describe("task ack confirmations", () => {
     await (t.bot as unknown as { agentTurn(a: string, f: string, text: string): Promise<string> }).agentTurn(
       "assistant", "knower", "file the Berlin takeaways"
     );
-    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted a task from **knower**"))).toBe(true);
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted **knower**'s task: “On it — leave it with me.”"))).toBe(true);
   });
 
   it("task acks respect the per-agent opt-out", async () => {
@@ -1390,14 +1411,31 @@ describe("task ack confirmations", () => {
     await (t.bot as unknown as { agentTurn(a: string, f: string, text: string): Promise<string> }).agentTurn(
       "assistant", "knower", "file the report"
     );
-    expect(t.transport.pushed.some((p) => p.opts.text.includes("accepted a task"))).toBe(false);
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("accepted"))).toBe(false);
   });
 
   it("owner task assignments in the agent's chat ack too", async () => {
     const t = makeBot();
     (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("On it — will do."));
     await t.transport.say("file the Berlin takeaways");
-    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted a task from **you**"))).toBe(true);
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted your task: “On it — will do.”"))).toBe(true);
+  });
+
+  it("acks thread to the original task message when its id is known", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("On it — will do."));
+    await t.bot.handleIncoming(t.transport, "42", "please file the Berlin takeaways today", undefined, 77);
+    const ack = t.transport.pushed.find((p) => p.opts.text.includes("🤝"));
+    expect(ack?.opts.replyToMessageId).toBe(77);
+    // threaded lines are description-first — no attribution needed
+    expect(ack?.opts.text).toBe("🤝 **assistant**: “On it — will do.”");
+  });
+
+  it("chatter-trigger words never ack in owner chats", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("On it — will do."));
+    await t.transport.say("ok");
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝"))).toBe(false);
   });
 
   function bBind(t: ReturnType<typeof makeBot>, agentId: string, ck: string): void {
