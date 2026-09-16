@@ -264,7 +264,7 @@ export class TelegramTransport implements Transport {
   private openWhenEmpty: boolean;
   private me?: { id: number; username?: string; first_name: string; can_manage_bots?: boolean };
   private lastCallbackQuery?: { id: string; data?: string };
-  private onMessageCb: ((text: string, chatId: string, reply?: ReplyContext) => Promise<void>) | null = null;
+  private onMessageCb: ((text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>) | null = null;
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   private onPollAnswerCb: ((pollId: string, optionIndex: number, voterId: string) => Promise<void>) | null = null;
   private duplicateGuard = new TelegramDuplicateGuard();
@@ -300,7 +300,7 @@ export class TelegramTransport implements Transport {
       void this.markIncoming(String(ctx.chat?.id), msg.message_id);
       const reply = replyContextFrom(msg.reply_to_message, this.me?.id);
       // fire-and-forget: agent turns can run long (ask_user blocks) — never stall polling
-      void this.onMessageCb(text, String(ctx.chat?.id), reply).catch((e) => console.error("[telegram] message handler:", e));
+      void this.onMessageCb(text, String(ctx.chat?.id), reply, msg.message_id).catch((e) => console.error("[telegram] message handler:", e));
     });
 
     this.bot.on("message:voice", (ctx) => void this.handleMediaMessage(ctx, "voice").catch((e) => console.error("[telegram] voice handler:", e)));
@@ -528,7 +528,7 @@ export class TelegramTransport implements Transport {
     }
   }
 
-  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext) => Promise<void>): void {
+  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>): void {
     this.onMessageCb = cb;
   }
 
@@ -699,9 +699,13 @@ export class TelegramTransport implements Transport {
       // first plain message in a chat attaches the persistent quick-action keyboard —
       // only the main bot; subbot chats keep their own clean slate
       let sentId: number | undefined;
+      // reply threading: a push can answer a specific incoming message
+      const replyParams = opts.replyToMessageId
+        ? { reply_parameters: { message_id: opts.replyToMessageId, allow_sending_without_reply: true } }
+        : {};
       // rich content (tables, headings) routes through sendRichMessage (Bot API 10.1+);
       // legacy/self-hosted servers that 404 the method fall back to classic entities
-      if (!opts.card && isRichTelegramContent(text)) {
+      if (!opts.card && !opts.replyToMessageId && isRichTelegramContent(text)) {
         try {
           sentId = messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendRichMessage(chatId, { markdown: text })));
         } catch (e) {
@@ -709,6 +713,7 @@ export class TelegramTransport implements Transport {
           const sent = await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
             parse_mode: "HTML",
             reply_markup: keyboard(opts.card),
+            ...replyParams,
           }));
           sentId = messageIdOf(sent);
         }
@@ -716,6 +721,7 @@ export class TelegramTransport implements Transport {
         const sent = await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
           parse_mode: "HTML",
           reply_markup: TelegramTransport.QUICK_KEYBOARD,
+          ...replyParams,
         }));
         this.keyboardSent.add(chatId);
         sentId = messageIdOf(sent);
@@ -723,6 +729,7 @@ export class TelegramTransport implements Transport {
         const sent = await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
           parse_mode: "HTML",
           reply_markup: keyboard(opts.card),
+          ...replyParams,
         }));
         sentId = messageIdOf(sent);
       }

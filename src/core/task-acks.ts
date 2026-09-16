@@ -61,22 +61,37 @@ export function classifyTaskReply(reply: string): TaskAck | undefined {
 
 const ICON: Record<TaskAck, string> = { accepted: "🤝", declined: "🚫", completed: "✅" };
 
-/** The passive confirmation line for the agent's bot chat. */
-export function taskAckLine(ack: TaskAck, agentId: string, from: string, taskSnippet: string): string {
-  const snippet = truncateOneLine(taskSnippet, 80);
+/** The passive confirmation line. Description-first: what the agent actually said/did.
+ *  Threaded (reply-to the original task message): the line needs no task context —
+ *  `✅ **agent**: "what was done"`. Unthreaded (sibling tasks): attribution inline. */
+export function taskAckLine(
+  ack: TaskAck,
+  agentId: string,
+  doneSnippet: string,
+  context?: { from?: string },
+): string {
+  const done = truncateOneLine(doneSnippet, 110);
+  if (!context?.from) return `${ICON[ack]} **${agentId}**: “${done}”`;
+  const fromLabel = context.from === "you" ? "your" : `**${context.from}**'s`;
   switch (ack) {
     case "accepted":
-      return `${ICON[ack]} **${agentId}** accepted a task from **${from}** — “${snippet}”`;
+      return `🤝 **${agentId}** accepted ${fromLabel} task: “${done}”`;
     case "declined":
-      return `${ICON[ack]} **${agentId}** declined a task from **${from}** — “${snippet}”`;
+      return `🚫 **${agentId}** declined ${fromLabel} task: “${done}”`;
     case "completed":
-      return `${ICON[ack]} **${agentId}** completed the task from **${from}** — “${snippet}”`;
+      return `✅ **${agentId}** completed ${fromLabel} task: “${done}”`;
   }
 }
 
 function truncateOneLine(s: string, max: number): string {
   const flat = s.replace(/\s+/g, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+}
+
+/** Owner-chat guard: a handed task is at least a few words — trigger words
+ *  ("go", "ok ahead") are conversation, not tasks, and must not ack. */
+export function isTaskLike(text: string): boolean {
+  return text.trim().split(/\s+/).filter(Boolean).length >= 4;
 }
 
 /** Manifest gate — taskAcks default on; explicit false opts out. */

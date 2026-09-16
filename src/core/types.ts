@@ -62,6 +62,9 @@ export interface Card {
 export interface PushOptions {
   text: string;
   card?: Card;
+  /** Thread this push as a Telegram reply to that message id (transports that
+   *  support replies use it; others ignore it). */
+  replyToMessageId?: number;
 }
 
 /** Context about a Telegram message the user replied to (transport-supplied). */

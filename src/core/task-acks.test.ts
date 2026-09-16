@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyTaskReply, taskAckLine, taskAcksEnabled } from "./task-acks.js";
+import { classifyTaskReply, isTaskLike, taskAckLine, taskAcksEnabled } from "./task-acks.js";
 
 describe("task-acks classifier", () => {
   it("detects implicit acceptance language", () => {
@@ -30,19 +30,29 @@ describe("task-acks classifier", () => {
 });
 
 describe("task-ack lines", () => {
-  it("formats the passive confirmation line", () => {
-    expect(taskAckLine("accepted", "creator", "knower", "file the Berlin takeaways\nwith sources")).toBe(
-      "🤝 **creator** accepted a task from **knower** — “file the Berlin takeaways with sources”"
+  it("formats description-first lines — threaded drops attribution, unthreaded keeps it", () => {
+    expect(taskAckLine("accepted", "creator", "On it — will file it with sources.")).toBe(
+      "🤝 **creator**: “On it — will file it with sources.”"
     );
-    expect(taskAckLine("declined", "tax", "you", "audit my expenses")).toContain("🚫 **tax** declined");
-    expect(taskAckLine("completed", "knower", "coach", "sweep the vault")).toContain("✅ **knower** completed");
+    expect(taskAckLine("declined", "tax", "I can't take this on.", { from: "knower" })).toBe(
+      "🚫 **tax** declined **knower**'s task: “I can't take this on.”"
+    );
+    expect(taskAckLine("completed", "knower", "Done — vault swept.", { from: "coach" })).toBe(
+      "✅ **knower** completed **coach**'s task: “Done — vault swept.”"
+    );
   });
 
-  it("truncates long task snippets", () => {
+  it("truncates long done-snippets", () => {
     const long = "x".repeat(200);
-    const line = taskAckLine("accepted", "a", "b", long);
+    const line = taskAckLine("accepted", "a", long);
     expect(line.length).toBeLessThan(200);
     expect(line.endsWith("…”")).toBe(true);
+  });
+
+  it("isTaskLike guards chatter-triggers", () => {
+    expect(isTaskLike("Go ahead and")).toBe(false);
+    expect(isTaskLike("ok")).toBe(false);
+    expect(isTaskLike("file the Berlin takeaways with sources")).toBe(true);
   });
 });
 
