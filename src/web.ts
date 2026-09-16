@@ -753,6 +753,7 @@ ${hasToken ? `<div class="card">
         const sn = deps.scheduler.snoozeState(a.id);
         const staged = deps.evolution.staged(a.id);
         const skills = listSkillDirs(path.join(a.dir, "skills"));
+        const stagedDetail = deps.evolution.stagedDetail(a.id);
         return `<div class="card">
   <a href="/agents/${esc(a.id)}"><strong>${esc(a.id)}</strong></a>
   <span class="muted">${esc(a.manifest.description ?? "")}</span><br>
@@ -763,6 +764,10 @@ ${hasToken ? `<div class="card">
   ${skills.length ? `<span class="pill">${skills.length} skills</span>` : ""}
   ${staged.length ? `<span class="pill on">🧬 ${staged.length} staged</span>` : ""}
   ${sn ? `<span class="pill">😴 until ${esc(fmtWhen(sn.until))}</span>` : ""}
+  ${stagedDetail.length ? `<div style="margin-top:10px">${stagedDetail.map((s2) => {
+    const stagePath = `/agents/${esc(a.id)}/staged/${esc(s2.name)}`;
+    return `<a href="${stagePath}"><span class="pill on">${esc(s2.name)}</span></a> <a href="${stagePath}" class="mini">view</a> <form class="inline" method="post" action="${stagePath}/promote">${csrfField()}<button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="${stagePath}/reject">${csrfField()}<button class="mini danger" type="submit">reject</button></form>`;
+  }).join(" · ")}</div>` : ""}
 </div>`;
       })
       .join("\n");
@@ -965,7 +970,7 @@ ${manifestForm(agent, csrfToken)}
 <h2>Skills</h2>
 <div class="card" id="skills-card">
   ${skills.length ? skills.map((s) => `<div><strong>${esc(s.name)}</strong> <span class="muted">${esc(s.description)}</span></div>`).join("") : '<span class="muted">No skills yet.</span>'}
-  ${staged.length ? `<div style="margin-top:12px"><strong>Staged:</strong> ${staged.map((s) => `<span class="pill on">${esc(s)}</span> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/promote" data-swap="#skills-card">${csrfField()}<button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/reject" data-swap="#skills-card">${csrfField()}<button class="mini danger" type="submit">reject</button></form>`).join(" · ")}</div>` : ""}
+  ${staged.length ? `<div style="margin-top:12px"><strong>Staged:</strong> ${staged.map((s) => `<a href="/agents/${esc(agent.id)}/staged/${esc(s)}"><span class="pill on">${esc(s)}</span></a> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/promote" data-swap="#skills-card">${csrfField()}<button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/reject" data-swap="#skills-card">${csrfField()}<button class="mini danger" type="submit">reject</button></form>`).join(" · ")}</div>` : ""}
 </div>
 
 <h2>Telegram sub-bot <span class="muted">(its own @identity)</span></h2>
@@ -1164,6 +1169,27 @@ ${manifestForm(agent, csrfToken)}
     if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     deps.evolution.reject(c.req.param("id"), c.req.param("name"));
     return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Rejected 🗑")}`);
+  });
+
+  app.get("/agents/:id/staged/:name", async (c) => {
+    const agent = agentOr404(c.req.param("id"));
+    if (!agent) return c.notFound();
+    const name = c.req.param("name");
+    const content = deps.evolution.stagedContent(agent.id, name);
+    if (content === undefined) return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Nothing staged under that name")}`);
+    const cand = deps.evolution.stagedDetail(agent.id).find((s2) => s2.name === name);
+    const meta = [
+      cand?.scores?.length ? `probes ${cand.scores.join(", ")}` : "",
+      cand?.closesBacklog?.length ? `closes ${cand.closesBacklog.join(", ")}` : "",
+    ].filter(Boolean).join(" · ");
+    const body = `<h2>Staged: <strong>${esc(name)}</strong> <span class="muted">${esc(cand?.mode ?? "create")}${meta ? ` · ${esc(meta)}` : ""}</span></h2>
+<div class="card"><pre class="events" style="max-height:520px">${esc(content)}</pre></div>
+<div class="card">
+  <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(name)}/promote">${csrfField()}<button class="mini" type="submit">✅ Promote</button></form>
+  <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(name)}/reject">${csrfField()}<button class="mini danger" type="submit">✖ Reject</button></form>
+  <a href="/agents/${esc(agent.id)}" style="margin-left:8px">← Back</a>
+</div>`;
+    return c.html(page(`${agent.id} · staged ${name}`, body, c.req.query("msg")));
   });
 
   app.post("/agents/:id/rebind", async (c) => {
