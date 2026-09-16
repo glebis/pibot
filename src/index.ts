@@ -199,6 +199,9 @@ async function main(): Promise<void> {
   await bot.start();
   scheduler.rearm();
 
+  // pilot governance on boot: weekly scorecard jobs follow the manifest flags
+  for (const a of agents.list()) commitments.syncPilotGovernance(a.id);
+
   // web dashboard (config CRUD) — always on unless disabled
   const webPort = config.webPort ?? parseInt(process.env.PIBOT_WEB_PORT || "7860", 10);
   if (process.env.PIBOT_WEB !== "0") {
