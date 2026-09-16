@@ -155,6 +155,11 @@ export interface AgentManifest {
    * directly by model/cascade; global and authenticated-provider tails stay off. */
   providers?: string[];
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  /** Optional dedicated Telegram identity (token from BotFather): the agent posts
+   *  as its own sender instead of the shared bot. At boot, env
+   *  PIBOT_TELEGRAM_TOKEN_<AGENTID> overrides this, and both override a token
+   *  persisted from the dashboard's managed flow. */
+  telegram?: { token?: string };
   /** built-in + custom tool names; default excludes bash (safer for remote chats) */
   tools?: string[];
   /** Host capability ids. Omit for the conservative default set; opt in to

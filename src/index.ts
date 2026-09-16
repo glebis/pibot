@@ -130,7 +130,7 @@ async function main(): Promise<void> {
     events,
     vaultDir: config.vaultDir,
     host: {
-      deliverToAgent: (agentId, text) => bot.deliverToAgent(agentId, text),
+      deliverToAgent: (agentId, text, opts) => bot.deliverToAgent(agentId, text, opts),
       escalateToAgent: (agentId, instruction) => bot.escalateToAgent(agentId, instruction),
       lastUserMessageAt: (agentId) => bot.lastUserMessageAt(agentId),
     },

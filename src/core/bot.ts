@@ -351,20 +351,32 @@ export class PiBot implements HeartbeatHost {
     const attempts = Math.max(1, opts.attempts ?? 3);
     const delayMs = opts.delayMs ?? 5_000;
     const subs = this.deps.secrets.get().telegram?.subBots ?? {};
+    // Unified token map. Explicit owner config (env PIBOT_TELEGRAM_TOKEN_<AGENTID>
+    // or agent.json telegram.token) overrides a token persisted from the managed
+    // dashboard flow; agents with neither post through the shared bot with a
+    // [name] prefix (deliverToAgent).
+    const tokens: Record<string, { token: string; username?: string }> = {};
+    for (const [agentId, sub] of Object.entries(subs)) {
+      if (sub?.token) tokens[agentId] = { token: sub.token, username: sub.username };
+    }
+    for (const agent of this.deps.agents.list()) {
+      const envKey = `PIBOT_TELEGRAM_TOKEN_${agent.id.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+      const explicit = process.env[envKey] || agent.manifest.telegram?.token;
+      if (explicit) tokens[agent.id] = { token: explicit, username: tokens[agent.id]?.username };
+    }
     const attached: string[] = [];
     const failed: string[] = [];
-    for (const [agentId, sub] of Object.entries(subs)) {
-      if (!sub.token) continue;
+    for (const [agentId, entry] of Object.entries(tokens)) {
       let lastError = "unknown error";
       let ok = false;
       for (let a = 1; a <= attempts && !ok; a++) {
         if (a > 1) await new Promise((r) => setTimeout(r, delayMs));
-        const r = await this.attachSubBot(agentId, sub.token);
+        const r = await this.attachSubBot(agentId, entry.token);
         ok = r.ok;
         if (ok) break;
         lastError = r.error ?? lastError;
       }
-      const name = sub.username ? `@${sub.username}` : agentId;
+      const name = entry.username ? `@${entry.username}` : agentId;
       if (ok) {
         attached.push(agentId);
         console.log(`[pibot] sub-bot for ${agentId} → ${name}`);
@@ -1737,7 +1749,7 @@ export class PiBot implements HeartbeatHost {
       if (report.staged && report.skill) {
         // stage → review card lands in the owner's chat immediately: accept/reject in place
         const tok = this.deps.evolution.reviewToken(job.agentId, report.skill);
-        await this.deliverToAgent(job.agentId, `🧬 Evolution staged **${report.skill}** for your review: ${report.summary}`, evolutionReviewCard(tok));
+        await this.deliverToAgent(job.agentId, `🧬 Evolution staged **${report.skill}** for your review: ${report.summary}`, undefined, evolutionReviewCard(tok));
       }
       return;
     }
@@ -1771,6 +1783,8 @@ export class PiBot implements HeartbeatHost {
     const lines = [`${icon} **${job.title}**`];
     if (job.detail) lines.push(job.detail);
     if (snoozed) lines.push("_(fired during snooze — marked important)_");
+    // shared-bot fallback: attribute the sender (dedicated identity doesn't need it)
+    if (t.boundAgentId !== job.agentId) lines[0] = `**[${job.agentId}]** ${lines[0]}`;
     await t.push(job.chat.chatId, {
       text: lines.join("\n"),
       card: {
@@ -1978,7 +1992,10 @@ export class PiBot implements HeartbeatHost {
     });
   }
 
-  async deliverToAgent(agentId: string, text: string, card?: Card) {    const cks = this.agentChats.get(agentId) ?? new Set<string>();
+  async deliverToAgent(agentId: string, text: string, opts: { origin?: "heartbeat" } = {}, card?: Card) {
+    // heartbeat-originated proactive messages carry an origin tag regardless of transport
+    if (opts.origin === "heartbeat") text = `[heartbeat] ${text}`;
+    const cks = this.agentChats.get(agentId) ?? new Set<string>();
     const all = [...cks];
     const dedicated = all.filter((ck) => {
       const { transport } = this.splitChatKey(ck);
@@ -2003,7 +2020,8 @@ export class PiBot implements HeartbeatHost {
     for (const ck of owned) {
       const { transport, chatId } = this.splitChatKey(ck);
       const t = this.transports.get(transport);
-      if (t) await t.push(chatId, { text, card }).catch((e) => console.error("[bot] deliver failed:", e));
+      // shared-bot fallback: attribute the sender (a dedicated identity doesn't need it)
+      if (t) await t.push(chatId, { text: t.boundAgentId === agentId ? text : `**[${agentId}]** ${text}`, card }).catch((e) => console.error("[bot] deliver failed:", e));
     }
   }
 

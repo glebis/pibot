@@ -30,7 +30,7 @@ const MAX_WAKEUP_MS = 12 * 3600e3;
 
 export interface HeartbeatHost {
   /** Heartbeat wants to say something short to the user */
-  deliverToAgent(agentId: string, text: string): Promise<void>;
+  deliverToAgent(agentId: string, text: string, opts?: { origin?: "heartbeat" }): Promise<void>;
   /** Heartbeat flags something that needs the full agent brain */
   escalateToAgent(agentId: string, instruction: string): Promise<void>;
   /** timestamp (ms) of the last message the user actually sent to this agent */
@@ -432,7 +432,7 @@ export class HeartbeatEngine {
       if (this.lastSpeakFingerprint.get(agent.id) === speakFingerprint) return;
       // backoff: proactive speaks that go unanswered make the heartbeat quieter
       const n = (this.unansweredSpeaks.get(agent.id) ?? 0) + 1;
-      await this.deps.host.deliverToAgent(agent.id, act.speak);
+      await this.deps.host.deliverToAgent(agent.id, act.speak, { origin: "heartbeat" });
       this.unansweredSpeaks.set(agent.id, n);
       this.lastSpeakFingerprint.set(agent.id, speakFingerprint);
       this.persistAgent(agent.id);

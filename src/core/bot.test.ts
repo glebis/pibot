@@ -696,7 +696,7 @@ describe("PiBot card actions", () => {
 });
 
 describe("PiBot fire delivery", () => {
-  it("direct delivery pushes a formatted card", async () => {
+  it("direct delivery pushes a formatted card, sender-attributed on a shared transport", async () => {
     const t = makeBot();
     await t.bot.deliverFire(
       {
@@ -706,8 +706,24 @@ describe("PiBot fire delivery", () => {
       },
       false
     );
-    expect(t.transport.lastText()).toContain("stretch");
+    expect(t.transport.lastText()).toContain("**[assistant]** ⏰ **stretch**");
     expect(t.transport.lastCard()?.map((b) => b.label)).toEqual(["⏰ +10m", "🕒 +1h", "🗑 Done"]);
+  });
+
+  it("direct delivery on the agent's own bot skips the sender prefix", async () => {
+    const t = makeBot();
+    const own = new MockTransport("telegram:assistant", "assistant");
+    t.bot.addTransport(own);
+    await t.bot.deliverFire(
+      {
+        id: "sc1b", agentId: "assistant", chat: { transport: "telegram:assistant", chatId: "42" },
+        title: "stretch", kind: "reminder", dueAt: Date.now(), wake: "normal",
+        delivery: "direct", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    expect(own.lastText()).toContain("⏰ **stretch**");
+    expect(own.lastText()).not.toContain("[assistant]");
   });
 
   it("agent delivery prompts the agent instead", async () => {
@@ -831,7 +847,61 @@ describe("PiBot fire delivery", () => {
     await t.transport.say("ping"); // registers chat
     t.transport.pushed.length = 0;
     await t.bot.deliverToAgent("assistant", "good morning ✨");
-    expect(t.transport.lastText()).toBe("good morning ✨");
+    expect(t.transport.lastText()).toBe("**[assistant]** good morning ✨"); // shared transport → sender attribution
+  });
+
+  it("heartbeat-originated sends carry an [heartbeat] tag on both transport kinds", async () => {
+    const t = makeBot();
+    await t.transport.say("ping"); // shared chat
+    const own = new MockTransport("telegram:assistant", "assistant");
+    t.bot.addTransport(own);
+    await own.say("register dedicated chat");
+
+    await t.bot.deliverToAgent("assistant", "check-in from the rhythm", { origin: "heartbeat" });
+    expect(own.lastText()).toBe("[heartbeat] check-in from the rhythm");
+    // dedicated identity wins: proactive output goes there only, shared bot stays silent
+    expect(t.transport.lastText()).toBe("");
+  });
+
+  it("heartbeat origin is tagged together with the sender prefix on a shared transport", async () => {
+    const t = makeBot();
+    await t.transport.say("ping");
+    t.transport.pushed.length = 0;
+    await t.bot.deliverToAgent("assistant", "quiet tick", { origin: "heartbeat" });
+    expect(t.transport.lastText()).toBe("**[assistant]** [heartbeat] quiet tick");
+  });
+
+  it("resolves per-agent telegram tokens: env overrides manifest overrides persisted settings", async () => {
+    const t = makeBot();
+    const attach = vi.fn(async () => ({ ok: true, botName: "@pimother_test_bot" }));
+    (t.bot as unknown as { attachSubBot: unknown }).attachSubBot = attach;
+    (t.agents.list as ReturnType<typeof vi.fn>).mockReturnValue([
+      { id: "assistant", dir: "/x", manifest: { name: "assistant", telegram: { token: "111:manifest" } } },
+      { id: "coach", dir: "/y", manifest: { name: "coach" } },
+      { id: "tax", dir: "/z", manifest: { name: "tax", telegram: { token: "333:manifest-only" } } },
+    ]);
+    const prev = process.env.PIBOT_TELEGRAM_TOKEN_ASSISTANT;
+    process.env.PIBOT_TELEGRAM_TOKEN_ASSISTANT = "222:env";
+    try {
+      const r = await t.bot.attachConfiguredSubBots({ attempts: 1 });
+      expect(attach).toHaveBeenCalledTimes(2);
+      expect(attach).toHaveBeenCalledWith("assistant", "222:env"); // env beats manifest
+      expect(attach).toHaveBeenCalledWith("tax", "333:manifest-only"); // manifest when no env
+      expect(r.attached).toEqual(["assistant", "tax"]);
+    } finally {
+      if (prev === undefined) delete process.env.PIBOT_TELEGRAM_TOKEN_ASSISTANT;
+      else process.env.PIBOT_TELEGRAM_TOKEN_ASSISTANT = prev;
+    }
+  });
+
+  it("agents without a token stay on the shared bot (no attach attempt)", async () => {
+    const t = makeBot();
+    const attach = vi.fn(async () => ({ ok: true, botName: "@x" }));
+    (t.bot as unknown as { attachSubBot: unknown }).attachSubBot = attach;
+    const r = await t.bot.attachConfiguredSubBots({ attempts: 1 });
+    expect(attach).not.toHaveBeenCalled();
+    expect(r.attached).toEqual([]);
+    expect(r.failed).toEqual([]);
   });
 
   it("suppresses heartbeat escalations for agents that own no chat", async () => {
