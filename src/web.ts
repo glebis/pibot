@@ -38,6 +38,13 @@ export interface WebDeps {
   scheduler: Scheduler;
   events: EventLog;
   evolution: EvolutionEngine;
+  /** model cascade control facade (same one /cascade uses): health + probe/retry/clear */
+  cascade?: {
+    status(agentId?: string): string;
+    probe(): Promise<string>;
+    retry(): Promise<string>;
+    clear(): string;
+  };
   dataDir: string;
   telegram?: TelegramControl;
   secrets?: { get(): import("./config.js").Settings; save(patch: Partial<import("./config.js").Settings>): Promise<void> };
@@ -720,7 +727,7 @@ ${hasToken ? `<div class="card">
   };
 
   // ── overview ──
-  app.get("/", (c) => {
+  app.get("/", async (c) => {
     const agents = deps.agents.list();
     const cards = agents
       .map((a) => {
@@ -744,7 +751,17 @@ ${hasToken ? `<div class="card">
     const authBanner = authRequired() ? `<div class="card"><span class="pill on">🔒 locked</span> <span class="muted">${authStore.hasCredentials() ? authStore.credentials.length+" passkey(s)" : ""} ${webToken ? "· token enabled" : ""}</span>
       <form method="post" action="/auth/logout" class="inline" style="float:right">${csrfField()}<button class="ghost mini" type="submit">Logout</button></form>
       <a href="/auth" style="margin-left:8px">Auth →</a></div>` : `<div class="card"><span class="pill">🔓 open</span> <span class="muted">No passkey, no token — <a href="/auth">enroll Touch ID</a> to lock dashboard</span></div>`;
-    return c.html(page("overview", `${authBanner}${cards || '<p class="muted">No agents yet.</p>'}
+    const cascadeText = deps.cascade ? await deps.cascade.status() : "";
+    const cascadeCard = deps.cascade ? `<h2>Cascade <span class="muted">(model fallback health)</span></h2>
+<div class="card" id="cascade-card">
+  <pre class="events">${esc(cascadeText) || "(chain clear)"}</pre>
+  <div style="margin-top:10px">
+    <form class="inline" method="post" action="/cascade/probe">${csrfField()}<button class="mini" type="submit">probe</button></form>
+    <form class="inline" method="post" action="/cascade/retry" data-swap="#cascade-card">${csrfField()}<button class="mini" type="submit">retry dead-letters</button></form>
+    <form class="inline" method="post" action="/cascade/clear" data-swap="#cascade-card">${csrfField()}<button class="mini danger" type="submit">clear breakers</button></form>
+  </div>
+</div>` : "";
+    return c.html(page("overview", `${authBanner}${cascadeCard}${cards || '<p class="muted">No agents yet.</p>'}
 <h2>Telegram</h2>
 <div class="card">
   ${deps.telegram?.hasTransport("telegram")
@@ -1128,6 +1145,29 @@ ${manifestForm(agent, csrfToken)}
   });
 
   // ── telegram settings ──
+  // ── cascade control (mirror of /cascade in chat) ──
+  app.post("/cascade/probe", async (c) => {
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
+    if (!deps.cascade) return c.redirect("/?msg=" + encodeURIComponent("Cascade is not wired in this build."));
+    return c.redirect("/?msg=" + encodeURIComponent("Probing models…\n" + (await deps.cascade.probe())));
+  });
+
+  app.post("/cascade/retry", async (c) => {
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
+    if (!deps.cascade) return c.redirect("/?msg=" + encodeURIComponent("Cascade is not wired in this build."));
+    return c.redirect("/?msg=" + encodeURIComponent(await deps.cascade.retry()));
+  });
+
+  app.post("/cascade/clear", async (c) => {
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
+    if (!deps.cascade) return c.redirect("/?msg=" + encodeURIComponent("Cascade is not wired in this build."));
+    return c.redirect("/?msg=" + encodeURIComponent(deps.cascade.clear()));
+  });
+
+  // ── telegram ──
   app.get("/telegram", (c) => {
     const enabled = deps.telegram?.hasTransport("telegram") ?? false;
     const username = deps.telegram?.telegramUsername();

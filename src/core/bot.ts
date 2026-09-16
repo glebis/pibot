@@ -1248,7 +1248,8 @@ export class PiBot implements HeartbeatHost {
   }
 
   /** @internal narrow surface for the command layer */
-  private commandContext(): CommandContext {
+  /** Public: the dashboard reuses the same cascade control facade as /cascade. */
+  commandContext(): CommandContext {
     return {
       config: this.deps.config,
       agents: this.deps.agents,

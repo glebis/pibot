@@ -273,7 +273,7 @@ describe("web /telegram", () => {
   let app: ReturnType<typeof createWebApp>;
   let control: ReturnType<typeof fakeControl>;
 
-  function boot(over: Partial<TelegramControl> = {}) {
+  function boot(over: Partial<TelegramControl> = {}, cascade?: WebDeps["cascade"]) {
     dir = tmpDir();
     const agents = new AgentManager(dir, { getModels: () => [] } as unknown as ModelRuntime);
     agents.createAgent("assistant");
@@ -288,7 +288,7 @@ describe("web /telegram", () => {
       io: { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() },
     });
     control = fakeControl(over);
-    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, webToken: "dashboard-test-token", telegram: control, secrets: { get: () => loadSettings(dir), save: async (p) => { await saveSettings(dir, p); } } } satisfies WebDeps);
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, webToken: "dashboard-test-token", telegram: control, secrets: { get: () => loadSettings(dir), save: async (p) => { await saveSettings(dir, p); } }, ...(cascade ? { cascade } : {}) } satisfies WebDeps);
     authenticateTestApp(app);
   }
 
@@ -320,6 +320,33 @@ describe("web /telegram", () => {
     expect(html).toContain("connected as");
     expect(html).toContain("@test_bot");
     expect(html).toContain("/telegram");
+  });
+
+  it("cascade card renders health and control actions when wired, hides when not", async () => {
+    const probe = vi.fn(async () => "probe: all 3 ok");
+    boot({}, {
+      status: () => "primary ✓\nfallback ✕ — down (network), retry in 4m",
+      probe, retry: vi.fn(async () => "replayed 1"), clear: () => "Reopened 2 model(s)",
+    });
+    let res = await app.request("/");
+    let html = await res.text();
+    expect(html).toContain("Cascade");
+    expect(html).toContain("fallback ✕");
+    expect(html).toContain('action="/cascade/probe"');
+    expect(html).toContain('action="/cascade/clear"');
+
+    const form = new FormData();
+    form.set("_csrf", withCsrf(new FormData(), app).get("_csrf") ?? "");
+    res = await app.request("/cascade/probe", { method: "POST", body: form, redirect: "manual" });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(302);
+  });
+
+  it("cascade card stays hidden when cascade is not wired", async () => {
+    boot();
+    const res = await app.request("/");
+    const html = await res.text();
+    expect(html).not.toContain("model fallback health");
   });
 
   it("POST connects with a valid token and persists settings", async () => {

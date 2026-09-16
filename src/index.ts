@@ -187,6 +187,8 @@ async function main(): Promise<void> {
       agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
       webToken: config.webToken, webRpId: config.webRpId, webPort,
       providers: providerManager,
+      // same cascade control facade the /cascade chat command uses
+      cascade: bot.commandContext().cascade,
     });
     const server = serve({ fetch: webApp.fetch, port: webPort, hostname: "127.0.0.1" });
     console.log(`[pibot] dashboard → http://127.0.0.1:${webPort}${config.webToken ? " 🔒 token" : ""}${config.webRpId ? ` (rpId=${config.webRpId})` : ""}`);
