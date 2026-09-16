@@ -433,6 +433,36 @@ export class PiBot implements HeartbeatHost {
     return this.telegramUsername();
   }
 
+  /** Chat-binding inventory for the dashboard: every remembered chat, its
+   *  current interactive owner and whether a dedicated transport answers it. */
+  chatBindings(): Array<{ chat: string; agent: string; dedicated: boolean }> {
+    const out = new Map<string, { chat: string; agent: string; dedicated: boolean }>();
+    for (const [agentId, cks] of this.agentChats) {
+      for (const ck of cks) {
+        const idx = ck.lastIndexOf(":");
+        const dedicated = this.transports.get(ck.slice(0, idx))?.boundAgentId === agentId;
+        out.set(ck, { chat: ck, agent: this.chatAgent.get(ck) ?? agentId, dedicated });
+      }
+    }
+    return [...out.values()];
+  }
+
+  /** The main bot's primary chat key (first allowed chat of the shared telegram transport). */
+  mainChat(): string | undefined {
+    const t = this.transports.get("telegram");
+    const allowed = (t as { allowedChats?: () => string[] } | undefined)?.allowedChats;
+    const first = typeof allowed === "function" ? allowed.call(t)[0] : undefined;
+    return first && t ? `${t.name}:${first}` : undefined;
+  }
+
+  /** Dashboard action: bind a chat to an agent (same memory write /agent switching does). */
+  rebind(chat: string, agentId: string): { ok: boolean; error?: string } {
+    if (!this.deps.agents.getAgent(agentId)) return { ok: false, error: `unknown agent "${agentId}"` };
+    if (!this.transports.get(chat.slice(0, chat.lastIndexOf(":")))) return { ok: false, error: `no transport for "${chat}"` };
+    this.rememberChat(agentId, chat);
+    return { ok: true };
+  }
+
   subBotFor(agentId: string): { username?: string } | undefined {
     const t = this.transports.get(`telegram:${agentId}`);
     return t instanceof TelegramTransport && t.botUsername() ? { username: t.botUsername() } : undefined;

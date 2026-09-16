@@ -17,6 +17,9 @@ function fakeControl(over: Partial<TelegramControl> = {}): TelegramControl & { e
     telegramUsername: vi.fn(() => undefined),
     enableTelegram: enableSpy,
     disableTelegram: vi.fn(async () => true),
+    chatBindings: vi.fn(() => []),
+    mainChat: vi.fn(() => undefined),
+    rebind: vi.fn(() => ({ ok: true })),
     ...over,
     enableSpy,
   } as never;
@@ -352,6 +355,31 @@ describe("web /telegram", () => {
     expect(res.status).toBe(302);
     const page = await (await app.request("/agents/assistant")).text();
     expect(page).toContain('name="task_acks" checked');
+  });
+
+  it("chat bindings card lists chats and offers reclaim for the main chat", async () => {
+    boot({
+      subBotFor: vi.fn(() => undefined),
+      managerMode: vi.fn(() => true),
+      chatBindings: vi.fn(() => [
+        { chat: "telegram:161427550", agent: "knower", dedicated: false },
+        { chat: "telegram:creator:161427550", agent: "creator", dedicated: true },
+      ]),
+      mainChat: vi.fn(() => "telegram:161427550"),
+      rebind: vi.fn(() => ({ ok: true })),
+    });
+    const res = await app.request("/agents/assistant");
+    const html = await res.text();
+    expect(html).toContain("who answers where");
+    expect(html).toContain("none bound yet");
+    expect(html).toContain("reclaim main chat");
+    expect(html).toContain("answer here");
+
+    const form = new FormData();
+    form.set("_csrf", withCsrf(new FormData(), app).get("_csrf") ?? "");
+    form.set("chat", "telegram:161427550");
+    const r = await app.request("/agents/assistant/rebind", { method: "POST", body: form, redirect: "manual" });
+    expect(r.status).toBe(302);
   });
 
   it("cascade card stays hidden when cascade is not wired", async () => {

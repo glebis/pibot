@@ -32,6 +32,9 @@ export interface TelegramControl {
   attachSubBot(agentId: string, token: string, allowedChats?: string[]): Promise<{ ok: boolean; botName?: string; error?: string }>;
   detachSubBot(agentId: string): Promise<boolean>;
   requestSubBotCreation(agentId: string): Promise<void>;
+  chatBindings(): Array<{ chat: string; agent: string; dedicated: boolean }>;
+  mainChat(): string | undefined;
+  rebind(chat: string, agentId: string): { ok: boolean; error?: string };
 }
 
 export interface WebDeps {
@@ -887,6 +890,12 @@ ${hasToken ? `<div class="card">
     const staged = deps.evolution.staged(agent.id);
     const skills = listSkillDirs(path.join(agent.dir, "skills"));
     const events = deps.events.tail(agent.id, 12);
+    const bindings = deps.telegram?.chatBindings() ?? [];
+    const mainChat = deps.telegram?.mainChat();
+    const ownedChats = bindings.filter((b) => b.agent === agent.id);
+    const others = bindings.filter((b) => b.agent !== agent.id);
+    const mainOwner = mainChat ? bindings.find((b) => b.chat === mainChat)?.agent : undefined;
+    const mainOwned = mainOwner === agent.id;
     const memoryFile = path.join(agent.dir, "memory", "MEMORY.md");
     const memory = fs.existsSync(memoryFile) ? fs.readFileSync(memoryFile, "utf8") : "";
 
@@ -970,6 +979,13 @@ ${manifestForm(agent, csrfToken)}
   <input type="password" name="token" placeholder="123456:ABC…" autocomplete="off">
   <button type="submit">Attach sub-bot</button>
 </form>
+
+<h2>Chat bindings <span class="muted">(who answers where)</span></h2>
+<div class="card" id="bindings-card">
+  <div><strong>this agent:</strong> ${ownedChats.map((b) => `<span class="pill ${b.dedicated ? "on" : ""}">${esc(b.chat)}${b.dedicated ? " · dedicated" : " · interactive"}</span>`).join(" ") || '<span class="muted">none bound yet</span>'}</div>
+  ${mainChat && !mainOwned ? `<div style="margin-top:10px"><span class="mono">${esc(mainChat)}</span> → <strong>${esc(mainOwner ?? "?")}</strong> <form class="inline" method="post" action="/agents/${esc(agent.id)}/rebind" data-swap="#bindings-card">${csrfField()}<input type="hidden" name="chat" value="${esc(mainChat)}"><button class="mini" type="submit">reclaim main chat</button></form></div>` : ""}
+  ${others.length ? `<div style="margin-top:10px"><strong>other chats:</strong> ${others.map((b) => `<span class="mono">${esc(b.chat)}</span> → <strong>${esc(b.agent)}</strong> <form class="inline" method="post" action="/agents/${esc(agent.id)}/rebind" data-swap="#bindings-card">${csrfField()}<input type="hidden" name="chat" value="${esc(b.chat)}"><button class="mini" type="submit">answer here</button></form>`).join(" · ")}</div>` : ""}
+</div>
 
 <h2>Run evolution now</h2>
 <form method="post" action="/agents/${esc(agent.id)}/evolve" class="card">
@@ -1121,6 +1137,14 @@ ${manifestForm(agent, csrfToken)}
     if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     deps.evolution.reject(c.req.param("id"), c.req.param("name"));
     return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Rejected 🗑")}`);
+  });
+
+  app.post("/agents/:id/rebind", async (c) => {
+    const b = await c.req.parseBody() as Record<string,string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
+    const chat = String(b.chat ?? "").trim();
+    const r = deps.telegram?.rebind(chat, c.req.param("id")) ?? { ok: false, error: "telegram not wired" };
+    return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent(r.ok ? `Bound — ${chat} now reaches ${c.req.param("id")}` : r.error ?? "rebind failed")}`);
   });
 
   app.post("/agents/:id/subbot", async (c) => {
