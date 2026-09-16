@@ -3,19 +3,22 @@ import { Type } from "typebox";
 import { truncate } from "../core/util.js";
 
 export interface CommsHooks {
-  /** deliver a message into another agent's session; returns that agent's reply text */
-  askAgent(fromAgentId: string, toAgentId: string, text: string, timeoutMs?: number): Promise<string>;
+  /** deliver a message into another agent's session; returns that agent's reply text.
+   *  originChat: the chat the delegating agent is bound to — status/acks route back there. */
+  askAgent(fromAgentId: string, toAgentId: string, text: string, timeoutMs?: number, originChat?: { transport: string; chatId: string }): Promise<string>;
   /** handoff: package this agent's context + deliver to the target; returns the target's ack */
-  handoffContext(fromAgentId: string, toAgentId: string, note?: string): Promise<string>;
+  handoffContext(fromAgentId: string, toAgentId: string, note?: string, originChat?: { transport: string; chatId: string }): Promise<string>;
   /** list available sibling agents */
   listAgents(): Array<{ id: string; description?: string }>;
 }
 
 export interface AgentCommsPluginDeps {
   agentId: string;
+  /** chat that owns the session this plugin instance is bound to — origin for status routing */
+  chat: { transport: string; chatId: string };
   /** provided by the host (PiBot) — routes through inter-agent sessions */
-  askAgent: (from: string, to: string, text: string, timeoutMs?: number) => Promise<string>;
-  handoffContext: (from: string, to: string, note?: string) => Promise<string>;
+  askAgent: CommsHooks["askAgent"];
+  handoffContext: CommsHooks["handoffContext"];
   listAgents: () => Array<{ id: string; description?: string }>;
 }
 
@@ -46,7 +49,7 @@ export function agentCommsPlugin(deps: AgentCommsPluginDeps): InlineExtension {
             details = { ok: false };
           } else {
             try {
-              await deps.askAgent(deps.agentId, params.to, params.text);
+              await deps.askAgent(deps.agentId, params.to, params.text, undefined, deps.chat);
               text = `Delivered to **${params.to}**.`;
               details = { ok: true };
             } catch (e) {
@@ -77,7 +80,7 @@ export function agentCommsPlugin(deps: AgentCommsPluginDeps): InlineExtension {
           } else {
             const timeoutMs = params.timeoutMinutes ? (parseFloat(params.timeoutMinutes) || 10) * 60e3 : undefined;
             try {
-              const reply = await deps.askAgent(deps.agentId, params.to, params.question, timeoutMs);
+              const reply = await deps.askAgent(deps.agentId, params.to, params.question, timeoutMs, deps.chat);
               text = `**${params.to}** replied:\n${truncate(reply, 2500)}`;
               details = { reply };
             } catch (e) {
@@ -106,7 +109,7 @@ export function agentCommsPlugin(deps: AgentCommsPluginDeps): InlineExtension {
             details = { ok: false };
           } else {
             try {
-              const reply = await deps.handoffContext(deps.agentId, params.to, params.note);
+              const reply = await deps.handoffContext(deps.agentId, params.to, params.note, deps.chat);
               text = `Handed off to **${params.to}**. They have the context now.\n${truncate(reply, 300)}`;
               details = { ok: true };
             } catch (e) {

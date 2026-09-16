@@ -1957,13 +1957,12 @@ export class PiBot implements HeartbeatHost {
 
   // ── agent-to-agent messaging ─────────────────────────────────────────────
 
-  /** Run one turn in an agent's inter-agent session and return the reply text */
   private commsHooks() {
     return {
-      askAgent: (fromAgentId: string, toAgentId: string, text: string, timeoutMs?: number) =>
-        this.agentAsk(fromAgentId, toAgentId, text, timeoutMs),
-      handoffContext: (fromAgentId: string, toAgentId: string, note?: string) =>
-        this.handoffContext(fromAgentId, toAgentId, note),
+      askAgent: (fromAgentId: string, toAgentId: string, text: string, timeoutMs?: number, originChat?: ChatRef) =>
+        this.agentAsk(fromAgentId, toAgentId, text, timeoutMs, originChat),
+      handoffContext: (fromAgentId: string, toAgentId: string, note?: string, originChat?: ChatRef) =>
+        this.handoffContext(fromAgentId, toAgentId, note, originChat),
       listAgents: () => this.deps.agents.list().map((agent) => ({ id: agent.id, description: agent.manifest.description })),
     };
   }
@@ -1998,7 +1997,11 @@ export class PiBot implements HeartbeatHost {
     return { sent: 1, targets: [chat] };
   }
 
-  private async agentTurn(agentId: string, fromAgent: string, text: string, timeoutMs?: number): Promise<string> {
+  /** Run one turn in an agent's inter-agent session and return the reply text.
+   *  originChat: the user chat the delegating agent is bound to — the target's
+   *  final reply is auto-pushed back there so owner-facing status never vanishes
+   *  into agent-only sessions. */
+  private async agentTurn(agentId: string, fromAgent: string, text: string, timeoutMs?: number, originChat?: ChatRef): Promise<string> {
     const target = this.deps.agents.getAgent(agentId);
     if (!target) throw new Error(`unknown agent "${agentId}"`);
     const ck = `agent::${agentId}::from-${fromAgent}`;
@@ -2006,7 +2009,10 @@ export class PiBot implements HeartbeatHost {
       agentId, ck, { transport: "agent", chatId: fromAgent }, this.deps.scheduler, undefined, this.commsHooks()
     );
     if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("target agent is busy");
-    const run = session.prompt(envelope(`[agent-message from "${fromAgent}"]\n\n${text}`));
+    const envelopeText = originChat
+      ? `${text}\n\n(Reply-to (owner's chat): ${originChat.transport}:${originChat.chatId} — when you finish or need input, your final reply is delivered back to that chat automatically.)`
+      : text;
+    const run = session.prompt(envelope(`[agent-message from "${fromAgent}"]\n\n${envelopeText}`));
     const reply = timeoutMs
       ? await Promise.race([
           run.then(() => extractAssistantTextFromSession(session)),
@@ -2014,12 +2020,21 @@ export class PiBot implements HeartbeatHost {
         ])
       : await run.then(() => extractAssistantTextFromSession(session));
     const finalReply = reply || "(no reply)";
+    if (originChat) {
+      // owner-facing status: the reply lands in the chat the work was requested from
+      const t = this.transports.get(originChat.transport);
+      if (t) {
+        const outbound = t.boundAgentId === agentId ? finalReply : `**[${agentId}]** ${truncate(finalReply, 900)}`;
+        await t.push(originChat.chatId, { text: outbound }).catch(() => {});
+        this.deps.events.log(agentId, "send", `→ ${originChat.transport}:${originChat.chatId}: ${truncate(finalReply, 80)}`);
+      }
+    }
     this.maybeEmitTaskAck(agentId, fromAgent, text, finalReply);
     return finalReply;
   }
 
-  /** Agent-initiated handoff: move the sender's conversation to the target when the sender owns a rebindable (non-subbot) chat; otherwise deliver the brief into the target's pair session. */
-  async handoffContext(fromAgent: string, toAgent: string, note?: string): Promise<string> {
+  /** Agent-initiated handoff: move the sender's conversation to the target when the sender owns a rebindable (non-subbot) chat; otherwise deliver the brief into the target's pair session (status routes back to the origin chat). */
+  async handoffContext(fromAgent: string, toAgent: string, note?: string, originChat?: ChatRef): Promise<string> {
     const fromCk = [...(this.agentChats.get(fromAgent) ?? [])][0];
     if (fromCk) {
       const { transport: transportName, chatId } = this.splitChatKey(fromCk);
@@ -2043,12 +2058,13 @@ export class PiBot implements HeartbeatHost {
     });
     return this.agentTurn(toAgent, fromAgent,
       `[handoff from "${fromAgent}"] The user may move this thread to you.${note ? ` Note: ${note}` : ""}\n\n# Context from ${fromAgent}\n${brief}\n\nAcknowledge briefly and continue.`,
-      10 * 60e3
+      10 * 60e3,
+      originChat ?? (fromCk ? this.splitChatKey(fromCk) : undefined)
     );
   }
 
   /** Blocking inter-agent question — used by the agent_ask tool */
-  async agentAsk(fromAgent: string, toAgent: string, question: string, timeoutMs?: number): Promise<string> {
+  async agentAsk(fromAgent: string, toAgent: string, question: string, timeoutMs?: number, originChat?: ChatRef): Promise<string> {
     if (!this.deps.agents.getAgent(toAgent)) throw new Error(`unknown agent "${toAgent}"`);
     // loop protection: identical asks within 5 minutes are rejected (OpenClaw-style bot loop guard)
     const now = Date.now();
@@ -2059,7 +2075,7 @@ export class PiBot implements HeartbeatHost {
     const hit = this.recentAsks.get(dedupeKey);
     if (hit && now - hit < 5 * 60e3) throw new Error(`loop guard: the same question was sent to ${toAgent} recently`);
     this.recentAsks.set(dedupeKey, now);
-    return this.agentTurn(toAgent, fromAgent, question, timeoutMs);
+    return this.agentTurn(toAgent, fromAgent, question, timeoutMs, originChat);
   }
 
   private recentAsks = new Map<string, number>(); // "from->to:text" → ts
@@ -2213,7 +2229,11 @@ export class PiBot implements HeartbeatHost {
     for (const [k, ts] of this.lastTaskAcks) if (now - ts > 10 * 60e3) this.lastTaskAcks.delete(k);
     if (this.lastTaskAcks.has(fp)) return;
     this.lastTaskAcks.set(fp, now);
-    const line = taskAckLine(ack, agentId, reply, threaded ? undefined : { from: fromAgent });
+    // Unthreaded sibling lines quote the handed task text (the reply went back on
+    // the relay — quoting it leaves the owner guessing what the task even was).
+    // Threaded and owner-handed lines keep the reply: the thread / the owner's own
+    // message carries the task context, so the quote can be what the agent said.
+    const line = taskAckLine(ack, agentId, threaded || fromAgent === "you" ? reply : taskText, threaded ? undefined : { from: fromAgent });
     const ackFrom = threaded ? "you" : fromAgent;
     this.deps.events.log(agentId, "task-ack", `${ack} — ${truncate(taskText, 80)} (reply: ${truncate(reply, 80)})`);
     void this.deliverToAgent(agentId, line, { replyToMessageId: delivery.replyToMessageId, onlyChat: delivery.onlyChat, selfAttributed: true }).catch(() => {});

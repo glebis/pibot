@@ -1461,8 +1461,35 @@ describe("task ack confirmations", () => {
     await (t.bot as unknown as { agentTurn(a: string, f: string, text: string): Promise<string> }).agentTurn(
       "assistant", "knower", "file the Berlin takeaways"
     );
-    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted **knower**'s task: “On it — leave it with me.”"))).toBe(true);
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted **knower**'s task: “file the Berlin takeaways”"))).toBe(true);
     expect(t.events.log).toHaveBeenCalledWith("assistant", "task-ack", expect.stringContaining("accepted"));
+  });
+
+  it("origin-chat routing: delegated work reports back to the chat the owner typed in", async () => {
+    const t = makeBot();
+    const sess = sessionWithReply("Built and committed. Dashboard is live.");
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
+    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
+      "fitness", "assistant", "implement the dashboard", undefined, { transport: "mock", chatId: "42" }
+    );
+    // final status pushed into the origin chat, sender-attributed (shared transport)
+    const status = t.transport.pushed.find((p) => p.opts.text.includes("Built and committed"));
+    expect(status).toBeDefined();
+    expect(status!.opts.text).toContain("[assistant]");
+    // envelope told the target agent where the owner typed
+    const promptArg = (sess.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(promptArg).toContain("Reply-to (owner's chat): mock:42");
+    // trail: origin send is event-logged with a bounded preview
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "send", expect.stringContaining("mock:42"));
+  });
+
+  it("origin-chat routing: unknown origin transport degrades silently", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("done"));
+    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
+      "fitness", "assistant", "implement", undefined, { transport: "ghost", chatId: "42" }
+    );
+    expect(t.transport.pushed.length).toBe(0); // no push, no crash
   });
 
   it("task acks respect the per-agent opt-out", async () => {

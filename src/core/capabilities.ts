@@ -181,7 +181,7 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
   {
     id: "agent-comms", defaultEnabled: true, tools: ["agent_message", "agent_ask", "agent_list", "handoff"],
     prompt: "agent_message (fire-and-forget), agent_ask (blocking), and agent_list coordinate with sibling agents; handoff packages a distilled task brief from the recent conversation and moves the chat to the target agent when it allows rebinding. Messages prefixed `[agent-message from ...]` come from a sibling and should receive a natural reply.",
-    available: (ctx) => Boolean(ctx.comms), create: (ctx) => agentCommsPlugin({ agentId: ctx.agent.id, ...ctx.comms! }),
+    available: (ctx) => Boolean(ctx.comms), create: (ctx) => agentCommsPlugin({ agentId: ctx.agent.id, chat: ctx.chat, ...ctx.comms! }),
   },
   {
     id: "questions", defaultEnabled: true, tools: ["ask_user"],
