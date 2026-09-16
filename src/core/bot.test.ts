@@ -1216,6 +1216,33 @@ describe("cascade dead-letter loop guards", () => {
     expect(t.cascade.noteSuccess).toHaveBeenCalledWith("ollama/test");
   });
 
+  it("notifies the user when a turn is answered on a fallback model (primary down)", async () => {
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["primary/m", "fallback/m"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("fallback/m");
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "fallback" } as never);
+    t.promptSpy.mockResolvedValue(undefined);
+
+    await t.bot.promptAgent(t.transport, "42", "assistant", "hello");
+
+    const notice = t.transport.pushed.map((p) => p.opts.text).find((text) => text.includes("answering on fallback model"));
+    expect(notice).toBeTruthy();
+    expect(notice).toContain("`fallback/m`");
+    expect(notice).toContain("**primary/m**");
+  });
+
+  it("reports the fallback notice once, not once per message, while the primary stays down", async () => {
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["primary/m", "fallback/m"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("fallback/m");
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "fallback" } as never);
+    t.promptSpy.mockResolvedValue(undefined);
+
+    await t.bot.promptAgent(t.transport, "42", "assistant", "first");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "second");
+
+    const notices = t.transport.pushed.filter((p) => p.opts.text.includes("answering on fallback model"));
+    expect(notices).toHaveLength(1);
+  });
+
   it("does not mistake historical assistant text for partial output on a terminal error", async () => {
     const original = {
       id: "dl-history", agentId: "assistant", transport: "mock", chatId: "42",

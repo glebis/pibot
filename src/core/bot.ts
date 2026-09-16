@@ -82,6 +82,8 @@ export class PiBot implements HeartbeatHost {
   private sessionSpec = new Map<string, string>();
   private pendingPushes = new Map<string, Promise<void>>();
   private sessionTurnFailures = new Map<string, { error: string; hadPartialText: boolean }>();
+  /** chatKey::agentId → last model that completed a turn (drives the "answering on fallback" notice) */
+  private lastAnswerModel = new Map<string, string>();
   private probing = false; // one recovery probe at a time
 
   /** @internal session cache access for handoff context extraction */
@@ -762,6 +764,8 @@ export class PiBot implements HeartbeatHost {
 
     const agent = this.deps.agents.getAgent(agentId);
     const chain = cascade.chainFor(agent?.manifest ?? {});
+    // The model this agent prefers when everything is healthy (manifest model, else chain head).
+    const primary = (agent?.manifest.model ?? "").trim() || chain[0] || "";
     const wkey = `${agentId}::${ck}`;
     let spec = this.sessionSpec.get(wkey) ?? ""; // "" = not yet bound
     if (spec && !chain.includes(spec)) spec = "";
@@ -823,6 +827,7 @@ export class PiBot implements HeartbeatHost {
       const err = thrown ?? eventFailure?.error ?? lastAssistantError(((session as { agent?: { state?: { messages?: unknown[] } } }).agent?.state?.messages) ?? []);
       if (!err) {
         if (spec) cascade.noteSuccess(spec);
+        await this.maybeNotifyFallback(t, chatId, ck, agentId, spec, primary, text);
         return;
       }
       ambiguousPartialFailure ||= Boolean(eventFailure?.hadPartialText);
@@ -865,6 +870,40 @@ export class PiBot implements HeartbeatHost {
     const dl = cascade.queueDead({ agentId, transport: t.name, chatId, text, createdAt: Date.now(), attempts, lastError });
     this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — queued ${dl.id} (${cascade.deadLetterCount()} pending)`);
     await t.notifyError(chatId, this.cascadeDownNotice(agentId, attempts, failures, cascade));
+  }
+
+  /**
+   * Notify the user in plain, deterministic text when a turn was answered on a
+   * fallback model because the agent's primary could not be used (circuit-open /
+   * failed). Fires once per (chat, agent) per distinct fallback model, so a burst
+   * of messages while the primary is down doesn't re-spam the identical notice,
+   * but a genuine re-switch (primary recovered then dropped again) reports again.
+   * Never model-generated; internal host prompts are excluded.
+   */
+  private async maybeNotifyFallback(
+    t: Transport,
+    chatId: string,
+    ck: string,
+    agentId: string,
+    spec: string,
+    primary: string,
+    text: string,
+  ): Promise<void> {
+    const key = `${ck}::${agentId}`;
+    const last = this.lastAnswerModel.get(key);
+    const internal = INTERNAL_PROMPT_PREFIXES.some((p) => text.startsWith(p));
+    const switchedToFallback = Boolean(spec && primary && spec !== primary);
+    if (switchedToFallback && !internal && last !== spec) {
+      const msg =
+        `🔀 Heads up — *${agentId}* is answering on fallback model \`${spec}\` because the primary **${primary}** is currently unavailable. ` +
+        `The reply above was produced normally — just via a backup model. \`/cascade\` for status.`;
+      try {
+        await t.push(chatId, { text: msg });
+      } catch {
+        /* notice is best-effort */
+      }
+    }
+    this.lastAnswerModel.set(key, spec || primary || "");
   }
 
   /**
