@@ -332,9 +332,17 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
     <div><label>Quiet from</label><input type="text" name="hb_from" value="${esc(qh.from)}"></div>
     <div><label>Quiet to</label><input type="text" name="hb_to" value="${esc(qh.to)}"></div>
   </div>
+  <div class="row">
+    <div><label class="mono">daily morning brief (non-default agents: opt-in) <input type="checkbox" name="hb_morning_brief" ${hb.morningBrief ? "checked" : ""} style="width:auto"></label></div>
+  </div>
   <h2 style="border:0;margin-top:18px">Comms</h2>
   <div class="row">
     <div><label class="mono">task confirmations in its bot chat <input type="checkbox" name="task_acks" ${taskAcksEnabled(m) ? "checked" : ""} style="width:auto"></label></div>
+  </div>
+  <h2 style="border:0;margin-top:18px">Voice privacy</h2>
+  <div class="row">
+    <div><label>STT providers (comma-separated; empty = local only)</label><input type="text" name="stt_providers" value="${esc((m.speech?.sttProviders ?? []).join(","))}" placeholder="whisperkit,groq"></div>
+    <div><label class="mono">allow external STT <input type="checkbox" name="allow_external_stt" ${m.speech?.allowExternalStt ? "checked" : ""} style="width:auto"></label></div>
   </div>
   <div class="row">
     <div><label>Wakeup min (floor for adaptive wakeups)</label><input type="text" name="hb_min" value="${esc(hb.minInterval ?? "5m")}"></div>
@@ -1028,10 +1036,17 @@ ${manifestForm(agent, csrfToken)}
       tools: str("tools") ? str("tools").split(",").map((t) => t.trim()).filter(Boolean) : undefined,
       providers: str("providers") ? str("providers").split(",").map((provider) => provider.trim()).filter(Boolean) : undefined,
       comms: { ...agent.manifest.comms, taskAcks: on("task_acks") },
+      speech: {
+        sttProviders: str("stt_providers")
+          ? (str("stt_providers").split(",").map((v) => v.trim()).filter(Boolean) as Array<"whisperkit" | "local_whisper" | "groq">)
+          : undefined,
+        allowExternalStt: on("allow_external_stt"),
+      },
       heartbeat: {
         enabled: on("hb_enabled"),
         interval: hbInterval,
         model: str("hb_model") || "same",
+        morningBrief: on("hb_morning_brief") || undefined,
         quietHours: { from: str("hb_from") || "23:00", to: str("hb_to") || "08:00" },
         minInterval: hbMin,
         maxInterval: hbMax,

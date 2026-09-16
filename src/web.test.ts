@@ -382,6 +382,22 @@ describe("web /telegram", () => {
     expect(r.status).toBe(302);
   });
 
+  it("manifest editor persists morning brief and voice privacy fields", async () => {
+    boot({ subBotFor: vi.fn(() => undefined), managerMode: vi.fn(() => true) });
+    const form = new FormData();
+    form.set("_csrf", withCsrf(new FormData(), app).get("_csrf") ?? "");
+    form.set("description", "assistant");
+    form.set("hb_morning_brief", "on");
+    form.set("stt_providers", "whisperkit, groq");
+    form.set("allow_external_stt", "on");
+    const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form, redirect: "manual" });
+    expect(res.status).toBe(302);
+    const page = await (await app.request("/agents/assistant")).text();
+    expect(page).toContain('name="hb_morning_brief" checked');
+    expect(page).toContain('value="whisperkit,groq"');
+    expect(page).toContain('name="allow_external_stt" checked');
+  });
+
   it("cascade card stays hidden when cascade is not wired", async () => {
     boot();
     const res = await app.request("/");
