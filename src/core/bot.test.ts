@@ -1360,6 +1360,53 @@ describe("voice transcript echo", () => {
   });
 });
 
+describe("task ack confirmations", () => {
+  function sessionWithReply(text: string) {
+    return {
+      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text }] }] } },
+      prompt: vi.fn(async () => {}),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+  }
+
+  it("inter-agent task replies surface a passive ack line in the recipient's chat", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("On it — leave it with me."));
+    bBind(t, "assistant", "mock:42");
+    await (t.bot as unknown as { agentTurn(a: string, f: string, text: string): Promise<string> }).agentTurn(
+      "assistant", "knower", "file the Berlin takeaways"
+    );
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted a task from **knower**"))).toBe(true);
+  });
+
+  it("task acks respect the per-agent opt-out", async () => {
+    const t = makeBot();
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "assistant" ? { id, dir: "/x", manifest: { name: id, comms: { taskAcks: false } } } : undefined
+    );
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("On it, will do."));
+    bBind(t, "assistant", "mock:42");
+    await (t.bot as unknown as { agentTurn(a: string, f: string, text: string): Promise<string> }).agentTurn(
+      "assistant", "knower", "file the report"
+    );
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("accepted a task"))).toBe(false);
+  });
+
+  it("owner task assignments in the agent's chat ack too", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("On it — will do."));
+    await t.transport.say("file the Berlin takeaways");
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted a task from **you**"))).toBe(true);
+  });
+
+  function bBind(t: ReturnType<typeof makeBot>, agentId: string, ck: string): void {
+    const b = t.bot as unknown as { agentChats: Map<string, Set<string>>; chatAgent: Map<string, string> };
+    b.chatAgent.set(ck, agentId);
+    b.agentChats.set(agentId, new Set([ck]));
+  }
+});
+
 describe("chat routing ownership", () => {
   type RoutingBot = {
     agentChats: Map<string, Set<string>>;

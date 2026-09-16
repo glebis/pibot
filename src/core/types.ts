@@ -181,6 +181,10 @@ export interface AgentManifest {
   /** "repo": this agent develops the pibot source itself — its session cwd is the
    *  repo root instead of its own agent dir (used by the built-in pibot-dev agent). */
   workspace?: "agent-dir" | "repo";
+  /** inter-agent communication surface. taskAcks: when this agent accepts/declines/
+   *  completes a task handed to it (by a sibling agent or the owner), a passive
+   *  confirmation line lands in its bot chat. Default: on. */
+  comms?: { taskAcks?: boolean };
 }
 
 export const DEFAULT_AGENT_TOOLS: string[] = [];

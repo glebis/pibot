@@ -6,6 +6,7 @@ import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-
 import { TelegramTransport } from "../transports/telegram.js";
 import { attendCli } from "../plugins/attend-plugin.js";
 import { createCommandHandler, evolutionReviewCard, type CommandContext } from "./commands.js";
+import { classifyTaskReply, taskAckLine, taskAcksEnabled } from "./task-acks.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
@@ -696,7 +697,7 @@ export class PiBot implements HeartbeatHost {
     chatId: string,
     agentId: string,
     text: string,
-    opts: { recoveringDeadLetter?: boolean; reply?: ReplyContext } = {},
+    opts: { recoveringDeadLetter?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null } = {},
   ): Promise<void> {
     const ck = this.chatKey(t, chatId);
     this.rememberChat(agentId, ck);
@@ -714,6 +715,12 @@ export class PiBot implements HeartbeatHost {
       this.pendingPushes.delete(`${agentId}::${ck}`);
       // followUp: concurrent messages queue behind the running turn instead of erroring
       await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, text), opts.recoveringDeadLetter ?? false);
+      // implicit task acks: when this agent just accepted/declined/completed a task
+      // handed to it in its chat (owner assignments), surface a passive line
+      if (opts.taskAckFrom !== null) {
+        const replyText = extractAssistantTextFromSession(session);
+        if (replyText) this.maybeEmitTaskAck(agentId, opts.taskAckFrom ?? "you", text, replyText);
+      }
       await Promise.resolve();
       const delivery = this.pendingPushes.get(`${agentId}::${ck}`);
       if (delivery) {
@@ -1882,7 +1889,9 @@ export class PiBot implements HeartbeatHost {
           new Promise<string>((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
         ])
       : await run.then(() => extractAssistantTextFromSession(session));
-    return reply || "(no reply)";
+    const finalReply = reply || "(no reply)";
+    this.maybeEmitTaskAck(agentId, fromAgent, text, finalReply);
+    return finalReply;
   }
 
   /** Agent-initiated handoff: move the sender's conversation to the target when the sender owns a rebindable (non-subbot) chat; otherwise deliver the brief into the target's pair session. */
@@ -2025,6 +2034,24 @@ export class PiBot implements HeartbeatHost {
     }
   }
 
+  private lastTaskAcks = new Map<string, number>();
+
+  /** Implicit task confirmations: when an agent's reply lexicon-matches an
+   *  acceptance/decline/completion of a handed task, a passive line lands in
+   *  the agent's bot chat (deliverToAgent ownership rules apply). Deterministic
+   *  lexicon — no match, no line. Deduped per (agent, ack, task) within 10 min. */
+  private maybeEmitTaskAck(agentId: string, fromAgent: string, taskText: string, reply: string): void {
+    if (!taskAcksEnabled(this.deps.agents.getAgent(agentId)?.manifest)) return;
+    const ack = classifyTaskReply(reply);
+    if (!ack) return;
+    const fp = `${agentId}|${ack}|${taskText.slice(0, 80)}`;
+    const now = Date.now();
+    for (const [k, ts] of this.lastTaskAcks) if (now - ts > 10 * 60e3) this.lastTaskAcks.delete(k);
+    if (this.lastTaskAcks.has(fp)) return;
+    this.lastTaskAcks.set(fp, now);
+    void this.deliverToAgent(agentId, taskAckLine(ack, agentId, fromAgent, taskText)).catch(() => {});
+  }
+
   async escalateToAgent(agentId: string, instruction: string): Promise<void> {
     // Same ownership rule as deliverToAgent: escalate only into chats this agent
     // owns (bound subbot or currently selected agent) — never into a chat some
@@ -2037,7 +2064,7 @@ export class PiBot implements HeartbeatHost {
     const idx = ck.lastIndexOf(":");
     const t = this.transports.get(ck.slice(0, idx));
     if (!t) return;
-    await this.promptAgent(t, ck.slice(idx + 1), agentId, `[heartbeat] ${instruction}`);
+    await this.promptAgent(t, ck.slice(idx + 1), agentId, `[heartbeat] ${instruction}`, { taskAckFrom: null }); // heartbeat instructions are not owner tasks
   }
 
   /** Does this agent own the chat: dedicated identity or current interactive binding? */
