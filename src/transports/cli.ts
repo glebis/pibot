@@ -8,12 +8,12 @@ import { truncate } from "../core/util.js";
  */
 export class CliTransport implements Transport {
   readonly name = "cli";
-  private onMessageCb: ((text: string, chatId: string, reply?: ReplyContext) => Promise<void>) | null = null;
+  private onMessageCb: ((text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>) | null = null;
   private onActionCb: ((action: string, chatId: string) => Promise<string | void>) | null = null;
   private pendingCard: { buttons: { label: string; action: string }[] } | null = null;
   private rl: readline.Interface | null = null;
 
-  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext) => Promise<void>): void {
+  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>): void {
     this.onMessageCb = cb;
   }
 

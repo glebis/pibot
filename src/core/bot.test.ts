@@ -59,7 +59,7 @@ class MockTransport implements Transport {
   readonly chatId = "42";
   pushed: Array<{ chatId: string; opts: PushOptions }> = [];
   typing: Array<[string, boolean]> = [];
-  messageCb: ((text: string, chatId: string, reply?: ReplyContext) => Promise<void>) | null = null;
+  messageCb: ((text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>) | null = null;
   actionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   mediaCb: ((media: import("./types.js").IncomingMedia) => Promise<void>) | null = null;
   mediaSeen: import("./types.js").IncomingMedia[] = [];
@@ -84,7 +84,7 @@ class MockTransport implements Transport {
   async sendAudio(chatId: string, filePath: string, caption?: string): Promise<void> {
     this.speechSeen.push({ kind: "audio", chatId, filePath, caption });
   }
-  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext) => Promise<void>): void {
+  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>): void {
     this.messageCb = cb;
   }
   onMedia(cb: (media: import("./types.js").IncomingMedia) => Promise<void>): void {
@@ -102,8 +102,8 @@ class MockTransport implements Transport {
   lastCard(): { label: string; action: string }[] | undefined {
     return this.pushed.at(-1)?.opts.card?.buttons;
   }
-  async say(text: string): Promise<void> {
-    await this.messageCb?.(text, this.chatId);
+  async say(text: string, messageId?: number): Promise<void> {
+    await this.messageCb?.(text, this.chatId, undefined, messageId);
   }
   async sayReply(text: string, reply: ReplyContext): Promise<void> {
     await this.messageCb?.(text, this.chatId, reply);
@@ -1509,7 +1509,37 @@ describe("task ack confirmations", () => {
     const t = makeBot();
     (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("On it — will do."));
     await t.transport.say("file the Berlin takeaways");
-    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted your task: “On it — will do.”"))).toBe(true);
+    // unthreaded owner lines quote the handed task, not the reply — quoting the
+    // reply reads as if the reply were the task ("accepted your task: 'On it…'")
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted your task: “file the Berlin takeaways”"))).toBe(true);
+  });
+
+  it("wiring: transports forwarding the message id produce threaded acks", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("On it — will do."));
+    await t.transport.say("please file the Berlin takeaways today", 77);
+    const ack = t.transport.pushed.find((p) => p.opts.text.includes("🤝"));
+    expect(ack?.opts.replyToMessageId).toBe(77);
+    // threaded lines are description-first — no attribution needed
+    expect(ack?.opts.text).toBe("🤝 **assistant**: “On it — will do.”");
+  });
+
+  it("owner statements and questions never ack — even when the reply quotes completion words", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(
+      sessionWithReply("That was a housekeeping receipt. The note says: report finished files, not intentions.")
+    );
+    await t.transport.say("received this in creator, [17. Sep 2026]: rotation serviced");
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("✅") || p.opts.text.includes("🤝") || p.opts.text.includes("🚫"))).toBe(false);
+  });
+
+  it("threaded owner turns on non-task statements stay silent too", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(
+      sessionWithReply("Nothing changed in how the bots behave — the word finished was inside a quoted note.")
+    );
+    await t.transport.say("received this in creator, [17. Sep 2026]: rotation serviced", 55);
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("✅") || p.opts.text.includes("🤝") || p.opts.text.includes("🚫"))).toBe(false);
   });
 
   it("acks thread to the original task message when its id is known", async () => {

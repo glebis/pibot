@@ -104,7 +104,7 @@ export interface Transport {
   push(chatId: string, opts: PushOptions): Promise<void>;
   /** System-level error notice (agent crashed, bad model, …) */
   notifyError(chatId: string, message: string): Promise<void>;
-  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext) => Promise<void>): void;
+  onMessage(cb: (text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>): void;
   /** Media messages (optional; telegram only). Transport downloads to a local dir first. */
   onMedia?(cb: (media: IncomingMedia) => Promise<void>): void;
   /** cb may return a short toast string for Telegram callback feedback */

@@ -133,7 +133,7 @@ export class PiBot implements HeartbeatHost {
 
   addTransport(t: Transport): void {
     this.transports.set(t.name, t);
-    t.onMessage((text, chatId, reply) => this.handleIncoming(t, chatId, text, reply).catch((e) => console.error("[bot] message error:", e)));
+    t.onMessage((text, chatId, reply, messageId) => this.handleIncoming(t, chatId, text, reply, messageId).catch((e) => console.error("[bot] message error:", e)));
     t.onAction((action, chatId) => this.handleAction(t, chatId, action).catch((e) => console.error("[bot] action error:", e)));
     if (t.onMedia) {
       t.onMedia((media) => this.handleMedia(t, media).catch((e) => console.error("[bot] media error:", e)));
@@ -2223,17 +2223,25 @@ export class PiBot implements HeartbeatHost {
     // unthreaded (sibling tasks): attribution inline + chatter guard (trigger
     // words like "go"/"ok" handed to an agent are conversation, not tasks).
     const threaded = delivery.replyToMessageId !== undefined;
-    if (!threaded && !isTaskLike(taskText)) return;
+    // Owner chats are conversation, not a queue: a statement or question ("this
+    // seems confusing", "received this in creator…", "what changed?") is not a
+    // handed task, so an explanatory reply to it must not ack — the completion
+    // lexicon fires on a word like "finished" inside quoted discussion. Owner
+    // tasks need task shape (threaded or not); sibling handoffs keep the
+    // word-count guard. A suppressed false positive is silence, never a claim.
+    const ownerTask = fromAgent === "you";
+    if (ownerTask ? !isTaskLike(taskText, true) : !threaded && !isTaskLike(taskText)) return;
     const fp = `${agentId}|${ack}|${taskText.slice(0, 80)}`;
     const now = Date.now();
     for (const [k, ts] of this.lastTaskAcks) if (now - ts > 10 * 60e3) this.lastTaskAcks.delete(k);
     if (this.lastTaskAcks.has(fp)) return;
     this.lastTaskAcks.set(fp, now);
-    // Unthreaded sibling lines quote the handed task text (the reply went back on
-    // the relay — quoting it leaves the owner guessing what the task even was).
-    // Threaded and owner-handed lines keep the reply: the thread / the owner's own
-    // message carries the task context, so the quote can be what the agent said.
-    const line = taskAckLine(ack, agentId, threaded || fromAgent === "you" ? reply : taskText, threaded ? undefined : { from: fromAgent });
+    // Unthreaded lines quote the handed task text — the owner's own words or the
+    // sibling brief. The reply went to its recipient already; quoting meta-reply
+    // chatter reads as if the reply were the task ("completed your task:
+    // 'You're right to raise…'"). Threaded lines keep the reply: the thread
+    // carries the task context, so the quote can be what the agent said.
+    const line = taskAckLine(ack, agentId, threaded ? reply : taskText, threaded ? undefined : { from: fromAgent });
     const ackFrom = threaded ? "you" : fromAgent;
     this.deps.events.log(agentId, "task-ack", `${ack} — ${truncate(taskText, 80)} (reply: ${truncate(reply, 80)})`);
     void this.deliverToAgent(agentId, line, { replyToMessageId: delivery.replyToMessageId, onlyChat: delivery.onlyChat, selfAttributed: true }).catch(() => {});
