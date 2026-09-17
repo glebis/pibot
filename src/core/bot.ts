@@ -724,7 +724,7 @@ export class PiBot implements HeartbeatHost {
         await t.push(media.chatId, { text: `🎙 ${corrected}` });
       }
       // speech answers pending questions with the bare transcript, exactly like typing
-      if (this.questions.answerViaText(this.chatKey(t, media.chatId), result.text)) return;
+      if (this.questions.answerViaText(this.chatKey(t, media.chatId), result.text, "voice")) return;
       const body = media.caption ? `${corrected}\n\n(caption: ${media.caption})` : corrected;
       if (!body.trim()) {
         await t.push(media.chatId, { text: "🎙 Couldn't make out any words — try again a bit closer?" });

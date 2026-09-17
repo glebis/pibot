@@ -67,6 +67,14 @@ describe("QuestionBus buttons", () => {
     expect(a?.index).toBe(-1);
   });
 
+  it("voice answers record the voice source (transcript answers like typing)", async () => {
+    const { bus } = makeBus();
+    const promise = bus.ask("a1", CHAT, spec());
+    expect(bus.answerViaText("mock:42", "voice transcript answer", "voice")).toBe(true);
+    const a = await promise;
+    expect(a?.source).toBe("voice");
+  });
+
   it("times out gracefully", async () => {
     const { bus } = makeBus();
     const promise = bus.ask("a1", CHAT, spec({ timeoutMs: 50 }));

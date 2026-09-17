@@ -14,6 +14,8 @@ export interface QuestionAnswer {
   choice: string;
   index: number; // -1 for free text
   via: "button" | "text" | "poll";
+  /** how the user answered: voice arrives as transcribed text (analytics modality) */
+  source?: "text" | "voice";
   timedOut?: boolean;
   /** a newer question replaced this one */
   replaced?: boolean;
@@ -128,8 +130,9 @@ export class QuestionBus {
   /**
    * Next text message in a chat with a pending question becomes the answer.
    * "1"/"2"/… maps to options; an option name maps too; anything else is free text.
+   * source marks how the answer arrived (voice arrives as transcribed text).
    */
-  answerViaText(chatKey: string, text: string): boolean {
+  answerViaText(chatKey: string, text: string, source: "text" | "voice" = "text"): boolean {
     const entry = [...this.pending.values()].find((p) => p.chatKey === chatKey);
     if (!entry) return false;
     const numeric = text.trim().match(/^(\d+)$/);
@@ -147,7 +150,7 @@ export class QuestionBus {
       return true;
     }
     // free-text answer
-    this.finish(entry.qid, { choice: text.trim(), index: -1, via: "text" });
+    this.finish(entry.qid, { choice: text.trim(), index: -1, via: "text", source });
     return true;
   }
 
