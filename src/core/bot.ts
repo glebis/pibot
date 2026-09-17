@@ -2006,7 +2006,16 @@ export class PiBot implements HeartbeatHost {
     if (!target) throw new Error(`unknown agent "${agentId}"`);
     const ck = `agent::${agentId}::from-${fromAgent}`;
     const session = await this.deps.agents.getOrCreateSession(
-      agentId, ck, { transport: "agent", chatId: fromAgent }, this.deps.scheduler, undefined, this.commsHooks()
+      agentId,
+      ck,
+      { transport: "agent", chatId: fromAgent },
+      this.deps.scheduler,
+      // origin-chat routing for inter-agent questions: ask_user from a delegated
+      // turn renders in the chat the owner typed in; answers flow back here
+      originChat
+        ? (spec: QuestionSpec) => this.questions.ask(agentId, originChat, spec)
+        : undefined,
+      this.commsHooks()
     );
     if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("target agent is busy");
     const envelopeText = originChat

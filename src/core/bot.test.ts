@@ -1492,6 +1492,34 @@ describe("task ack confirmations", () => {
     expect(t.transport.pushed.length).toBe(0); // no push, no crash
   });
 
+  it("origin-chat routing: inter-agent questions render in the owner's chat", async () => {
+    const t = makeBot();
+    const sess = sessionWithReply("answered with the structured question");
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
+    let askHook: ((spec: unknown) => Promise<unknown>) | undefined;
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockImplementation(async (...args: unknown[]) => {
+      askHook = args[4] as (spec: unknown) => Promise<unknown>;
+      return sess;
+    });
+    const p = (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
+      "fitness", "assistant", "decide with me", undefined, { transport: "mock", chatId: "42" }
+    );
+    await vi.waitFor(() => expect(askHook).toBeDefined());
+    // ask_user from the pair session renders into the origin chat
+    const answerPromise = askHook!({ text: "Which framing?", options: ["survey", "interviews"] } as never) as Promise<unknown>;
+    await vi.waitFor(() => {
+      const pushed = t.transport.pushed.find((p2) => p2.opts.text.includes("Which framing?"));
+      expect(pushed).toBeDefined();
+    });
+    const card = t.transport.pushed.find((p2) => p2.opts.text.includes("framing?"))!.opts.card!;
+    const action = card.buttons[0].action; // tap "survey"
+    expect(card.buttons.map((b) => b.label)).toEqual(["survey", "interviews"]);
+    await (t.bot as unknown as { handleAction(t: unknown, chatId: string, action: string): Promise<void> }).handleAction(t.transport, "42", action);
+    const answer = (await answerPromise) as { choice: string; via: string };
+    expect(answer.choice).toBe("survey");
+    await p; // the delegated turn completes
+  });
+
   it("task acks respect the per-agent opt-out", async () => {
     const t = makeBot();
     (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
