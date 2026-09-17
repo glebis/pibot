@@ -6,6 +6,7 @@
 //   - returns a normalized IntakeAnswer with modality + skipped flags so
 //     analytics can distinguish modality and skip rates.
 
+import * as fs from "node:fs";
 import type { ChatRef } from "./types.js";
 import type { QuestionAnswer, QuestionSpec } from "./questions.js";
 
@@ -96,4 +97,144 @@ export async function askText(
 ): Promise<IntakeAnswer<string>> {
   const raw = await ask(chat, { text, options: [], timeoutMs: opts.timeoutMs });
   return wrap(raw, (r) => r.choice, opts.source);
+}
+// ─── Intake persistence + analytics (data/proactive/intake.json, 0600) ────────
+
+import * as path from "node:path";
+import { readJson, uid, writeJsonAtomic } from "./util.js";
+
+export type IntakeKind = "choice" | "poll" | "confirm" | "scale" | "text";
+export type IntakeSessionStatus = "active" | "completed" | "skipped" | "failed";
+
+export interface IntakeAnswerRecord {
+  key: string;
+  question: string;
+  kind: IntakeKind;
+  value?: string | number | boolean;
+  modality: IntakeModality;
+  skipped: boolean;
+  latencyMs: number;
+  ts: number;
+}
+
+export interface IntakeRecord {
+  id: string;
+  agentId: string;
+  chat: { transport: string; chatId: string };
+  flow: string;
+  status: IntakeSessionStatus;
+  createdAt: number;
+  finishedAt?: number;
+  /** question keys not yet answered, in order */
+  pendingKeys: string[];
+  answers: IntakeAnswerRecord[];
+}
+
+export interface IntakeStats {
+  sessions: number;
+  answers: number;
+  answered: number;
+  skipped: number;
+  skipPct: number;
+  modalitySplit: Record<string, number>;
+  avgLatencyMs: number;
+  perFlow: Record<string, number>;
+}
+
+export class IntakeStore {
+  private file: string;
+  private sessions: IntakeRecord[];
+
+  constructor(dataDir: string) {
+    this.file = path.join(dataDir, "proactive", "intake.json");
+    fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
+    this.sessions = readJson<IntakeRecord[]>(this.file, []);
+  }
+
+  private save(): void {
+    writeJsonAtomic(this.file, this.sessions, 0o600);
+  }
+
+  createSession(agentId: string, chat: { transport: string; chatId: string }, flow: string, keys: string[]): IntakeRecord {
+    const rec: IntakeRecord = {
+      id: uid("in", 6),
+      agentId,
+      chat,
+      flow,
+      status: "active",
+      createdAt: Date.now(),
+      pendingKeys: [...keys],
+      answers: [],
+    };
+    this.sessions.push(rec);
+    this.save();
+    return rec;
+  }
+
+  get(id: string): IntakeRecord | undefined {
+    return this.sessions.find((s) => s.id === id);
+  }
+
+  recordAnswer(
+    id: string,
+    key: string,
+    a: { value?: string | number | boolean; modality: IntakeModality; skipped: boolean; latencyMs?: number; kind?: IntakeKind; question?: string }
+  ): IntakeRecord | undefined {
+    const rec = this.get(id);
+    if (!rec) return undefined;
+    rec.pendingKeys = rec.pendingKeys.filter((k) => k !== key);
+    rec.answers.push({
+      key,
+      question: a.question ?? "",
+      kind: a.kind ?? "text",
+      value: a.skipped ? undefined : a.value,
+      modality: a.modality,
+      skipped: a.skipped,
+      latencyMs: a.latencyMs ?? 0,
+      ts: Date.now(),
+    });
+    this.save();
+    return rec;
+  }
+
+  finishSession(id: string, status: Exclude<IntakeSessionStatus, "active">): IntakeRecord | undefined {
+    const rec = this.get(id);
+    if (!rec) return undefined;
+    rec.status = status;
+    rec.finishedAt = Date.now();
+    this.save();
+    return rec;
+  }
+
+  get list(): IntakeRecord[] {
+    return this.sessions;
+  }
+
+  stats(f: { since?: number; agentId?: string; flow?: string } = {}): IntakeStats {
+    const sessions = this.sessions.filter((s) => {
+      if (f.agentId && s.agentId !== f.agentId) return false;
+      if (f.flow && s.flow !== f.flow) return false;
+      if (f.since && s.createdAt < f.since) return false;
+      return true;
+    });
+    const answers = sessions.flatMap((s) => s.answers);
+    const skipped = answers.filter((a) => a.skipped).length;
+    const answered = answers.length - skipped;
+    const latencies = answers.filter((a) => !a.skipped).map((a) => a.latencyMs);
+    const modalitySplit: Record<string, number> = {};
+    for (const a of answers.filter((x) => !x.skipped)) modalitySplit[a.modality] = (modalitySplit[a.modality] ?? 0) + 1;
+    const pct = (n: number, d: number): number => (d === 0 ? 0 : Math.round((n / d) * 100));
+    const perFlow: Record<string, number> = {};
+    for (const s of sessions) perFlow[s.flow] = (perFlow[s.flow] ?? 0) + 1;
+    return {
+      sessions: sessions.length,
+      answers: answers.length,
+      answered,
+      skipped,
+      skipPct: pct(skipped, answers.length),
+      modalitySplit,
+      avgLatencyMs: latencies.length ? Math.round(latencies.reduce((x, y) => x + y, 0) / latencies.length) : 0,
+      perFlow,
+    };
+  }
 }
