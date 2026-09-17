@@ -360,7 +360,16 @@ export function createCommandHandler(ctx: CommandContext) {
         await reply(`🧬 Running an evolution cycle${goal ? ` — goal: “${goal}”` : " (self-directed)"}. This runs cheap probes, takes a minute…`);
         const report = await deps.evolution.evolve(agentId, goal, { force: true });
         deps.events.log(agentId, "system", `evolution run: ${report.summary}`);
-        await reply(`${report.ok ? "🧬" : "⛔"} ${report.summary}${report.staged ? "\nReview it: /evolve status — accept or reject right from the card." : ""}`);
+        // Guardrail rejections stay out of the chat (owner decision 2026-09-17): they
+        // are noise, not action items — the events log + dashboard carry the detail.
+        // The chat only hears actionable outcomes: a staged candidate to review, a
+        // promote, or a neutral "nothing staged".
+        const chatLine = report.staged
+          ? `🧬 ${report.summary}\nReview it: /evolve status — accept or reject right from the card.`
+          : report.ok
+            ? `🧬 ${report.summary}`
+            : `🧬 Cycle finished — nothing staged. A draft failed the guardrails (detail in the events log/dashboard); nothing was changed.`;
+        await reply(chatLine);
         return;
       }
 
