@@ -65,6 +65,6 @@ describe("research-intake primitives", () => {
     const a: IntakeAnswer<boolean> = await askConfirm(f.ask, CHAT, "still there?");
     expect(a.value).toBeUndefined();
     expect(a.skipped).toBe(true);
-    expect(a.modality).toBe("button");
+    expect(a.modality).toBe("none"); // a timeout never answered — no modality
   });
 });
