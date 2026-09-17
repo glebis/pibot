@@ -29,6 +29,8 @@ import type { AvatarArtifactStore, AvatarProviderRegistry } from "./avatar.js";
 import type { SpeechArtifactStore, SpeechKind, SpeechProviderRegistry } from "./speech.js";
 import type { CommitmentPluginEngine } from "../plugins/commitment-plugin.js";
 import { commitmentPlugin } from "../plugins/commitment-plugin.js";
+import { researchIntakePlugin } from "../plugins/research-intake-plugin.js";
+import type { IntakeStore } from "./research-intake.js";
 
 export interface CapabilityAgent { id: string; dir: string; manifest: AgentManifest }
 export interface CapabilityContext {
@@ -57,6 +59,8 @@ export interface CapabilityContext {
   };
   /** measurable commitment loop (proactive pilot) — present when the engine is wired */
   commitments?: CommitmentPluginEngine;
+  /** durable research-intake sessions (wizard persistence) */
+  intake?: IntakeStore;
 }
 
 export type { CommitmentPluginEngine };
@@ -139,6 +143,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     prompt: "commitment_capture proposes a measurable follow-through item when the owner states a concrete deliverable with a time bound — the owner confirms it via a card before tracking starts. commitment_list and commitment_cancel manage tracked items.",
     available: (ctx) => Boolean(ctx.commitments && ctx.agent.manifest.proactive?.pilot),
     create: (ctx) => commitmentPlugin({ agentId: ctx.agent.id, chat: ctx.chat, engine: ctx.commitments! }),
+  },
+  {
+    id: "research-intake", defaultEnabled: true, tools: ["research_intake_run"],
+    prompt: "research_intake_run runs a 3–5 question intake flow in the owner's chat with inline progress, skip/exit, and persisted analytics. Use it for structured research intake instead of asking questions one by one in prose.",
+    available: (ctx) => Boolean(ctx.intake && ctx.ask),
+    create: (ctx) => researchIntakePlugin({ agentId: ctx.agent.id, chat: ctx.chat, ask: ctx.ask!, store: ctx.intake! }),
   },
   {
     id: "memory", defaultEnabled: true, tools: ["memory_save", "memory_recall"],

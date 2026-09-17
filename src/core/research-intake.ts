@@ -29,6 +29,7 @@ export interface IntakeAnswer<T = string | number | boolean | undefined> {
 }
 
 function modalityOf(raw: QuestionAnswer, source?: "text" | "voice"): IntakeModality {
+  if (raw.timedOut || raw.replaced) return "none"; // never answered — no modality
   if (source === "voice" && raw.via === "text") return "voice";
   if (raw.via === "button") return "button";
   if (raw.via === "poll") return "poll";
@@ -236,5 +237,120 @@ export class IntakeStore {
       avgLatencyMs: latencies.length ? Math.round(latencies.reduce((x, y) => x + y, 0) / latencies.length) : 0,
       perFlow,
     };
+  }
+}
+
+// ─── ResearchWizard: reusable 3–5-question intake flow ────────────────────────
+
+export interface WizardQuestion {
+  key: string;
+  question: string;
+  kind: IntakeKind;
+  /** choice options (≤5 when skippable, so the Skip button keeps it inline) */
+  options?: string[];
+  /** scale upper bound (buttons 1..max, ≤6) */
+  max?: number;
+  /** required questions cannot be skipped; timeout ends the run */
+  required?: boolean;
+}
+
+export interface WizardResult {
+  sessionId: string;
+  status: "completed" | "skipped" | "failed";
+  answers: Record<string, string | number | boolean | undefined>;
+}
+
+const WIZARD_MAX_QUESTIONS = 5;
+const SKIP_RE = /^\s*skip\b/i;
+const EXIT_RE = /^\s*(exit|stop|quit)\b/i;
+
+export class ResearchWizard {
+  constructor(
+    private deps: {
+      ask: AskFn;
+      store: IntakeStore;
+      /** question timeout for every step (QuestionBus default 10m when unset) */
+      timeoutMs?: number;
+      now?: () => number;
+    }
+  ) {}
+
+  async run(
+    agentId: string,
+    chat: { transport: string; chatId: string },
+    flow: string,
+    questions: WizardQuestion[]
+  ): Promise<WizardResult> {
+    if (questions.length < 3 || questions.length > WIZARD_MAX_QUESTIONS) {
+      throw new Error(`an intake flow takes 3–5 questions (got ${questions.length})`);
+    }
+    const sess = this.deps.store.createSession(agentId, chat, flow, questions.map((q) => q.key));
+    const answers: WizardResult["answers"] = {};
+    const total = questions.length;
+
+    try {
+      for (let i = 0; i < total; i++) {
+        const q = questions[i];
+        const started = this.deps.now?.() ?? Date.now();
+        const progress = `(${i + 1}/${total}) `;
+        const skipHint = q.required ? "" : " — reply skip or exit anytime";
+        let raw: QuestionAnswer;
+        if (q.kind === "confirm") {
+          raw = await this.deps.ask(chat, { text: `${progress}${q.question}${skipHint}`, options: ["Yes", "No"], timeoutMs: this.deps.timeoutMs });
+        } else if (q.kind === "scale") {
+          const n = Math.max(2, Math.min(q.max ?? 5, 6));
+          const options = Array.from({ length: n }, (_, x) => String(x + 1));
+          if (!q.required) options.push("Skip");
+          raw = await this.deps.ask(chat, { text: `${progress}${q.question}${skipHint}`, options, timeoutMs: this.deps.timeoutMs });
+        } else if (q.kind === "text") {
+          raw = await this.deps.ask(chat, { text: `${progress}${q.question}${skipHint}`, options: [], timeoutMs: this.deps.timeoutMs });
+        } else {
+          const options = [...(q.options ?? [])];
+          if (!q.required && options.length < 6) options.push("Skip");
+          raw = await this.deps.ask(chat, { text: `${progress}${q.question}${skipHint}`, options, timeoutMs: this.deps.timeoutMs });
+        }
+
+        if (EXIT_RE.test(raw.choice)) {
+          this.deps.store.finishSession(sess.id, "skipped");
+          return { sessionId: sess.id, status: "skipped", answers };
+        }
+        if (SKIP_RE.test(raw.choice) && !q.required) {
+          this.deps.store.recordAnswer(sess.id, q.key, { modality: modalityOf(raw), skipped: true, latencyMs: this.deps.now?.() ?? 0 - started, kind: q.kind, question: q.question });
+          answers[q.key] = undefined;
+          continue;
+        }
+        if (raw.timedOut || raw.replaced) {
+          this.deps.store.recordAnswer(sess.id, q.key, { modality: modalityOf(raw), skipped: true, latencyMs: this.deps.now?.() ?? 0 - started, kind: q.kind, question: q.question });
+          if (q.required) {
+            // a required question timing out ends the run — no re-ask loop
+            this.deps.store.finishSession(sess.id, "skipped");
+            return { sessionId: sess.id, status: "skipped", answers };
+          }
+          answers[q.key] = undefined;
+          continue;
+        }
+
+        const value =
+          q.kind === "confirm"
+            ? raw.index === 0 || raw.choice.toLowerCase().startsWith("y")
+            : q.kind === "scale"
+              ? (Number.isInteger(raw.index) && raw.index >= 0 ? raw.index + 1 : Number(raw.choice) || undefined)
+              : raw.choice;
+        this.deps.store.recordAnswer(sess.id, q.key, {
+          value: value as string | number | boolean,
+          modality: modalityOf(raw),
+          skipped: false,
+          latencyMs: (this.deps.now?.() ?? Date.now()) - started,
+          kind: q.kind,
+          question: q.question,
+        });
+        answers[q.key] = value;
+      }
+      this.deps.store.finishSession(sess.id, "completed");
+      return { sessionId: sess.id, status: "completed", answers };
+    } catch (e) {
+      this.deps.store.finishSession(sess.id, "failed");
+      throw e;
+    }
   }
 }

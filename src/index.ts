@@ -14,6 +14,7 @@ import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
 import { ConsolidationEngine, createLlmConsolidationIO } from "./core/consolidation.js";
 import { ProactiveStore } from "./core/proactive-store.js";
 import { CommitmentEngine } from "./core/commitments.js";
+import { IntakeStore } from "./core/research-intake.js";
 import { HeartbeatEngine } from "./core/heartbeat.js";
 import { Scheduler } from "./core/scheduler.js";
 import { createWebApp } from "./web.js";
@@ -139,6 +140,7 @@ async function main(): Promise<void> {
     },
   });
   agents.commitments = commitments;
+  agents.intake = new IntakeStore(config.dataDir);
 
   const heartbeat = new HeartbeatEngine({
     agents,

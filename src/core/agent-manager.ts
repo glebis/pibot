@@ -16,6 +16,7 @@ import type { TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
 import { AvatarArtifactStore, createDefaultAvatarProviders } from "./avatar.js";
 import { createDefaultSpeechProviders, SpeechArtifactStore, type SpeechKind } from "./speech.js";
 import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext, type CapabilityDefinition, type CommitmentPluginEngine } from "./capabilities.js";
+import type { IntakeStore } from "./research-intake.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
 import { ensureDir, errorMessage, readJson, truncate, writeJsonAtomic } from "./util.js";
@@ -31,6 +32,8 @@ export class AgentManager {
   private sessions = new Map<string, AgentSession>(); // `${agentId}::${chatKey}` → session
   /** measurable commitment loop (proactive pilot); set by the host after wiring */
   commitments?: CommitmentPluginEngine;
+  /** durable research-intake sessions (wizard persistence) */
+  intake?: IntakeStore;
   private agentsDir: string;
   private vaultDir: string;
   private repoRoot: string;
@@ -187,6 +190,7 @@ export class AgentManager {
       telegramSend,
       dictionary: { dataDir: this.dataDir },
       commitments: this.commitments,
+      intake: this.intake,
       avatar: applyProfilePhoto && chat.transport.startsWith("telegram") && agent.manifest.capabilities?.includes("avatar") ? {
         providers: createDefaultAvatarProviders(),
         store: new AvatarArtifactStore(path.join(agent.dir, "runtime", "avatars")),
