@@ -12,6 +12,8 @@ const DUPLICATE_WINDOW_MS = 30_000;
 const MIN_CHAT_SEND_GAP_MS = 1_000;
 /** Hard ceiling per Telegram API call — a hung request must never wedge a chat's outbox forever. */
 const DEFAULT_SEND_TIMEOUT_MS = 30_000;
+/** Third argument of Bot API sendMessage (reply_markup, reply_parameters, parse_mode…). */
+type SendMessageExtra = Parameters<Bot["api"]["sendMessage"]>[2];
 function sendTimeoutMs(): number {
   return Math.max(250, Number(process.env.PIBOT_TG_SEND_TIMEOUT_MS) || DEFAULT_SEND_TIMEOUT_MS);
 }
@@ -94,13 +96,82 @@ function isRichUnsupported(e: unknown): boolean {
   return err?.error_code === 404 || /method not found|method is not available/i.test(String(err?.message ?? ""));
 }
 
-function toTelegramHtml(text: string): string {
-  // Minimal, safe markdown→HTML: **bold**, *italic*, `code`. Everything else escaped.
-  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  let out = esc(text);
-  out = out.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
-  out = out.replace(/\*([^*\n]+)\*/g, "<i>$1</i>");
-  out = out.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+/**
+ * Telegram's 400 for markup WE produced (crossed/unknown tags, bad nesting).
+ * Distinct from real 400s like "chat not found": our own formatting must never
+ * cost the message, so this one is retryable as plain text.
+ */
+function isEntityParseError(e: unknown): boolean {
+  const err = e as { error_code?: number; description?: string; message?: string };
+  if (err?.error_code !== 400) return false;
+  return /can't parse entities|can't find end tag|unsupported start tag|unmatched end tag/i.test(
+    String(err?.description ?? err?.message ?? ""),
+  );
+}
+
+/** Inline delimiters, longest first so `**` wins over `*`. */
+const HTML_DELIMITERS = [
+  { md: "**", open: "<b>", close: "</b>" },
+  { md: "`", open: "<code>", close: "</code>" },
+  { md: "*", open: "<i>", close: "</i>" },
+];
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** True when the delimiter at `from` has a partner later on the same line (markup never spans lines). */
+function hasCloserOnLine(text: string, md: string, from: number): boolean {
+  const found = text.indexOf(md, from);
+  if (found === -1) return false;
+  const lineEnd = text.indexOf("\n", from);
+  return lineEnd === -1 || found < lineEnd;
+}
+
+/**
+ * Minimal, safe markdown→HTML: `**bold**`, `*italic*`, `` `code` ``; everything else escaped.
+ *
+ * Single left-to-right pass with a tag stack. The old three sequential regex passes
+ * crossed tags whenever delimiters overlapped (`` `a *b` c* `` → `<code>a <i>b</code> c</i>`),
+ * and Telegram answers crossed tags with 400 "can't parse entities" — losing the whole
+ * reply (Sep 18 incident). Closers always close whatever is on top of the stack and every
+ * open tag is closed before its line ends, so the output can never be malformed. Openers
+ * still need a partner on the same line, so `* bullet` and `2 * 3` stay literal.
+ */
+export function toTelegramHtml(text: string): string {
+  let out = "";
+  const open: Array<{ md: string; close: string }> = [];
+  const closeAll = () => {
+    while (open.length) out += (open.pop() as { close: string }).close;
+  };
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\n") {
+      closeAll();
+      out += ch;
+      continue;
+    }
+    const token = HTML_DELIMITERS.find((d) => text.startsWith(d.md, i));
+    if (!token) {
+      out += escapeHtml(ch);
+      continue;
+    }
+    i += token.md.length - 1;
+    const top = open[open.length - 1];
+    if (top && top.md === token.md) {
+      open.pop();
+      out += token.close;
+    } else if (open.some((d) => d.md === token.md)) {
+      out += escapeHtml(token.md); // same type already open → nesting it adds nothing
+    } else if (hasCloserOnLine(text, token.md, i + 1)) {
+      open.push({ md: token.md, close: token.close });
+      out += token.open;
+    } else {
+      out += escapeHtml(token.md);
+    }
+  }
+  closeAll();
   return out;
 }
 
@@ -709,34 +780,49 @@ export class TelegramTransport implements Transport {
         try {
           sentId = messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendRichMessage(chatId, { markdown: text })));
         } catch (e) {
-          if (!isRichUnsupported(e)) throw e;
-          const sent = await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
-            parse_mode: "HTML",
+          // 404 → legacy server (classic entities below); markup rejection → same
+          // degrade as the classic path, so a formatting bug never eats a reply.
+          if (!isRichUnsupported(e) && !isEntityParseError(e)) throw e;
+          const sent = await this.sendClassicMessage(chatId, text, {
             reply_markup: keyboard(opts.card),
             ...replyParams,
-          }));
+          });
           sentId = messageIdOf(sent);
         }
       } else if (!this.keyboardSent.has(chatId) && !opts.card && !this.boundAgentId && process.env.PIBOT_QUICK_KEYBOARD !== "0") {
-        const sent = await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
-          parse_mode: "HTML",
+        const sent = await this.sendClassicMessage(chatId, text, {
           reply_markup: TelegramTransport.QUICK_KEYBOARD,
           ...replyParams,
-        }));
+        });
         this.keyboardSent.add(chatId);
         sentId = messageIdOf(sent);
       } else {
-        const sent = await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), {
-          parse_mode: "HTML",
+        const sent = await this.sendClassicMessage(chatId, text, {
           reply_markup: keyboard(opts.card),
           ...replyParams,
-        }));
+        });
         sentId = messageIdOf(sent);
       }
       this.recordCardMessage(chatId, sentId, Boolean(opts.card));
       await this.sweepStaleCards(chatId);
       this.duplicateGuard.markSent(chatId, payload);
     });
+  }
+
+  /**
+   * Classic entity path with a safety net: send the converted HTML, and when
+   * Telegram rejects the markup (`can't parse entities`) resend the very same
+   * text with no parse_mode. Formatting is cosmetic — a dropped reply is not.
+   * Real 400s (chat not found, blocked bot) still surface.
+   */
+  private async sendClassicMessage(chatId: string, text: string, extra: SendMessageExtra): Promise<unknown> {
+    try {
+      return await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), { parse_mode: "HTML", ...extra }));
+    } catch (e) {
+      if (!isEntityParseError(e)) throw e;
+      console.warn(`[telegram] (${this.name}) markup rejected for chat ${chatId} — resending as plain text`);
+      return await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, text, extra));
+    }
   }
 
   private recordCardMessage(chatId: string, messageId: number | undefined, isCard: boolean): void {

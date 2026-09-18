@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { InputFile } from "grammy";
 import type { InputProfilePhoto } from "grammy/types";
-import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec, serviceMessageKind } from "./telegram.js";
+import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec, serviceMessageKind, toTelegramHtml } from "./telegram.js";
 
 describe("TelegramDuplicateGuard", () => {
   it("suppresses an identical payload to the same chat inside the window", () => {
@@ -340,6 +340,112 @@ describe("push settle deadlock guard", () => {
     await Promise.race([p, new Promise((_, reject) => setTimeout(() => reject(new Error("push deadlocked")), 3_000))]);
     expect(calls).toContain("sendMessage");
     expect(calls).toContain("setMessageReaction");
+  });
+});
+
+/** Stack check: Telegram rejects crossed/unbalanced tags with "can't parse entities". */
+function isWellFormedHtml(html: string): boolean {
+  const open = ["b", "i", "code", "a", "u", "s", "pre", "tg-spoiler"];
+  const stack: string[] = [];
+  const token = /<(\/?)([a-z-]+)[^>]*>/g;
+  let m: RegExpExecArray | null;
+  while ((m = token.exec(html)) !== null) {
+    const [, slash, tag] = m;
+    if (!open.includes(tag)) return false;
+    if (slash) {
+      if (stack.pop() !== tag) return false; // crossed or unmatched
+    } else {
+      stack.push(tag);
+    }
+  }
+  return stack.length === 0;
+}
+
+describe("markdown → Telegram HTML entities", () => {
+  it("converts the inline markup pibot has always supported", () => {
+    expect(toTelegramHtml("**bold** and *italic* and `code`")).toBe("<b>bold</b> and <i>italic</i> and <code>code</code>");
+  });
+
+  it("keeps bullets and lone asterisks literal", () => {
+    expect(toTelegramHtml("* one\n* two")).toBe("* one\n* two");
+    expect(toTelegramHtml("2 * 3 = 6")).toBe("2 * 3 = 6");
+    expect(toTelegramHtml("waiting... *")).toBe("waiting... *");
+  });
+
+  it("escapes agent output that looks like markup", () => {
+    expect(toTelegramHtml("<b>not markup</b> & <script>")).toBe("&lt;b&gt;not markup&lt;/b&gt; &amp; &lt;script&gt;");
+  });
+
+  it("never crosses tags when delimiters overlap", () => {
+    // Regression: sequential regex passes produced <code>a <i>b</code> c</i> here,
+    // which Telegram rejected with 400 "can't parse entities" — message lost.
+    const adversarial = [
+      "`a *b` c*",
+      "*a `b* c`",
+      "`repo view *`, `api repos/*`",
+      "**a `b** c`",
+      "`x**y`z**",
+      "- `gh` — read-only subcommands: `repo view *`, `api repos/*` (auth's already done)",
+      "a **b *c* d** e",
+    ];
+    for (const input of adversarial) {
+      const html = toTelegramHtml(input);
+      expect(isWellFormedHtml(html), `input ${JSON.stringify(input)} → ${html}`).toBe(true);
+    }
+  });
+});
+
+describe("telegram entity rejection must not cost the message", () => {
+  const ENTITY_ERROR = "Bad Request: can't parse entities: Unmatched end tag at byte offset 604, expected \"</i>\", found \"</code>\"";
+
+  it("resends the same text without parse_mode when Telegram rejects the entities", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    const attempts: Array<{ text: string; parse_mode: string | undefined }> = [];
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendMessage: async (_cid: string, text: string, extra?: { parse_mode?: string }) => {
+          attempts.push({ text, parse_mode: extra?.parse_mode });
+          if (extra?.parse_mode === "HTML") {
+            throw Object.assign(new Error(ENTITY_ERROR), { error_code: 400, description: ENTITY_ERROR });
+          }
+          return { message_id: 11 };
+        },
+      },
+    };
+    await t.push("42", { text: "**bold** reply with `code`" });
+    expect(attempts.map((a) => a.parse_mode)).toEqual(["HTML", undefined]);
+    expect(attempts[1]?.text).toBe("**bold** reply with `code`");
+  });
+
+  it("still surfaces a real 400 that is not a markup problem", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendMessage: async () => {
+          throw Object.assign(new Error("Bad Request: chat not found"), { error_code: 400, description: "Bad Request: chat not found" });
+        },
+      },
+    };
+    await expect(t.push("42", { text: "plain reply" })).rejects.toThrow(/chat not found/);
+  });
+
+  it("rich-markdown rejections degrade too, instead of dropping a heading reply", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    const calls: string[] = [];
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendRichMessage: async () => {
+          calls.push("sendRichMessage");
+          throw Object.assign(new Error(ENTITY_ERROR), { error_code: 400, description: ENTITY_ERROR });
+        },
+        sendMessage: async (_cid: string, _text: string, extra?: { parse_mode?: string }) => {
+          calls.push(extra?.parse_mode === "HTML" ? "sendMessage:html" : "sendMessage:plain");
+          return { message_id: 12 };
+        },
+      },
+    };
+    await t.push("42", { text: "## Status\n\nAll green." });
+    expect(calls).toEqual(["sendRichMessage", "sendMessage:html"]);
   });
 });
 

@@ -639,6 +639,45 @@ export class PiBot implements HeartbeatHost {
     }
   }
 
+  /**
+   * A turn can succeed while its terminal message carries no text block: the
+   * model ends on reasoning only (or on a tool call) and there is nothing to
+   * push. The owner's chat then just stays silent — no error, no dead letter,
+   * no log line (Sep 18: a genuine question ran 14 tool calls, ended
+   * reasoning-only, and the bot looked dead for half an hour). Silence is never
+   * an honest answer, and the intermediate narration of a working turn
+   * ("Now the Telegram transport:") is not the answer either — so say plainly
+   * that the turn produced nothing.
+   *
+   * Host-generated prompts are exempt: a heartbeat or a scheduled check may
+   * legitimately decide there is nothing worth saying.
+   */
+  private async notifySilentTurn(t: Transport, chatId: string, agentId: string, session: AgentSession, prompt: string): Promise<void> {
+    if (INTERNAL_PROMPT_PREFIXES.some((p) => prompt.startsWith(p))) return;
+    const messages = (session.agent.state.messages ?? []) as unknown[];
+    const assistants = messages.filter((m) => (m as { role?: string })?.role === "assistant");
+    if (assistants.length === 0) return; // nothing ran — not a silence we can explain
+    const terminal = lastAssistantMessage(messages);
+    if (terminal && extractAssistantText([terminal])) return; // the reply went out normally
+
+    let toolCalls = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i] as { role?: string; content?: Array<{ type?: string }> };
+      if (m?.role === "user") break; // only the turn that just finished
+      if (m?.role !== "assistant") continue;
+      toolCalls += (m.content ?? []).filter((b) => b?.type === "toolCall" || b?.type === "tool_use").length;
+    }
+    const ran = toolCalls === 1 ? "1 tool call" : `${toolCalls} tool calls`;
+    this.deps.events.log(agentId, "system", `silent turn: terminal message carried no text after ${ran}`);
+    try {
+      await t.push(chatId, {
+        text: `⚠️ **${agentId}** finished that turn without a reply — the model ended on reasoning only after ${ran}, so nothing was sent. Ask again, or say “continue”.`,
+      });
+    } catch (e) {
+      console.error("[bot] silent-turn notice failed:", e);
+    }
+  }
+
   private static QUICK_ACTIONS: Record<string, string> = {
     "😴 snooze 1h": "/snooze 1h",
     "😴 until morning": "/snooze until morning",
@@ -870,6 +909,7 @@ export class PiBot implements HeartbeatHost {
       if (!err) {
         if (spec) cascade.noteSuccess(spec);
         await this.maybeNotifyFallback(t, chatId, ck, agentId, spec, primary, text);
+        await this.notifySilentTurn(t, chatId, agentId, session, text);
         return;
       }
       ambiguousPartialFailure ||= Boolean(eventFailure?.hadPartialText);

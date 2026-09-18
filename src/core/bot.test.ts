@@ -1760,3 +1760,69 @@ describe("schedule failure notices", () => {
     expect((events.log as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[2]).includes("suppressed"))).toBe(true);
   });
 });
+
+describe("silent turns — a turn that produces no text must not leave the owner guessing", () => {
+  // Sep 18 incident: a genuine question to pibot-dev ran 14 tool calls and ended on a
+  // reasoning-only terminal message. Nothing was pushed, no error, no log line — the
+  // owner's chat simply stayed silent and looked like a dead bot.
+  function sessionWithMessages(messages: unknown[]) {
+    return {
+      agent: { state: { messages } },
+      prompt: vi.fn(async () => {}),
+      setModel: vi.fn(async () => {}),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+  }
+  const userTurn = { role: "user", content: [{ type: "text", text: "[Fri, Sep 18, 2026, 3:55 PM]\n\nanalyse the whole flow" }] };
+  const reasoningOnly = { role: "assistant", content: [{ type: "thinking", thinking: "weighing options…" }], stopReason: "stop" };
+  const toolCallOnly = { role: "assistant", content: [{ type: "toolCall", name: "read", args: {} }], stopReason: "toolUse" };
+  const narrated = { role: "assistant", content: [{ type: "text", text: "Now the Telegram transport:" }], stopReason: "toolUse" };
+
+  async function runTurn(t: ReturnType<typeof makeBot>, prompt: string, messages: unknown[]) {
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithMessages(messages));
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    await t.bot.promptAgent(t.transport, "42", "assistant", prompt);
+    return t.transport.pushed.filter((p) => p.opts.text.includes("without a reply"));
+  }
+
+  it("announces the silence on a genuine user turn instead of pushing nothing", async () => {
+    const t = makeBot();
+    const notices = await runTurn(t, "analyse the whole flow", [userTurn, narrated, toolCallOnly, reasoningOnly]);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.opts.text).toContain("1 tool call");
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "system", expect.stringContaining("silent turn"));
+  });
+
+  it("does not narrate stale intermediate text as if it were the answer", async () => {
+    const t = makeBot();
+    const notices = await runTurn(t, "analyse the whole flow", [userTurn, narrated, reasoningOnly]);
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Now the Telegram transport:"))).toBe(false);
+    expect(notices).toHaveLength(1);
+  });
+
+  it("stays quiet for host-generated prompts — a heartbeat may legitimately say nothing", async () => {
+    const t = makeBot();
+    const notices = await runTurn(t, "[heartbeat] stretch and check the queue", [userTurn, reasoningOnly]);
+    expect(notices).toHaveLength(0);
+    expect(t.events.log).not.toHaveBeenCalledWith("assistant", "system", expect.stringContaining("silent turn"));
+  });
+
+  it("stays quiet when the terminal message does carry a reply", async () => {
+    const t = makeBot();
+    const replied = { role: "assistant", content: [{ type: "text", text: "Here is the analysis." }], stopReason: "stop" };
+    const notices = await runTurn(t, "analyse the whole flow", [userTurn, replied]);
+    expect(notices).toHaveLength(0);
+  });
+
+  it("counts only the current turn's tool calls, not the whole session", async () => {
+    const t = makeBot();
+    const olderTurn = { role: "user", content: [{ type: "text", text: "[Thu, Sep 17, 2026]\n\nearlier ask" }] };
+    const olderTools = [
+      { role: "assistant", content: [{ type: "toolCall", name: "read" }, { type: "toolCall", name: "read" }], stopReason: "toolUse" },
+    ];
+    const notices = await runTurn(t, "analyse the whole flow", [olderTurn, ...olderTools, userTurn, toolCallOnly, reasoningOnly]);
+    expect(notices[0]?.opts.text).toContain("1 tool call");
+  });
+});
