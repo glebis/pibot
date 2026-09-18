@@ -1483,6 +1483,19 @@ describe("task ack confirmations", () => {
     expect(t.events.log).toHaveBeenCalledWith("assistant", "send", expect.stringContaining("mock:42"));
   });
 
+  it("origin-chat routing: long delegated replies survive past the old 900-char cap", async () => {
+    const t = makeBot();
+    const tail = "TAIL-MARKER-cue-35-37-survive";
+    const sess = sessionWithReply("A".repeat(900) + " … " + tail);
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
+    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
+      "fitness", "assistant", "long job with a long report", undefined, { transport: "mock", chatId: "42" }
+    );
+    const status = t.transport.pushed.find((p) => p.opts.text.includes(tail));
+    expect(status).toBeDefined(); // the tail must survive the origin-chat push
+    expect(status!.opts.text).toContain("[assistant]"); // attribution kept
+  });
+
   it("origin-chat routing: unknown origin transport degrades silently", async () => {
     const t = makeBot();
     (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("done"));

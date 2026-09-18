@@ -2033,7 +2033,10 @@ export class PiBot implements HeartbeatHost {
       // owner-facing status: the reply lands in the chat the work was requested from
       const t = this.transports.get(originChat.transport);
       if (t) {
-        const outbound = t.boundAgentId === agentId ? finalReply : `**[${agentId}]** ${truncate(finalReply, 900)}`;
+        // Delegated-reply cap: the old 900 silently ate long tails of agent-to-agent
+        // replies (LinkedIn cue tail delivered 5x, Sep 17 handoff half). Telegram
+        // truncates at ~4096 anyway — keep the attribution, keep the bound sane.
+        const outbound = t.boundAgentId === agentId ? finalReply : `**[${agentId}]** ${truncate(finalReply, 4000)}`;
         await t.push(originChat.chatId, { text: outbound }).catch(() => {});
         this.deps.events.log(agentId, "send", `→ ${originChat.transport}:${originChat.chatId}: ${truncate(finalReply, 80)}`);
       }
