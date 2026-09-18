@@ -90,6 +90,23 @@ export function isRichTelegramContent(text: string): boolean {
   return false;
 }
 
+/**
+ * Pre-connection network failures (DNS / routing / name lookup). The request
+ * never reached Telegram, so a retry is SAFE — nothing was delivered the first
+ * time. Ambiguous failures (connection reset mid-flight, our own send timeout)
+ * are deliberately NOT retried: a duplicated reply is worse than a logged loss.
+ * Sep 18: a DNS outage (getaddrinfo ENOTFOUND) silently ate replies because only
+ * 429s were retried.
+ */
+const RETRYABLE_NETWORK_RX = /ENOTFOUND|EAI_AGAIN|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|getaddrinfo|name resolution/i;
+const NETWORK_RETRY_BACKOFF_MS = [750, 2_500];
+
+function isPreConnectionNetworkError(e: unknown): boolean {
+  const err = e as { code?: string; errno?: string; error?: { code?: string; errno?: string }; message?: string };
+  const probe = [err?.code, err?.errno, err?.error?.code, err?.error?.errno, err?.message].filter(Boolean).join(" ");
+  return RETRYABLE_NETWORK_RX.test(probe);
+}
+
 /** Legacy/self-hosted Bot API servers (< 10.1) reject the method with HTTP 404 — everything else must surface. */
 function isRichUnsupported(e: unknown): boolean {
   const err = e as { error_code?: number; message?: string };
@@ -762,13 +779,37 @@ export class TelegramTransport implements Transport {
     return this.enqueue(chatId, async () => {
       const text = truncate(opts.text, TG_LIMIT) + (opts.text.length > TG_LIMIT ? "\n\n…(truncated)" : "");
       const payload = JSON.stringify({ text, card: opts.card ?? null });
-      if (!this.duplicateGuard.shouldSend(chatId, payload)) {
+      // Dedupe key: a reply to a user turn carries its turn identity, so two identical
+      // answers to two different messages both go out. A proactive push has no turn
+      // and falls back to payload equality — repeated unchanged proactive output is
+      // exactly the case this backstop exists for (and the only one ever observed).
+      const dedupeKey = opts.dedupeKey ?? payload;
+      if (!this.duplicateGuard.shouldSend(chatId, dedupeKey)) {
         console.warn(`[telegram] (${this.name}) suppressed duplicate send to chat ${chatId}: ${payload.slice(0, 140)}`);
+        await this.settleIncoming(chatId); // the identical earlier copy was delivered
         return;
       }
-      await this.settleIncoming(chatId);
       // first plain message in a chat attaches the persistent quick-action keyboard —
       // only the main bot; subbot chats keep their own clean slate
+      let sentId: number | undefined;
+      try {
+        sentId = await this.sendPushBody(chatId, text, opts);
+      } catch (e) {
+        // The 👍 must never claim a delivery that did not happen: it is settled
+        // BEFORE the send precisely so a wedged outbox cannot block it, which also
+        // means a failed send used to leave "answered" on the user's message.
+        await this.settleIncoming(chatId, "👎");
+        throw e;
+      }
+      await this.settleIncoming(chatId);
+      this.recordCardMessage(chatId, sentId, Boolean(opts.card));
+      await this.sweepStaleCards(chatId);
+      this.duplicateGuard.markSent(chatId, dedupeKey);
+    });
+  }
+
+  /** Push body: rich/legacy routing, quick-action keyboard, reply threading. */
+  private async sendPushBody(chatId: string, text: string, opts: PushOptions): Promise<number | undefined> {
       let sentId: number | undefined;
       // reply threading: a push can answer a specific incoming message
       const replyParams = opts.replyToMessageId
@@ -803,10 +844,7 @@ export class TelegramTransport implements Transport {
         });
         sentId = messageIdOf(sent);
       }
-      this.recordCardMessage(chatId, sentId, Boolean(opts.card));
-      await this.sweepStaleCards(chatId);
-      this.duplicateGuard.markSent(chatId, payload);
-    });
+      return sentId;
   }
 
   /**
@@ -897,8 +935,12 @@ export class TelegramTransport implements Transport {
       } catch (error) {
         this.lastSentAtByChat.set(chatId, Date.now());
         const retryAfterMs = telegramRetryAfterMs(error);
-        if (retryAfterMs == null || attempt === 2) throw error;
-        await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+        const netRetry = retryAfterMs == null && isPreConnectionNetworkError(error);
+        if (retryAfterMs == null && !netRetry) throw error;
+        if (attempt === 2) throw error;
+        const backoff = retryAfterMs ?? NETWORK_RETRY_BACKOFF_MS[Math.min(attempt, NETWORK_RETRY_BACKOFF_MS.length - 1)]!;
+        console.warn(`[telegram] (${this.name}) ${netRetry ? "network failure" : "rate limit"} sending to chat ${chatId} — retry ${attempt + 1}/2 in ${backoff}ms`);
+        await new Promise((resolve) => setTimeout(resolve, backoff));
       }
     }
     throw new Error("telegram send exhausted retries");

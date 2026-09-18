@@ -65,6 +65,14 @@ export interface PushOptions {
   /** Thread this push as a Telegram reply to that message id (transports that
    *  support replies use it; others ignore it). */
   replyToMessageId?: number;
+  /**
+   * Identity of the thing being answered (a turn, an event, a job). Transports
+   * with a duplicate backstop dedupe on THIS instead of the message payload, so
+   * two identical replies to two different incoming messages both get delivered.
+   * Omit it for proactive pushes — repeated unchanged proactive output is what
+   * the backstop is for.
+   */
+  dedupeKey?: string;
 }
 
 /** Context about a Telegram message the user replied to (transport-supplied). */

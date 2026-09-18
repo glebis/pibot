@@ -1826,3 +1826,69 @@ describe("silent turns — a turn that produces no text must not leave the owner
     expect(notices[0]?.opts.text).toContain("1 tool call");
   });
 });
+
+describe("turn identity + failed attachments (silent-loss fixes)", () => {
+  /** Drive a turn through the real wiring (sessionFor subscribes the listener). */
+  function wireTurn(t: ReturnType<typeof makeBot>, replyText: string | null) {
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementation(async () => {
+      if (replyText === null) return;
+      t.emitSessionEvent({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: replyText }] }],
+      });
+    });
+  }
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  it("stamps every reply with its turn's identity, not its text", async () => {
+    const t = makeBot();
+    wireTurn(t, "On it.");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "do X", { incomingMessageId: 101 });
+    await t.bot.promptAgent(t.transport, "42", "assistant", "do X", { incomingMessageId: 102 });
+
+    const replies = t.transport.pushed.filter((p) => p.opts.text === "On it.");
+    expect(replies).toHaveLength(2); // the same words answering two messages are not a duplicate
+    expect(replies.map((p) => p.opts.dedupeKey)).toEqual([
+      expect.stringContaining("msg:101"),
+      expect.stringContaining("msg:102"),
+    ]);
+  });
+
+  it("gives a turn with no incoming message a unique key rather than falling back to text", async () => {
+    const t = makeBot();
+    wireTurn(t, "Same words.");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "one");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "two");
+
+    const keys = t.transport.pushed.filter((p) => p.opts.text === "Same words.").map((p) => p.opts.dedupeKey);
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).not.toBe(keys[1]);
+  });
+
+  it("surfaces a failed attachment instead of only logging it to the console", async () => {
+    const t = makeBot();
+    (t.transport as unknown as { sendMedia: unknown }).sendMedia = vi.fn(async () => {
+      throw new Error("file too big");
+    });
+    wireTurn(t, "Report attached.\n\nMEDIA: /tmp/flow-review.md");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "send the report");
+    await settle();
+
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "system", expect.stringContaining("media send failed"));
+    const notice = t.transport.pushed.find((p) => p.opts.text.includes("couldn't deliver the attachment"));
+    expect(notice?.opts.text).toContain("flow-review.md");
+  });
+
+  it("stays quiet when the attachment arrives", async () => {
+    const t = makeBot();
+    (t.transport as unknown as { sendMedia: unknown }).sendMedia = vi.fn(async () => {});
+    wireTurn(t, "Report attached.\n\nMEDIA: /tmp/ok.md");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "send the report");
+    await settle();
+
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("couldn't deliver"))).toBe(false);
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "media", expect.stringContaining("ok.md"));
+  });
+});

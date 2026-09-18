@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { serve } from "@hono/node-server";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.js";
-import { ensureDir, hardenRuntimeDataDir, readJson } from "./core/util.js";
+import { enforceOwnerOnlyRuntimeState, ensureDir, readJson } from "./core/util.js";
 import { SecretStore } from "./core/secrets.js";
 import { AgentManager } from "./core/agent-manager.js";
 import { PiBot } from "./core/bot.js";
@@ -25,9 +25,13 @@ import { SttService } from "./core/stt.js";
 import { AudioMediaProcessor } from "./core/audio-media.js";
 
 async function main(): Promise<void> {
+  // Private runtime state (sessions, memories, skills, media, secrets) is written by
+  // several layers, including the SDK — a process-wide umask makes every file the daemon
+  // creates owner-only, and the boot-time repair fixes what earlier runs left readable.
+  process.umask(0o077);
   const config = loadConfig();
   ensureDir(config.dataDir);
-  hardenRuntimeDataDir(config.dataDir);
+  enforceOwnerOnlyRuntimeState([config.dataDir, config.agentsDir]);
 
   // disk guard: catch ENOSPC anywhere in the daemon (process events, swallowed
   // catches via errorMessage, low-water watcher) and auto-run the disk-cleanup

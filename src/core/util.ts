@@ -51,6 +51,32 @@ export function hardenRuntimeDataDir(root: string): void {
   harden(root);
 }
 
+/**
+ * Owner-only runtime state, enforced for the whole process lifetime.
+ *
+ * The umask matters as much as the repair: session transcripts, memories and
+ * generated skills are written by several layers (including the agent SDK), so
+ * only a process-wide umask keeps NEW files private — chmod alone is a snapshot
+ * that the next turn invalidates (Sep 18: 346 world-readable paths under
+ * agentsDir, containing verbatim user conversation).
+ *
+ * Best-effort by design: a boot must never fail over permissions.
+ */
+export function enforceOwnerOnlyRuntimeState(dirs: string[]): void {
+  try {
+    process.umask(0o077);
+  } catch {
+    /* platform without umask — the repair below still applies */
+  }
+  for (const dir of dirs) {
+    try {
+      if (dir && fs.existsSync(dir)) hardenRuntimeDataDir(dir);
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
 // ─── durations & times ──────────────────────────────────────────────────────
 
 const UNIT_MS: Record<string, number> = {

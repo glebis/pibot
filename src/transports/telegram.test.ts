@@ -472,3 +472,123 @@ describe("sendTelegram send timeout (outbox wedge guard)", () => {
     vi.unstubAllEnvs();
   });
 });
+
+describe("outbound resilience: replies must survive a network flap", () => {
+  function transportWith(api: Record<string, unknown>): TelegramTransport {
+    const t = new TelegramTransport("123:test", ["42"]);
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = { api };
+    return t;
+  }
+  /** A DNS failure the way node-fetch/grammy report it (outer HttpError → FetchError). */
+  const dnsFailure = () =>
+    Object.assign(new Error("Network request for 'sendMessage' failed!"), {
+      error: Object.assign(new Error("request to https://api.telegram.org/botX/sendMessage failed, reason: getaddrinfo ENOTFOUND api.telegram.org"), { code: "ENOTFOUND", errno: "ENOTFOUND" }),
+    });
+
+  it("retries a pre-connection network failure instead of losing the reply", async () => {
+    let calls = 0;
+    const t = transportWith({
+      sendMessage: async () => {
+        calls += 1;
+        if (calls === 1) throw dnsFailure();
+        return { message_id: 21 };
+      },
+    });
+    await t.push("42", { text: "the reply" });
+    expect(calls).toBe(2);
+  });
+
+  it("gives up after bounded retries and surfaces the failure", async () => {
+    let calls = 0;
+    const t = transportWith({
+      sendMessage: async () => {
+        calls += 1;
+        throw dnsFailure();
+      },
+    });
+    await expect(t.push("42", { text: "the reply" })).rejects.toThrow(/Network request/);
+    expect(calls).toBe(3); // 1 + 2 retries, never unbounded
+  });
+
+  it("does NOT retry an ambiguous failure (a duplicate reply is worse than a logged loss)", async () => {
+    let calls = 0;
+    const t = transportWith({
+      sendMessage: async () => {
+        calls += 1;
+        throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+      },
+    });
+    await expect(t.push("42", { text: "the reply" })).rejects.toThrow(/socket hang up/);
+    expect(calls).toBe(1);
+  });
+
+  it("settles 👀→👍 only after the send actually succeeded", async () => {
+    const order: string[] = [];
+    const t = transportWith({
+      sendMessage: async () => {
+        order.push("send");
+        return { message_id: 22 };
+      },
+      setMessageReaction: async () => {
+        order.push("reaction");
+        return true;
+      },
+    });
+    (t as unknown as { processingIds: Map<string, number[]> }).processingIds.set("42", [7]);
+    await t.push("42", { text: "answered" });
+    expect(order).toEqual(["send", "reaction"]);
+  });
+
+  it("downgrades to 👎 when the send fails, so the reaction never claims a delivery", async () => {
+    const reactions: string[] = [];
+    const t = transportWith({
+      sendMessage: async () => {
+        throw Object.assign(new Error("chat not found"), { error_code: 400, description: "Bad Request: chat not found" });
+      },
+      setMessageReaction: async (_c: number, _m: number, r: Array<{ emoji: string }>) => {
+        reactions.push(r[0]?.emoji ?? "");
+        return true;
+      },
+    });
+    (t as unknown as { processingIds: Map<string, number[]> }).processingIds.set("42", [7]);
+    await expect(t.push("42", { text: "never arrives" })).rejects.toThrow(/chat not found/);
+    expect(reactions).toEqual(["👎"]);
+  });
+});
+
+describe("duplicate backstop keys on turn identity, not on reply text", () => {
+  function countingTransport() {
+    const texts: string[] = [];
+    const t = new TelegramTransport("123:test", ["42"]);
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendMessage: async (_c: string, text: string) => {
+          texts.push(text);
+          return { message_id: texts.length + 30 };
+        },
+      },
+    };
+    return { t, texts };
+  }
+
+  it("delivers two identical replies that answer two different messages", async () => {
+    const { t, texts } = countingTransport();
+    await t.push("42", { text: "On it.", dedupeKey: "mock:42:msg:101" });
+    await t.push("42", { text: "On it.", dedupeKey: "mock:42:msg:102" });
+    expect(texts).toHaveLength(2);
+  });
+
+  it("still suppresses a second send for the SAME turn (the accidental double-fire case)", async () => {
+    const { t, texts } = countingTransport();
+    await t.push("42", { text: "On it.", dedupeKey: "mock:42:msg:101" });
+    await t.push("42", { text: "On it.", dedupeKey: "mock:42:msg:101" });
+    expect(texts).toHaveLength(1);
+  });
+
+  it("keeps payload dedupe for proactive pushes (which carry no turn)", async () => {
+    const { t, texts } = countingTransport();
+    await t.push("42", { text: "hourly nudge" });
+    await t.push("42", { text: "hourly nudge" });
+    expect(texts).toHaveLength(1);
+  });
+});

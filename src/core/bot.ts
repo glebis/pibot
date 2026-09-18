@@ -69,6 +69,8 @@ export function parsePendingSubBots(
 export class PiBot implements HeartbeatHost {
   private transports = new Map<string, Transport>();
   private wired = new Set<string>();
+  /** agent::chat → identity of the turn currently running (see PushOptions.dedupeKey) */
+  private turnKeys = new Map<string, string>();
   private chatAgent = new Map<string, string>(); // chatKey → agentId
   private agentChats = new Map<string, Set<string>>(); // agentId → chatKeys
   private wizardChats = new Set<string>(); // chats running /newagent interview
@@ -626,11 +628,17 @@ export class PiBot implements HeartbeatHost {
             }
             void t.sendMedia(chatId, source).then(
               () => this.deps.events.log(agentId, "media", `sent ${truncate(source, 140)} via ${t.name} → ${chatId}`),
-              (e) => console.error("[bot] media send failed:", e),
+              (e) => {
+                // A failed attachment used to reach nobody but the console: the text
+                // went out, the file did not, and the owner had no way to know.
+                const file = source.split("/").pop() ?? source;
+                this.deps.events.log(agentId, "system", `media send failed: ${truncate(source, 120)} — ${truncate(errorMessage(e), 160)}`);
+                void t.push(chatId, { text: `⚠️ couldn't deliver the attachment \`${truncate(file, 80)}\` — the text above is complete, but re-ask if you need the file.` }).catch(() => {});
+              },
             );
           }
           if (!cleanText.trim()) return;
-          const delivery = t.push(chatId, { text: cleanText });
+          const delivery = t.push(chatId, { text: cleanText, dedupeKey: this.turnKeys.get(key) });
           this.pendingPushes.set(key, delivery);
           void delivery.catch((e) => console.error("[bot] push failed:", e));
           this.deps.events.log(agentId, "message", truncate(cleanText, 200));
@@ -798,6 +806,9 @@ export class PiBot implements HeartbeatHost {
     t.setTyping?.(chatId, true);
     try {
       this.pendingPushes.delete(`${agentId}::${ck}`);
+      // the reply this turn produces is deduped by turn identity, never by text:
+      // answering two questions with the same words is normal, not a duplicate.
+      this.turnKeys.set(`${agentId}::${ck}`, opts.incomingMessageId ? `${ck}:msg:${opts.incomingMessageId}` : `${ck}:turn:${uid("t")}`);
       // followUp: concurrent messages queue behind the running turn instead of erroring
       await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, text), opts.recoveringDeadLetter ?? false);
       // implicit task acks: when this agent just accepted/declined/completed a task
@@ -813,6 +824,7 @@ export class PiBot implements HeartbeatHost {
         await delivery;
       }
     } finally {
+      this.turnKeys.delete(`${agentId}::${ck}`);
       t.setTyping?.(chatId, false);
     }
     await this.flushCards(t, chatId, agentId);

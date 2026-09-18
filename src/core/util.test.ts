@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { fmtWhen, hardenRuntimeDataDir, inQuietHours, nextRepeatAt, parseDuration, parseWhen, writeJsonAtomic } from "./util.js";
+import { enforceOwnerOnlyRuntimeState, fmtWhen, hardenRuntimeDataDir, inQuietHours, nextRepeatAt, parseDuration, parseWhen, writeJsonAtomic } from "./util.js";
 
 const tempDirs: string[] = [];
 
@@ -180,5 +180,45 @@ describe("inQuietHours", () => {
     expect(inQuietHours({ from: "12:00", to: "14:00" }, new Date(2026, 7, 27, 13, 0).getTime())).toBe(true);
     expect(inQuietHours({ from: "14:00", to: "13:00" }, new Date(2026, 7, 27, 2, 0).getTime())).toBe(true);
     expect(inQuietHours(undefined, NOW)).toBe(false);
+  });
+});
+
+describe("enforceOwnerOnlyRuntimeState", () => {
+  it("repairs world-readable session/memory state to owner-only, without following symlinks", () => {
+    const root = tempDir();
+    const sessions = path.join(root, "sessions");
+    const outside = path.join(tempDir(), "outside.md");
+    fs.mkdirSync(sessions, { recursive: true, mode: 0o755 });
+    const transcript = path.join(sessions, "chat.jsonl");
+    fs.writeFileSync(transcript, "{}\n", { mode: 0o644 });
+    fs.writeFileSync(outside, "not ours\n", { mode: 0o644 });
+    fs.chmodSync(root, 0o755);
+    fs.chmodSync(sessions, 0o755);
+    const link = path.join(root, "link.md");
+    fs.symlinkSync(outside, link);
+
+    enforceOwnerOnlyRuntimeState([root]);
+
+    expect(fs.statSync(root).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(sessions).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(transcript).mode & 0o777).toBe(0o600);
+    // the symlink target belongs to someone else — untouched
+    expect(fs.statSync(outside).mode & 0o777).toBe(0o644);
+  });
+
+  it("sets a process umask so NEW files are owner-only too (chmod alone is a snapshot)", () => {
+    const before = process.umask();
+    try {
+      enforceOwnerOnlyRuntimeState([]);
+      const created = path.join(tempDir(), "fresh.jsonl");
+      fs.writeFileSync(created, "{}\n");
+      expect(fs.statSync(created).mode & 0o077).toBe(0);
+    } finally {
+      process.umask(before);
+    }
+  });
+
+  it("tolerates missing dirs and empty entries", () => {
+    expect(() => enforceOwnerOnlyRuntimeState([path.join(tempDir(), "nope"), ""])).not.toThrow();
   });
 });
