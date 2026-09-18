@@ -969,6 +969,15 @@ export class TelegramTransport implements Transport {
     this.workTimers.set(chatId, timer);
   }
 
+  /** Stable work badge on the last incoming message — no interval, no cycling.
+   *  Dev-turn confirmation: 👀 received → 🛠 developing → 👍 answered / 👎 failed. */
+  setWorkBadge(chatId: string, emoji: string): void {
+    const list = this.processingIds.get(chatId) ?? [];
+    const lastId = list[list.length - 1];
+    if (!lastId) return;
+    void this.setReaction(chatId, lastId, emoji);
+  }
+
   setTyping(chatId: string, on: boolean): void {
     if (on) void this.bot.api.sendChatAction(chatId, "typing").catch(() => {});
   }

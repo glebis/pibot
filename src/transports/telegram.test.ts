@@ -592,3 +592,36 @@ describe("duplicate backstop keys on turn identity, not on reply text", () => {
     expect(texts).toHaveLength(1);
   });
 });
+
+describe("Telegram setWorkBadge", () => {
+  it("reacts 🛠 on the last incoming message, stable — no cycling interval", async () => {
+    const transport = new TelegramTransport("123:test", ["42"]);
+    const reactions: Array<{ chat: string; message: number; emoji: string }> = [];
+    (transport as unknown as { bot: { api: { setMessageReaction: (...a: unknown[]) => Promise<unknown> } } }).bot.api.setMessageReaction =
+      async (...args: unknown[]) => {
+        const [chatId, messageId, reaction] = args as [unknown, number, Array<{ emoji: string }>];
+        reactions.push({ chat: String(chatId), message: Number(messageId), emoji: reaction[0]?.emoji ?? "" });
+        return true;
+      };
+    (transport as unknown as { processingIds: Map<string, number[]> }).processingIds.set("42", [7, 9]);
+
+    transport.setWorkBadge("42", "🛠");
+    await new Promise((r) => setTimeout(r, 20)); // let the enqueued task run
+
+    expect(reactions).toEqual([{ chat: "42", message: 9, emoji: "🛠" }]);
+    expect((transport as unknown as { workTimers: Map<string, unknown> }).workTimers.size).toBe(0);
+  });
+
+  it("is a no-op when the chat has no marked incoming message", async () => {
+    const transport = new TelegramTransport("123:test", ["42"]);
+    const reactions: unknown[] = [];
+    (transport as unknown as { bot: { api: { setMessageReaction: (...a: unknown[]) => Promise<unknown> } } }).bot.api.setMessageReaction =
+      async (...a: unknown[]) => {
+        reactions.push(a);
+        return true;
+      };
+    transport.setWorkBadge("42", "🛠");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(reactions.length).toBe(0);
+  });
+});

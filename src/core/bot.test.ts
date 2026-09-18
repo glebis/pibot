@@ -59,6 +59,8 @@ class MockTransport implements Transport {
   readonly chatId = "42";
   pushed: Array<{ chatId: string; opts: PushOptions }> = [];
   typing: Array<[string, boolean]> = [];
+  working: Array<[string, boolean]> = [];
+  workBadges: Array<[string, string]> = [];
   messageCb: ((text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>) | null = null;
   actionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   mediaCb: ((media: import("./types.js").IncomingMedia) => Promise<void>) | null = null;
@@ -95,6 +97,12 @@ class MockTransport implements Transport {
   }
   setTyping(chatId: string, on: boolean): void {
     this.typing.push([chatId, on]);
+  }
+  setWorking(chatId: string, on: boolean): void {
+    this.working.push([chatId, on]);
+  }
+  setWorkBadge(chatId: string, emoji: string): void {
+    this.workBadges.push([chatId, emoji]);
   }
   lastText(): string {
     return this.pushed.at(-1)?.opts.text ?? "";
@@ -137,7 +145,9 @@ function fakeAgentManager(promptSpy = vi.fn()) {
     resolveModel: vi.fn(() => undefined),
     sessions: new Map(),
     getAgent: vi.fn((id: string) =>
-      id === "assistant" || id === "fitness"
+      id === "pibot-dev"
+        ? { id, dir: `/tmp/fake-${id}`, manifest: { name: id, description: "d", workspace: "repo" } }
+        : id === "assistant" || id === "fitness"
         ? { id, dir: `/tmp/fake-${id}`, manifest: { name: id, description: "d", heartbeat: { enabled: true, interval: "45m" }, evolution: { enabled: true, interval: "6h" } } }
         : undefined
     ),
@@ -1890,5 +1900,25 @@ describe("turn identity + failed attachments (silent-loss fixes)", () => {
 
     expect(t.transport.pushed.some((p) => p.opts.text.includes("couldn't deliver"))).toBe(false);
     expect(t.events.log).toHaveBeenCalledWith("assistant", "media", expect.stringContaining("ok.md"));
+  });
+});
+
+describe("dev-turn start confirmation", () => {
+  it("dev agent turn start: stable 🛠 badge instead of the emoji cycle", async () => {
+    const t = makeBot();
+    await t.bot.promptAgent(t.transport, t.transport.chatId, "pibot-dev", "dig into the flow");
+    t.emitSessionEvent({ type: "agent_start" });
+    expect(t.transport.workBadges).toEqual([["42", "🛠"]]);
+    expect(t.transport.working.length).toBe(0);
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("ordinary agent turn start: emoji cycle, no badge", async () => {
+    const t = makeBot();
+    await t.transport.say("hello");
+    t.emitSessionEvent({ type: "agent_start" });
+    expect(t.transport.working.length).toBe(1);
+    expect(t.transport.workBadges.length).toBe(0);
+    fs.rmSync(t.dir, { recursive: true, force: true });
   });
 });

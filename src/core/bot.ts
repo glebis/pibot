@@ -602,7 +602,16 @@ export class PiBot implements HeartbeatHost {
   private onSessionEvent(t: Transport, chatId: string, agentId: string, ev: AgentSessionEvent): void {
     if (ev.type === "agent_start") {
       t.setTyping?.(chatId, true);
-      t.setWorking?.(chatId, true);
+      // Dev-turn confirmation: the owner must always see that development started —
+      // a stable 🛠 badge on their message completes the lifecycle
+      // 👀 received → 🛠 developing → 👍 answered / 👎 failed. The badge is host-set
+      // (deterministic — survives a model that never speaks) and replaces the
+      // emoji cycle, which would overwrite it within seconds.
+      if (this.deps.agents.getAgent(agentId)?.manifest.workspace === "repo") {
+        t.setWorkBadge?.(chatId, "🛠");
+      } else {
+        t.setWorking?.(chatId, true);
+      }
     } else if (ev.type === "agent_end") {
       t.setTyping?.(chatId, false);
       t.setWorking?.(chatId, false);

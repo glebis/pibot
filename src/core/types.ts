@@ -121,6 +121,9 @@ export interface Transport {
   setTyping?(chatId: string, on: boolean): void;
   /** Cycle working reactions + refresh typing while a turn runs (optional) */
   setWorking?(chatId: string, on: boolean): void;
+  /** Set a stable work badge (e.g. 🛠) on the last incoming message — replaces
+   *  the cycling reactions when the host wants a durable "work started" marker. */
+  setWorkBadge?(chatId: string, emoji: string): void;
   /** Structured question as a native poll (optional; returns its poll id) */
   sendPoll?(chatId: string, question: string, options: string[]): Promise<{ pollId: string }>;
   /** Poll votes (optional) */
