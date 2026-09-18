@@ -12,6 +12,10 @@
 //     the post-deploy verification gate: run it against the real bot chat
 //     right after a restart, instead of typing test messages by hand.
 //
+// Cleanup: every message the harness sends — and the bot's direct reply to it —
+// is deleted via telethon ~10s after its scenario completes (--keep-probes
+// disables this), so live-test traffic never litters real chats.
+//
 // Env (each resolves env → data/telegram-test.env → AppleScript dialog):
 //   TELEGRAM_LIVE_TEST_TOKEN    test-bot token (spawn mode) — asked with hidden input
 //   TELEGRAM_LIVE_TEST_CHAT_ID  your numeric Telegram user id (the spawned test bot
@@ -51,6 +55,7 @@ const hasFlag = (name: string) => args.includes(`--${name}`);
 const attach = hasFlag("attach");
 const scenario = argVal("scenario") ?? (attach ? "smoke" : "full");
 const noPrompt = hasFlag("no-prompt");
+const keepProbes = hasFlag("keep-probes");
 const webPort = parseInt(argVal("web-port") || "7871", 10);
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-live-"));
 
@@ -144,10 +149,95 @@ function sendTg(chatRef: string, text: string): { sent: boolean; id?: number } {
   if (!r.ok) return { sent: false };
   try {
     const j = JSON.parse(r.out) as { sent?: boolean; message_id?: number };
+    if (j.sent && j.message_id) trackSend(chatRef, j.message_id);
     return { sent: Boolean(j.sent), id: j.message_id };
   } catch {
     return { sent: r.out.includes("true") };
   }
+}
+
+// ─── probe cleanup (delete harness traffic after a beat) ───────────────────
+
+/** How long after sending a probe stays visible before telethon deletes it. */
+const PROBE_DELETE_BEAT_MS = 10_000;
+
+interface Probe {
+  chat: string;
+  /** the sent probe id first; the bot's captured reply id(s) appended after */
+  ids: number[];
+  sentAt: number;
+}
+const probes: Probe[] = [];
+
+/** Register a harness-sent message for post-scenario deletion. */
+function trackSend(chatRef: string, id?: number): void {
+  if (id === undefined || id <= 0) return;
+  probes.push({ chat: chatRef, ids: [id], sentAt: Date.now() });
+}
+
+/** Attach the bot's reply to the most recent probe of this chat (deleted with it). */
+function trackReply(chatRef: string, msg: TgMessage | null | undefined): void {
+  if (!msg || msg.id <= 0) return;
+  const last = [...probes].reverse().find((p) => p.chat === chatRef);
+  if (last && !last.ids.includes(msg.id)) last.ids.push(msg.id);
+}
+
+/** Delete one chat's probe batch. Best effort — but verifies the result: tg.py
+ *  delete exits 0 even when the module returns {"deleted": false, error}, so a
+ *  result check + retry is required (first live run silently no-op'd). */
+function deleteProbes(chatRef: string, ids: number[]): void {
+  if (!ids.length) return;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const r = sh(["delete", "--chat", chatRef, "--message-ids", ...ids.map(String)]);
+    let deleted = false;
+    let error = "";
+    try {
+      const j = JSON.parse(r.out) as { deleted?: boolean; error?: string };
+      deleted = j.deleted === true;
+      error = j.error ?? "";
+    } catch {
+      error = r.out.slice(0, 120);
+    }
+    if (deleted) return;
+    if (attempt < 3) {
+      spawnSync("sleep", ["3"]);
+      continue;
+    }
+    console.warn(`[harness] probe cleanup FAILED (${chatRef}, ids ${ids.join(",")}): ${error || r.out.slice(0, 120)}`);
+  }
+}
+
+/** Remove probes sent ≥ beatMs ago (default beat from send), batched per chat. */
+function sweepProbes(beatMs = PROBE_DELETE_BEAT_MS): number {
+  if (keepProbes) return 0;
+  const now = Date.now();
+  const due = probes.filter((p) => now - p.sentAt >= beatMs);
+  for (const p of due) {
+    const idx = probes.indexOf(p);
+    if (idx >= 0) probes.splice(idx, 1);
+  }
+  const byChat = new Map<string, number[]>();
+  for (const p of due) {
+    const list = byChat.get(p.chat) ?? [];
+    for (const id of p.ids) if (!list.includes(id)) list.push(id);
+    byChat.set(p.chat, list);
+  }
+  let n = 0;
+  for (const [chat, ids] of byChat) {
+    deleteProbes(chat, ids);
+    n += ids.length;
+  }
+  if (n) console.log(`🧹 removed ${n} live-test message(s)`);
+  return n;
+}
+
+/** Wait out the beat so late-registered probes are covered, then sweep. */
+async function finalProbeCleanup(): Promise<void> {
+  if (keepProbes || !probes.length) return;
+  const oldest = Math.min(...probes.map((p) => p.sentAt));
+  const rest = PROBE_DELETE_BEAT_MS - (Date.now() - oldest);
+  if (rest > 0) await sleep(rest);
+  sweepProbes(0);
 }
 
 function recentJson(chatRef: string, limit = 8): TgMessage[] {
@@ -276,6 +366,7 @@ async function scenarioStatusRoundTrip(chatRef: string): Promise<void> {
     reply = recentJson(chatRef).find((m) => m.text && /model:/i.test(m.text) && Date.parse(m.date) >= sentTs - 1_000) ?? null;
     if (!reply) await sleep(2_000);
   }
+  trackReply(chatRef, reply);
   record("T1 /status round-trip", Boolean(reply), reply ? reply.text.split("\n")[0].slice(0, 70) : "no reply within 45s");
 }
 
@@ -289,6 +380,7 @@ async function scenarioUnknownCommand(chatRef: string): Promise<void> {
     reply = recentJson(chatRef).find((m) => m.text && /Unknown/.test(m.text) && Date.parse(m.date) >= sentTs - 1_000) ?? null;
     if (!reply) await sleep(2_000);
   }
+  trackReply(chatRef, reply);
   record("T2 unknown command reply", Boolean(reply), reply ? reply.text.split("\n")[0].slice(0, 70) : "no reply within 45s");
 }
 
@@ -299,8 +391,10 @@ async function scenarioSeededConsolidation(chatRef: string, artifactsDir: string
   const r = sendTg(chatRef, "/consolidate");
   if (!r.sent) return record("T7 seeded consolidation round", false, "telethon send failed");
   const ack = await awaitReply(chatRef, /Distilling/i, sentTs, 20_000);
+  trackReply(chatRef, ack);
   if (!ack) return record("T7 seeded consolidation round", false, "no ack within 20s");
   const report = await awaitReply(chatRef, /consolidation: \d+ event/, Date.parse(ack.date), 60_000);
+  trackReply(chatRef, report);
   if (!report) return record("T7 seeded consolidation round", false, `ack ok, no consolidation report within 60s (model down?): ${ack.text}`);
   const blocksFile = path.join(artifactsDir, "blocks.json");
   if (!fs.existsSync(blocksFile)) return record("T7 seeded consolidation round", false, report.text + " — but blocks.json missing");
@@ -319,6 +413,7 @@ async function scenarioSeededConsolidation(chatRef: string, artifactsDir: string
   const sent2 = Date.now();
   await sendTg(chatRef, "/consolidate");
   const again = await awaitReply(chatRef, /no new events to consolidate/, sent2, 30_000);
+  trackReply(chatRef, again);
   const state2 = JSON.parse(fs.readFileSync(blocksFile, "utf8")) as typeof state;
   record("T7b consolidation idempotence", Boolean(again) && state2.blocks?.length === 1, again ? "second run: no new events, blocks unchanged" : "no idempotent no-op reply (cursor advanced further?)");
   const md = fs.existsSync(path.join(artifactsDir, "CONSOLIDATED.md")) ? fs.readFileSync(path.join(artifactsDir, "CONSOLIDATED.md"), "utf8") : "";
@@ -512,6 +607,7 @@ async function main(): Promise<void> {
 
   await scenarioStatusRoundTrip(chatRef);
   await scenarioUnknownCommand(chatRef);
+  await sweepProbes();
 
   if (scenario === "full" && !attach) {
     await scenarioSeededConsolidation(chatRef, artifactsDir, 8);
@@ -530,12 +626,19 @@ async function main(): Promise<void> {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 
+  await finalProbeCleanup();
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${failed.length ? "🛑" : "✅"} ${results.length - failed.length}/${results.length} checks passed${failed.length ? ` — failed: ${failed.map((f) => f.name).join(", ")}` : ""}`);
   process.exit(failed.length ? 1 : 0);
 }
 
-process.on("SIGINT", () => child?.kill("SIGKILL"));
+process.on("SIGINT", () => {
+  child?.kill("SIGKILL");
+  // best effort: don't leave probe traffic behind on a manual abort
+  if (!keepProbes) for (const p of probes) deleteProbes(p.chat, p.ids);
+  process.exit(130);
+});
 main().catch((e) => {
   console.error("harness crashed:", e);
   child?.kill("SIGKILL");

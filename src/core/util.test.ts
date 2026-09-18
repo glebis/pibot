@@ -192,6 +192,9 @@ describe("enforceOwnerOnlyRuntimeState", () => {
     const transcript = path.join(sessions, "chat.jsonl");
     fs.writeFileSync(transcript, "{}\n", { mode: 0o644 });
     fs.writeFileSync(outside, "not ours\n", { mode: 0o644 });
+    // explicit chmod: under a hardened umask (0077) the writes above would be born 0600 —
+    // the assertion must not depend on the inherited umask, only on hardening not crossing symlinks
+    fs.chmodSync(outside, 0o644);
     fs.chmodSync(root, 0o755);
     fs.chmodSync(sessions, 0o755);
     const link = path.join(root, "link.md");
