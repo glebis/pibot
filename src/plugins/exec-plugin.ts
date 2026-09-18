@@ -22,6 +22,8 @@ export interface ExecAllowEntry {
   denyArgRe?: RegExp[];
   /** if set: the first non-pin argument that looks like a file path must resolve under this dir */
   requireScriptUnder?: string;
+  /** if set: remaining args after the pin must be EXACTLY ONE https URL starting with one of these prefixes */
+  urlsUnder?: string[];
 }
 
 /**
@@ -38,6 +40,10 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
   { bin: "whisperkit-cli" },
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/youtube-transcript/scripts/extract_transcript.py")] },
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/fathom/scripts/fetch.py")] },
+  // read-only GitHub fetches for link-saves (host-pinned curl, gh repo view / api repos/*)
+  { bin: "curl", pin: ["-sL", "--max-time", "15"], urlsUnder: ["https://api.github.com/", "https://github.com/", "https://raw.githubusercontent.com/"] },
+  { bin: "gh", pin: ["repo", "view"] },
+  { bin: "gh", pin: ["api", "repos/"] },
   { bin: "afplay" },
   { bin: "osascript", denyArgRe: [/^-e$/, /^-i$/] },
   // ssh pinned to the fleet-configured mini aliases only (remote commands are the point;
@@ -113,6 +119,12 @@ export async function resolveExec(argv: string[], deps: ExecPluginDeps, allowlis
       const probe = fs.existsSync(first) ? fs.realpathSync(first) : path.resolve(first);
       if (probe !== under && !probe.startsWith(under + path.sep)) {
         constraintFailure = `refused: ${entry.bin} script must live under ${under}`;
+        continue;
+      }
+    }
+    if (entry.urlsUnder) {
+      if (rest.length !== 1 || !entry.urlsUnder.some((u) => rest[0].startsWith(u))) {
+        constraintFailure = `refused: ${entry.bin} allows exactly one https URL under ${entry.urlsUnder.join(" or ")}`;
         continue;
       }
     }

@@ -101,6 +101,17 @@ describe("exec plugin allowlist resolution", () => {
     expect(ok.error).toBeUndefined();
   });
 
+  it("urlsUnder: exactly one allowed-host URL, no extra flags", async () => {
+    const plain = path.join(agentDir, "bin/fake-plain");
+    const allowCurl = [{ bin: plain, pin: ["-sL", "--max-time", "15"], urlsUnder: ["https://api.github.com/"] }];
+    const ok = await resolveExec([plain, "-sL", "--max-time", "15", "https://api.github.com/repos/x/y"], { workspace: agentDir, agentDir }, allowCurl);
+    expect(ok.error).toBeUndefined();
+    const evil = await resolveExec([plain, "-sL", "--max-time", "15", "https://evil.example.com/exfil"], { workspace: agentDir, agentDir }, allowCurl);
+    expect(evil.error).toMatch(/exactly one https URL/);
+    const extra = await resolveExec([plain, "-sL", "--max-time", "15", "-o", "/tmp/out", "https://api.github.com/x"], { workspace: agentDir, agentDir }, allowCurl);
+    expect(extra.error).toMatch(/exactly one https URL/);
+  });
+
   it("tries sibling entries when a constraint fails — two ssh pins coexist", async () => {
     const plain = path.join(agentDir, "bin/fake-plain");
     const allowSsh: ExecAllowEntry[] = [
