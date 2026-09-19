@@ -603,12 +603,14 @@ export class PiBot implements HeartbeatHost {
     if (ev.type === "agent_start") {
       t.setTyping?.(chatId, true);
       // Dev-turn confirmation: the owner must always see that development started —
-      // a stable 🛠 badge on their message completes the lifecycle
-      // 👀 received → 🛠 developing → 👍 answered / 👎 failed. The badge is host-set
+      // a stable 👨‍💻 badge on their message completes the lifecycle
+      // 👀 received → 👨‍💻 developing → 👍 answered / 👎 failed. The badge is host-set
       // (deterministic — survives a model that never speaks) and replaces the
-      // emoji cycle, which would overwrite it within seconds.
+      // emoji cycle, which would overwrite it within seconds. Emoji must be in
+      // Telegram's bot-reaction allowlist (🛠 and 🤖 are NOT — 400 REACTION_INVALID;
+      // 👨‍💻 verified live 2026-09-20).
       if (this.deps.agents.getAgent(agentId)?.manifest.workspace === "repo") {
-        t.setWorkBadge?.(chatId, "🛠");
+        t.setWorkBadge?.(chatId, "👨‍💻");
       } else {
         t.setWorking?.(chatId, true);
       }

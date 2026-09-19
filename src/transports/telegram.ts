@@ -586,7 +586,7 @@ export class TelegramTransport implements Transport {
       if (bypassQueue) await call();
       else await this.enqueue(chatId, call);
     } catch (e) {
-      console.warn("[telegram] reaction failed:", (e as Error).message, `[chat ${chatId} msg ${messageId}]`);
+      console.warn("[telegram] reaction failed:", (e as Error).message, `[chat ${chatId} msg ${messageId}] (${this.name})`);
     }
   }
 

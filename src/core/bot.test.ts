@@ -1933,7 +1933,7 @@ describe("dev-turn start confirmation", () => {
     const t = makeBot();
     await t.bot.promptAgent(t.transport, t.transport.chatId, "pibot-dev", "dig into the flow");
     t.emitSessionEvent({ type: "agent_start" });
-    expect(t.transport.workBadges).toEqual([["42", "🛠"]]);
+    expect(t.transport.workBadges).toEqual([["42", "👨‍💻"]]);
     expect(t.transport.working.length).toBe(0);
     fs.rmSync(t.dir, { recursive: true, force: true });
   });
