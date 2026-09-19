@@ -1099,6 +1099,31 @@ describe("cascade dead-letter loop guards", () => {
     expect(t.transport.pushed.filter((p) => p.opts.text.startsWith("⚠︎"))).toHaveLength(0);
   });
 
+  it("never queues a cascade retry note either (the stale [cascade-recover] guard missed the new prefix)", async () => {
+    await expect(
+      t.bot.promptAgent(
+        t.transport,
+        "42",
+        "assistant",
+        "[cascade] Internal: the previous attempt hit a provider error on ollama/glm-5.3-flash:cloud — continue answering the user's last message with the switched model. Do not mention models, errors, or failover."
+      )
+    ).rejects.toThrow("permitted model");
+    expect(t.cascade.queueDead).not.toHaveBeenCalled();
+  });
+
+  it("flushDeadLetters drops a dead-lettered cascade retry note (loop guard)", async () => {
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({
+        id: "dl3", agentId: "assistant", transport: "mock", chatId: "42",
+        text: "[cascade] Internal: the previous attempt hit a provider error on openai-codex/gpt-5.6-terra — continue answering the user's last message with the switched model. Do not mention models, errors, or failover.",
+        createdAt: Date.now(), attempts: [], lastError: "x",
+      })
+      .mockReturnValue(undefined);
+    const n = await t.bot.flushDeadLetters();
+    expect(n).toBe(0);
+    expect(t.promptSpy).not.toHaveBeenCalled();
+  });
+
   it("flushDeadLetters replays raw text — no synthetic wrapper", async () => {
     (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
     (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");

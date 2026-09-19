@@ -913,12 +913,16 @@ export class PiBot implements HeartbeatHost {
 
     let landed = false; // has the user's text entered the session history?
     let lastError = "";
+    let failedSpec: string | undefined;
     let ambiguousPartialFailure = false;
     for (let step = 0; canPrompt && step < MAX_TURN_MODELS; step++) {
       let thrown: string | null = null;
+      // Retry note names the model that FAILED (failedSpec), not the one being
+      // switched to — the old wording labelled the new model, which read as
+      // "error on <the model that is working now>" (Sep 19 chat-log confusion).
       const body = !landed
         ? text
-        : `[cascade] Internal: the previous attempt hit a provider error${spec ? ` on ${spec}` : ""} — the model was switched. Answer the user's last message directly and naturally; do not mention models, errors, or failover.`;
+        : `[cascade] Internal: the previous attempt hit a provider error${failedSpec ? ` on ${failedSpec}` : ""} — continue answering the user's last message with the switched model. Do not mention models, errors, or failover.`;
       try {
         this.sessionTurnFailures.delete(wkey);
         await session.prompt(envelope(body), { streamingBehavior: "followUp" });
@@ -936,6 +940,7 @@ export class PiBot implements HeartbeatHost {
       ambiguousPartialFailure ||= Boolean(eventFailure?.hadPartialText);
       landed = thrown === null; // prompt resolved → the user msg is in history; retries use the note
       lastError = err;
+      failedSpec = spec || undefined;
       attempts.push(spec || "(auto)");
       if (spec) failures.push({ spec, cls: cascade.noteFailure(spec, err) });
       this.deps.events.log(agentId, "system", `model error on ${spec || "(auto)"} [${classifyModelError(err)}]: ${truncate(err, 160)}`);
@@ -955,11 +960,11 @@ export class PiBot implements HeartbeatHost {
     }
 
     // deterministic fallback: queue genuine user messages, tell the user honestly.
-    // Host-generated prompts ([scheduler]/[heartbeat]/[cascade-recover]/[handoff from])
-    // are NEVER queued: they re-fire on their own schedule, and re-queueing them
-    // compounded the dead-letter queue into a self-feeding loop (each failed
+    // Host-generated prompts ([scheduler]/[heartbeat]/[cascade-recover]/[cascade] Internal
+    // retry notes/[handoff from]) are NEVER queued: they re-fire on their own schedule, and
+    // re-queueing them compounded the dead-letter queue into a self-feeding loop (each failed
     // replay got re-queued wrapped in another [cascade-recover] layer — Aug 2026 incident).
-    const internal = INTERNAL_PROMPT_PREFIXES.some((p) => text.startsWith(p));
+    const internal = isInternalPrompt(text);
     if (internal || recoveringDeadLetter) {
       const disposition = recoveringDeadLetter
         ? "dead-letter replay failed; retained for a later retry"
@@ -1076,10 +1081,11 @@ export class PiBot implements HeartbeatHost {
     for (let i = 0; i < 25; i++) {
       const dl = cascade.takeOneDead();
       if (!dl) break;
-      // loop guard: entries produced by the old recover-wrapper (meta-prompt soup,
-      // no user content) are dropped rather than fed back into a session
-      if (dl.text.startsWith("[cascade-recover]")) {
-        this.deps.events.log(dl.agentId, "system", "cascade recovery: dropped wrapped meta-entry (dead-letter loop guard)");
+      // loop guard: host-injected prompts (old recover-wrapper meta-soup, cascade retry
+      // notes, scheduler/heartbeat/handoff) are dropped rather than fed back into a
+      // session — a dead-lettered internal prompt must never replay as a user turn
+      if (isInternalPrompt(dl.text)) {
+        this.deps.events.log(dl.agentId, "system", "cascade recovery: dropped host-internal dead-letter entry (loop guard)");
         continue;
       }
       const registered = [...(this.agentChats.get(dl.agentId) ?? [])];
@@ -2409,8 +2415,17 @@ const MAX_TURN_MODELS = 5;
 
 class AmbiguousReplayError extends Error {}
 
-/** Prompts issued by the host itself — deterministic fallback for these stays quiet (no toast) */
-const INTERNAL_PROMPT_PREFIXES = ["[scheduler]", "[heartbeat]", "[cascade-recover]", "[handoff from"];
+/** Prompts issued by the host itself — deterministic fallback for these stays quiet (no toast).
+ *  These must NEVER enter the dead-letter queue as if they were user content: the Aug 2026
+ *  incident was a self-feeding loop of re-queued internal prompts. The loop guard in
+ *  flushDeadLetters uses the same list. */
+const INTERNAL_PROMPT_PREFIXES = ["[scheduler]", "[heartbeat]", "[cascade-recover]", "[cascade] Internal", "[handoff from"];
+
+/** A host-injected prompt (never user content). Used by the cascade fallback
+ *  decision and the dead-letter replay loop guard. */
+function isInternalPrompt(text: string): boolean {
+  return INTERNAL_PROMPT_PREFIXES.some((p) => text.startsWith(p));
+}
 
 /** Time envelope so the agent always knows the moment */
 function envelope(text: string): string {
