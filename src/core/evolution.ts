@@ -35,13 +35,21 @@ export interface SkillGateResult {
   errors: string[];
 }
 
+/** Structure gate: at least one line that is a heading ("# "), a bullet ("- ", "*", "•"),
+ *  a numbered step ("1." / "1)"), or starts with "step" — anchored at line starts so
+ *  structure in the FIRST line counts too (Sep 20: bodies opening with a heading or
+ *  bullet were rejected because every alternative demanded a preceding newline, and
+ *  markdown "*" bullets were never recognized). */
+const SKILL_STRUCTURE_RE = /(?:^|\n)(?:#{1,3} |\s*[-*•] |\s*\d+[.)] |step)/;
+
 /** Deterministic guardrails applied before anything reaches the live skills dir */
 export function validateSkillFile(name: string, description: string, content: string): SkillGateResult {
   const errors: string[] = [];
   if (!validateSkillName(name)) errors.push(`invalid skill name "${name}"`);
   if (!description || description.length < 10) errors.push("description too short (need a trigger: 'Use when …')");
   if (Buffer.byteLength(content, "utf8") > 15_000) errors.push("skill exceeds 15KB budget");
-  if (!/\n#{1,3} |^step|\n- |\n\d+\./m.test(content)) errors.push("body has no structure (steps/list) — skills need actionable structure");
+  if (!SKILL_STRUCTURE_RE.test(content))
+    errors.push('body has no structure (steps/list) — include a line starting with "# ", "- ", "*", or "1. "');
   return { ok: errors.length === 0, errors };
 }
 
@@ -490,13 +498,20 @@ export class EvolutionEngine {
 
   private gate(agent: LoadedAgent, p: EvolutionProposal, recentEvents: Array<{ type: string; summary: string }> = []): SkillGateResult {
     const errors: string[] = [];
-    const nameCheck = validateSkillFile(p.skillName, p.description, p.content ?? p.replace ?? "");
+    const skillsDir = path.join(agent.dir, "skills");
+    const existingPath = path.join(skillsDir, p.skillName, "SKILL.md");
+    const exists = fs.existsSync(existingPath);
+    // Structure must hold on the RESULTING candidate, not the bare snippet: a
+    // one-paragraph patch of an already-structured skill is still a structured
+    // skill (Sep 20: five drafts were rejected because patch snippets were
+    // judged alone and never contain steps/lists).
+    const candidate = p.mode === "patch" && exists ? this.candidateContent(agent, p) : (p.content ?? "");
+    const nameCheck = validateSkillFile(p.skillName, p.description, candidate);
     errors.push(...nameCheck.errors);
     if (p.mode === "patch") {
-      const file = path.join(agent.dir, "skills", p.skillName, "SKILL.md");
-      if (!fs.existsSync(file)) errors.push(`cannot patch — skill "${p.skillName}" does not exist`);
-      else if (p.find && !fs.readFileSync(file, "utf8").includes(p.find)) errors.push("cannot patch — find-text not present");
-    } else if (fs.existsSync(path.join(agent.dir, "skills", p.skillName, "SKILL.md"))) {
+      if (!exists) errors.push(`cannot patch — skill "${p.skillName}" does not exist`);
+      else if (p.find && !fs.readFileSync(existingPath, "utf8").includes(p.find)) errors.push("cannot patch — find-text not present");
+    } else if (exists) {
       errors.push(`skill "${p.skillName}" already exists — use mode "patch"`);
     }
     if (!p.probes?.length) errors.push("no eval probes provided");
@@ -723,6 +738,7 @@ Rules:
 - Derive the proposal from the goal (if given) and from friction visible in recent events (snoozes, missed fires, repeated asks, corrections).
 - If a "Distilled memory" section is present, mine it for durable patterns: repeated workflows, recurring frictions, and preferences are the best skill candidates.
 - Skills are markdown files with steps: name, trigger-style description ("Use when …"), concise actionable body. Max 15KB.
+- The body MUST be structured: at least one line starting with "# ", "- ", "*", or "1. " (heading, bullets, or numbered steps) — plain prose is rejected by the structure gate.
 - Prefer small, sharp skills over encyclopedic ones. One skill = one workflow.
 - For patch mode: find-text must EXACTLY match a snippet of the existing skill.
 - Provide 1-2 eval probes: concrete tasks the skill should handle, each with judge criteria.

@@ -33,6 +33,13 @@ describe("validateSkillFile", () => {
     expect(validateSkillFile("my-skill", "Use when the user asks for X", "plain text with no structure").ok).toBe(false);
     expect(validateSkillFile("Bad!", "Use when the user asks for X", good).ok).toBe(false);
   });
+
+  it("accepts structure in the FIRST line and markdown * / numbered forms (Sep 20 gate false-rejections)", () => {
+    expect(validateSkillFile("my-skill", "Use when the user asks for X", "# When to use\n\nprose paragraph").ok).toBe(true);
+    expect(validateSkillFile("my-skill", "Use when the user asks for X", "- do the thing\n- verify it").ok).toBe(true);
+    expect(validateSkillFile("my-skill", "Use when the user asks for X", "* item one\n* item two").ok).toBe(true);
+    expect(validateSkillFile("my-skill", "Use when the user asks for X", "1. do the thing\n2. verify").ok).toBe(true);
+  });
 });
 
 describe("applyPatch", () => {
@@ -225,6 +232,26 @@ describe("EvolutionEngine", () => {
     const report = await engine.evolve("assistant", "g");
     expect(report.ok).toBe(false);
     expect(report.errors?.join(" ")).toContain("does not exist");
+  });
+
+  it("gates judge patch structure on the resulting file, not the bare snippet", async () => {
+    // a prose one-line patch of an already-structured skill used to fail "no structure"
+    const liveDir = path.join(dir, "assistant", "skills", "morning-brief");
+    fs.mkdirSync(liveDir, { recursive: true });
+    fs.writeFileSync(path.join(liveDir, "SKILL.md"), "---\nname: morning-brief\ndescription: live\n---\n\n## Steps\n- check the calendar\n- draft three bullets\n");
+    (io.propose as ReturnType<typeof vi.fn>).mockResolvedValue({
+      mode: "patch",
+      skillName: "morning-brief",
+      description: "Use when the day starts.",
+      find: "- check the calendar",
+      replace: "check the calendar and surface conflicts",
+      rationale: "x",
+      probes: [{ task: "t", criteria: "c" }],
+    });
+    (io.judge as ReturnType<typeof vi.fn>).mockResolvedValue(2); // stays staged, no promote side effects
+    const report = await engine.evolve("assistant", "g");
+    expect(report.ok).toBe(true);
+    expect(engine.staged("assistant")).toHaveLength(1);
   });
 
   it("enforces the daily budget unless forced", async () => {
