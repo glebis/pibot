@@ -235,7 +235,10 @@ async function main(): Promise<void> {
   }
   // per-agent sub-bots attach INDEPENDENTLY of the main bot's transport source.
   // Retried per bot: a boot-time network blip must not leave a bot silent for days.
-  await bot.attachConfiguredSubBots();
+  const subBoot = await bot.attachConfiguredSubBots();
+  // post-boot confirmation (owner request, Sep 20): one line, every boot —
+  // the restart verdict reaches the owner's chat without anyone asking
+  await bot.notifyBoot(subBoot).catch(() => {});
 
   const shutdown = () => {
     console.log("\n[pibot] stopping…");

@@ -1947,3 +1947,24 @@ describe("dev-turn start confirmation", () => {
     fs.rmSync(t.dir, { recursive: true, force: true });
   });
 });
+
+describe("post-boot confirmation", () => {
+  it("sends one 🟢 line to the owner's main chat, with offline sub-bots surfaced", async () => {
+    const t = makeBot();
+    await t.transport.say("hi"); // binds the default agent's chat
+    t.transport.pushed.length = 0;
+    await t.bot.notifyBoot({ attached: ["tax"], failed: ["knower"] });
+    const text = t.transport.pushed.map((p) => p.opts.text).join("\n");
+    expect(text).toContain("🟢 pibot restarted");
+    expect(text).toContain("1 agent · telegram offline · 1 sub-bot attached");
+    expect(text).toContain("⚠︎ offline: knower");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("stays silent when no chat is bound (suppression, not a crash)", async () => {
+    const t = makeBot();
+    await expect(t.bot.notifyBoot({ attached: [], failed: [] })).resolves.toBeUndefined();
+    expect(t.transport.pushed).toHaveLength(0);
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+});

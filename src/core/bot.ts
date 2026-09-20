@@ -2214,6 +2214,24 @@ export class PiBot implements HeartbeatHost {
     if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] notify failed:", e));
   }
 
+  /** Post-boot confirmation: the owner should always know the daemon came back —
+   *  once per boot, one deterministic line, with sub-bot attach failures surfaced.
+   *  Sep 20 (owner request): restarts previously ended silently; the only signal
+   *  was the absence of complaints. */
+  async notifyBoot(subResult: { attached: string[]; failed: string[] }): Promise<void> {
+    const telegramUp = this.transports.has("telegram");
+    const bits = [
+      `${this.deps.agents.list().length} agent${this.deps.agents.list().length === 1 ? "" : "s"}`,
+      telegramUp ? "telegram up" : "telegram offline",
+      subResult.attached.length ? `${subResult.attached.length} sub-bot${subResult.attached.length === 1 ? "" : "s"} attached` : undefined,
+    ].filter(Boolean);
+    const lines = [
+      `🟢 pibot restarted — ${bits.join(" · ")}`,
+      subResult.failed.length ? `⚠︎ offline: ${subResult.failed.join(", ")}` : undefined,
+    ].filter(Boolean);
+    await this.notifyOwnerEvent(lines.join("\n"));
+  }
+
   /** bd CLI runner (repo cwd) — shared by the /issue wizard and bdshow cards */
   private bdRun(args: string[]): Promise<string> {
     if (this.deps.runBd) return this.deps.runBd(args);
