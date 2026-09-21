@@ -99,6 +99,14 @@ function fileAge(p: string, now: number): string | null {
   }
 }
 
+function fileAgeHours(p: string, now: number): number | null {
+  try {
+    return (now - fs.statSync(p).mtimeMs) / 3600e3;
+  } catch {
+    return null;
+  }
+}
+
 /** Appends a durable maintenance note to memory/maintenance.jsonl (best-effort). */
 export function recordMaintenanceNote(agentDir: string, note: string): void {
   try {
@@ -175,8 +183,28 @@ export function buildMaintenancePanel(agentDir: string, now = Date.now()): strin
 
   const lines = [
     "# Maintenance (service AT MOST ONE stale item per tick — rotate, never everything at once)",
-    `- memory (memory/MEMORY.md): ${memoryAge ? `updated ${memoryAge}` : "(missing)"} — durable memory your digest carries; memory_save does NOT refresh this line (write with file tools)`,
-    `- persona (AGENTS.md): ${personaAge ? `updated ${personaAge}` : "(missing)"} — one paragraph on how you changed lately keeps it alive`,
+    // Rotation floor (24h): an mtime younger than the floor is "current" — the panel
+    // used to print raw ages, so agents read any 5h-old digest as stale and rewrote
+    // identical content every few hours (the Sep 21 churn: 15:03 and 20:45 pings).
+    ...(() => {
+      const ROTATION_FLOOR_H = 24;
+      const memoryHours = fileAgeHours(path.join(agentDir, "memory", "MEMORY.md"), now);
+      const personaHours = fileAgeHours(path.join(agentDir, "AGENTS.md"), now);
+      const memLine = memoryHours == null
+        ? "(missing) — write the digest now with file tools; memory_save does NOT refresh this line"
+        : memoryHours < ROTATION_FLOOR_H
+          ? `current (updated ${memoryAge}) — durable memory your digest carries; memory_save does NOT refresh this line (write with file tools)`
+          : `STALE ${ageAgo(now - memoryHours * 3600e3, now)} — service this rotation (memory_save does NOT refresh this line; write with file tools)`;
+      const personaLine = personaHours == null
+        ? "(missing) — write a persona paragraph now"
+        : personaHours < ROTATION_FLOOR_H
+          ? `current (updated ${personaAge}) — one paragraph on how you changed lately`
+          : `STALE ${ageAgo(now - personaHours * 3600e3, now)} — service this rotation (one paragraph on how you changed lately)`;
+      return [
+        `- memory (memory/MEMORY.md): ${memLine}`,
+        `- persona (AGENTS.md): ${personaLine}`,
+      ];
+    })(),
     `- notes (memory/notes): ${notes} — durable facts, decisions, preferences`,
   ];
   const consolidationLine = consolidationPanelLine(agentDir, now);

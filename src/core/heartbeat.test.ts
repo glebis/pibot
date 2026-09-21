@@ -457,10 +457,25 @@ describe("HeartbeatEngine backoff", () => {
       const panel = buildMaintenancePanel(dir);
       expect(panel).toContain("# Maintenance");
       expect(panel).toContain("AT MOST ONE");
+      // under the 24h rotation floor the digest reads current, not service-worthy
+      expect(panel).toContain("current (updated 2h ago)");
       expect(panel).toContain("MEMORY.md");
-      expect(panel).toMatch(/2h ago/);
+      // past the floor: explicit STALE, still mtime-anchored
+      expect(panel).toContain("STALE 6d ago");
       expect(panel).toMatch(/AGENTS\.md/);
       expect(panel).toMatch(/6d ago/);
+    });
+
+    it("24h rotation floor: same mtime reads current below the floor, stale above it", () => {
+      fs.mkdirSync(path.join(dir, "memory"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "memory", "MEMORY.md"), "x");
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "x");
+      utime(path.join(dir, "memory", "MEMORY.md"), 0.9); // ~21.6h — under the floor
+      utime(path.join(dir, "AGENTS.md"), 1.1); // ~26h — past it
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toContain("current (updated 21h ago)");
+      expect(panel).toContain("STALE 26h ago");
+      expect(panel).not.toContain("STALE 22h");
     });
 
     it("marks missing files and shows the last maintenance entry", () => {
