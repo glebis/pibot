@@ -21,6 +21,7 @@ import type { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
 import { ensureDir, errorMessage, fmtWhen, inQuietHours, parseDuration, readJson, truncate, writeJsonAtomic } from "./util.js";
 import { appendBacklogItems, formatBacklogDigest } from "./backlog.js";
+import { buildResearchSignals } from "./research-signals.js";
 
 /** Adaptive-wakeup bounds (Ouroboros set_next_wakeup pattern): the agent may
  *  compress the next gap when something is brewing, stretch it when idle.
@@ -558,6 +559,12 @@ export function buildHeartbeatDigest(
   // improvement backlog (advisory; feeds /evolve goal selection)
   const backlog = formatBacklogDigest(agent.dir, { limit: 5 });
   if (backlog) parts.push(backlog);
+
+  // research-signals panel (metadata only; manifest-gated — research.signals)
+  if (agent.manifest.research?.signals) {
+    const panel = buildResearchSignals({ vaultDir });
+    if (panel) parts.push(panel);
+  }
 
   return parts.join("\n\n");
 }

@@ -45,6 +45,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 
 import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine, recordMaintenanceNote, verifyMemoryClaim } from "./heartbeat.js";
 import { appendBacklogItems, loadBacklogItems } from "./backlog.js";
+import { clearSignalsCache } from "./research-signals.js";
 import type { LoadedAgent } from "./agent-manager.js";
 import type { HeartbeatHost } from "./heartbeat.js";
 import * as PiAgent from "@earendil-works/pi-coding-agent";

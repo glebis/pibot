@@ -204,6 +204,12 @@ export interface AgentManifest {
     dailyBudget?: number;
     precheckLead?: string;
   };
+  /** Research-signals heartbeat panel: recent Codex session topics + vault note
+   *  titles (metadata only) become digest context the heartbeat may suggest
+   *  from. Default off. */
+  research?: {
+    signals?: boolean;
+  };
   /** inter-agent communication surface. taskAcks: when this agent accepts/declines/
    *  completes a task handed to it (by a sibling agent or the owner), a passive
    *  confirmation line lands in its bot chat. Default: on. */
