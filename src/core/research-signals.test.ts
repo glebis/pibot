@@ -48,6 +48,20 @@ describe("buildResearchSignals", () => {
     expect(panel).toContain("research topic number 3"); // newest first
   });
 
+  it("skips instruction preambles and takes the real user topic", () => {
+    const d = new Date(NOW - 3600e3);
+    const day = path.join(dir, "sessions", `${d.getFullYear()}`, `${String(d.getMonth() + 1).padStart(2, "0")}`, `${String(d.getDate()).padStart(2, "0")}`);
+    fs.mkdirSync(day, { recursive: true });
+    const file = path.join(day, "rollout-2026-09-21T17-00-00-000Z-preamble.jsonl");
+    const meta = JSON.stringify({ type: "session_meta", payload: { session_id: "s2" } });
+    const preamble = JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "# AGENTS.md instructions for /brain <INSTRUCTIONS> - Push back when wrong" }] } });
+    const real = JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "compare attention-sink papers" }] } });
+    fs.writeFileSync(file, `${meta}\n${preamble}\n${real}\n`);
+    const panel = buildResearchSignals({ codexHome: dir, vaultDir: vault, now: NOW });
+    expect(panel).toContain("attention-sink papers");
+    expect(panel).not.toContain("Push back");
+  });
+
   it("excludes sessions older than the window", () => {
     fakeSession(dir, new Date(NOW - 10 * DAY), "old topic");
     fakeSession(dir, new Date(NOW - 3600e3), "fresh topic");

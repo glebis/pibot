@@ -66,8 +66,8 @@ export function recentCodexSessions(codexHome: string, now: number, windowDays: 
 }
 
 /** First user topic of a rollout: skip meta/instruction preambles, take the first
- *  real user text, bounded. Metadata only — at most ~64KB read per file. */
-export function codexSessionTopic(file: string): string | undefined {
+ *  real user text, bounded. Metadata only — reads at most `head` bytes per file. */
+export function codexSessionTopic(file: string, headBytes = 64 * 1024): string | undefined {
   let fd: number;
   try {
     fd = fs.openSync(file, "r");
@@ -75,7 +75,7 @@ export function codexSessionTopic(file: string): string | undefined {
     return undefined;
   }
   try {
-    const buf = Buffer.alloc(64 * 1024);
+    const buf = Buffer.alloc(headBytes);
     const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
     const head = buf.subarray(0, bytesRead).toString("utf8");
     for (const line of head.split("\n")) {
@@ -84,7 +84,13 @@ export function codexSessionTopic(file: string): string | undefined {
         const e = JSON.parse(line) as { type?: string; payload?: { type?: string; role?: string; content?: Array<{ type?: string; text?: string }> } };
         if (e.type !== "response_item" || e.payload?.type !== "message" || e.payload?.role !== "user") continue;
         const text = (e.payload.content ?? []).map((c) => c.text ?? "").join(" ").trim();
-        if (!text || text.startsWith("<user_instructions>") || text.startsWith("<environment_context>") || text.startsWith("<user_info>")) continue;
+        if (!text) continue;
+        // wrapper preambles: any text opening with an XML-ish tag
+        // (<user_instructions>, <turn_aborted>, <recommended_plugins>, …), the
+        // AGENTS.md-instructions wrapper, and harness history wrappers
+        if (/^<[a-z][a-z0-9_]*>/i.test(text)) continue;
+        if (/^#[^\n]{0,80}instructions\b[^\n]*<INSTRUCTIONS>/i.test(text.slice(0, 200)) || text.slice(0, 300).includes("<INSTRUCTIONS>")) continue;
+        if (/^The following is the (?:Codex|Claude) agent history/i.test(text)) continue;
         return truncateLine(text);
       } catch {
         continue; // not JSON — skip the line
@@ -137,10 +143,15 @@ export function buildResearchSignals(opts: ResearchSignalsOpts = {}): string {
   const codexHome = opts.codexHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
   const sessions = recentCodexSessions(codexHome, now, windowDays);
   const topics: string[] = [];
-  for (const file of sessions.slice(0, maxCodex * 4)) {
+  const seen = new Set<string>();
+  for (const file of sessions.slice(0, maxCodex * 12)) {
     if (topics.length >= maxCodex) break;
-    const topic = codexSessionTopic(file);
-    if (topic) topics.push(redactEventSummary(truncateLine(topic)));
+    const topic = codexSessionTopic(file, 256 * 1024);
+    if (!topic) continue;
+    const key = truncateLine(topic, 60);
+    if (seen.has(key)) continue; // dedupe identical topics
+    seen.add(key);
+    topics.push(redactEventSummary(truncateLine(topic)));
   }
 
   const vaultDir = opts.vaultDir;
