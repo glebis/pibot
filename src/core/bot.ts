@@ -2117,6 +2117,15 @@ export class PiBot implements HeartbeatHost {
     const envelopeText = originChat
       ? `${text}\n\n(Reply-to (owner's chat): ${originChat.transport}:${originChat.chatId} — when you finish or need input, your final reply is delivered back to that chat automatically.)`
       : text;
+    if (originChat) {
+      // acceptance ack: the owner sees the work was accepted BEFORE it begins
+      // (interface principle: accepted → visible ack → work starts → status/result)
+      const t = this.transports.get(originChat.transport);
+      if (t) {
+        await t.push(originChat.chatId, { text: `⏳ **[${agentId}]** accepted — working on: "${truncate(text, 120)}"` }).catch(() => {});
+        this.deps.events.log(agentId, "send", `→ ${originChat.transport}:${originChat.chatId}: accepted ${truncate(text, 60)}`);
+      }
+    }
     const run = session.prompt(envelope(`[agent-message from "${fromAgent}"]\n\n${envelopeText}`));
     const reply = timeoutMs
       ? await Promise.race([

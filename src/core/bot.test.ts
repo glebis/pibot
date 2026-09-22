@@ -1502,7 +1502,12 @@ describe("task ack confirmations", () => {
 
   it("origin-chat routing: delegated work reports back to the chat the owner typed in", async () => {
     const t = makeBot();
-    const sess = sessionWithReply("Built and committed. Dashboard is live.");
+    const sess = {
+      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] }] } },
+      prompt: vi.fn(async () => {}),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
     (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
     await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
       "fitness", "assistant", "implement the dashboard", undefined, { transport: "mock", chatId: "42" }
@@ -1997,5 +2002,32 @@ describe("nudge feedback cards", () => {
     (t as unknown as { bot: { rememberChat: (a: string, c: string) => void } }).bot.rememberChat("assistant", "mock:42");
     await t.bot.deliverToAgent("assistant", "plain update", {});
     expect(t.transport.pushed.at(-1)?.opts.card).toBeUndefined();
+  });
+});
+
+describe("acceptance acks for delegated work", () => {
+  it("origin chat sees an immediate accepted-ack before the final result", async () => {
+    const t = makeBot();
+    const sess = {
+      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] }] } },
+      prompt: vi.fn(async () => {}),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
+    // release the session prompt only after a tick so the ack has time to land first
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    sess.prompt = vi.fn(async () => { await gate; });
+    setTimeout(release, 20);
+    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
+      "fitness", "assistant", "implement the dashboard", undefined, { transport: "mock", chatId: "42" }
+    );
+    const texts = t.transport.pushed.map((p) => p.opts.text);
+    const ackIdx = texts.findIndex((x) => x.includes("accepted"));
+    const doneIdx = texts.findIndex((x) => x.includes("Dashboard is live"));
+    expect(ackIdx).toBeGreaterThanOrEqual(0);
+    expect(ackIdx).toBeLessThan(doneIdx); // ack precedes the result
+    expect(texts[ackIdx]).toContain("[assistant]");
   });
 });
