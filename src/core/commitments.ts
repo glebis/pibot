@@ -5,7 +5,7 @@
 
 import type { AgentManager } from "./agent-manager.js";
 import type { EventLog } from "./events.js";
-import type { ProactiveStore, Commitment, CommitmentOrigin, Summary } from "./proactive-store.js";
+import type { ProactiveEvent, ProactiveStore, Commitment, CommitmentOrigin } from "./proactive-store.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Card, ChatRef, Schedule } from "./types.js";
 import { fmtWhen, parseDuration, truncate, uid } from "./util.js";
@@ -26,6 +26,8 @@ export interface CommitmentHost {
   deliverToAgent(agentId: string, text: string, card?: Card): Promise<boolean>;
   /** Deliver to one specific chat (the commitment's own loop chat). */
   pushChat(chat: ChatRef, text: string, card?: Card): Promise<boolean>;
+  /** Flag the full agent brain — e.g. the owner tapped "research this" on a nudge */
+  escalate?(agentId: string, instruction: string): Promise<void>;
 }
 
 export interface CommitmentDeps {
@@ -36,6 +38,8 @@ export interface CommitmentDeps {
   bot: CommitmentHost;
   /** one next-action suggestion when the owner is blocked; omit/throw → fallback text */
   suggestNextAction?(agentId: string, text: string): Promise<string>;
+  /** nudge-rating governor (heartbeat pacing) */
+  governor?: { noteNudgeRating(agentId: string, up: boolean): void };
   now?: () => number;
 }
 
@@ -108,6 +112,19 @@ export function commitmentCard(stage: string, c: { id: string; text: string; due
 export function isOverBudget(source: { events: ReturnType<ProactiveStore["events"]> }, budget: number, now: number): boolean {
   const midnight = new Date(now).setHours(0, 0, 0, 0);
   return source.events.filter((e) => e.stage === "delivered").length >= budget;
+}
+
+/** Nudge feedback card: deterministic 👍/👎/🔎/later on a heartbeat speak. */
+export function nudgeCard(nudgeId: string): Card {
+  return {
+    text: "",
+    buttons: [
+      { label: "👍", action: `nudge:${nudgeId}:up` },
+      { label: "👎", action: `nudge:${nudgeId}:down` },
+      { label: "🔎", action: `nudge:${nudgeId}:research` },
+      { label: "⏰ later", action: `nudge:${nudgeId}:later` },
+    ],
+  };
 }
 
 // ─── the engine ───────────────────────────────────────────────────────────────
@@ -476,8 +493,49 @@ export class CommitmentEngine {
     this.deps.store.appendEvent({ agentId, loop: "pilot", stage: ok ? "delivered" : "skipped", outcome: "scorecard" });
   }
 
-  /** Heartbeat speaks land in the store too — the loop filter needs both loops. */
-  deliverHeartbeatSpeak(agentId: string, delivered: boolean): void {
-    this.deps.store.appendEvent({ agentId, loop: "heartbeat", stage: delivered ? "delivered" : "skipped", outcome: delivered ? undefined : "push:failed" });
+  /** Heartbeat speaks land in the store too — the loop filter needs both loops.
+   *  Returns the stored event so the host can attach a feedback card whose
+   *  actions correlate back to this delivered event. */
+  deliverHeartbeatSpeak(agentId: string, delivered: boolean, nudgeId?: string): ProactiveEvent | undefined {
+    return this.deps.store.appendEvent({
+      ...(nudgeId ? { id: nudgeId } : {}),
+      agentId,
+      loop: "heartbeat",
+      stage: delivered ? "delivered" : "skipped",
+      outcome: delivered ? undefined : "push:failed",
+    });
+  }
+
+  /** Card actions on heartbeat nudges: ratings, research-this, later. */
+  async handleNudgeAction(action: string, _chatId: string): Promise<string | void> {
+    const m = action.match(/^nudge:(\w+):(up|down|research|later)$/);
+    if (!m) return;
+    const [, nudgeId, verb] = m;
+    const ev = this.deps.store.getEvent(nudgeId);
+    if (!ev) return "Unknown nudge.";
+    const store = this.deps.store;
+    const acted = (outcome: string): void => {
+      store.appendEvent({ agentId: ev.agentId, loop: "heartbeat", stage: "acted", commitmentId: nudgeId, outcome });
+    };
+    switch (verb) {
+      case "up":
+        acted("rating:up");
+        this.deps.governor?.noteNudgeRating(ev.agentId, true);
+        return "Noted — more of this 👍";
+      case "down":
+        acted("rating:down");
+        this.deps.governor?.noteNudgeRating(ev.agentId, false);
+        return "Noted — I'll quiet down.";
+      case "research":
+        acted("nudge:research");
+        await this.deps.bot.escalate?.(ev.agentId, `The owner tapped "research this" on your recent proactive nudge (event ${nudgeId}). Look at your recent heartbeat speak, then run a research cycle on that subject and report back.`);
+        return "On it — researching.";
+      case "later":
+        acted("nudge:later");
+        this.deps.scheduler.snooze(ev.agentId, this.now() + 2 * 3600e3, "nudge later");
+        return "Snoozed the rhythm 2h — important items still come through.";
+      default:
+        return;
+    }
   }
 }

@@ -257,6 +257,32 @@ export class HeartbeatEngine {
     this.persistAgent(agentId);
   }
 
+  /** Nudge-rating governor: 👍 resets the backoff; 👎 counts as unanswered and
+   *  stretches the next wakeup to interval × 1.5 (clamped by manifest bounds). */
+  noteNudgeRating(agentId: string, up: boolean): void {
+    this.hydrateAgent(agentId);
+    if (up) {
+      this.unansweredSpeaks.delete(agentId);
+      this.pendingWakeup.delete(agentId);
+      this.persistAgent(agentId);
+      return;
+    }
+    const n = (this.unansweredSpeaks.get(agentId) ?? 0) + 1;
+    this.unansweredSpeaks.set(agentId, n);
+    this.persistAgent(agentId);
+    const agent = this.deps.agents.getAgent(agentId);
+    if (!agent) return;
+    const base = parseDuration(agent.manifest.heartbeat?.interval ?? "45m") ?? 45 * 60e3;
+    const ms = this.clampWakeup(agent, base * 1.5);
+    if (ms != null) this.pendingWakeup.set(agentId, ms);
+  }
+
+  /** test/debug surface: unanswered speaks for one agent */
+  unansweredFor(agentId: string): number {
+    this.hydrateAgent(agentId);
+    return this.unansweredSpeaks.get(agentId) ?? 0;
+  }
+
   /** Should a heartbeat tick run at all? (economics guards, pure) */
   shouldTick(
     agent: LoadedAgent,

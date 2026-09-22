@@ -7,7 +7,7 @@ import { AgentManager } from "./agent-manager.js";
 import { EventLog } from "./events.js";
 import { Scheduler } from "./scheduler.js";
 import { ProactiveStore, parseCommitDue } from "./proactive-store.js";
-import { CommitmentEngine, precheckAt, commitmentCard } from "./commitments.js";
+import { CommitmentEngine, precheckAt, commitmentCard, nudgeCard } from "./commitments.js";
 import type { Card, Schedule } from "./types.js";
 import type { Commitment } from "./proactive-store.js";
 
@@ -258,5 +258,67 @@ describe("commitmentCard", () => {
   it("renders the confirmation card for proposed commitments", () => {
     const card = commitmentCard("confirm", { id: "cmX", text: "book dentist" } as never);
     expect(card.buttons.map((b) => b.action)).toEqual(["cm:cmX:confirm", "cm:cmX:dismiss"]);
+  });
+});
+describe("nudge feedback (heartbeat cards)", () => {
+  function makeNudgeHarness(opts: { pilot?: boolean; dailyBudget?: number } = {}) {
+    const dir = tmpDir();
+    const manifest = { name: "assistant", proactive: { pilot: opts.pilot !== false, ...(opts.dailyBudget != null ? { dailyBudget: opts.dailyBudget } : {}) } };
+    const agents = { getAgent: (id: string) => ({ id, dir: path.join(dir, id), manifest }) } as unknown as AgentManager;
+    const store = new ProactiveStore(dir);
+    const scheduler = new Scheduler(path.join(dir, "data"), () => {});
+    const events = new EventLog(dir);
+    const escalate = vi.fn(async () => {});
+    const pushChat = vi.fn(async () => true);
+    const deliverToAgent = vi.fn(async () => true);
+    const governor = { noteNudgeRating: vi.fn() };
+    const snoozeSpy = vi.spyOn(scheduler, "snooze");
+    const engine = new CommitmentEngine({
+      agents, scheduler, events, store,
+      bot: { pushChat, deliverToAgent, escalate },
+      suggestNextAction: async () => "draft it",
+      governor,
+      now: () => 1_700_000_000_000,
+    });
+    return { store, scheduler, escalate, pushChat, governor, engine, events, snoozeSpy };
+  }
+
+  it("nudgeCard renders 👍/👎/🔎/later buttons carrying the nudge id", () => {
+    const card = nudgeCard("nvpilot01");
+    expect(card.buttons.map((b) => b.action)).toEqual([
+      "nudge:nvpilot01:up",
+      "nudge:nvpilot01:down",
+      "nudge:nvpilot01:research",
+      "nudge:nvpilot01:later",
+    ]);
+  });
+
+  it("up/down ratings record acted events and drive the governor", async () => {
+    const h = makeNudgeHarness();
+    const ev = h.store.appendEvent({ agentId: "assistant", loop: "heartbeat", stage: "delivered", id: "nvpilot01" });
+    expect(await h.engine.handleNudgeAction("nudge:nvpilot01:up", "42")).toContain("more of");
+    expect(h.governor.noteNudgeRating).toHaveBeenCalledWith("assistant", true);
+    await h.engine.handleNudgeAction("nudge:nvpilot01:down", "42");
+    expect(h.governor.noteNudgeRating).toHaveBeenCalledWith("assistant", false);
+    const acted = h.store.events({ commitmentId: "nvpilot01" }).filter((e) => e.stage === "acted");
+    expect(acted.map((e) => e.outcome).sort()).toEqual(["rating:down", "rating:up"]);
+    expect(acted.every((e) => e.loop === "heartbeat")).toBe(true);
+  });
+
+  it("research escalates to the agent; later snoozes the rhythm 2h", async () => {
+    const h = makeNudgeHarness();
+    h.store.appendEvent({ agentId: "assistant", loop: "heartbeat", stage: "delivered", id: "nvpilot02" });
+    await h.engine.handleNudgeAction("nudge:nvpilot02:research", "42");
+    expect(h.escalate).toHaveBeenCalledWith("assistant", expect.stringContaining("nvpilot02"));
+    await h.engine.handleNudgeAction("nudge:nvpilot02:later", "42");
+    expect(h.snoozeSpy).toHaveBeenCalledWith("assistant", expect.any(Number), "nudge later");
+    const acted = h.store.events({ commitmentId: "nvpilot02" }).map((e) => e.outcome).sort();
+    expect(acted).toEqual(["nudge:later", "nudge:research"]);
+  });
+
+  it("unknown nudge ids are refused", async () => {
+    const h = makeNudgeHarness();
+    expect(await h.engine.handleNudgeAction("nudge:nada0000:up", "42")).toMatch(/unknown/i);
+    expect(h.governor.noteNudgeRating).not.toHaveBeenCalled();
   });
 });

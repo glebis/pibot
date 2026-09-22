@@ -195,3 +195,17 @@ describe("summarize", () => {
     expect(s.noisePct).toBeGreaterThanOrEqual(33);
   });
 });
+describe("summarize nudge ratings", () => {
+  const now = Date.now();
+  it("helpful% counts heartbeat nudge 👍/👎 events (no commitmentId), not just commitments", () => {
+    const events = [
+      ev({ ts: now - 3600e3, id: "nv01", loop: "heartbeat", stage: "delivered" }),
+      ev({ ts: now - 3000e3, id: "nv02", loop: "heartbeat", stage: "delivered" }),
+      ev({ ts: now - 2000e3, id: "a1", commitmentId: "nv01", loop: "heartbeat", stage: "acted", outcome: "rating:up" }),
+      ev({ ts: now - 1000e3, id: "a2", commitmentId: "nv02", loop: "heartbeat", stage: "acted", outcome: "rating:down" }),
+      ev({ ts: now - 900e3, id: "a3", loop: "pilot", stage: "acted", outcome: "rating:up" }),
+    ];
+    const s = summarize({ events, commitments: [] }, { since: now - 86_400e3, now });
+    expect(s.helpfulPct).toBe(67); // 2 up (nudge + pilot) of 3 rated nudges
+  });
+});

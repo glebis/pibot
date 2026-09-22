@@ -140,6 +140,11 @@ export class ProactiveStore {
     return this.commitmentList.find((c) => c.id === id);
   }
 
+  /** One stored event by opaque id (nudge-card correlation). */
+  getEvent(id: string): ProactiveEvent | undefined {
+    return this.readEvents().find((e) => e.id === id);
+  }
+
   updateCommitment(id: string, patch: Partial<Commitment>): Commitment | undefined {
     const c = this.getCommitment(id);
     if (!c) return undefined;
@@ -297,10 +302,23 @@ export function summarize(
   const completed = commitments.filter((c) => c.status === "completed").length;
   const missed = commitments.filter((c) => c.status === "missed").length;
   const closed = completed + missed;
+  // ratings come from acted events when any exist (pilot commitments AND
+  // heartbeat nudges both record `rating:up|down` acted events); legacy
+  // commitment.rating fields are the fallback when no events were recorded.
+  const ratingEvents = events.filter((e) => e.stage === "acted" && (e.outcome === "rating:up" || e.outcome === "rating:down"));
   const rated = commitments.filter((c) => c.rating);
-  const up = rated.filter((c) => c.rating === "up").length;
+  let up: number;
+  let ratedCount: number;
+  if (ratingEvents.length) {
+    up = ratingEvents.filter((e) => e.outcome === "rating:up").length;
+    ratedCount = ratingEvents.length;
+  } else {
+    up = rated.filter((c) => c.rating === "up").length;
+    ratedCount = rated.length;
+  }
   const dismissed = events.filter((e) => e.stage === "dismissed").length;
-  const downCount = rated.length - up;
+  const downCount = ratedCount - up;
+
 
   const pct = (n: number, d: number): number => (d === 0 ? 0 : Math.round((n / d) * 100));
 
@@ -315,7 +333,7 @@ export function summarize(
     seenPct: pct(seen, delivered),
     actedPct: pct(acted, delivered),
     completedPct: pct(completed, closed),
-    helpfulPct: pct(up, rated.length),
+    helpfulPct: pct(up, ratedCount),
     noisePct: pct(ignored + dismissed + downCount, Math.max(delivered, 1)),
     ignored,
     explicitCount: commitments.filter((c) => c.origin === "explicit").length,

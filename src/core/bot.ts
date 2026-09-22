@@ -9,6 +9,7 @@ import { createCommandHandler, evolutionReviewCard, type CommandContext } from "
 import { classifyTaskReply, isTaskLike, taskAckLine, taskAcksEnabled } from "./task-acks.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { CommitmentEngine } from "./commitments.js";
+import { nudgeCard } from "./commitments.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
@@ -1202,6 +1203,9 @@ export class PiBot implements HeartbeatHost {
   /** Returns a short toast string for Telegram callback feedback */
   async handleAction(t: Transport, chatId: string, action: string): Promise<string | void> {
     if (action.startsWith("url:")) return; // URL buttons open in the client; no callback
+    if (action.startsWith("nudge:") && this.deps.commitments) {
+      return this.deps.commitments.handleNudgeAction(action, chatId);
+    }
     if (action.startsWith("cm:") && this.deps.commitments) {
       return this.deps.commitments.handleAction(action, chatId);
     }
@@ -2271,6 +2275,12 @@ export class PiBot implements HeartbeatHost {
   ): Promise<boolean> {
     // heartbeat-originated proactive messages carry an origin tag regardless of transport
     if (opts.origin === "heartbeat") text = `[heartbeat] ${text}`;
+    // deterministic nudge feedback card on every heartbeat speak (no extra message)
+    let nudgeId: string | undefined;
+    if (opts.origin === "heartbeat" && this.deps.commitments && !card) {
+      nudgeId = uid("nv", 8);
+      card = nudgeCard(nudgeId);
+    }
     let all = [...(this.agentChats.get(agentId) ?? new Set<string>())];
     if (opts.onlyChat) all = all.filter((ck) => ck === opts.onlyChat); // thread-target chat only
     const dedicated = all.filter((ck) => {
@@ -2287,7 +2297,7 @@ export class PiBot implements HeartbeatHost {
           await t.push(chatId, { text, card, replyToMessageId: opts.replyToMessageId }).then(() => (delivered = true)).catch((e) => console.error("[bot] deliver failed:", e));
         }
       }
-      if (opts.origin === "heartbeat") this.deps.commitments?.deliverHeartbeatSpeak(agentId, delivered);
+      if (opts.origin === "heartbeat") this.deps.commitments?.deliverHeartbeatSpeak(agentId, delivered, nudgeId);
       return delivered;
     }
     // No dedicated identity: only chats the agent currently owns (is the bound agent of).
@@ -2307,7 +2317,7 @@ export class PiBot implements HeartbeatHost {
         await t.push(chatId, { text: shown, card, replyToMessageId: opts.replyToMessageId }).then(() => (delivered = true)).catch((e) => console.error("[bot] deliver failed:", e));
       }
     }
-    if (opts.origin === "heartbeat") this.deps.commitments?.deliverHeartbeatSpeak(agentId, delivered);
+    if (opts.origin === "heartbeat") this.deps.commitments?.deliverHeartbeatSpeak(agentId, delivered, nudgeId);
     return delivered;
   }
 

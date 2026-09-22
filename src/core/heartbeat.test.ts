@@ -566,3 +566,25 @@ describe("HeartbeatEngine backoff", () => {
     });
   });
 });
+
+describe("nudge-rating governor", () => {
+  it("up resets backoff; down increments it and schedules a longer wakeup", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-nudge-"));
+    const agent = makeAgent(dir);
+    const { engine, host } = makeEngine(agent, dir);
+    (host.deliverToAgent as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    // a proactive speak puts the agent at 1 unanswered
+    queueActs([{ speak: "research signals are live" }]);
+    void engine.tick(agent.id).then(() => {
+      expect(engine.unansweredFor(agent.id)).toBe(1);
+      // 👎 → 2 unanswered + pending wakeup stretched to interval × 1.5 (45m → 67.5m)
+      engine.noteNudgeRating(agent.id, false);
+      expect(engine.unansweredFor(agent.id)).toBe(2);
+      expect(engine.takeNextWakeup(agent.id)).toBe(45 * 60e3 * 1.5);
+      // 👍 resets
+      engine.noteNudgeRating(agent.id, true);
+      expect(engine.unansweredFor(agent.id)).toBe(0);
+      expect(engine.takeNextWakeup(agent.id)).toBeNull();
+    });
+  });
+});

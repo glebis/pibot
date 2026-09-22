@@ -1968,3 +1968,34 @@ describe("post-boot confirmation", () => {
     fs.rmSync(t.dir, { recursive: true, force: true });
   });
 });
+
+describe("nudge feedback cards", () => {
+  it("heartbeat-origin pushes carry the 👍/👎/🔎/later card and record the nudge id", async () => {
+    const t = makeBot();
+    const commitments = {
+      deliverHeartbeatSpeak: vi.fn(),
+      handleNudgeAction: vi.fn(async () => "Noted — more of this 👍"),
+      onFire: vi.fn(async () => {}),
+    };
+    (t.bot as unknown as { deps: { commitments: unknown } }).deps.commitments = commitments;
+    const bBind2 = (t as unknown as { bot: { rememberChat: (a: string, c: string) => void } }).bot;
+    bBind2.rememberChat("assistant", "mock:42");
+    await t.bot.deliverToAgent("assistant", "research signals look interesting", { origin: "heartbeat" });
+    const push = t.transport.pushed.find((p) => p.opts.text.includes("research signals"));
+    expect(push?.opts.card?.buttons.map((b) => b.label)).toEqual(["👍", "👎", "🔎", "⏰ later"]);
+    expect(push?.opts.card?.buttons[0].action).toMatch(/^nudge:nv\w+:up$/);
+    expect(commitments.deliverHeartbeatSpeak).toHaveBeenCalledWith("assistant", true, expect.stringMatching(/^nv/));
+    // card tap routes to the engine
+    await t.bot.handleAction(t.transport, "42", "nudge:nv000001:up");
+    expect(commitments.handleNudgeAction).toHaveBeenCalledWith("nudge:nv000001:up", "42");
+  });
+
+  it("non-heartbeat pushes carry no nudge card", async () => {
+    const t = makeBot();
+    const commitments = { deliverHeartbeatSpeak: vi.fn(), handleNudgeAction: vi.fn() };
+    (t.bot as unknown as { deps: { commitments: unknown } }).deps.commitments = commitments;
+    (t as unknown as { bot: { rememberChat: (a: string, c: string) => void } }).bot.rememberChat("assistant", "mock:42");
+    await t.bot.deliverToAgent("assistant", "plain update", {});
+    expect(t.transport.pushed.at(-1)?.opts.card).toBeUndefined();
+  });
+});
