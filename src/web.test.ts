@@ -346,6 +346,30 @@ describe("web /telegram", () => {
     expect(res.status).toBe(302);
   });
 
+  it("agent page exposes the Telegram managed-bot generation link when manager mode is on", async () => {
+    boot({
+      subBotFor: vi.fn(() => undefined),
+      managerMode: vi.fn(() => true),
+      managerUsername: vi.fn(() => "pimother_bot"),
+    });
+    const html = await (await app.request("/agents/assistant")).text();
+    expect(html).toContain("Generate Telegram bot");
+    expect(html).toContain("https://t.me/newbot/pimother_bot/pimother_assistant_bot?name=assistant");
+    expect(html).toContain("Bot API managed-bot flow");
+  });
+
+  it("agent page explains manual BotFather fallback when managed generation is unavailable", async () => {
+    boot({
+      subBotFor: vi.fn(() => undefined),
+      managerMode: vi.fn(() => false),
+      managerUsername: vi.fn(() => "pimother_bot"),
+    });
+    const html = await (await app.request("/agents/assistant")).text();
+    expect(html).toContain("Managed generation unavailable");
+    expect(html).toContain("enable bot management mode");
+    expect(html).toContain("pimother_assistant_bot");
+  });
+
   it("manifest save persists the comms.taskAcks toggle", async () => {
     boot({ subBotFor: vi.fn(() => undefined), managerMode: vi.fn(() => true) });
     const form = new FormData();

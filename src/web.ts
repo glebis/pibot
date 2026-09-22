@@ -1026,6 +1026,9 @@ ${hasToken ? `<div class="card">
     const mainOwned = mainOwner === agent.id;
     const memoryFile = path.join(agent.dir, "memory", "MEMORY.md");
     const memory = fs.existsSync(memoryFile) ? fs.readFileSync(memoryFile, "utf8") : "";
+    const managerUsername = (typeof deps.telegram?.managerUsername === "function" ? deps.telegram.managerUsername() : undefined) ?? deps.telegram?.telegramUsername() ?? "pimother_bot";
+    const suggestedBotUsername = suggestedSubBotUsername(agent.id, managerUsername);
+    const managedBotLink = `https://t.me/newbot/${encodeURIComponent(managerUsername.replace(/^@/, ""))}/${encodeURIComponent(suggestedBotUsername)}?name=${encodeURIComponent(agent.id)}`;
 
     const scheduleRows = pending
       .map(
@@ -1093,13 +1096,16 @@ ${manifestForm(agent, csrfToken)}
        <form method="post" action="/agents/${esc(agent.id)}/subbot/detach" class="inline" data-swap="#subbot-card">${csrfField()}<button class="danger mini" type="submit" data-arm>Detach</button></form>`
     : `<span class="pill">⚪ shared bot only</span>`}
   ${deps.telegram?.managerMode()
-    ? `<p class="muted">Manager mode is ON — tap the button below in Telegram, or use the link here.</p>
+    ? `<p><strong>Generate Telegram bot</strong> <span class="pill on">Bot API managed-bot flow</span></p>
+       <p class="muted">Suggested username: <span class="mono">${esc(suggestedBotUsername)}</span>. Tap the direct link, confirm in Telegram, then pibot fetches the token, wires the bot, and restricts it to you.</p>
+       <p><a class="btn ghost" href="${esc(managedBotLink)}">Open Telegram creation link →</a></p>
+       <p class="mono muted">${esc(managedBotLink)}</p>
        <form method="post" action="/agents/${esc(agent.id)}/subbot/request" class="inline" data-swap="#subbot-card">
          ${csrfField()}
          <button class="ghost" type="submit">Send creation link to my chats →</button>
-       </form>
-       <p class="muted">Tap the link in Telegram (or the button above after it arrives) and confirm — pibot fetches the token, wires the bot, and restricts it to you.</p>`
-    : `<p class="muted">Manager mode is off — create a bot with @BotFather (/newbot) and paste its token here to give ${esc(agent.id)} its own identity.</p>`}
+       </form>`
+    : `<p><strong>Managed generation unavailable</strong></p>
+       <p class="muted">To generate bots directly, enable bot management mode for @${esc(managerUsername.replace(/^@/, ""))} in BotFather's mini app. Until then, create one manually with @BotFather (/newbot), use username <span class="mono">${esc(suggestedBotUsername)}</span>, then paste its token here.</p>`}
 </div>
 <form method="post" action="/agents/${esc(agent.id)}/subbot" class="card">
   ${csrfField()}
