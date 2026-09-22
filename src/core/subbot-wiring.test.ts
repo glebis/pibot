@@ -89,6 +89,12 @@ class FakeTelegramTransport implements Transport {
   async getManagedBotToken(): Promise<string> {
     return this.tokenFetch();
   }
+  replaceToken = vi.fn(async (): Promise<string> => {
+    throw new Error("Call to 'replaceManagedBotToken' failed! (400: Bad Request: invalid user_id specified)");
+  });
+  async replaceManagedBotToken(): Promise<string> {
+    return this.replaceToken();
+  }
   setManagedBotAccessSettings = vi.fn(async (): Promise<unknown> => ({}));
   async fire(info: ManagedInfo): Promise<void> {
     await this.managedBotCb?.(info);
@@ -322,6 +328,60 @@ describe("managed sub-bot wiring", () => {
     expect(state.pendingSubBots ?? {}).toEqual({}); // disarmed
     expect(state.pendingSubBotIds ?? {}).toEqual({});
     expect(schedulerCancelCalled(bot)).toBe(true); // probe job cancels itself when nothing is pending
+  });
+
+  it("re-probe falls back to replaceManagedBotToken when the fetch hits Telegram's propagation 400", async () => {
+    const now = Date.now();
+    fs.writeFileSync(
+      path.join(dir, "state.json"),
+      JSON.stringify({
+        chats: { "telegram:42": "assistant" },
+        agentChats: { assistant: ["telegram:42"] },
+        pendingSubBots: { assistant: now - 60e3 },
+        pendingSubBotIds: { assistant: 8802922531 },
+      })
+    );
+
+    const tg = new FakeTelegramTransport();
+    const { bot } = makeWiringBot(dir, tg);
+    await bot.start();
+    const attach = vi.fn(async () => ({ ok: true, botName: "@pimother_assistant_bot" }));
+    (bot as unknown as { attachSubBot: unknown }).attachSubBot = attach;
+    tg.replaceToken.mockResolvedValue("8802922531:AAE-replaced");
+
+    await bot.deliverFire({ kind: "subbot-probe", agentId: "system" } as never, false);
+
+    expect(attach).toHaveBeenCalledWith("assistant", "8802922531:AAE-replaced");
+    expect(tg.setManagedBotAccessSettings).toHaveBeenCalledWith(8802922531, true);
+    expect(tg.lastText()).toContain("🟢");
+    const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+    expect(state.pendingSubBots ?? {}).toEqual({});
+    expect(state.pendingSubBotIds ?? {}).toEqual({});
+  });
+
+  it("re-probe stays armed when both the fetch and the replace fallback fail", async () => {
+    const now = Date.now();
+    fs.writeFileSync(
+      path.join(dir, "state.json"),
+      JSON.stringify({
+        chats: { "telegram:42": "assistant" },
+        agentChats: { assistant: ["telegram:42"] },
+        pendingSubBots: { assistant: now - 60e3 },
+        pendingSubBotIds: { assistant: 8802922531 },
+      })
+    );
+
+    const tg = new FakeTelegramTransport();
+    const { bot } = makeWiringBot(dir, tg);
+    await bot.start();
+    tg.replaceToken.mockRejectedValue(new Error("Call to 'replaceManagedBotToken' failed! (400: Bad Request: invalid user_id specified)"));
+    const pushesBefore = tg.pushed.length;
+
+    await bot.deliverFire({ kind: "subbot-probe", agentId: "system" } as never, false);
+
+    expect(tg.pushed.length).toBe(pushesBefore); // silent
+    const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+    expect(state.pendingSubBots.assistant).toBeGreaterThan(0); // still armed
   });
 });
 

@@ -546,6 +546,25 @@ export class TelegramTransport implements Transport {
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
+  /** Mint a fresh token for a managed bot (manager bots only; Bot API 9.6).
+   *  Recovery path for the creator-record propagation window: when
+   *  getManagedBotToken keeps failing with "invalid user_id" after a bot is
+   *  created, asking Telegram to REPLACE the token can succeed where the fetch
+   *  cannot — and the owner needs no BotFather visit. */
+  async replaceManagedBotToken(botUserId: number, opts: { attempts?: number } = {}): Promise<string> {
+    const attempts = Math.max(1, opts.attempts ?? MANAGED_BOT_TOKEN_BACKOFF_MS.length + 1);
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, MANAGED_BOT_TOKEN_BACKOFF_MS[Math.min(attempt - 1, MANAGED_BOT_TOKEN_BACKOFF_MS.length - 1)]));
+      const r = await this.bot.api.replaceManagedBotToken({ user_id: botUserId } as never).catch((e: unknown) => {
+        lastErr = e;
+        return null;
+      });
+      if (r) return String(r);
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  }
+
   /** Restrict a managed bot to its owner (Bot API 9.6) */
   async setManagedBotAccessSettings(botUserId: number, restricted: boolean): Promise<void> {
     await fetch(`https://api.telegram.org/bot${(this.bot as unknown as { token: string }).token}/setManagedBotAccessSettings`, {

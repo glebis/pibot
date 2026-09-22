@@ -40,7 +40,7 @@ const PENDING_SUBBOT_TTL_MS = 24 * 3600e3;
  *  creator-record propagation can outlast the initial in-handler retry window
  *  (observed: still "invalid user_id" after ~5 min, fetchable ~10 min later),
  *  and no new managed_bot update arrives by itself — so we poll. */
-const SUBBOT_PROBE_EVERY_MS = 3 * 60e3;
+const SUBBOT_PROBE_EVERY_MS = 90e3;
 
 export interface PersistedBotState {
   chats?: Record<string, string>;
@@ -1825,7 +1825,17 @@ export class PiBot implements HeartbeatHost {
         continue;
       }
       try {
-        const token = await tg.getManagedBotToken(botId, { attempts: 1 });
+        let token: string;
+        try {
+          token = await tg.getManagedBotToken(botId, { attempts: 1 });
+        } catch {
+          // Telegram's creator-record propagation makes the fetch 400 for minutes
+          // after creation — asking it to REPLACE the token can succeed where the
+          // fetch cannot, and needs no owner action (Bot API 9.6).
+          const replace = (tg as { replaceManagedBotToken?: (id: number, opts?: { attempts?: number }) => Promise<string> }).replaceManagedBotToken;
+          if (typeof replace !== "function") throw new Error("token not ready");
+          token = await replace.call(tg, botId, { attempts: 1 });
+        }
         const r = await this.attachSubBot(agentId, token);
         this.disarmPendingSubBot(agentId);
         this.pendingSubBotIds.delete(agentId);
