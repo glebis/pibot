@@ -21,6 +21,16 @@ function capability(overrides: Partial<CapabilityDefinition> = {}): CapabilityDe
 }
 
 describe("capability registry", () => {
+  it("keeps link triage off unless the scraper is explicitly opted in and shadow mode is enabled", () => {
+    const definition = CAPABILITY_REGISTRY.find((item) => item.id === "link-triage")!;
+    expect(definition).toMatchObject({ defaultEnabled: false, tools: ["link_triage_shadow"] });
+    vi.stubEnv("PIBOT_LINK_TRIAGE_SHADOW", "0");
+    expect(resolveCapabilities({ ...baseContext, agent: { ...baseContext.agent, id: "scraper" } }, [definition], ["link-triage"]).ids).toEqual([]);
+    vi.stubEnv("PIBOT_LINK_TRIAGE_SHADOW", "1");
+    expect(resolveCapabilities(baseContext, [definition], ["link-triage"]).ids).toEqual([]);
+    expect(resolveCapabilities({ ...baseContext, agent: { ...baseContext.agent, id: "scraper" } }, [definition], ["link-triage"]).tools).toContain("link_triage_shadow");
+    vi.unstubAllEnvs();
+  });
   it("loads only selected capabilities and derives factories, tools and prompt from one definition", () => {
     const def = capability();
     const result = resolveCapabilities(baseContext, [def], ["sample"]);

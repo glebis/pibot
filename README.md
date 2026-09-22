@@ -29,7 +29,23 @@ The host process (`src/`) runs a **scheduler** (JSON-backed timer wheel with sno
 }
 ```
 
-Available ids are `avatar`, `speech`, `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `attend`, `telegram-responder`, `delegate`, `herdr`, `developer`, and `remote-workshop`. Avatar, Calendar, and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
+Available ids are `avatar`, `speech`, `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `link-triage`, `attend`, `telegram-responder`, `delegate`, `herdr`, `developer`, and `remote-workshop`. Avatar, Calendar, and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
+
+### Jev link triage (shadow mode)
+
+The `link-triage` capability is an opt-in, scraper-only decision aid. After the scraper has saved one material under its own `materials/` directory, it can call `link_triage_shadow` with that material's absolute path. The tool reads at most 64 KiB locally and sends only a bounded source title, description or excerpt, public source host, tool name, and configured focus text to Jev through Vercel AI Gateway. It does not send the full URL, query parameters, full page, session history, or material path. It returns separate relevance, suggested destination, and suggested processing-depth choices. Results are advisory: no fetching, saving, discarding, routing, or messaging follows automatically.
+
+Enable it with both an explicit `"link-triage"` entry in the scraper agent's `capabilities` list and these server-side variables:
+
+```text
+PIBOT_LINK_TRIAGE_SHADOW=1
+PIBOT_LINK_TRIAGE_FOCUS=<one short, owner-approved focus statement>
+AI_GATEWAY_API_KEY=<Vercel AI Gateway key>
+```
+
+The feature defaults off. Focus text is capped at 500 characters. Use only public source descriptions that you are comfortable sending to the Gateway and TypeSafe AI; do not put private vault notes, credentials, or signed URLs into the focus statement. Missing focus, insufficient description, blocked sources, invalid local paths, malformed model replies, timeouts, and weak choice probabilities yield `review_needed`. A probability threshold of 0.75 is provisional and needs evaluation on owner-labeled links before it guides any action. The event log records only outcome categories and timings, not source content or URLs.
+
+PiBot currently has no typed scraper-completion event: scraping is agent-directed and its saved materials vary in format. The tool call is therefore an explicit post-save step, not an automatic hook. A future deterministic completion event would let the same evaluator run automatically. The reusable `jev-evaluator` supports bounded Boolean, Choice, and Score questions for later experiments in routing, pre-action review, post-action verification, heartbeat novelty, skill evaluation, and context selection; those hooks are not enabled here.
 
 The `herdr` capability (requires the `herdr` CLI and a running herdr instance) lets an agent run subagents in new tabs of the owner's herdr UI: `herdr_dispatch` spawns claude/codex/pi/opencode in a fresh tab with a self-contained brief, waits for `done`, and returns the transcript (`--detach` returns immediately; `herdr_read` and `herdr_wait` observe the pane afterwards). The target workspace resolves from the invoking herdr pane, `$PIBOT_HERDR_WORKSPACE`, or an explicit `workspace` argument; briefs are passed as temp files and never carry secrets.
 

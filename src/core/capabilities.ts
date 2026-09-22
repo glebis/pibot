@@ -30,6 +30,8 @@ import type { SpeechArtifactStore, SpeechKind, SpeechProviderRegistry } from "./
 import type { CommitmentPluginEngine } from "../plugins/commitment-plugin.js";
 import { commitmentPlugin } from "../plugins/commitment-plugin.js";
 import { researchIntakePlugin } from "../plugins/research-intake-plugin.js";
+import { linkTriageConfig, linkTriagePlugin } from "../plugins/link-triage-plugin.js";
+import { EventLog } from "./events.js";
 import type { IntakeStore } from "./research-intake.js";
 
 export interface CapabilityAgent { id: string; dir: string; manifest: AgentManifest }
@@ -99,6 +101,15 @@ const confirmMutation = (ctx: CapabilityContext) => async (description: string):
 };
 
 export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
+  {
+    id: "link-triage", defaultEnabled: false, tools: ["link_triage_shadow"],
+    prompt: "link_triage_shadow evaluates a saved scraper material against the owner's configured focus in shadow mode. Call it only after saving a source under your own materials directory. Its recommendation is advisory: do not route, save, discard, fetch more, or message another agent because of the result. Follow the owner's Firecrawl-only policy for article scraping.",
+    available: (ctx) => ctx.agent.id === "scraper" && linkTriageConfig().enabled,
+    create: (ctx) => {
+      const events = new EventLog(path.dirname(ctx.agent.dir));
+      return linkTriagePlugin({ agentDir: ctx.agent.dir, log: (summary) => events.log(ctx.agent.id, "system", summary) });
+    },
+  },
   {
     id: "speech", defaultEnabled: false, tools: ["speech_generate", "speech_send"],
     prompt: "speech_generate creates a private local voice/audio artifact and never sends it. speech_send sends that selected artifact only to this invoking Telegram chat. Use both only when the owner explicitly asks for speech. Never use speech from heartbeat, schedules, replay, or automatic reply conversion.",
