@@ -370,6 +370,37 @@ describe("web /telegram", () => {
     expect(html).toContain("pimother_assistant_bot");
   });
 
+  it("GET /media serves a seeded file with a valid token", async () => {
+    boot();
+    const dirMedia = path.join(dir, "media");
+    fs.mkdirSync(dirMedia, { recursive: true });
+    fs.writeFileSync(path.join(dirMedia, "report.mp4"), "fake-video-bytes", { mode: 0o600 });
+    const { signMediaToken, getMediaLinkKey } = await import("../src/core/media-links.js");
+    const token = signMediaToken("report.mp4", getMediaLinkKey(dir), Date.now());
+
+    const res = await app.request(`/media/report.mp4?t=${encodeURIComponent(token)}`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("fake-video-bytes");
+    expect(res.headers.get("content-disposition")).toContain("attachment");
+  });
+
+  it("GET /media rejects missing/invalid/expired tokens, unknown files, and traversal", async () => {
+    boot();
+    const dirMedia = path.join(dir, "media");
+    fs.mkdirSync(dirMedia, { recursive: true });
+    fs.writeFileSync(path.join(dirMedia, "report.mp4"), "fake-video-bytes", { mode: 0o600 });
+    const { signMediaToken, getMediaLinkKey } = await import("../src/core/media-links.js");
+    const key = getMediaLinkKey(dir);
+
+    expect((await app.request("/media/report.mp4")).status).toBe(403);
+    expect((await app.request(`/media/report.mp4?t=${signMediaToken("report.mp4", "wrong-key", Date.now())}`)).status).toBe(403);
+    const expired = signMediaToken("report.mp4", key, Date.now() - 30 * 3600e3);
+    expect((await app.request(`/media/report.mp4?t=${encodeURIComponent(expired)}`)).status).toBe(403);
+    const otherFile = signMediaToken("other.mp4", key, Date.now());
+    expect((await app.request(`/media/report.mp4?t=${encodeURIComponent(otherFile)}`)).status).toBe(403);
+    expect((await app.request(`/media/../settings.json?t=${signMediaToken("settings.json", key, Date.now())}`)).status).toBe(404);
+  });
+
   it("manifest save persists the comms.taskAcks toggle", async () => {
     boot({ subBotFor: vi.fn(() => undefined), managerMode: vi.fn(() => true) });
     const form = new FormData();

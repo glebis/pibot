@@ -1931,6 +1931,26 @@ describe("turn identity + failed attachments (silent-loss fixes)", () => {
     expect(t.transport.pushed.some((p) => p.opts.text.includes("couldn't deliver"))).toBe(false);
     expect(t.events.log).toHaveBeenCalledWith("assistant", "media", expect.stringContaining("ok.md"));
   });
+
+  it("oversized attachments become a private tailnet link instead of a failed upload", async () => {
+    const t = makeBot();
+    const big = path.join(t.dir, "big-export.zip");
+    fs.writeFileSync(big, Buffer.alloc(24 * 1024 * 1024, 7)); // > 20MB pibot cap
+    const sendMedia = vi.fn(async () => {});
+    (t.transport as unknown as { sendMedia: unknown }).sendMedia = sendMedia;
+    const hostname = vi.fn(async () => "https://macbook-pro-4.tail1234.ts.net");
+    (t.bot as unknown as { mediaBaseOverride?: unknown }).mediaBaseOverride = hostname;
+    wireTurn(t, `Export attached.\n\nMEDIA: ${big}`);
+    await t.bot.promptAgent(t.transport, "42", "assistant", "send the export");
+    await settle();
+
+    expect(sendMedia).not.toHaveBeenCalled(); // no doomed upload attempt
+    const notice = t.transport.pushed.find((p) => p.opts.text.includes("📦"));
+    expect(notice?.opts.text).toContain("big-export.zip");
+    expect(notice?.opts.text).toContain("https://macbook-pro-4.tail1234.ts.net/media/big-export.zip?t=");
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "media", expect.stringContaining("tailnet link"));
+    fs.rmSync(big, { force: true });
+  });
 });
 
 describe("dev-turn start confirmation", () => {

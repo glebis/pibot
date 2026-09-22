@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Readable } from "node:stream";
 import { Hono } from "hono";
 import type { AgentManager, LoadedAgent } from "./core/agent-manager.js";
 import { listSkillDirs } from "./core/agent-manager.js";
@@ -15,6 +16,7 @@ import { taskAcksEnabled } from "./core/task-acks.js";
 import { CAPABILITY_REGISTRY } from "./core/capabilities.js";
 import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
 import { providerRowHtml } from "./core/providers.js";
+import { getMediaLinkKey, mediaDirFor, verifyMediaToken } from "./core/media-links.js";
 import { WebAuthStore } from "./web-auth.js";
 import {
   generateRegistrationOptions,
@@ -467,6 +469,31 @@ export function createWebApp(deps: WebDeps): Hono {
       return c.redirect(`http://localhost${port}${url.pathname}${url.search}`);
     }
     return next();
+  });
+
+  // ── tailnet media links (token-authed; no dashboard session needed) ──
+  app.get("/media/:file", async (c) => {
+    const name = path.basename(c.req.param("file"));
+    const token = c.req.query("t") ?? "";
+    const key = getMediaLinkKey(deps.dataDir);
+    if (verifyMediaToken(token, key, Date.now()) !== name) return c.text("invalid or expired link", 403);
+    const file = path.join(mediaDirFor(deps.dataDir), name);
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return c.text("link target not found", 404);
+    const types: Record<string, string> = {
+      ".mp4": "video/mp4", ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".ogg": "audio/ogg", ".wav": "audio/wav",
+      ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+      ".webp": "image/webp", ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json", ".zip": "application/zip",
+      ".srt": "text/plain", ".vtt": "text/vtt",
+    };
+    const ext = path.extname(name).toLowerCase();
+    const stream = Readable.toWeb(fs.createReadStream(file)) as ReadableStream<Uint8Array>;
+    return new Response(stream, {
+      headers: {
+        "content-type": types[ext] ?? "application/octet-stream",
+        "content-disposition": `attachment; filename="${name.replace(/"/g, "")}"`,
+        "cache-control": "private, no-store",
+      },
+    });
   });
 
   // ── auth pages (open) ──

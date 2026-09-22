@@ -24,6 +24,7 @@ import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
 import { buildHandoffEnvelope, composeHandoffBrief } from "./handoff-brief.js";
 import { SttService, type SttPolicy } from "./stt.js";
 import { applyCorrections, composeBias, loadDictionary } from "./dictionary.js";
+import { getMediaLinkKey, mediaBase, mediaLinkUrl, stashForLink } from "./media-links.js";
 import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { classifyModelError, ModelCascade, specProvider } from "./cascade.js";
@@ -84,6 +85,25 @@ export class PiBot implements HeartbeatHost {
   private subBots = new Map<string, { token: string; username?: string }>(); // agentId → token
   /** model spec currently bound to each persistent session ("" = not yet bound) */
   private sessionSpec = new Map<string, string>();
+  /** test/debug surface: inject the media link base (hostname detection is env/CLI based) */
+  private mediaBaseOverride?: () => Promise<string | undefined>;
+
+  /** >20MB attachment: stash privately + hand the owner a signed, expiring tailnet link. */
+  private async deliverLargeFileLink(t: Transport, chatId: string, agentId: string, source: string, size: number): Promise<void> {
+    let name = path.basename(source);
+    try {
+      name = stashForLink(this.deps.config.dataDir, source); // kept locally regardless of hostname detection
+      const base = await (this.mediaBaseOverride ? this.mediaBaseOverride() : mediaBase(this.deps.config.dataDir));
+      if (!base) throw new Error("no tailnet hostname (set PIBOT_MEDIA_BASE or check tailscale)");
+      const url = mediaLinkUrl(base, name, getMediaLinkKey(this.deps.config.dataDir), Date.now());
+      await t.push(chatId, { text: `📦 \`${truncate(name, 80)}\` (${fmtBytes(size)}) is too large for Telegram — grab it here (private tailnet link, expires in 24h):\n${url}` });
+      this.deps.events.log(agentId, "media", `oversized attachment → tailnet link (${truncate(url, 200)})`);
+    } catch (e) {
+      this.deps.events.log(agentId, "system", `large-file link failed: ${truncate(errorMessage(e), 160)} — kept at ${truncate(path.join(this.deps.config.dataDir, "media", name), 160)}`);
+      await t.push(chatId, { text: `⚠️ couldn't deliver \`${truncate(name, 80)}\` (${fmtBytes(size)}) — too large for Telegram and no tailnet link available. The file is kept on this Mac at \`${truncate(path.join(this.deps.config.dataDir, "media", name), 140)}\`.` }).catch(() => {});
+    }
+  }
+
   private pendingPushes = new Map<string, Promise<void>>();
   private sessionTurnFailures = new Map<string, { error: string; hadPartialText: boolean }>();
   /** chatKey::agentId → last model that completed a turn (drives the "answering on fallback" notice) */
@@ -630,12 +650,22 @@ export class PiBot implements HeartbeatHost {
         this.sessionTurnFailures.delete(key);
         if (text) {
           const { text: cleanText, media } = splitMediaLines(text);
+const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
+
           for (const source of media) {
             if (!t.sendMedia) {
               // Silent skip here made MEDIA attachments vanish without a trace
               // (Sep 16: creator's SRT/VTT never reached the owner while the
               // text pushed fine). Record the drop where the agent can see it.
               this.deps.events.log(agentId, "system", `media dropped: transport "${t.name}" has no sendMedia — file: ${truncate(source, 120)}`);
+              continue;
+            }
+            // Oversized local files never fit Telegram (20MB pibot cap) — a doomed
+            // upload attempt only wastes a minute. Owner decision 2026-09-23:
+            // private tailnet link instead (signed, expiring, tailnet-only).
+            const size = localFileSize(source);
+            if (size != null && size > MEDIA_MAX_BYTES) {
+              void this.deliverLargeFileLink(t, chatId, agentId, source, size).catch((e) => console.error("[bot] large-file link failed:", e));
               continue;
             }
             void t.sendMedia(chatId, source).then(
@@ -2471,6 +2501,25 @@ export function splitMediaLines(text: string): { text: string; media: string[] }
     return "";
   });
   return { text: clean.replace(/\n{3,}/g, "\n\n").trim(), media };
+}
+
+/** Local file size, undefined for URLs/missing files (non-local media keeps its normal path). */
+function localFileSize(source: string): number | undefined {
+  if (/^https?:\/\//i.test(source)) return undefined;
+  try {
+    const st = fs.statSync(source);
+    return st.isFile() ? st.size : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Human size (deterministic, unit-tested via media tests). */
+function fmtBytes(n: number): string {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)}GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)}MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(0)}KB`;
+  return `${n}B`;
 }
 
 /** Photo/document prompt: reference the local file, plus caption. */
