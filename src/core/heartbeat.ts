@@ -54,6 +54,7 @@ Principles:
 - Never repeat anything from recent events.
 - Light nudges about items due soon are good. Repeating what the user already knows is bad.
 - If nothing is worth saying, call heartbeat_act with no fields (or a private note only).
+- NEVER send a status update about the heartbeat itself: "no immediate action needed", "just checking in", "let me know if you need anything" are all silence — omit speak entirely. A speak must carry specific, fresh, owner-relevant content (a due item, a promise, a change). If your speak could be replaced by "all is well", do not speak.
 
 Adaptive rhythm — you pace yourself:
 - heartbeat_act also accepts wakeup: how long until you want your next wakeup (e.g. "10m", "45m", "2h").
@@ -238,6 +239,25 @@ interface PersistedHeartbeatState {
 
 function fingerprint(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+/** Pure: is this heartbeat speak a self-referential status report with no owner value?
+ *  Deliberately NARROW — a filler-shaped check-in ("no immediate action needed…",
+ *  "just checking in…", "heartbeat ran/tick") is suppressed as silence; anything
+ *  with concrete content (dates, names, items) still delivers. False silence is
+ *  cheaper than false noise, but a speak like "The form is due tomorrow — let me
+ *  know if you need an extension" must NOT match. */
+export function isValuelessHeartbeatSpeak(text: string): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  const filler = [
+    /no (immediate )?action needed/i,
+    /^(hey,? )?(just )?(a )?(quick )?(check[- ]?in|status (update|report)|fyi)\b/i,
+    /\bheartbeat (ran|tick(ed)?|status|check)\b/i,
+    /^nothing (new|urgent|to report|needs)/i,
+    /\b(all|everything) (is|looks) (calm|quiet|fine|good|normal)\b/i,
+  ];
+  return filler.some((rx) => rx.test(t));
 }
 
 export class HeartbeatEngine {
@@ -483,6 +503,15 @@ export class HeartbeatEngine {
     if (act.escalate) {
       await this.deps.host.escalateToAgent(agent.id, act.escalate);
     } else if (act.speak) {
+      // Valueless status reports ("no immediate action needed — let me know if…")
+      // are silence wearing a message. The 2026-09-22 11:49 incident delivered
+      // exactly that: model-generated heartbeat self-report with zero owner value.
+      // Policy: heartbeats are silent when nothing is meaningful — enforce it
+      // deterministically instead of trusting every cheap model to comply.
+      if (isValuelessHeartbeatSpeak(act.speak)) {
+        this.deps.events.log(agent.id, "heartbeat", `(suppressed, valueless) ${act.speak}`);
+        return;
+      }
       const speakFingerprint = fingerprint(act.speak);
       if (this.lastSpeakFingerprint.get(agent.id) === speakFingerprint) return;
       // backoff: proactive speaks that go unanswered make the heartbeat quieter

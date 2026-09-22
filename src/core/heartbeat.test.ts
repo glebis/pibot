@@ -227,6 +227,25 @@ describe("HeartbeatEngine backoff", () => {
       expect((PiAgent.createAgentSession as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(sessionsBefore);
       expect((events.log as ReturnType<typeof vi.fn>).mock.calls.some((c: unknown[]) => String(c[2]).includes("hello 3"))).toBe(false);
     });
+    it("suppresses a valueless status-report speak as silence (2026-09-22 11:49 incident)", async () => {
+      const agent = makeAgent(dir);
+      const { engine, host, events } = makeEngine(agent, dir);
+      const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+      queueActs([
+        { speak: "The agent's heartbeat at Tuesday 11:49 AM. No immediate action needed. Let me know if there's something you need to address. ––" },
+        { speak: "Your appointment is tomorrow at 09:00." },
+      ]);
+
+      await engine.tick(agent.id);
+      expect(deliver).not.toHaveBeenCalled(); // status-report filler is silence
+      expect((engine as unknown as { unansweredSpeaks: Map<string, number> }).unansweredSpeaks.get(agent.id)).toBeUndefined(); // silence ≠ backoff
+      expect((events.log as ReturnType<typeof vi.fn>).mock.calls.some((c: unknown[]) => String(c[2]).startsWith("(suppressed, valueless)"))).toBe(true);
+
+      await engine.tick(agent.id);
+      expect(deliver).toHaveBeenCalledTimes(1); // a real, specific speak still lands
+      expect(deliver.mock.calls[0][1]).toBe("Your appointment is tomorrow at 09:00.");
+    });
+
     it("resumes after noteUserMessage", async () => {
       const agent = makeAgent(dir);
       const { engine, host } = makeEngine(agent, dir);
