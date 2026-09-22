@@ -537,7 +537,7 @@ export class TelegramTransport implements Transport {
     let lastErr: unknown;
     for (let attempt = 0; attempt < attempts; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, MANAGED_BOT_TOKEN_BACKOFF_MS[Math.min(attempt - 1, MANAGED_BOT_TOKEN_BACKOFF_MS.length - 1)]));
-      const r = await this.bot.api.getManagedBotToken({ user_id: botUserId } as never).catch((e: unknown) => {
+      const r = await this.bot.api.getManagedBotToken(botUserId).catch((e: unknown) => {
         lastErr = e;
         return null;
       });
@@ -556,7 +556,7 @@ export class TelegramTransport implements Transport {
     let lastErr: unknown;
     for (let attempt = 0; attempt < attempts; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, MANAGED_BOT_TOKEN_BACKOFF_MS[Math.min(attempt - 1, MANAGED_BOT_TOKEN_BACKOFF_MS.length - 1)]));
-      const r = await this.bot.api.replaceManagedBotToken({ user_id: botUserId } as never).catch((e: unknown) => {
+      const r = await this.bot.api.replaceManagedBotToken(botUserId).catch((e: unknown) => {
         lastErr = e;
         return null;
       });

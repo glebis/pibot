@@ -625,3 +625,37 @@ describe("Telegram setWorkBadge", () => {
     expect(reactions.length).toBe(0);
   });
 });
+
+describe("managed-bot token fetch (grammY wrapper shape)", () => {
+  it("passes the bot id as a scalar, not a payload object — an object yields 'invalid user_id' from Telegram", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    const calls: unknown[] = [];
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        getManagedBotToken: async (id: number) => {
+          calls.push(id);
+          return "8900661099:AAE-fake";
+        },
+      },
+    };
+    const token = await t.getManagedBotToken(8900661099, { attempts: 1 });
+    expect(token).toBe("8900661099:AAE-fake");
+    expect(calls).toEqual([8900661099]); // scalar number — NOT { user_id }
+  });
+
+  it("replaceManagedBotToken passes the bot id as a scalar too", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    const calls: unknown[] = [];
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        replaceManagedBotToken: async (id: number) => {
+          calls.push(id);
+          return "8900661099:AAE-new";
+        },
+      },
+    };
+    const token = await t.replaceManagedBotToken(8900661099, { attempts: 1 });
+    expect(token).toBe("8900661099:AAE-new");
+    expect(calls).toEqual([8900661099]);
+  });
+});
