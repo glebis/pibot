@@ -7,11 +7,15 @@
 //   4. authenticated models from providers explicitly allowed by the manifest
 //
 // When a turn fails with a model error, the error is classified
-// (auth / rate-limit / transient / context / unknown), the failing model gets
-// a circuit-breaker cooldown sized to that class, and the next model in the
+// (unavailable / auth / credits / rate-limit / transient / context / unknown),
+// the failing model gets a circuit-breaker cooldown sized to that class
+// (escalating ×4 per consecutive failure, capped), and the next model in the
 // chain takes the turn inside the same session (history is preserved).
-// If the whole chain is down, the message goes to a dead-letter queue and is
-// replayed to the agent automatically once a probe shows recovery.
+// `unavailable` failures (model removed upstream / incompatible with the
+// account) MARK the model and delete it from every chain until a successful
+// manual re-probe re-arms it. If the whole chain is down, the message goes to a
+// dead-letter queue and is replayed to the agent automatically once a probe
+// shows recovery.
 
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { resolveCliModel } from "@earendil-works/pi-coding-agent";
@@ -22,9 +26,13 @@ import { errorMessage, readJson, truncate, uid, writeJsonAtomic } from "./util.j
 
 // ─── error classification ───────────────────────────────────────────────────
 
-export type ModelErrorClass = "auth" | "credits" | "rate-limit" | "transient" | "context" | "unknown";
+export type ModelErrorClass = "unavailable" | "auth" | "credits" | "rate-limit" | "transient" | "context" | "unknown";
 
 const RX = {
+  // permanent unavailability: the model is gone upstream or can never work with
+  // the current auth. These fail identically every retry, so they are MARKED and
+  // removed from rotation instead of cooling down (checked first — most specific).
+  unavailable: /\bno endpoints found\b|\bmodel is not supported\b|\bmodel_not_found\b|\bmodel (has been )?(removed|deprecated|discontinued)\b/i,
   // credit/billing exhaustion: the account (not one model) can't pay for requests.
   // checked before rate-limit/auth so provider-specific billing wording wins over
   // generic 429/401 status codes.
@@ -38,8 +46,10 @@ const RX = {
 /** Classify a model/transport error message into a triage class. */
 export function classifyModelError(message: string): ModelErrorClass {
   const m = message ?? "";
-  // order matters: credit/billing markers are specific and beat bare status codes;
+  // order matters: permanent-unavailability markers are the most specific and
+  // win over everything; credit/billing markers beat bare status codes;
   // rate-limit mentions counting tokens; auth messages may mention quota; context is a model mismatch, not an outage
+  if (RX.unavailable.test(m)) return "unavailable";
   if (RX.context.test(m)) return "context";
   if (RX.credits.test(m)) return "credits";
   if (RX.rateLimit.test(m)) return "rate-limit";
@@ -50,6 +60,7 @@ export function classifyModelError(message: string): ModelErrorClass {
 
 /** How long a failing model is skipped after an error of each class. */
 export const COOLDOWN_MS: Record<ModelErrorClass, number> = {
+  unavailable: 24 * 3600e3, // nominally long; the unavailable flag removes it from rotation outright
   auth: 4 * 3600e3, // bad keys rarely self-heal mid-session
   credits: 60 * 60e3, // exhaustion heals by top-up, not time — the recovery probe catches it early
   "rate-limit": 90e3,
@@ -57,6 +68,10 @@ export const COOLDOWN_MS: Record<ModelErrorClass, number> = {
   context: 30 * 60e3, // compaction usually recovers these; don't hammer meanwhile
   unknown: 10 * 60e3,
 };
+
+/** Consecutive-failure escalation: cooldown multiplier per streak step, capped. */
+export const ESCALATION_FACTOR = 4;
+export const ESCALATION_CAP_MS = 24 * 3600e3;
 
 /** "provider/model" → "provider" ("" when the spec has no provider prefix). */
 export function specProvider(spec: string): string {
@@ -75,6 +90,12 @@ export interface CascadeEntry {
   lastFailureAt?: number;
   lastSuccessAt?: number;
   failures: number;
+  /** consecutive failures since the last success — drives cooldown escalation */
+  streak?: number;
+  /** permanently unavailable (model removed upstream / incompatible with auth) — removed from rotation */
+  unavailable?: boolean;
+  unavailableAt?: number;
+  unavailableReason?: string;
 }
 
 export interface DeadLetter {
@@ -152,6 +173,7 @@ export class ModelCascade {
         const v = item.trim();
         if (!v || v === "same") continue;
         if (enforcePolicy && !providerAllowed(v)) continue;
+        if (this.entry(v)?.unavailable) continue; // deleted from rotation
         if (!specs.includes(v)) specs.push(v);
       }
     };
@@ -165,6 +187,7 @@ export class ModelCascade {
         if (specs.includes(spec)) continue;
         if (!allowedProviders.has(m.provider)) continue;
         if (!this.deps.modelRuntime.hasConfiguredAuth(m.provider)) continue;
+        if (this.entry(spec)?.unavailable) continue; // deleted from rotation
         specs.push(spec);
       }
     } catch {
@@ -195,19 +218,32 @@ export class ModelCascade {
     return Boolean(e && e.openUntil > now);
   }
 
-  /** Record a model failure: classify, open the breaker for the cooldown, persist. */
+  /** Record a model failure: classify, open the breaker for the cooldown, persist.
+   *  Consecutive failures of the same model escalate the cooldown (×4 per step,
+   *  capped) so a permanently sick entry fades out instead of re-poisoning the
+   *  chain head every base-cooldown cycle. `unavailable` failures skip
+   *  escalation — the model is removed from rotation outright. */
   noteFailure(spec: string, err: string, now = Date.now()): ModelErrorClass {
     const cls = classifyModelError(err);
     const key = spec.trim().toLowerCase();
     const prev = this.state.entries[key];
+    const streak = (prev?.streak ?? 0) + 1;
+    const base = COOLDOWN_MS[cls];
+    const escalated = cls === "credits" || cls === "unavailable"
+      ? base
+      : Math.min(base * Math.pow(ESCALATION_FACTOR, streak - 1), ESCALATION_CAP_MS);
     this.state.entries[key] = {
       model: spec.trim(),
-      openUntil: now + COOLDOWN_MS[cls],
+      openUntil: now + escalated,
       lastError: truncate(err, 300),
       lastErrorClass: cls,
       lastFailureAt: now,
       failures: (prev?.failures ?? 0) + 1,
+      streak,
       lastSuccessAt: prev?.lastSuccessAt,
+      ...(cls === "unavailable"
+        ? { unavailable: true, unavailableAt: now, unavailableReason: truncate(err, 200) }
+        : {}),
     };
     // credits exhaustion is per account: block every model of this provider,
     // not just the one that happened to answer the request
@@ -222,12 +258,16 @@ export class ModelCascade {
     return cls;
   }
 
-  /** Record a success: clear the breaker, mark liveness. */
+  /** Record a success: clear the breaker, mark liveness, re-arm a marked-unavailable model. */
   noteSuccess(spec: string, now = Date.now()): void {
     const key = spec.trim().toLowerCase();
     const e = this.state.entries[key] ?? { model: spec.trim(), openUntil: 0, failures: 0 };
     e.openUntil = 0;
     e.lastSuccessAt = now;
+    e.streak = 0;
+    delete e.unavailable;
+    delete e.unavailableAt;
+    delete e.unavailableReason;
     this.state.entries[key] = e;
     const provider = specProvider(spec);
     if (provider && this.state.providerCreditHolds?.[provider]) {
@@ -260,6 +300,7 @@ export class ModelCascade {
     for (const spec of chain) {
       const key = spec.trim().toLowerCase();
       if (key === failedKey) continue;
+      if (this.entry(key)?.unavailable) continue; // removed from rotation
       if (this.isOpen(spec, now)) continue;
       // same account, same credits — a credits hold rules out the provider's siblings too
       const provider = specProvider(spec);
@@ -268,6 +309,30 @@ export class ModelCascade {
       return spec;
     }
     return undefined;
+  }
+
+  /** First n healthy, resolvable specs in the chain — for recovery probes that
+   *  must not stall on a single (possibly mis-probed) chain head. */
+  firstHealthyCandidates(chain: string[], n: number, now = Date.now()): string[] {
+    const out: string[] = [];
+    for (const spec of chain) {
+      if (this.entry(spec.trim().toLowerCase())?.unavailable) continue;
+      if (this.isOpen(spec, now)) continue;
+      const provider = specProvider(spec);
+      if (provider && this.providerHold(provider, now)) continue;
+      if (!this.resolveModel(spec)) continue;
+      if (!out.includes(spec)) out.push(spec);
+      if (out.length >= n) break;
+    }
+    return out;
+  }
+
+  /** Specs currently marked permanently unavailable (most recent first). */
+  unavailableEntries(now = Date.now()): Array<CascadeEntry & { spec: string }> {
+    return Object.values(this.state.entries)
+      .filter((e) => e.unavailable)
+      .sort((a, b) => (b.unavailableAt ?? 0) - (a.unavailableAt ?? 0))
+      .map((e) => ({ ...e, spec: e.model }));
   }
 
   /** First healthy, resolvable spec in the chain — for fresh turns. */

@@ -917,7 +917,14 @@ export class PiBot implements HeartbeatHost {
     let lastError = "";
     let failedSpec: string | undefined;
     let ambiguousPartialFailure = false;
-    for (let step = 0; canPrompt && step < MAX_TURN_MODELS; step++) {
+    // The walk must be able to reach healthy models BEHIND a sick chain head:
+    // each failed attempt opens that model's breaker, so nextCandidate strictly
+    // progresses and the walk self-bounds at chain length. The +2 covers the
+    // cannot-bind path (which also opens a breaker). A fixed small cap here once
+    // dead-lettered turns while a healthy model sat bound-but-unprompted
+    // (Sep 2026 researcher incident: 6 dead entries at the head, cap 5).
+    const walkCap = chain.length + 2;
+    for (let step = 0; canPrompt && step < walkCap; step++) {
       let thrown: string | null = null;
       // Retry note names the model that FAILED (failedSpec), not the one being
       // switched to — the old wording labelled the new model, which read as
@@ -1052,14 +1059,14 @@ export class PiBot implements HeartbeatHost {
     if (!cascade || !cascade.needsRecoveryProbe()) return;
     this.probing = true;
     try {
-      // probe each dead-letter agent's first healthy candidate (capped)
+      // probe each dead-letter agent's first healthy candidates (capped) —
+      // a single head can be mis-probed while healthy models sit deeper
       const specs = new Set<string>();
       const dls = cascade.deadLetters();
       if (dls.length) {
         for (const dl of dls.slice(-3)) {
           const chain = cascade.chainFor(this.deps.agents.getAgent(dl.agentId)?.manifest ?? {});
-          const head = cascade.firstHealthy(chain) ?? chain[0];
-          if (head) specs.add(head);
+          for (const spec of cascade.firstHealthyCandidates(chain, 3)) specs.add(spec);
         }
       } else {
         const chain = cascade.chainFor(this.deps.agents.list()[0]?.manifest ?? {});
@@ -1122,14 +1129,22 @@ export class PiBot implements HeartbeatHost {
     return flushed;
   }
 
-  /** One recovery probe now, with results as text (used by /cascade probe & retry) */
+  /** One recovery probe now, with results as text (used by /cascade probe & retry).
+   *  Also re-tests models marked permanently unavailable — a success re-arms them. */
   async cascadeProbe(): Promise<string> {
     const cascade = this.deps.cascade;
     if (!cascade) return "Cascade is not wired in this build.";
     const agentLike = this.deps.agents.getAgent(this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId() ?? "") ?? this.deps.agents.list()[0];
     const chain = cascade.chainFor(agentLike?.manifest ?? {});
-    const specs = [cascade.firstHealthy(chain) ?? chain[0]].filter(Boolean) as string[];
-    for (const s of chain) if (cascade.isOpen(s) && !specs.includes(s) && specs.length < 3) specs.push(s);
+    const specs: string[] = [];
+    for (const s of chain) {
+      if (cascade.isOpen(s) && specs.length < 3) specs.push(s);
+    }
+    for (const s of cascade.firstHealthyCandidates(chain, 3)) if (!specs.includes(s)) specs.push(s);
+    for (const e of cascade.unavailableEntries()) {
+      if (specs.length >= 5) break;
+      if (!specs.includes(e.spec)) specs.push(e.spec);
+    }
     const results = await cascade.probeAlive(specs);
     const lines = results.map((r) => `${r.ok ? "✓" : "✕"} ${r.spec}${r.ok ? " — alive" : ` — ${truncate(r.error ?? "unreachable", 100)}`}`);
     if (results.some((r) => r.ok)) {
@@ -1147,6 +1162,14 @@ export class PiBot implements HeartbeatHost {
     const chain = cascade.chainFor(agent?.manifest ?? {});
     const lines = [`model cascade for **${agent?.manifest.name ?? "(no agents)"}**:`];
     lines.push(...(chain.length ? cascade.statusLines(chain) : ["(no configured models)"]));
+    const gone = cascade.unavailableEntries();
+    if (gone.length) {
+      lines.push("removed from rotation (marked unavailable — /cascade probe re-tests): ");
+      for (const e of gone.slice(0, 6)) {
+        const when = e.unavailableAt ? new Date(e.unavailableAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+        lines.push(`🗑 ${e.spec} — ${truncate(e.unavailableReason ?? e.lastError ?? "unavailable", 90)}${when ? ` (marked ${when})` : ""}`);
+      }
+    }
     const creditProvs = cascade.creditBlockedProviders();
     if (creditProvs.length) lines.push(`out of credits: ${creditProvs.join(", ")} — top up at the provider console; probes run every 5 min`);
     const queued = cascade.deadLetterCount();
@@ -2431,7 +2454,7 @@ function mediaPromptText(media: IncomingMedia): string {
 }
 
 /** Per-turn bound: primary + at most this many fallback models try one user turn */
-const MAX_TURN_MODELS = 5;
+// (the old fixed MAX_TURN_MODELS=5 cap was removed — see promptAgent walkCap)
 
 class AmbiguousReplayError extends Error {}
 
