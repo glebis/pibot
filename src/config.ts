@@ -9,6 +9,8 @@ export interface Config {
   agentsDir: string;
   /** the owner's Obsidian vault — ground truth for all agents; read-only unless an agent opts in to the "vault-file" capability */
   vaultDir: string;
+  /** Optional Breeze TTS 2 staging: key file on remote hosts (0600), read by wrappers at runtime. */
+  breezeApiKeyPath?: string;
   defaultAgentId?: string;
   heartbeatModel?: string;
   telegramToken?: string;
