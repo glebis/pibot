@@ -231,9 +231,10 @@ async function main(): Promise<void> {
   // when BOTH the agent's manifest asks for it (goal.judge="jev" + scope +
   // provider) AND this daemon switch allows it. Every failure falls back to the
   // local judge, so an unavailable evaluator can never look like a verdict.
+  const goalJudgeMode = process.env.PIBOT_GOAL_JUDGE === "jev" ? "jev" : process.env.PIBOT_GOAL_JUDGE === "shadow" ? "shadow" : "off";
   const goalJudge = createCompositeGoalJudge({
     local: (state, reply) => localGoalIO.judge(state, reply),
-    enabled: process.env.PIBOT_GOAL_JUDGE === "jev",
+    mode: goalJudgeMode,
   });
   const goalIO = {
     draftContract: (objective: string) => localGoalIO.draftContract(objective),

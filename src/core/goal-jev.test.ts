@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { buildGoalJudgeState, createCompositeGoalJudge, goalQuestions, jevGoalPermitted, judgeGoalWithJev, JEV_GOAL_MIN_CONFIDENCE } from "./goal-jev.js";
 import { newGoal } from "./goals.js";
 import type { evaluateJev } from "./jev-evaluator.js";
@@ -150,5 +150,54 @@ describe("the composite: optional, configurable, and never silently unjudged", (
     const r = await composite.judge(goal(), "x", { permission: grant, log: (s: string) => logs.push(s) });
     expect(r).toMatchObject({ verdict: "continue" });
     expect(logs.join(" ")).toMatch(/network_error/);
+  });
+});
+
+describe("shadow mode: measure before trusting", () => {
+  const localDone = vi.fn(async () => ({ verdict: "done" as const, reason: "local says done" }));
+  // these mocks are shared across the cases; a stale call count is not evidence
+  beforeEach(() => vi.clearAllMocks());
+  const localCont = vi.fn(async () => ({ verdict: "continue" as const, reason: "local says continue" }));
+  const jevAgrees = vi.fn(async () => ({ ok: true as const, verdict: "done" as const, reason: "jev agrees", confidence: 0.91 }));
+  const jevDiffers = vi.fn(async () => ({ ok: true as const, verdict: "continue" as const, reason: "jev disagrees", confidence: 0.88 }));
+  const grant = { judge: "jev" as const, dataScope: "redacted_approved" as const, providers: ["typesafe-ai"] };
+
+  it("returns the LOCAL verdict and logs the comparison when they agree", async () => {
+    const logs: string[] = [];
+    const composite = createCompositeGoalJudge({ local: localDone, mode: "shadow", apiKey: "k", judgeJev: jevAgrees as never });
+    const r = await composite.judge(goal(), "x", { permission: grant, log: (s: string) => logs.push(s) });
+    expect(r).toEqual({ verdict: "done", reason: "local says done" }); // unchanged, shadow cannot act
+    expect(logs.join(" ")).toMatch(/goal judge shadow: local=done jev=done agreement=yes confidence=0\.91/);
+  });
+
+  it("still returns the local verdict when Jev disagrees — and says so", async () => {
+    const logs: string[] = [];
+    const composite = createCompositeGoalJudge({ local: localDone, mode: "shadow", apiKey: "k", judgeJev: jevDiffers as never });
+    const r = await composite.judge(goal(), "x", { permission: grant, log: (s: string) => logs.push(s) });
+    expect(r).toEqual({ verdict: "done", reason: "local says done" });
+    expect(logs.join(" ")).toMatch(/agreement=no/);
+  });
+
+  it("records Jev's typed failure in shadow instead of hiding it", async () => {
+    const logs: string[] = [];
+    const composite = createCompositeGoalJudge({ local: localCont, mode: "shadow", apiKey: "k", judgeJev: (async () => ({ ok: false, reason: "timeout" })) as never });
+    const r = await composite.judge(goal(), "x", { permission: grant, log: (s: string) => logs.push(s) });
+    expect(r).toMatchObject({ verdict: "continue" });
+    expect(logs.join(" ")).toMatch(/jev=unavailable\(timeout\)/);
+  });
+
+  it("makes no external call in shadow mode without the per-agent grant", async () => {
+    const logs: string[] = [];
+    const composite = createCompositeGoalJudge({ local: localCont, mode: "shadow", apiKey: "k", judgeJev: jevAgrees as never });
+    await composite.judge(goal(), "x", { permission: { judge: "local" }, log: (s: string) => logs.push(s) });
+    expect(jevAgrees).not.toHaveBeenCalled();
+    expect(logs.join(" ")).not.toMatch(/shadow:/);
+  });
+
+  it("off means local only — the default is unchanged", async () => {
+    const composite = createCompositeGoalJudge({ local: localCont, mode: "off", apiKey: "k", judgeJev: jevAgrees as never });
+    const r = await composite.judge(goal(), "x", { permission: grant });
+    expect(r).toMatchObject({ verdict: "continue" });
+    expect(jevAgrees).not.toHaveBeenCalled();
   });
 });

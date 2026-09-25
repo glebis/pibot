@@ -111,28 +111,51 @@ export type CompositeGoalIO = {
 };
 
 /**
- * Jev when the agent asks for it and the daemon allows it, the local judge
- * otherwise — and the local judge anyway whenever Jev cannot answer (typed
- * failure, `unclear`, low confidence, oversize). A judge that is unavailable must
- * never look like a verdict, and must never leave the loop unjudged if a fallback
- * exists. Every branch says why in one line.
+ * Three modes, one switch:
+ *
+ *   off    — local judge only. No external call. (default)
+ *   shadow — local judge is AUTHORITATIVE and Jev runs alongside it; the two
+ *            verdicts are logged as metadata so the comparison can be read before
+ *            anything trusts it. Same idea as the evolution shadow observer.
+ *   jev    — Jev judges, local is the fallback on every failure.
+ *
+ * A judge that is unavailable must never look like a verdict, and must never
+ * leave the loop unjudged while a fallback exists. Every branch says why in one line.
  */
 export function createCompositeGoalJudge(deps: {
   local: LocalJudge;
-  enabled: boolean;
+  /** "off" | "shadow" | "jev" — the daemon switch; per-agent permission still gates both non-off modes */
+  mode?: "off" | "shadow" | "jev";
+  /** @deprecated kept for callers that only had on/off; prefer `mode` */
+  enabled?: boolean;
   apiKey?: string;
   judgeJev?: typeof judgeGoalWithJev;
   evaluate?: typeof evaluateJev;
 }): CompositeGoalIO {
+  const mode = deps.mode ?? (deps.enabled ? "jev" : "off");
   return {
     async judge(state, lastReply, ctx) {
       const permission = ctx?.permission as GoalJudgePermission | undefined;
-      const permitted = jevGoalPermitted(permission, { enabled: deps.enabled, ...(deps.apiKey ? { apiKey: deps.apiKey } : {}) });
+      const permitted = jevGoalPermitted(permission, { enabled: mode !== "off", ...(deps.apiKey ? { apiKey: deps.apiKey } : {}) });
       if (!permitted.ok) {
         if (permission?.judge === "jev") ctx?.log?.(`goal judge: jev not used (${permitted.reason}) — local judge`);
         return deps.local(state, lastReply);
       }
       const run = deps.judgeJev ?? judgeGoalWithJev;
+
+      // ── shadow: local stays authoritative, Jev is measured ──
+      if (mode === "shadow") {
+        const local = await deps.local(state, lastReply);
+        const jev = await run(state, lastReply, {
+          ...(deps.evaluate ? { evaluate: deps.evaluate } : {}),
+        }).catch((e: unknown) => ({ ok: false as const, reason: "network_error" as const, error: String(e) }));
+        const comparison = jev.ok
+          ? `local=${local?.verdict ?? "none"} jev=${jev.verdict} agreement=${local && local.verdict === jev.verdict ? "yes" : "no"} confidence=${jev.confidence.toFixed(2)}`
+          : `local=${local?.verdict ?? "none"} jev=unavailable(${jev.reason})`;
+        ctx?.log?.(`goal judge shadow: ${comparison}`);
+        // the authoritative answer is unchanged, even when Jev disagrees loudly
+        return local;
+      }
       const result = await run(state, lastReply, {
         ...(deps.evaluate ? { evaluate: deps.evaluate } : {}),
         ...(ctx?.log ? { trace: ctx.log } : {}),
