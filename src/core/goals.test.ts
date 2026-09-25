@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  advanceGoal, buildJudgePrompt, GOAL_MAX_PARSE_FAILURES, GOAL_MAX_TURNS_DEFAULT, hasContract, newGoal,
+  advanceGoal, buildJudgePrompt, GOAL_MAX_PARSE_FAILURES, GOAL_MAX_TURNS_DEFAULT, goalCard, hasContract, newGoal,
   parseGoalVerdict, renderGoalBlock, renderGoalStatus, shouldContinue,
 } from "./goals.js";
 
@@ -120,5 +120,22 @@ describe("when NOT to continue — the bounds are the design", () => {
 
   it("does not stack a second auto-turn on the same moment", () => {
     expect(shouldContinue(state(), { lastAutoTurnAt: 10_000, now: 10_500 })).toEqual({ continue: false, reason: "no_new_work" });
+  });
+});
+
+describe("goalCard — contextual pause/resume buttons", () => {
+  it("active goal renders a Pause button", () => {
+    const card = goalCard(state({ status: "active" }));
+    expect(card?.buttons.map((b) => [b.label, b.action])).toEqual([["⏸ Pause", "goal:pause"]]);
+  });
+
+  it("paused goal renders a Resume button", () => {
+    const card = goalCard(state({ status: "paused" }));
+    expect(card?.buttons.map((b) => [b.label, b.action])).toEqual([["▶️ Resume", "goal:resume"]]);
+  });
+
+  it("done or absent goals render no card", () => {
+    expect(goalCard(state({ status: "done" }))).toBeUndefined();
+    expect(goalCard(undefined)).toBeUndefined();
   });
 });

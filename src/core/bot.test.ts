@@ -2258,6 +2258,30 @@ describe("/goal — a bounded autonomy loop", () => {
     expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal paused"))).toBe(true);
   });
 
+  it("goal surfaces carry contextual pause/resume buttons and taps route to the commands", async () => {
+    const t = makeBot();
+    wire(t, ["step one"]);
+    (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = { draftContract: async () => null, judge: async () => ({ verdict: "wait" as const, reason: "needs the owner" }) };
+    await t.transport.say("/goal compare memory systems");
+
+    // setting an active goal offers Pause
+    const setPush = t.transport.pushed.find((p) => p.opts.text.includes("🎯 Goal set"));
+    expect(setPush?.opts.card?.buttons.map((b) => b.action)).toEqual(["goal:pause"]);
+
+    // a wait notice offers Resume
+    const waitPush = t.transport.pushed.find((p) => p.opts.text.includes("⏳ Goal waiting"));
+    expect(waitPush?.opts.card?.buttons.map((b) => b.action)).toEqual(["goal:resume"]);
+
+    // tap: pause → paused with a Resume button; tap resume → active again
+    await t.bot.handleAction(t.transport, "42", "goal:pause");
+    expect(goalState(t)["mock:42"].status).toBe("paused");
+    const pausedPush = t.transport.pushed.find((p) => p.opts.card?.buttons.some((b) => b.action === "goal:resume"));
+    expect(pausedPush).toBeTruthy();
+
+    await t.bot.handleAction(t.transport, "42", "goal:resume");
+    expect(goalState(t)["mock:42"].status).toBe("active");
+  });
+
   it("pause stops the loop, resume restarts it, clear forgets it", async () => {
     const t = makeBot();
     wire(t);

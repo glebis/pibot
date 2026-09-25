@@ -298,3 +298,12 @@ export async function createLlmGoalIO(deps: {
     },
   };
 }
+
+/** Contextual Telegram card for goal surfaces: an active goal offers Pause,
+ *  a paused/waiting goal offers Resume. Done/absent goals render no card. */
+export function goalCard(goal: GoalState | undefined): import("./types.js").Card | undefined {
+  if (!goal || goal.status === "done") return undefined;
+  return goal.status === "paused"
+    ? { text: "", buttons: [{ label: "▶️ Resume", action: "goal:resume" }] }
+    : { text: "", buttons: [{ label: "⏸ Pause", action: "goal:pause" }] };
+}

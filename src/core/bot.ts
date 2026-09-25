@@ -29,7 +29,7 @@ import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { applyVoiceStyle, isOperationalNotice, requestsFullPath, VOICE_STYLE_DIRECTIVE } from "./voice-style.js";
 import {
-  advanceGoal, newGoal, renderGoalBlock, renderGoalStatus, shouldContinue,
+  advanceGoal, goalCard, newGoal, renderGoalBlock, renderGoalStatus, shouldContinue,
   type GoalIO, type GoalState,
 } from "./goals.js";
 import { classifyModelError, ModelCascade, specProvider } from "./cascade.js";
@@ -1352,6 +1352,11 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
 
   /** Returns a short toast string for Telegram callback feedback */
   async handleAction(t: Transport, chatId: string, action: string): Promise<string | void> {
+    // goal control buttons reuse the /goal verbs directly
+    if (action === "goal:pause" || action === "goal:resume" || action === "goal:done") {
+      await this.commandGoal(t, chatId, action.slice(5));
+      return;
+    }
     if (action.startsWith("url:")) return; // URL buttons open in the client; no callback
     if (action.startsWith("nudge:") && this.deps.commitments) {
       return this.deps.commitments.handleNudgeAction(action, chatId);
@@ -1499,7 +1504,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     const current = this.goals.get(ck);
 
     if (!arg || lower === "status" || lower === "show") {
-      await t.push(chatId, { text: renderGoalStatus(current) });
+      await t.push(chatId, { text: renderGoalStatus(current), card: goalCard(current) });
       return;
     }
     if (lower === "clear") {
@@ -1514,7 +1519,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       this.goals.set(ck, { ...current, status });
       this.persistState();
       this.deps.events.log(agentId, "system", `goal ${status}: ${current.objective}`.slice(0, 200));
-      await t.push(chatId, { text: renderGoalStatus(this.goals.get(ck)) });
+      await t.push(chatId, { text: renderGoalStatus(this.goals.get(ck)), card: goalCard(this.goals.get(ck)) });
       return;
     }
     if (lower === "sub" || lower === "subgoal") {
@@ -1559,6 +1564,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
         `🎯 Goal set — ${objective}\n` +
         (contract.outcome ? `outcome: ${contract.outcome}\n` : drafting ? "contract: could not be drafted — run with a plainer objective or set it directly\n" : "") +
         `budget: ${goal.maxTurns} turns · /goal pause stops it · /goal status to check in`,
+      card: goalCard(goal),
     });
     // kick the first step immediately so the owner sees motion
     await this.promptAgent(t, chatId, agentId, `[goal] start: ${objective}`, { taskAckFrom: null });
@@ -1601,15 +1607,15 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       return;
     }
     if (next.status === "paused") {
-      await t.push(chatId, { text: `⏸ Goal paused — ${next.lastReason ?? "the judge reply could not be read"}. /goal resume to continue.` });
+      await t.push(chatId, { text: `⏸ Goal paused — ${next.lastReason ?? "the judge reply could not be read"}. /goal resume to continue.`, card: goalCard(next) });
       return;
     }
     if (next.turnsUsed >= next.maxTurns) {
-      await t.push(chatId, { text: `🎯 Goal budget spent (${next.maxTurns} turns) — ${next.objective}. /goal max <n> to extend, or /goal done.` });
+      await t.push(chatId, { text: `🎯 Goal budget spent (${next.maxTurns} turns) — ${next.objective}. /goal max <n> to extend, or /goal done.`, card: goalCard({ ...next, status: "paused" }) });
       return;
     }
     if (judged?.verdict === "wait") {
-      await t.push(chatId, { text: `⏳ Goal waiting on something external — ${judged.reason}\n/goal resume when that clears.` });
+      await t.push(chatId, { text: `⏳ Goal waiting on something external — ${judged.reason}\n/goal resume when that clears.`, card: goalCard({ ...next, status: "paused" }) });
       return;
     }
     await this.promptAgent(t, chatId, agentId, `[goal] keep going: ${next.objective}`, { taskAckFrom: null });
