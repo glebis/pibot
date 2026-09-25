@@ -366,6 +366,28 @@ describe("markdown → Telegram HTML entities", () => {
     expect(toTelegramHtml("**bold** and *italic* and `code`")).toBe("<b>bold</b> and <i>italic</i> and <code>code</code>");
   });
 
+  it("converts [text](https://…) links to anchors", () => {
+    expect(toTelegramHtml("[docs](https://example.com/a)")).toBe('<a href="https://example.com/a">docs</a>');
+    expect(toTelegramHtml("see [docs](https://example.com) now")).toBe('see <a href="https://example.com">docs</a> now');
+    expect(toTelegramHtml("[a & b](https://example.com)")).toBe('<a href="https://example.com">a &amp; b</a>');
+  });
+
+  it("escapes attribute-hostile characters out of hrefs", () => {
+    expect(toTelegramHtml("[t](https://e.com/?a=1&b=2)")).toBe('<a href="https://e.com/?a=1&amp;b=2">t</a>');
+    expect(toTelegramHtml('[t](https://e.com/?a="x")')).toBe('[t](https://e.com/?a="x")');
+  });
+
+  it("keeps non-http, malformed, or markup-bearing links literal", () => {
+    expect(toTelegramHtml("[t](javascript:alert(1))")).toBe("[t](javascript:alert(1))");
+    expect(toTelegramHtml("[t](ftp://example.com)")).toBe("[t](ftp://example.com)");
+    expect(toTelegramHtml("[t](https://example.com")).toBe("[t](https://example.com");
+    expect(toTelegramHtml("[t] (https://example.com)")).toBe("[t] (https://example.com)");
+    expect(toTelegramHtml("[](https://example.com)")).toBe("[](https://example.com)");
+    // label markup isn't part of any anchor (links need plain labels) but still renders inline:
+    expect(toTelegramHtml("[**bold**](https://example.com)")).toBe("[<b>bold</b>](https://example.com)");
+    expect(toTelegramHtml("[a\nb](https://example.com)")).toBe("[a\nb](https://example.com)");
+  });
+
   it("keeps bullets and lone asterisks literal", () => {
     expect(toTelegramHtml("* one\n* two")).toBe("* one\n* two");
     expect(toTelegramHtml("2 * 3 = 6")).toBe("2 * 3 = 6");
@@ -387,6 +409,10 @@ describe("markdown → Telegram HTML entities", () => {
       "`x**y`z**",
       "- `gh` — read-only subcommands: `repo view *`, `api repos/*` (auth's already done)",
       "a **b *c* d** e",
+      "[**bold](https://e.com) rest**",
+      "[a [b](https://c.com) d](https://e.com)",
+      "[`code](https://e.com) tail`",
+      "[x](https://e.com/**y*)",
     ];
     for (const input of adversarial) {
       const html = toTelegramHtml(input);

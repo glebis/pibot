@@ -137,6 +137,37 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** escapeHtml plus `"` — for attribute values (href), where an unescaped quote ends the attribute. */
+function escapeHtmlAttr(s: string): string {
+  return escapeHtml(s).replace(/"/g, "&quot;");
+}
+
+/** Only http(s) is turned into an anchor; anything else in `[t](u)` stays literal text. */
+const LINK_SCHEMES = ["http://", "https://"];
+
+/**
+ * Matches one `[label](url)` at `from`, or returns null (caller renders the source literally).
+ * Deliberately narrow so the anchor is emitted as one atomic, always-well-formed unit:
+ * same line only; label is plain text (no markup delimiters, no brackets — so links can
+ * never nest or swallow a stack tag); url must be http(s) with no whitespace or quotes.
+ * A non-match is harmless: the raw text falls through to escaping, and bare URLs still
+ * autolink natively.
+ */
+function matchMarkdownLink(text: string, from: number): { label: string; url: string; end: number } | null {
+  const lineEnd = text.indexOf("\n", from);
+  const bound = lineEnd === -1 ? text.length : lineEnd;
+  const closeBracket = text.indexOf("]", from + 1);
+  if (closeBracket === -1 || closeBracket >= bound || !text.startsWith("](", closeBracket)) return null;
+  const urlStart = closeBracket + 2;
+  const closeParen = text.indexOf(")", urlStart);
+  if (closeParen === -1 || closeParen >= bound) return null;
+  const label = text.slice(from + 1, closeBracket);
+  const url = text.slice(urlStart, closeParen);
+  if (!label || !LINK_SCHEMES.some((scheme) => url.startsWith(scheme))) return null;
+  if (/[\s"'`*[\]]/.test(url) || /[*`[\]]/.test(label)) return null;
+  return { label, url, end: closeParen + 1 };
+}
+
 /** True when the delimiter at `from` has a partner later on the same line (markup never spans lines). */
 function hasCloserOnLine(text: string, md: string, from: number): boolean {
   const found = text.indexOf(md, from);
@@ -146,7 +177,7 @@ function hasCloserOnLine(text: string, md: string, from: number): boolean {
 }
 
 /**
- * Minimal, safe markdown→HTML: `**bold**`, `*italic*`, `` `code` ``; everything else escaped.
+ * Minimal, safe markdown→HTML: `**bold**`, `*italic*`, `` `code` ``, `[text](https://url)`; everything else escaped.
  *
  * Single left-to-right pass with a tag stack. The old three sequential regex passes
  * crossed tags whenever delimiters overlapped (`` `a *b` c* `` → `<code>a <i>b</code> c</i>`),
@@ -167,6 +198,16 @@ export function toTelegramHtml(text: string): string {
     if (ch === "\n") {
       closeAll();
       out += ch;
+      continue;
+    }
+    if (ch === "[") {
+      const link = matchMarkdownLink(text, i);
+      if (link) {
+        out += `<a href="${escapeHtmlAttr(link.url)}">${escapeHtml(link.label)}</a>`;
+        i = link.end - 1;
+        continue;
+      }
+      out += escapeHtml(ch);
       continue;
     }
     const token = HTML_DELIMITERS.find((d) => text.startsWith(d.md, i));
