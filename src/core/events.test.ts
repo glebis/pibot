@@ -75,7 +75,7 @@ describe("EventLog", () => {
     );
 
     expect(log.tail("agent")[0].summary).toBe(
-      "request failed: Bearer [REDACTED]; bot [TELEGRAM_BOT_TOKEN_REDACTED]",
+      "request failed: Bearer [REDACTED]; bot 123456789:[TELEGRAM_BOT_TOKEN_REDACTED]", // the bot id is kept: not a credential, and it names the failing bot
     );
   });
 

@@ -3,7 +3,8 @@ import * as path from "node:path";
 import { serve } from "@hono/node-server";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.js";
-import { enforceOwnerOnlyRuntimeState, ensureDir, readJson } from "./core/util.js";
+import { ensureDir, enforceOwnerOnlyRuntimeState, readJson } from "./core/util.js";
+import { installLogRedaction } from "./core/log-redact.js";
 import { SecretStore } from "./core/secrets.js";
 import { AgentManager } from "./core/agent-manager.js";
 import { PiBot } from "./core/bot.js";
@@ -26,6 +27,10 @@ import { SttService } from "./core/stt.js";
 import { AudioMediaProcessor } from "./core/audio-media.js";
 
 async function main(): Promise<void> {
+  // FIRST: daemon.log is stdout/stderr, and error objects (grammy/node-fetch)
+  // embed live bot tokens in their stack text. Redact at the console before
+  // anything can write, so no later sink has to remember to (bd pibot-vuu).
+  installLogRedaction();
   // Private runtime state (sessions, memories, skills, media, secrets) is written by
   // several layers, including the SDK — a process-wide umask makes every file the daemon
   // creates owner-only, and the boot-time repair fixes what earlier runs left readable.

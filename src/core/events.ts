@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ensureDir, truncate } from "./util.js";
+import { redactSecrets } from "./redact.js";
 
 export interface EventEntry {
   t: number;
@@ -8,19 +9,13 @@ export interface EventEntry {
   summary: string;
 }
 
-const REDACTED = "[REDACTED]";
-const SENSITIVE_JSON_ASSIGNMENT_RE = /("(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|private[_-]?key|signing[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|authorization|credentials?|password|passwd|passphrase|secret|token)"\s*:\s*)(?:"(?:\\.|[^"\\])*"|null|true|false|-?\d+(?:\.\d+)?)/gi;
-const SENSITIVE_ASSIGNMENT_RE = /(\b(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|private[_-]?key|signing[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|authorization|credentials?|password|passwd|passphrase|secret|token)\b\s*(?:=|:)\s*)(?:Bearer\s+[^\s,;}\]]+|"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\]]+)/gi;
-const BEARER_CREDENTIAL_RE = /\bBearer\s+[^\s,;}\]]+/gi;
-const TELEGRAM_BOT_TOKEN_RE = /(?<!\d)\d{5,12}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g;
-
-/** Remove common credential forms at the single boundary where event summaries persist. */
+/**
+ * Remove common credential forms at the boundary where event summaries persist.
+ * Shares one scrubber with the console boundary (src/core/log-redact.ts) so a new
+ * credential pattern lands in both places instead of one (bd pibot-vuu).
+ */
 export function redactEventSummary(summary: string): string {
-  return summary
-    .replace(SENSITIVE_JSON_ASSIGNMENT_RE, `$1"${REDACTED}"`)
-    .replace(SENSITIVE_ASSIGNMENT_RE, `$1${REDACTED}`)
-    .replace(BEARER_CREDENTIAL_RE, `Bearer ${REDACTED}`)
-    .replace(TELEGRAM_BOT_TOKEN_RE, "[TELEGRAM_BOT_TOKEN_REDACTED]");
+  return redactSecrets(summary);
 }
 
 /** Tiny per-agent append-only event log — feeds heartbeat context and debugging. */
