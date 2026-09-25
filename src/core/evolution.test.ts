@@ -485,7 +485,7 @@ describe("Jev shadow observer at the probe/judge boundary (bd pibot-n13)", () =>
     agents.createAgent("assistant");
     if (grant) {
       const agent = agents.getAgent("assistant")!;
-      agent.manifest.evolution = { ...agent.manifest.evolution, shadow: { enabled: true, dataScope: "synthetic", providers: ["typesafe-ai"] } };
+      agent.manifest.evolution = { ...agent.manifest.evolution, shadow: { enabled: true, dataScope: "redacted_approved", providers: ["typesafe-ai"] } };
     }
     const events = new EventLog(dir);
     const announced: string[] = [];
@@ -511,7 +511,7 @@ describe("Jev shadow observer at the probe/judge boundary (bd pibot-n13)", () =>
 
   function shadowWith(evaluate: unknown, over: Partial<ConstructorParameters<typeof JevShadowObserver>[0]> = {}) {
     const records: JevShadowRecord[] = [];
-    const observer = new JevShadowObserver({ evaluate: evaluate as never, apiKey: "test-key", onRecord: (r) => records.push(r), ...over });
+    const observer = new JevShadowObserver({ evaluate: evaluate as never, apiKey: "test-key", mode: "live", onRecord: (r) => records.push(r), ...over });
     return { observer, records };
   }
 
@@ -560,6 +560,30 @@ describe("Jev shadow observer at the probe/judge boundary (bd pibot-n13)", () =>
       await vi.waitFor(() => expect(records, label).toHaveLength(1));
       expect(records[0]!.jevResult, label).toBe("failed");
     }
+  });
+
+  it("declares live probe text as live_probe, so a synthetic-only grant is refused on the wire", async () => {
+    const evaluate = vi.fn(async () => choice("meets"));
+    const records: JevShadowRecord[] = [];
+    const live = new JevShadowObserver({ evaluate: evaluate as never, apiKey: "k", mode: "live", onRecord: (r) => records.push(r) });
+    const h = setup(live, true);
+    h.agents.getAgent("assistant")!.manifest.evolution = { shadow: { enabled: true, dataScope: "synthetic", providers: ["typesafe-ai"] } };
+    await h.engine.evolve("assistant");
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(records[0]).toMatchObject({ jevResult: "not_permitted", jevReason: "scope_not_permitted" });
+  });
+
+  it("is inert in dry run too — the daemon's default mode cannot change a cycle either", async () => {
+    const control = await outcomeOf(setup());
+    const evaluate = vi.fn(async () => choice("misses_required"));
+    const records: JevShadowRecord[] = [];
+    const dry = new JevShadowObserver({ evaluate: evaluate as never, apiKey: "k", mode: "dry_run", onRecord: (r) => records.push(r) });
+    const watched = await outcomeOf(setup(dry, true));
+    expect(watched).toEqual(control);
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(records[0]).toMatchObject({ jevResult: "not_permitted", jevReason: "dry_run", decision: "promoted" });
   });
 
   it("does not call Jev at all when the agent's flag is off, and the cycle is unchanged", async () => {

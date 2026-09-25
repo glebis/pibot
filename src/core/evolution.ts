@@ -530,6 +530,8 @@ export class EvolutionEngine {
           task: probe.task,
           criteria: probe.criteria,
           candidateReply: reply,
+          // a live cycle's probe text is real user-derived material, not a synthetic case
+          dataClass: "live_probe",
           missingEvidence: ["baseline_reply"],
         },
         agent.manifest.evolution?.shadow,

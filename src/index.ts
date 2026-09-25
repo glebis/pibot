@@ -11,6 +11,7 @@ import { EventLog } from "./core/events.js";
 import { ModelCascade } from "./core/cascade.js";
 import { installDiskGuard } from "./core/disk-guard.js";
 import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
+import { JevShadowFileStore, JevShadowObserver } from "./core/jev-shadow.js";
 import { ConsolidationEngine, createLlmConsolidationIO } from "./core/consolidation.js";
 import { ProactiveStore } from "./core/proactive-store.js";
 import { CommitmentEngine } from "./core/commitments.js";
@@ -168,6 +169,15 @@ async function main(): Promise<void> {
     events,
     dataDir: config.dataDir,
     consolidation,
+    // Jev shadow observer (bd pibot-n13): advisory, and gated by TWO independent
+    // switches — the per-agent manifest flag plus this daemon-level mode. Only
+    // PIBOT_JEV_SHADOW=live performs external calls; anything else records what
+    // would have been sent (size, redaction, failure class) without sending it,
+    // so granting an agent the flag can never ship probe text off the machine.
+    shadow: new JevShadowObserver({
+      store: new JevShadowFileStore(path.join(config.dataDir, "jev-shadow.json")),
+      mode: process.env.PIBOT_JEV_SHADOW === "live" ? "live" : "dry_run",
+    }),
     host: { announce: async (agentId, text) => {
       await bot.deliverToAgent(agentId, text);
     } },

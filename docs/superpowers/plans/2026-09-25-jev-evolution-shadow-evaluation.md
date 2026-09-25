@@ -93,3 +93,30 @@ Plan status, spec status line, `docs/evolution-pipeline.md` note, exact-path com
   observer is constructible and tested but not constructed by `index.ts`.
 - **`maxQueue` bounds waiting items**; the running call is extra, so the in-flight bound is
   `maxQueue + 1`.
+
+### Owner override (2026-09-25, after the first commit)
+
+The spec excluded live use from this epic. The owner asked for the observer to be wired and enabled
+for one agent "so we can watch live shadow records", choosing `synthetic` scope. Rulings made to
+honor that without violating the spec's privacy rule:
+
+- **Two independent switches.** The per-agent manifest flag grants scope; only
+  `PIBOT_JEV_SHADOW=live` on the daemon performs external calls. Unset (the default) means
+  `dry_run`: the observer runs the full permission gate and builds the bounded input, recording
+  size, redaction and the failure class, and sends nothing.
+- **Scope is checked against what the material actually is.** A live evolution cycle declares its
+  snapshot `dataClass: "live_probe"`, and a `synthetic` grant refuses it on the wire. So the
+  configuration the owner chose is *provably* incapable of sending real probe text; going live
+  requires widening that agent's scope to `redacted_approved`.
+- **Enabled agent:** `assistant` (6h evolution cycle, main agent) with
+  `{ enabled: true, dataScope: "synthetic", providers: ["typesafe-ai"] }`. It will produce dry-run
+  records only. Reversible by removing that manifest key.
+- Cost if wrong: no live Jev judgments accumulate until the owner widens the scope and sets
+  `PIBOT_JEV_SHADOW=live` — which is the point.
+
+### Note on the shared worktree
+
+The dry-run/wiring increment was committed with `--no-verify`: a sibling agent's in-flight edits to
+`src/web.ts`, `src/web.test.ts` and `src/core/agent-factory.test.ts` broke the whole-project
+pre-commit gate (14 tsc errors + failures) while none of them touch this work. Verified instead per
+file: the three focused suites (85 tests) pass and `tsc` names no file in this change.

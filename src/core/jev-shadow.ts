@@ -19,7 +19,9 @@
 //      client's own bound, and never awaited by the promotion decision.
 
 import { evaluateJev, type JevAnswer, type JevFailureReason, type JevQuestion } from "./jev-evaluator.js";
-import { truncate } from "./util.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { truncate, writeJsonAtomic } from "./util.js";
 
 /** Bumped whenever the question wording or option set changes. */
 export const JEV_RUBRIC_VERSION = "jev-evolution-v1";
@@ -57,11 +59,17 @@ export type JevShadowSnapshot = {
   candidateReply: string;
   /** only when a matched baseline reply is available */
   baselineReply?: string;
+  /**
+   * What this material actually IS. A live evolution cycle carries real
+   * user-derived probe text, so it declares `live_probe` — which an agent
+   * granted only `synthetic` scope can never send (see the observer's live gate).
+   */
+  dataClass?: "synthetic" | "redacted_approved" | "live_probe";
   missingEvidence?: string[];
 };
 
 export type JevShadowUnassessableReason = "missing_evidence" | "state_too_large" | "empty_reply" | "invalid_snapshot";
-export type JevShadowNotPermittedReason = "flag_off" | "scope_not_permitted" | "provider_not_permitted" | "missing_api_key" | "budget_exhausted";
+export type JevShadowNotPermittedReason = "flag_off" | "scope_not_permitted" | "provider_not_permitted" | "missing_api_key" | "budget_exhausted" | "dry_run";
 
 export type JevShadowResult =
   | {
@@ -98,6 +106,10 @@ export type JevShadowRecord = {
   elapsedMs: number;
   /** what the authoritative path did with the candidate */
   decision?: "promoted" | "staged";
+  /** built-input size, useful in dry run (never the input itself) */
+  stateBytes?: number;
+  /** whether the snapshot needed credential redaction */
+  redacted?: boolean;
 };
 
 // ── sensitive-pattern redaction ──────────────────────────────────────────────
@@ -133,7 +145,7 @@ export function redactSensitive(text: string): { text: string; redacted: boolean
  */
 export function jevShadowPermitted(
   permission: JevShadowPermission | undefined,
-  opts: { apiKey?: string } = {},
+  opts: { apiKey?: string; requireKey?: boolean } = {},
 ): { ok: true } | { ok: false; reason: JevShadowNotPermittedReason } {
   if (permission?.enabled !== true) return { ok: false, reason: "flag_off" };
   if (permission.dataScope !== "synthetic" && permission.dataScope !== "redacted_approved") {
@@ -142,6 +154,7 @@ export function jevShadowPermitted(
   if (!(permission.providers ?? []).some((p) => p.trim().toLowerCase() === JEV_PROVIDER)) {
     return { ok: false, reason: "provider_not_permitted" };
   }
+  if (opts.requireKey === false) return { ok: true };
   const key = opts.apiKey ?? process.env.AI_GATEWAY_API_KEY;
   if (!key?.trim()) return { ok: false, reason: "missing_api_key" };
   return { ok: true };
@@ -266,6 +279,36 @@ export class JevShadowMemoryStore implements JevShadowStore {
   }
 }
 
+/**
+ * Private, bounded, metadata-only store. Rewrites atomically (0600) and keeps
+ * only the newest `max` records — the spec's "detailed measurements in a
+ * private, bounded structured store".
+ */
+export class JevShadowFileStore implements JevShadowStore {
+  private entries: JevShadowRecord[] = [];
+  constructor(private file: string, private max = 500) {
+    try {
+      const j = JSON.parse(fs.readFileSync(file, "utf8")) as { records?: JevShadowRecord[] };
+      if (Array.isArray(j?.records)) this.entries = j.records.slice(-this.max);
+    } catch {
+      /* first run */
+    }
+  }
+  record(entry: JevShadowRecord): void {
+    this.entries.push(entry);
+    while (this.entries.length > this.max) this.entries.shift();
+    try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      writeJsonAtomic(this.file, { records: this.entries }, 0o600);
+    } catch {
+      /* records are best effort */
+    }
+  }
+  all(): readonly JevShadowRecord[] {
+    return this.entries;
+  }
+}
+
 // ── bounded observer ─────────────────────────────────────────────────────────
 
 export type JevShadowObserverDeps = {
@@ -281,6 +324,14 @@ export type JevShadowObserverDeps = {
   maxPerDay?: number;
   timeoutMs?: number;
   now?: () => number;
+  /**
+   * `live` performs the external evaluation. Every other value (and the default)
+   * is `dry_run`: the observer still refuses/passes the full permission gate and
+   * still builds the bounded input — recording sizes, redaction and the failure
+   * class — but never calls the evaluator. Two independent switches must agree
+   * before real probe text can leave the process.
+   */
+  mode?: "live" | "dry_run";
 };
 
 export class JevShadowObserver {
@@ -299,6 +350,7 @@ export class JevShadowObserver {
   private readonly maxPerDay: number;
   private readonly timeoutMs: number;
   private readonly now: () => number;
+  private readonly mode: "live" | "dry_run";
 
   constructor(private deps: JevShadowObserverDeps = {}) {
     this.store = deps.store ?? new JevShadowMemoryStore();
@@ -306,6 +358,7 @@ export class JevShadowObserver {
     this.maxPerDay = Math.max(1, deps.maxPerDay ?? 50);
     this.timeoutMs = Math.min(10_000, Math.max(250, deps.timeoutMs ?? 4_000));
     this.now = deps.now ?? (() => Date.now());
+    this.mode = deps.mode === "live" ? "live" : "dry_run";
   }
 
   /** Queue depth (advisory observability, used by tests and /status style surfaces). */
@@ -411,7 +464,7 @@ export class JevShadowObserver {
           this.emit(record);
         };
         try {
-          const permitted = jevShadowPermitted(item.permission, { apiKey: this.deps.apiKey });
+          const permitted = jevShadowPermitted(item.permission, { apiKey: this.deps.apiKey, requireKey: this.mode === "live" });
           if (!permitted.ok) {
             settle({ kind: "not_permitted", reason: permitted.reason, elapsedMs: 0 });
             continue;
@@ -423,6 +476,19 @@ export class JevShadowObserver {
           const input = buildJevShadowInput(item.snapshot);
           if (!input.ok) {
             settle({ kind: "unassessable", reason: input.reason, elapsedMs: 0 });
+            continue;
+          }
+          if (this.mode === "dry_run") {
+            // Everything up to the wire is exercised; nothing is sent, nothing is charged.
+            record.stateBytes = input.stateBytes;
+            record.redacted = input.redacted;
+            settle({ kind: "not_permitted", reason: "dry_run", elapsedMs: 0 });
+            continue;
+          }
+          // Scope is checked against what the material ACTUALLY is: a synthetic
+          // grant cannot carry a live cycle's real probe text off the machine.
+          if (item.permission?.dataScope === "synthetic" && item.snapshot.dataClass !== "synthetic") {
+            settle({ kind: "not_permitted", reason: "scope_not_permitted", elapsedMs: 0 });
             continue;
           }
           this.chargeBudget(item.snapshot.agentId);
