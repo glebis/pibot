@@ -889,3 +889,109 @@ describe("proactive analytics page", () => {
     expect(manifest.proactive?.dailyBudget).toBe(4);
   });
 });
+
+// ── programmatic agent creation (owner API) ─────────────────────────────────
+
+describe("POST /api/agents", () => {
+  let dir: string;
+  let app: ReturnType<typeof createWebApp>;
+  let scheduler: Scheduler;
+  let agents: AgentManager;
+
+  beforeEach(() => {
+    dir = tmpDir();
+    agents = new AgentManager(dir, { getModels: () => [] } as unknown as ModelRuntime);
+    agents.createAgent("assistant", "You are a test companion.");
+    scheduler = new Scheduler(path.join(dir, "data"), () => {});
+    const events = new EventLog(dir);
+    const io: EvolutionIO = { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() };
+    const evolution = new EvolutionEngine({ agents, modelRuntime: {} as ModelRuntime, events, dataDir: dir, host: { announce: async () => {} }, io });
+    app = createWebApp({ agents, scheduler, events, evolution, dataDir: dir, webToken: "dashboard-test-token", secrets: { get: () => ({}), save: async () => {} } as never });
+  });
+
+  afterEach(() => {
+    scheduler.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const bearer = (token = "dashboard-test-token") => ({ authorization: `Bearer ${token}`, "content-type": "application/json" });
+
+  it("creates an agent, arms the rhythm, returns JSON", async () => {
+    const res = await app.request("/api/agents", {
+      method: "POST", headers: bearer(),
+      body: JSON.stringify({ id: "helper-bot", description: "Runs errands for Gleb" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok?: boolean; id?: string };
+    expect(body).toMatchObject({ ok: true, id: "helper-bot" });
+    expect(agents.getAgent("helper-bot")).toBeTruthy();
+    expect(scheduler.get("hb:helper-bot")?.status).toBe("pending");
+  });
+
+  it("answers 400 with a reason for invalid specs", async () => {
+    const post = (payload: unknown) => app.request("/api/agents", { method: "POST", headers: bearer(), body: JSON.stringify(payload) });
+    expect((await post({ id: "Bad_ID", description: "x" })).status).toBe(400);
+    const noCap = await post({ id: "caps-fail", description: "x", capabilities: ["telepathy"] });
+    expect(((await noCap.json()) as { error?: string }).error).toContain("telepathy");
+    const noDesc = await post({ id: "nodesc", description: "" });
+    expect(((await noDesc.json()) as { error?: string }).error).toContain("description");
+  });
+
+  it("requires owner auth", async () => {
+    const res = await app.request("/api/agents", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "x", description: "y" }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("fires the managed subbot flow when asked and returns the deep link", async () => {
+    const requestSubBotCreation = vi.fn(async () => {});
+    const dir2 = tmpDir();
+    const agents2 = new AgentManager(dir2, { getModels: () => [] } as never);
+    const events2 = new EventLog(dir2);
+    const io2: EvolutionIO = { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() };
+    const evolution2 = new EvolutionEngine({ agents: agents2, modelRuntime: {} as ModelRuntime, events: events2, dataDir: dir2, host: { announce: async () => {} }, io: io2 });
+    const telegram = {
+      hasTransport: () => true, telegramUsername: () => "pimother_bot", managerUsername: () => "pimother_bot",
+      managerMode: () => true, requestSubBotCreation,
+      subBotDeepLink: (_id: string, u: string) => `https://t.me/BotFather?start=${u}`,
+      subBotFor: () => undefined, chatBindings: () => [], mainChat: () => undefined,
+      rebind: () => ({ ok: true }), enableTelegram: async () => ({ ok: true }), disableTelegram: async () => true, askUserAllChats: async () => {},
+    } as unknown as TelegramControl;
+    const app2 = createWebApp({ agents: agents2, scheduler, events: events2, evolution: evolution2, dataDir: dir2, webToken: "t", secrets: { get: () => ({}), save: async () => {} } as never, telegram });
+    const res = await app2.request("/api/agents", {
+      method: "POST", headers: bearer("t"),
+      body: JSON.stringify({ id: "newone", description: "x", subbot: true }),
+    });
+    const body = (await res.json()) as { ok?: boolean; subbot?: { armed?: boolean; suggestedUsername?: string; deepLink?: string; error?: string } };
+    expect(body.ok).toBe(true);
+    expect(body.subbot).toMatchObject({ armed: true, suggestedUsername: "pimother_newone_bot", deepLink: "https://t.me/BotFather?start=pimother_newone_bot" });
+    expect(requestSubBotCreation).toHaveBeenCalledWith("newone");
+    fs.rmSync(dir2, { recursive: true, force: true });
+  });
+
+  it("reports a manager-mode failure without arming", async () => {
+    const requestSubBotCreation = vi.fn(async () => {});
+    const dir2 = tmpDir();
+    const agents2 = new AgentManager(dir2, { getModels: () => [] } as never);
+    const events2 = new EventLog(dir2);
+    const io2: EvolutionIO = { propose: vi.fn(), runProbe: vi.fn(), judge: vi.fn() };
+    const evolution2 = new EvolutionEngine({ agents: agents2, modelRuntime: {} as ModelRuntime, events: events2, dataDir: dir2, host: { announce: async () => {} }, io: io2 });
+    const telegram = {
+      hasTransport: () => true, telegramUsername: () => "pimother_bot", managerUsername: () => "pimother_bot",
+      managerMode: () => false, requestSubBotCreation, subBotFor: () => undefined, chatBindings: () => [], mainChat: () => undefined,
+      rebind: () => ({ ok: true }), enableTelegram: async () => ({ ok: true }), disableTelegram: async () => true, askUserAllChats: async () => {},
+    } as unknown as TelegramControl;
+    const app2 = createWebApp({ agents: agents2, scheduler, events: events2, evolution: evolution2, dataDir: dir2, webToken: "t", secrets: { get: () => ({}), save: async () => {} } as never, telegram });
+    const res = await app2.request("/api/agents", {
+      method: "POST", headers: bearer("t"),
+      body: JSON.stringify({ id: "newone", description: "x", subbot: true }),
+    });
+    const body = (await res.json()) as { ok?: boolean; subbot?: { armed?: boolean; error?: string } };
+    expect(body.ok).toBe(true);
+    expect(body.subbot).toMatchObject({ armed: false, error: expect.stringContaining("manager mode") });
+    expect(requestSubBotCreation).not.toHaveBeenCalled();
+    fs.rmSync(dir2, { recursive: true, force: true });
+  });
+});

@@ -1,4 +1,7 @@
+import * as path from "node:path";
+import { CAPABILITY_REGISTRY } from "./capabilities.js";
 import { defaultManifest, type AgentManifest } from "./types.js";
+import { parseDuration, writeJsonAtomic } from "./util.js";
 
 // ─── drafts (shared by the chat wizard and the web form) ────────────────────
 
@@ -83,4 +86,120 @@ export function buildPersona(draft: AgentDraft): string {
     `Never dump reports — talk like a good colleague on chat. When unsure whether to speak up, err toward silence.`,
     ``,
   ].join("\n");
+}
+// ─── programmatic creation (dashboard API / CLI) ────────────────────────────
+
+export interface CreateAgentSpec {
+  id: string;
+  /** one or two sentences: what this agent is for — anchors the persona */
+  description: string;
+  vibe?: string;
+  proactivity?: string;
+  capabilities?: string[] | string;
+  model?: string;
+  providers?: string[] | string;
+}
+
+export type AgentCreateResult =
+  | { ok: true; id: string; dir: string; manifest: AgentManifest }
+  | { ok: false; error: string };
+
+export interface CreateAgentDeps {
+  agents: {
+    list(): Array<{ id: string }>;
+    createAgent(name: string, persona?: string): string | undefined;
+    getAgent(id: string): { id: string; dir: string; manifest: AgentManifest } | undefined;
+    discover(): Promise<void>;
+  };
+  scheduler?: { ensure(job: never): unknown };
+  telegram?: { requestSubBotCreation(agentId: string): Promise<void>; managerMode(): boolean };
+}
+
+export const DEFAULT_API_PROACTIVITY: Proactivity = "quiet";
+export const DEFAULT_API_VIBE = "dry & efficient";
+
+function proactivityOrError(raw: string): Proactivity | null {
+  const s = raw.toLowerCase().trim();
+  for (const p of ["quiet", "balanced", "chatty", "off"] as const) {
+    if (s.startsWith(p)) return p;
+  }
+  return null;
+}
+
+function capabilitiesIssue(ids: string[]): string | null {
+  const known = CAPABILITY_REGISTRY.map((e) => e.id);
+  const unknown = ids.filter((id) => !known.includes(id));
+  return unknown.length ? `Unknown capabilities: ${unknown.join(", ")} — known: ${known.join(", ")}` : null;
+}
+
+/** Arm the internal heartbeat/evolution rhythm for a fresh agent (idempotent). */
+export function armRhythmJobs(scheduler: { ensure(job: never): unknown } | undefined, agent: { id: string; manifest: AgentManifest }): void {
+  if (!scheduler) return;
+  const hb = agent.manifest.heartbeat;
+  if (hb?.enabled) {
+    const everyMs = parseDuration(hb.interval) ?? 45 * 60e3;
+    scheduler.ensure({
+      id: `hb:${agent.id}`, agentId: agent.id, chat: { transport: "internal", chatId: "heartbeat" },
+      title: "heartbeat", kind: "heartbeat", dueAt: Date.now() + everyMs, repeat: { everyMs },
+      wake: "normal", delivery: "direct", status: "pending", createdAt: Date.now(), firedCount: 0, internal: true,
+    } as never);
+  }
+  if (agent.manifest.evolution?.enabled) {
+    const everyMs = parseDuration(agent.manifest.evolution.interval ?? "6h") ?? 6 * 3600e3;
+    scheduler.ensure({
+      id: `ev:${agent.id}`, agentId: agent.id, chat: { transport: "internal", chatId: "evolution" },
+      title: "evolution", kind: "evolution", dueAt: Date.now() + everyMs, repeat: { everyMs },
+      wake: "normal", delivery: "direct", status: "pending", createdAt: Date.now(), firedCount: 0, internal: true,
+    } as never);
+  }
+}
+
+/**
+ * Programmatic agent creation with the chat wizard's guarantees: id validation
+ * + collision check, 0700 layout, persona from the description, capability
+ * selection (explicit list replaces the conservative defaults), quiet-heartbeat
+ * default. Used by the dashboard API; the interactive wizard stays separate.
+ */
+export async function createAgentFromSpec(deps: CreateAgentDeps, spec: CreateAgentSpec): Promise<AgentCreateResult> {
+  const id = String(spec.id ?? "").toLowerCase().trim();
+  const description = String(spec.description ?? "").trim();
+  const nameErr = validateAgentName(id, deps.agents.list().map((a) => a.id));
+  if (nameErr) return { ok: false, error: nameErr };
+  if (!description) return { ok: false, error: "The description (job) is required — it anchors the persona." };
+
+  let proactivity: Proactivity = DEFAULT_API_PROACTIVITY;
+  if (spec.proactivity != null && String(spec.proactivity).trim()) {
+    const p = proactivityOrError(String(spec.proactivity));
+    if (!p) return { ok: false, error: `proactivity must be one of quiet|balanced|chatty|off — got "${spec.proactivity}"` };
+    proactivity = p;
+  }
+
+  let capabilities: string[] | undefined;
+  if (spec.capabilities != null) {
+    const caps = (Array.isArray(spec.capabilities) ? spec.capabilities : String(spec.capabilities).split(","))
+      .map((s) => String(s).trim())
+      .filter(Boolean);
+    const issue = capabilitiesIssue(caps);
+    if (issue) return { ok: false, error: issue };
+    capabilities = [...new Set(caps)];
+  }
+
+  const draft: AgentDraft = { name: id, job: description, vibe: spec.vibe?.trim() || DEFAULT_API_VIBE, proactivity };
+  const err = deps.agents.createAgent(id, buildPersona(draft));
+  if (err) return { ok: false, error: err };
+  const agent = deps.agents.getAgent(id);
+  if (!agent) return { ok: false, error: `Agent "${id}" vanished after creation` };
+
+  const manifest = buildManifest(draft);
+  if (capabilities) manifest.capabilities = capabilities;
+  if (spec.model != null && String(spec.model).trim()) manifest.model = String(spec.model).trim();
+  if (spec.providers != null) {
+    const providers = (Array.isArray(spec.providers) ? spec.providers : String(spec.providers).split(",")).map((s) => String(s).trim()).filter(Boolean);
+    if (providers.length) manifest.providers = providers;
+  }
+  writeJsonAtomic(path.join(agent.dir, "agent.json"), manifest);
+  await deps.agents.discover();
+  const fresh = deps.agents.getAgent(id)!;
+  armRhythmJobs(deps.scheduler, fresh);
+  return { ok: true, id, dir: agent.dir, manifest };
 }

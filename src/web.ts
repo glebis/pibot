@@ -11,7 +11,7 @@ import type { Commitment, ProactiveLoop, ProactiveStore } from "./core/proactive
 import { summarize } from "./core/proactive-store.js";
 import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
-import { buildManifest, buildPersona, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
+import { buildManifest, buildPersona, createAgentFromSpec, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
 import { taskAcksEnabled } from "./core/task-acks.js";
 import { CAPABILITY_REGISTRY } from "./core/capabilities.js";
 import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
@@ -37,6 +37,8 @@ export interface TelegramControl {
   attachSubBot(agentId: string, token: string, allowedChats?: string[]): Promise<{ ok: boolean; botName?: string; error?: string }>;
   detachSubBot(agentId: string): Promise<boolean>;
   requestSubBotCreation(agentId: string): Promise<void>;
+  /** deep link that opens Telegram's managed bot-creation flow (manager bots) */
+  subBotDeepLink?(agentId: string, username: string, displayName?: string): string;
   chatBindings(): Array<{ chat: string; agent: string; dedicated: boolean }>;
   mainChat(): string | undefined;
   rebind(chat: string, agentId: string): { ok: boolean; error?: string };
@@ -932,6 +934,44 @@ ${hasToken ? `<div class="card">
       });
     }
     return c.redirect(`/agents/${encodeURIComponent(name)}?msg=${encodeURIComponent(`Agent "${name}" created — rhythm armed`)}`);
+  });
+
+  // ── programmatic creation (owner API; same factory as the chat wizard) ──
+  app.post("/api/agents", async (c) => {
+    const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+    if (!body) return c.json({ ok: false, error: "JSON body required" }, 400);
+    const r = await createAgentFromSpec(
+      {
+        agents: deps.agents,
+        scheduler: deps.scheduler,
+        telegram: deps.telegram as unknown as { requestSubBotCreation(agentId: string): Promise<void>; managerMode(): boolean } | undefined,
+      },
+      {
+        id: String(body.id ?? ""),
+        description: String(body.description ?? ""),
+        vibe: body.vibe == null ? undefined : String(body.vibe),
+        proactivity: body.proactivity == null ? undefined : String(body.proactivity),
+        capabilities: body.capabilities == null ? undefined : Array.isArray(body.capabilities) ? body.capabilities.map(String) : String(body.capabilities),
+        model: body.model == null ? undefined : String(body.model),
+        providers: body.providers == null ? undefined : Array.isArray(body.providers) ? body.providers.map(String) : String(body.providers),
+      },
+    );
+    if (!r.ok) return c.json(r, 400);
+
+    let subbot: { armed: boolean; suggestedUsername: string; deepLink?: string; error?: string } | undefined;
+    if (body.subbot) {
+      const suggested = suggestedSubBotUsername(r.id, deps.telegram?.managerUsername() ?? deps.telegram?.telegramUsername());
+      subbot = { armed: false, suggestedUsername: suggested };
+      try {
+        if (!deps.telegram?.managerMode()) throw new Error("the main bot is not in manager mode — BotFather manage-bots delegation is off");
+        await deps.telegram.requestSubBotCreation(r.id);
+        subbot.armed = true;
+        subbot.deepLink = deps.telegram.subBotDeepLink?.(r.id, suggested, r.id);
+      } catch (e) {
+        subbot.error = e instanceof Error ? e.message : String(e);
+      }
+    }
+    return c.json({ ...r, subbot });
   });
 
   // ── proactive analytics (pilot) ──
