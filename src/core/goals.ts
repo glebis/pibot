@@ -198,7 +198,16 @@ export function shouldContinue(
 
 export type GoalIO = {
   draftContract(objective: string): Promise<GoalContract | null>;
-  judge(state: GoalState, lastReply: string): Promise<{ verdict: GoalVerdict; reason: string } | null>;
+  /**
+   * `ctx` carries POLICY (which judge this agent may use, where to trace) while the
+   * implementation carries MECHANISM — so the composite can choose Jev, local, or
+   * neither without the loop knowing anything about either.
+   */
+  judge(
+    state: GoalState,
+    lastReply: string,
+    ctx?: { agentId?: string; permission?: unknown; log?: (summary: string) => void },
+  ): Promise<{ verdict: GoalVerdict; reason: string } | null>;
 };
 
 const DRAFT_SYSTEM =

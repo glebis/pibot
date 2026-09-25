@@ -1584,7 +1584,13 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       return;
     }
     const reply = extractAssistantTextFromSession(session) ?? "";
-    const judged = this.deps.goalIO ? await this.deps.goalIO.judge(goal, reply) : null;
+    const judged = this.deps.goalIO
+      ? await this.deps.goalIO.judge(goal, reply, {
+          agentId,
+          permission: this.deps.agents.getAgent(agentId)?.manifest.goal,
+          log: (summary) => this.deps.events.log(agentId, "system", summary),
+        })
+      : null;
     const next = advanceGoal(goal, judged, Date.now());
     this.goals.set(ck, next);
     this.persistState();

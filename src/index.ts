@@ -14,6 +14,7 @@ import { installDiskGuard } from "./core/disk-guard.js";
 import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
 import { JevShadowFileStore, JevShadowObserver } from "./core/jev-shadow.js";
 import { createLlmGoalIO } from "./core/goals.js";
+import { createCompositeGoalJudge } from "./core/goal-jev.js";
 import { ConsolidationEngine, createLlmConsolidationIO } from "./core/consolidation.js";
 import { ProactiveStore } from "./core/proactive-store.js";
 import { CommitmentEngine } from "./core/commitments.js";
@@ -216,7 +217,7 @@ async function main(): Promise<void> {
 
   // /goal's judge + contract drafting: cheap ephemeral sessions on the first
   // healthy model of the default agent's chain (same resolution as consolidation).
-  const goalIO = await createLlmGoalIO({
+  const localGoalIO = await createLlmGoalIO({
     modelRuntime,
     model: (() => {
       const defaultAgentId = agents.defaultAgentId() ?? config.defaultAgentId ?? "";
@@ -225,6 +226,20 @@ async function main(): Promise<void> {
       return spec ? cascade.resolveModel(spec) : undefined;
     })(),
   });
+
+  // Jev as the goal judge is OPTIONAL and configurable: default local, and only
+  // when BOTH the agent's manifest asks for it (goal.judge="jev" + scope +
+  // provider) AND this daemon switch allows it. Every failure falls back to the
+  // local judge, so an unavailable evaluator can never look like a verdict.
+  const goalJudge = createCompositeGoalJudge({
+    local: (state, reply) => localGoalIO.judge(state, reply),
+    enabled: process.env.PIBOT_GOAL_JUDGE === "jev",
+  });
+  const goalIO = {
+    draftContract: (objective: string) => localGoalIO.draftContract(objective),
+    judge: (state: Parameters<typeof goalJudge.judge>[0], reply: string, ctx?: Parameters<typeof goalJudge.judge>[2]) =>
+      goalJudge.judge(state, reply, ctx),
+  };
 
   const providerManager = new ProviderManager(modelRuntime);
   bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, commitments, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir), goalIO });

@@ -192,6 +192,13 @@ export interface AgentManifest {
      */
     minimal?: boolean;
   };
+  /**
+   * /goal judging. `judge: "local"` (default) keeps everything on this machine;
+   * `"jev"` sends the goal + the agent's reply to the typed evaluator, and then
+   * only with the daemon switch (PIBOT_GOAL_JUDGE=jev), an approved data scope and
+   * the provider in scope. Failure always falls back to the local judge.
+   */
+  goal?: { judge?: "local" | "jev"; dataScope?: "synthetic" | "redacted_approved"; providers?: string[] };
   heartbeat?: HeartbeatConfig;
   /** goal-driven skill self-evolution (Hermes-style propose → gate → eval → apply) */
   evolution?: {
