@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -19,6 +20,12 @@ import { readConsolidatedDigest, type ConsolidationEngine } from "./consolidatio
 import type { EventLog } from "./events.js";
 import { buildHeartbeatDigest } from "./heartbeat.js";
 import { errorMessage, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
+import { JEV_RUBRIC_VERSION, type JevShadowObserver } from "./jev-shadow.js";
+
+/** Stable content identity for shadow metadata — the content itself never leaves. */
+function contentHash(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
 
 const run = promisify(execFile);
 
@@ -126,9 +133,17 @@ export interface EvolutionIO {
   propose(ctx: ProposalContext): Promise<EvolutionProposal>;
   /** run one eval probe in a session that has the candidate skill loaded; returns the agent reply */
   runProbe(probe: { task: string }, skillsDirs: string[], agent: LoadedAgent, model?: unknown): Promise<string>;
-  /** judge a probe reply against its success criteria; returns 1..5 */
-  judge(args: { task: string; criteria: string; reply: string }): Promise<number>;
+  /**
+   * Judge a probe reply against its success criteria; returns 1..5.
+   * May also report whether that number was parsed from the judge's answer or is
+   * its error fallback (a 5 plus a fallback 3 still averages to 4 — observation
+   * only, the score and the promotion rule are untouched by this metadata).
+   */
+  judge(args: { task: string; criteria: string; reply: string }): Promise<number | JudgeOutcome>;
 }
+
+/** A judge score plus its provenance. `parse` is absent when the IO cannot say. */
+export type JudgeOutcome = { score: number; parse?: "parsed" | "fallback" };
 
 export interface EvolutionReport {
   agentId: string;
@@ -208,6 +223,12 @@ export class EvolutionEngine {
       consolidation?: Pick<ConsolidationEngine, "consolidate">;
       host: { announce(agentId: string, text: string): Promise<void> };
       io: EvolutionIO;
+      /**
+       * Advisory Jev shadow observer (bd pibot-n13). Default off: it only runs when
+       * the agent's manifest grants flag + data scope + provider scope, and its
+       * result is never read by this engine.
+       */
+      shadow?: JevShadowObserver;
     }
   ) {
     this.stateFile = path.join(deps.dataDir, "evolution.json");
@@ -416,12 +437,20 @@ export class EvolutionEngine {
     if (closesIds.length) writeJsonAtomic(path.join(stagedDir, STAGING_BACKLOG_SIDECAR), { ids: closesIds }, 0o600);
 
     // 5. eval probes (staging dir takes precedence over live skills dir)
+    // The shadow observer sees a bounded snapshot only once a reply exists, and is
+    // never awaited: no Jev outcome can reach scores, gates, promotion or closure.
     const scores: number[] = [];
-    for (const probe of proposal.probes.slice(0, 2)) {
+    const shadowRunId = uid("run");
+    const shadowProbeIds: string[] = [];
+    for (const [index, probe] of proposal.probes.slice(0, 2).entries()) {
+      const probeId = `${shadowRunId}:p${index + 1}`;
+      shadowProbeIds.push(probeId);
       try {
         const reply = await this.deps.io.runProbe(probe, [path.join(skillsDir, ".staging"), skillsDir], agent);
-        const score = await this.deps.io.judge({ task: probe.task, criteria: probe.criteria, reply });
-        scores.push(score);
+        const judged = await this.deps.io.judge({ task: probe.task, criteria: probe.criteria, reply });
+        const outcome: JudgeOutcome = typeof judged === "number" ? { score: judged } : judged;
+        scores.push(outcome.score);
+        this.observeShadow(agent, proposal, probe, reply, outcome, shadowRunId, probeId, candidateContent);
       } catch (e) {
         scores.push(1);
         this.deps.events.log(agentId, "system", `evolution probe error: ${errorMessage(e)}`);
@@ -438,6 +467,7 @@ export class EvolutionEngine {
         // 6a. auto-promote with git checkpoint — close the backlog items the skill lands
         const promoted = this.promoteCandidate(agent, proposal.skillName, candidateContent, proposal.rationale);
         if (promoted) this.closeBacklogIds(agent, closesIds);
+        this.noteShadowDecision(shadowRunId, shadowProbeIds, promoted ? "promoted" : "staged");
         return {
           agentId,
           ok: true,
@@ -452,6 +482,7 @@ export class EvolutionEngine {
     }
 
     // 6b. stays staged for human review
+    this.noteShadowDecision(shadowRunId, shadowProbeIds, "staged");
     return {
       agentId,
       ok: true,
@@ -464,6 +495,63 @@ export class EvolutionEngine {
   }
 
   // ── internals ────────────────────────────────────────────────────────
+
+  /**
+   * Hand one probe to the shadow observer. Advisory only: nothing here can throw
+   * into a cycle, and nothing it returns is ever read.
+   *
+   * A live cycle has no verified prior-version reply (running the baseline would
+   * double probe cost, which the spec forbids), so it asks the criteria question
+   * only and marks the baseline as missing. The pairwise question belongs to the
+   * replay harness, where baseline and candidate are both run under matched
+   * conditions.
+   */
+  private observeShadow(
+    agent: LoadedAgent,
+    proposal: EvolutionProposal,
+    probe: { task: string; criteria: string },
+    reply: string,
+    outcome: JudgeOutcome,
+    runId: string,
+    probeId: string,
+    candidateContent: string,
+  ): void {
+    const observer = this.deps.shadow;
+    if (!observer) return;
+    try {
+      observer.observe(
+        {
+          runId,
+          probeId,
+          agentId: agent.id,
+          mode: proposal.mode,
+          candidateHash: contentHash(candidateContent),
+          rubricVersion: JEV_RUBRIC_VERSION,
+          task: probe.task,
+          criteria: probe.criteria,
+          candidateReply: reply,
+          missingEvidence: ["baseline_reply"],
+        },
+        agent.manifest.evolution?.shadow,
+        { score: outcome.score, parse: outcome.parse },
+      );
+    } catch {
+      /* the shadow can never break a cycle */
+    }
+  }
+
+  /** Record what the authoritative path did, as metadata only. */
+  private noteShadowDecision(runId: string, probeIds: string[], decision: "promoted" | "staged"): void {
+    const observer = this.deps.shadow;
+    if (!observer) return;
+    for (const probeId of probeIds) {
+      try {
+        observer.noteDecision(runId, probeId, decision);
+      } catch {
+        /* metadata only */
+      }
+    }
+  }
 
   /** Filter backlog ids down to actually-open items, then mark them done. */
   private closeBacklogIds(agent: LoadedAgent, ids: string[]): void {
@@ -697,21 +785,21 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
       }
     },
 
-    async judge(args: { task: string; criteria: string; reply: string }): Promise<number> {
+    async judge(args: { task: string; criteria: string; reply: string }): Promise<number | JudgeOutcome> {
       const session = await ephemeral(agentStub(), {
         systemPrompt: `You are a strict eval judge. Score 1-5 whether the REPLY handles the TASK according to the CRITERIA. Reply with ONLY the digit.`,
       });
       try {
         await session.prompt(`TASK: ${args.task}\nCRITERIA: ${args.criteria}\nREPLY: ${truncate(args.reply, 4000)}`);
         const merr = sessionError(session);
-        if (merr) return 3;
+        if (merr) return { score: 3, parse: "fallback" as const };
         const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
         const last = [...msgs].reverse().find((m) => m.role === "assistant");
         const text = (last?.content ?? []).filter((b) => b?.type === "text").map((b) => b.text).join(" ");
         const m = text.match(/\b([1-5])\b/);
-        return m ? parseInt(m[1], 10) : 3;
+        return m ? { score: parseInt(m[1], 10), parse: "parsed" as const } : { score: 3, parse: "fallback" as const };
       } catch {
-        return 3;
+        return { score: 3, parse: "fallback" as const };
       } finally {
         try {
           session.dispose();

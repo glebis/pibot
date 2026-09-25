@@ -53,6 +53,27 @@ goal = explicit <goal>                         create collision · probes requir
 | Stagnation | same skill proposed ≥3× in recent events → reject ("try a different improvement") |
 | Risky pattern | auto-promote blocked if content matches `RISKY_PATTERNS` (exec, fetch, eval, child_process, sops, rm -rf, require/import, process.env, prompt-injection) → manual review instead |
 
+## Jev shadow observer (advisory, default off)
+
+The probe/judge boundary additionally feeds an optional Jev observer (`src/core/jev-shadow.ts`,
+bd `pibot-n13`, spec `docs/superpowers/specs/2026-09-25-jev-evolution-shadow-evaluation.md`).
+It is **not** part of the decision path: the engine hands it a bounded snapshot after each probe
+reply exists, never awaits it, and never reads what it returns. Enabling it for an agent requires
+the manifest flag **and** an approved data scope **and** the provider in `providers` — a configured
+gateway key alone is not permission — so in practice it stays off until the owner decides.
+
+| Rule | Where |
+|---|---|
+| Snapshot is bounded and redacted; no skill file, memory, session or owner message | `buildJevShadowInput` |
+| Flag + data scope + provider scope + key, all required | `jevShadowPermitted` |
+| Queued work beyond the bound is dropped, per-agent daily budget, short timeout | `JevShadowObserver` |
+| Records are metadata only (hashes, categories, latency, the old score and its parse provenance) | `JevShadowRecord` |
+| Offline half: independence/provenance checks, blinding, verdicts, report | `src/core/jev-replay.ts` |
+
+The observer is not constructed by the daemon yet: wiring it is a one-line change plus a per-agent
+flag, and the epic's scope excludes live deployment. The current 1–5 judge, the `avg >= 4` rule and
+every gate above remain the only authorities.
+
 ## Code map
 
 | File | Role |

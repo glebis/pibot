@@ -187,7 +187,23 @@ export interface AgentManifest {
   };
   heartbeat?: HeartbeatConfig;
   /** goal-driven skill self-evolution (Hermes-style propose → gate → eval → apply) */
-  evolution?: { enabled?: boolean; interval?: string; model?: string };
+  evolution?: {
+    enabled?: boolean;
+    interval?: string;
+    model?: string;
+    /**
+     * Jev shadow evaluation (bd pibot-n13) — advisory and DEFAULT OFF. Live use
+     * requires this flag AND an approved data scope AND the provider in
+     * `providers`; a configured gateway key alone is not permission. Nothing the
+     * shadow returns can change a score, staging, promotion, announcement or
+     * backlog closure.
+     */
+    shadow?: {
+      enabled?: boolean;
+      dataScope?: "synthetic" | "redacted_approved";
+      providers?: string[];
+    };
+  };
   /** event-log → durable-memory consolidation (Skill Forge blueprint). Evolution
    *  cycles distill events first unless disabled here; the dedicated scheduler
    *  job requires explicit enable. */

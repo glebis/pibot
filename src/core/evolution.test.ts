@@ -6,6 +6,7 @@ import { AgentManager } from "./agent-manager.js";
 import { appendBacklogItems, loadBacklogItems } from "./backlog.js";
 import { applyPatch, containsRiskyPattern, EvolutionEngine, extractRecentProposals, lastProbeScores, validateSkillFile, validateSkillName, type EvolutionIO, type EvolutionProposal } from "./evolution.js";
 import { EventLog } from "./events.js";
+import { JevShadowObserver, type JevShadowRecord } from "./jev-shadow.js";
 import { writeJsonAtomic } from "./util.js";
 
 function tmpDir(): string {
@@ -469,4 +470,174 @@ describe("extractRecentProposals", () => {
     expect(lastProbeScores(empty, "x")).toEqual([]);
   });
 
+});
+
+describe("Jev shadow observer at the probe/judge boundary (bd pibot-n13)", () => {
+  type Harness = {
+    dir: string; agents: AgentManager; events: EventLog; io: EvolutionIO;
+    engine: EvolutionEngine; announced: string[];
+  };
+
+  /** Fresh environment per case so control and shadow runs cannot share staging. */
+  function setup(shadow?: JevShadowObserver, grant = true): Harness {
+    const dir = tmpDir();
+    const agents = new AgentManager(dir, { getModels: () => [] } as never);
+    agents.createAgent("assistant");
+    if (grant) {
+      const agent = agents.getAgent("assistant")!;
+      agent.manifest.evolution = { ...agent.manifest.evolution, shadow: { enabled: true, dataScope: "synthetic", providers: ["typesafe-ai"] } };
+    }
+    const events = new EventLog(dir);
+    const announced: string[] = [];
+    const io: EvolutionIO = {
+      propose: vi.fn(async () => ({
+        mode: "create" as const,
+        skillName: "morning-brief",
+        description: "Use when the user starts the day and wants a briefing.",
+        content: "# Morning brief\n\n## Steps\n- greet\n- list schedule\n",
+        rationale: "keeps mornings smooth",
+        probes: [{ task: "morning brief please", criteria: "short structured brief" }],
+      })),
+      runProbe: vi.fn(async () => "Here is your brief: 1) greet 2) schedule."),
+      judge: vi.fn(async () => 5),
+    };
+    const engine = new EvolutionEngine({
+      agents, modelRuntime: {} as never, events, dataDir: dir,
+      host: { announce: async (id, t) => { announced.push(`${id}:${t}`); } }, io,
+      ...(shadow ? { shadow } : {}),
+    });
+    return { dir, agents, events, io, engine, announced };
+  }
+
+  function shadowWith(evaluate: unknown, over: Partial<ConstructorParameters<typeof JevShadowObserver>[0]> = {}) {
+    const records: JevShadowRecord[] = [];
+    const observer = new JevShadowObserver({ evaluate: evaluate as never, apiKey: "test-key", onRecord: (r) => records.push(r), ...over });
+    return { observer, records };
+  }
+
+  const choice = (c: string) => ({ ok: true as const, elapsedMs: 9, answers: { criteria: { type: "choice" as const, choice: c, probabilities: { [c]: 1, partial: 0, misses_required: 0, unclear: 0 } } } });
+
+  /** The shape of a cycle that the shadow must never be able to alter. */
+  async function outcomeOf(h: Harness) {
+    const report = await h.engine.evolve("assistant");
+    const backlog = loadBacklogItems(path.join(h.dir, "assistant")).map((i) => `${i.summary}:${i.status}`).sort();
+    const staged = [...h.engine.staged("assistant")].sort();
+    return { summary: report.summary, scores: report.scores, staged: report.staged, promoted: report.promoted, backlog, announced: h.announced, stagedNames: staged };
+  }
+
+  it("cannot change the cycle when Jev agrees", async () => {
+    const control = await outcomeOf(setup());
+    const { observer, records } = shadowWith(vi.fn(async () => choice("meets")));
+    const watched = await outcomeOf(setup(observer, true));
+    expect(watched).toEqual(control);
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect(records[0]).toMatchObject({ jevResult: "evaluated", jevCriteria: "meets", oldScore: 5, oldParse: undefined, decision: "promoted" });
+  });
+
+  it("cannot change the cycle when Jev disagrees (misses_required would have held it back)", async () => {
+    const control = await outcomeOf(setup());
+    const { observer, records } = shadowWith(vi.fn(async () => choice("misses_required")));
+    const watched = await outcomeOf(setup(observer, true));
+    expect(watched).toEqual(control);
+    expect(watched.promoted).toBe(true); // the promotion path is untouched
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect(records[0]!.jevCriteria).toBe("misses_required");
+    expect(records[0]!.decision).toBe("promoted");
+  });
+
+  it("cannot change the cycle when the evaluator times out, returns garbage, or denies the request", async () => {
+    const control = await outcomeOf(setup());
+    const cases: Array<[string, unknown]> = [
+      ["timeout", vi.fn(async () => ({ ok: false as const, reason: "timeout" as const, elapsedMs: 4_000 }))],
+      ["invalid output", vi.fn(async () => ({ ok: false as const, reason: "invalid_response" as const, elapsedMs: 3 }))],
+      ["provider denial (thrown)", vi.fn(async () => { throw new Error("403 forbidden"); })],
+      ["provider denial (http)", vi.fn(async () => ({ ok: false as const, reason: "http_error" as const, elapsedMs: 3 }))],
+    ];
+    for (const [label, evaluate] of cases) {
+      const { observer, records } = shadowWith(evaluate);
+      const watched = await outcomeOf(setup(observer, true));
+      expect(watched, label).toEqual(control);
+      await vi.waitFor(() => expect(records, label).toHaveLength(1));
+      expect(records[0]!.jevResult, label).toBe("failed");
+    }
+  });
+
+  it("does not call Jev at all when the agent's flag is off, and the cycle is unchanged", async () => {
+    const control = await outcomeOf(setup());
+    const evaluate = vi.fn(async () => choice("meets"));
+    const { observer, records } = shadowWith(evaluate);
+    const watched = await outcomeOf(setup(observer, false)); // no grant
+    expect(watched).toEqual(control);
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(records[0]).toMatchObject({ jevResult: "not_permitted", jevReason: "flag_off" });
+  });
+
+  it("requires an approved data scope even when the flag is on", async () => {
+    const evaluate = vi.fn(async () => choice("meets"));
+    const { observer, records } = shadowWith(evaluate);
+    const h = setup(observer, true);
+    h.agents.getAgent("assistant")!.manifest.evolution = { shadow: { enabled: true, providers: ["typesafe-ai"] } }; // scope missing
+    await h.engine.evolve("assistant");
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(records[0]).toMatchObject({ jevResult: "not_permitted", jevReason: "scope_not_permitted" });
+  });
+
+  it("keeps backlog closure identical and records it as metadata", async () => {
+    const controlH = setup();
+    appendBacklogItems(path.join(controlH.dir, "assistant"), [{ summary: "top item", source: "chat", priority: "high" }]);
+    const control = await outcomeOf(controlH);
+
+    const { observer, records } = shadowWith(vi.fn(async () => choice("meets")));
+    const shadowH = setup(observer, true);
+    appendBacklogItems(path.join(shadowH.dir, "assistant"), [{ summary: "top item", source: "chat", priority: "high" }]);
+    const watched = await outcomeOf(shadowH);
+
+    expect(watched.backlog).toEqual(control.backlog);
+    expect(watched.backlog).toEqual(["top item:done"]);
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect(records[0]!.decision).toBe("promoted");
+  });
+
+  it("keeps a staged candidate staged — a Jev category is never a promotion", async () => {
+    const { observer, records } = shadowWith(vi.fn(async () => choice("meets")));
+    const h = setup(observer, true);
+    (h.io.judge as ReturnType<typeof vi.fn>).mockResolvedValue(2); // below the 4 threshold
+    const report = await h.engine.evolve("assistant");
+    expect(report.promoted).toBeFalsy();
+    expect(report.staged).toBe(true);
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect(records[0]!.decision).toBe("staged");
+    expect(records[0]!.oldScore).toBe(2);
+    expect(h.announced).toHaveLength(0);
+  });
+
+  it("records the judge parse status when the IO reports its error fallback", async () => {
+    const { observer, records } = shadowWith(vi.fn(async () => choice("unclear")));
+    const h = setup(observer, true);
+    (h.io.judge as ReturnType<typeof vi.fn>).mockResolvedValue({ score: 3, parse: "fallback" });
+    const report = await h.engine.evolve("assistant");
+    expect(report.scores).toEqual([3]); // the score itself is untouched by the metadata
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    expect(records[0]).toMatchObject({ oldScore: 3, oldParse: "fallback" });
+  });
+
+  it("keeps prompts and replies out of the shadow record", async () => {
+    const { observer, records } = shadowWith(vi.fn(async () => choice("meets")));
+    const h = setup(observer, true);
+    (h.io.propose as ReturnType<typeof vi.fn>).mockResolvedValue({
+      mode: "create", skillName: "secret-skill", description: "Use when secrets are requested.",
+      content: "# Secret\n\n## Steps\n- SECRET-BODY\n", rationale: "SECRET-RATIONALE",
+      probes: [{ task: "SECRET-TASK", criteria: "SECRET-CRITERIA" }],
+    });
+    (h.io.runProbe as ReturnType<typeof vi.fn>).mockResolvedValue("SECRET-REPLY");
+    await h.engine.evolve("assistant");
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    const serialized = JSON.stringify(records[0]);
+    for (const secret of ["SECRET-TASK", "SECRET-CRITERIA", "SECRET-REPLY", "SECRET-BODY", "SECRET-RATIONALE"]) {
+      expect(serialized).not.toContain(secret);
+    }
+    expect(records[0]!.candidateHash).toMatch(/^[0-9a-f]{16}$/);
+  });
 });
