@@ -13,6 +13,7 @@ import { ModelCascade } from "./core/cascade.js";
 import { installDiskGuard } from "./core/disk-guard.js";
 import { EvolutionEngine, createLlmEvolutionIO } from "./core/evolution.js";
 import { JevShadowFileStore, JevShadowObserver } from "./core/jev-shadow.js";
+import { createLlmGoalIO } from "./core/goals.js";
 import { ConsolidationEngine, createLlmConsolidationIO } from "./core/consolidation.js";
 import { ProactiveStore } from "./core/proactive-store.js";
 import { CommitmentEngine } from "./core/commitments.js";
@@ -213,8 +214,20 @@ async function main(): Promise<void> {
       ? [new TelegramTransport(telegramToken, allowedChats, { openWhenEmpty: config.telegramOpen, mediaDir, reactions: process.env.PIBOT_REACTIONS !== "0" })]
       : [new CliTransport()];
 
+  // /goal's judge + contract drafting: cheap ephemeral sessions on the first
+  // healthy model of the default agent's chain (same resolution as consolidation).
+  const goalIO = await createLlmGoalIO({
+    modelRuntime,
+    model: (() => {
+      const defaultAgentId = agents.defaultAgentId() ?? config.defaultAgentId ?? "";
+      const chain = cascade.chainFor(agents.getAgent(defaultAgentId)?.manifest ?? {});
+      const spec = cascade.firstHealthy(chain);
+      return spec ? cascade.resolveModel(spec) : undefined;
+    })(),
+  });
+
   const providerManager = new ProviderManager(modelRuntime);
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, commitments, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir) });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, commitments, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir), goalIO });
   diskGuard?.setNotify((text) => void bot.notifyOwnerEvent(text));
 
   await bot.start();

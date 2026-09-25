@@ -2176,3 +2176,131 @@ describe("minimal voice communication", () => {
     expect(styled).toMatch(/full path only when the request explicitly asks/i);
   });
 });
+
+describe("/goal — a bounded autonomy loop", () => {
+  function wire(t: ReturnType<typeof makeBot>, replies: string[] = ["step done"]) {
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    let i = 0;
+    t.promptSpy.mockImplementation(async () => {
+      const text = replies[Math.min(i++, replies.length - 1)];
+      t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text }] }] });
+    });
+  }
+  const last = (t: ReturnType<typeof makeBot>) => t.transport.pushed.at(-1)?.opts.text ?? "";
+  const goalState = (t: ReturnType<typeof makeBot>) => JSON.parse(fs.readFileSync(path.join(t.dir, "state.json"), "utf8")).goals;
+
+  it("sets a goal, persists it, injects it into the prompt, and takes the first step", async () => {
+    const t = makeBot();
+    wire(t);
+    await t.transport.say("/goal research three agent memory systems");
+    expect(t.transport.pushed.some((p) => p.opts.text.match(/🎯 Goal set — research three/))).toBe(true);
+
+    const prompts = t.promptSpy.mock.calls.map((c) => String(c[0]));
+    expect(prompts.some((p) => p.includes("[goal] start:"))).toBe(true);
+    expect(prompts.some((p) => p.includes("[goal] research three agent memory systems") && p.includes("turn 1 of 8"))).toBe(true);
+    expect(goalState(t)["mock:42"]).toMatchObject({ objective: "research three agent memory systems", maxTurns: 8 });
+  });
+
+  it("continues while the judge says continue, and stops when it says done", async () => {
+    const t = makeBot();
+    wire(t);
+    const verdicts = [
+      { verdict: "continue" as const, reason: "next: pricing" },
+      { verdict: "continue" as const, reason: "next: latency" },
+      { verdict: "done" as const, reason: "all three compared with sources" },
+    ];
+    let judged = 0;
+    (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = {
+      draftContract: async () => null,
+      judge: async () => verdicts[Math.min(judged++, verdicts.length - 1)],
+    };
+    await t.transport.say("/goal compare three memory systems");
+    // the chain runs to completion inside the awaited command, so the counts are settled
+    const prompts = t.promptSpy.mock.calls.map((c) => String(c[0]));
+    expect(prompts.filter((p) => p.includes("[goal] keep going")).length).toBe(2);
+    expect(goalState(t)["mock:42"].status).toBe("done");
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal complete"))).toBe(true);
+  });
+
+  it("stops at the turn budget even if the judge never says done", async () => {
+    const t = makeBot();
+    wire(t);
+    (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = {
+      draftContract: async () => null,
+      judge: async () => ({ verdict: "continue" as const, reason: "still going" }),
+    };
+    await t.transport.say("/goal an endless goal");
+    const prompts = t.promptSpy.mock.calls.map((c) => String(c[0]));
+    // the kick-off turn plus (maxTurns - 1) continuations, then the budget stops it
+    expect(prompts.filter((p) => p.includes("[goal] keep going")).length).toBe(7);
+    expect(goalState(t)["mock:42"].turnsUsed).toBe(8);
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("budget spent"))).toBe(true);
+  });
+
+  it("auto-pauses when the judge cannot be understood, instead of burning the budget", async () => {
+    const t = makeBot();
+    wire(t);
+    (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = { draftContract: async () => null, judge: async () => null };
+    await t.transport.say("/goal something vague");
+    // three unreadable verdicts auto-pause it; it must not run the full budget
+    const prompts = t.promptSpy.mock.calls.map((c) => String(c[0]));
+    expect(prompts.filter((p) => p.includes("[goal] keep going")).length).toBe(2);
+    expect(goalState(t)["mock:42"]).toMatchObject({ parseFailures: 3, status: "paused" });
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal paused"))).toBe(true);
+  });
+
+  it("pause stops the loop, resume restarts it, clear forgets it", async () => {
+    const t = makeBot();
+    wire(t);
+    const judge = vi.fn(async () => ({ verdict: "continue" as const, reason: "next" }));
+    (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = { draftContract: async () => null, judge };
+    await t.transport.say("/goal one");
+    await t.transport.say("/goal pause");
+    expect(last(t)).toMatch(/🎯 \*\*paused\*\*/);
+    const before = judge.mock.calls.length;
+    await t.bot.promptAgent(t.transport, "42", "assistant", "an unrelated message");
+    expect(judge.mock.calls.length).toBe(before); // no judge call while paused
+
+    await t.transport.say("/goal resume");
+    expect(goalState(t)["mock:42"].status).toBe("active");
+    await t.transport.say("/goal clear");
+    expect(goalState(t)["mock:42"]).toBeUndefined();
+  });
+
+  it("a newer message from the owner steers instead of being looped over", async () => {
+    const t = makeBot();
+    wire(t);
+    (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = {
+      draftContract: async () => null,
+      judge: async () => ({ verdict: "continue" as const, reason: "next" }),
+    };
+    await t.transport.say("/goal one");
+    const afterGoal = t.promptSpy.mock.calls.length;
+    // the owner speaks again: THEIR message is the next step (steering by ordering),
+    // and the goal survives rather than dying whenever the owner says anything
+    await t.transport.say("actually focus on pricing first");
+    const prompts = t.promptSpy.mock.calls.slice(afterGoal).map((c) => String(c[0]));
+    expect(prompts.some((p) => p.includes("actually focus on pricing"))).toBe(true);
+    expect(goalState(t)["mock:42"].status).toBe("active");
+  });
+
+  it("/goal sub adds a criterion the judge and the next prompt both see", async () => {
+    const t = makeBot();
+    wire(t);
+    const seen: string[] = [];
+    (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = {
+      draftContract: async () => null,
+      judge: async (state: { subgoals: string[] }) => {
+        seen.push(...state.subgoals);
+        // "wait" keeps the goal active without spending the rest of the budget here
+        return { verdict: "wait" as const, reason: "needs the owner" };
+      },
+    };
+    await t.transport.say("/goal a comparison");
+    await t.transport.say("/goal sub include pricing");
+    expect(last(t)).toMatch(/Added criterion 1: include pricing/);
+    await t.bot.promptAgent(t.transport, "42", "assistant", "keep going");
+    expect(seen).toContain("include pricing");
+  });
+});

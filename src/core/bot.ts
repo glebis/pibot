@@ -28,6 +28,10 @@ import { getMediaLinkKey, mediaBase, mediaLinkUrl, stashForLink } from "./media-
 import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { applyVoiceStyle, isOperationalNotice, requestsFullPath, VOICE_STYLE_DIRECTIVE } from "./voice-style.js";
+import {
+  advanceGoal, newGoal, renderGoalBlock, renderGoalStatus, shouldContinue,
+  type GoalIO, type GoalState,
+} from "./goals.js";
 import { classifyModelError, ModelCascade, specProvider } from "./cascade.js";
 import type { ModelErrorClass } from "./cascade.js";
 import type { ConsolidationEngine } from "./consolidation.js";
@@ -49,6 +53,8 @@ export interface PersistedBotState {
   agentChats?: Record<string, string[]>;
   /** chatKey → minimal-voice override (/minimal on|off); absent = follow the agent's manifest */
   minimalChats?: Record<string, boolean>;
+  /** chatKey → the active /goal (objective, contract, budget, judge history) */
+  goals?: Record<string, GoalState>;
   /** agentId → timestamp (ms) the pending request was armed at */
   pendingSubBots?: Record<string, number>;
   /** agentId → managed-bot user id, learned from the failed wiring's managed_bot
@@ -81,6 +87,10 @@ export class PiBot implements HeartbeatHost {
   private minimalChats = new Map<string, boolean>();
   /** chatKey → the in-flight turn explicitly asked for a path, so don't shorten them. */
   private wantsFullPath = new Map<string, boolean>();
+  /** chatKey → the active goal. In memory + state.json; the loop is bounded by its own budget. */
+  private goals = new Map<string, GoalState>();
+  /** chatKey → when the owner last spoke, so their newer message steers instead of being looped over */
+  private ownerSpokeAt = new Map<string, number>();
   private agentChats = new Map<string, Set<string>>(); // agentId → chatKeys
   private wizardChats = new Set<string>(); // chats running /newagent interview
   private commandHandler: ((t: Transport, chatId: string, text: string) => Promise<void>) | null = null;
@@ -155,6 +165,9 @@ export class PiBot implements HeartbeatHost {
       runBd?: (args: string[]) => Promise<string>;
       /** local media probing/extraction and private cleanup */
       audioMedia?: AudioMediaProcessor;
+      /** /goal's two model calls (draft a contract, judge a completed turn).
+       *  Absent = goals can be set and driven manually, but never auto-judged. */
+      goalIO?: GoalIO;
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
@@ -268,6 +281,7 @@ export class PiBot implements HeartbeatHost {
     for (const [ck, agentId] of Object.entries(state.chats ?? {})) this.chatAgent.set(ck, agentId);
     for (const [agentId, cks] of Object.entries(state.agentChats ?? {})) this.agentChats.set(agentId, new Set(cks));
     for (const [ck, on] of Object.entries(state.minimalChats ?? {})) this.minimalChats.set(ck, on === true);
+    for (const [ck, goal] of Object.entries(state.goals ?? {})) if (goal?.objective) this.goals.set(ck, goal);
     this.reconcileChatMemories();
 
     // restore pending sub-bot creation requests (TTL-pruned) so a token
@@ -577,7 +591,9 @@ export class PiBot implements HeartbeatHost {
     for (const [k, botId] of this.pendingSubBotIds) if (this.pendingSubBots.has(k)) pendingSubBotIds[k] = botId;
     const minimalChats: Record<string, boolean> = {};
     for (const [k, v] of this.minimalChats) minimalChats[k] = v;
-    writeJsonAtomic(this.statePath, { chats, agentChats, minimalChats, pendingSubBots, pendingSubBotIds } as PersistedBotState);
+    const goals: Record<string, GoalState> = {};
+    for (const [k, v] of this.goals) goals[k] = v;
+    writeJsonAtomic(this.statePath, { chats, agentChats, minimalChats, goals, pendingSubBots, pendingSubBotIds } as PersistedBotState);
   }
 
   /** Arm a pending sub-bot creation for agentId (durable across restarts). */
@@ -776,6 +792,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       return;
     }
     this.lastUserMessage.set(agentId, Date.now());
+    this.ownerSpokeAt.set(this.chatKey(t, chatId), Date.now());
     this.deps.heartbeat.noteUserMessage?.(agentId);
     await this.promptAgent(t, chatId, agentId, text, { reply, incomingMessageId });
   }
@@ -926,9 +943,17 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       // full path then, and the filter must not undo it
       if (requestsFullPath(text)) this.wantsFullPath.set(ck, true);
       else this.wantsFullPath.delete(ck);
-      const styled = this.minimalVoice(agentId, ck) ? `${text}\n\n${VOICE_STYLE_DIRECTIVE}` : text;
+      let styled = this.minimalVoice(agentId, ck) ? `${text}\n\n${VOICE_STYLE_DIRECTIVE}` : text;
+      // an active goal rides every turn (suffix: internal-prefix detection looks at the start)
+      const activeGoal = this.goals.get(ck);
+      if (activeGoal && activeGoal.status === "active") styled = `${styled}\n\n${renderGoalBlock(activeGoal)}`;
       // followUp: concurrent messages queue behind the running turn instead of erroring
       await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, styled), opts.recoveringDeadLetter ?? false);
+      // The goal loop: every turn that is genuinely about this chat gets judged —
+      // owner turns and the loop's own continuations, never scheduler/heartbeat/handoff
+      // traffic. Recursion IS the loop and is bounded by the goal's own turn budget.
+      const drivesGoal = !["[scheduler]", "[heartbeat]", "[handoff from", "[cascade-recover]"].some((p) => styled.startsWith(p));
+      if (drivesGoal) await this.continueGoal(t, chatId, agentId, ck, session);
       // implicit task acks: when this agent just accepted/declined/completed a task
       // handed to it in its chat (owner assignments), surface a passive line
       if (opts.taskAckFrom !== null) {
@@ -1432,8 +1457,138 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     // command deps (which have no access to the bot's chat→policy maps).
     const minimal = /^\/minimal(?:\s+(\S+))?$/i.exec(text.trim());
     if (minimal) return this.commandMinimal(t, chatId, minimal[1]);
+    const goal = /^\/goal(?:\s+([\s\S]*))?$/i.exec(text.trim());
+    if (goal) return this.commandGoal(t, chatId, (goal[1] ?? "").trim());
     this.commandHandler ??= createCommandHandler(this.commandContext());
     return this.commandHandler(t, chatId, text);
+  }
+
+  /**
+   * /goal — set and drive a bounded goal loop for this chat.
+   *   /goal <objective>        set it (contract optional; /goal draft writes one)
+   *   /goal draft <objective>  have the model write a completion contract
+   *   /goal / status           show objective, contract, progress, last verdict
+   *   /goal sub <criterion>    add a criterion the judge must consider
+   *   /goal max <n>            change the turn budget
+   *   /goal pause|resume|clear|done
+   */
+  private async commandGoal(t: Transport, chatId: string, arg: string): Promise<void> {
+    const ck = this.chatKey(t, chatId);
+    const agentId = this.currentAgent(ck) ?? "";
+    const [verb = "", ...rest] = arg.split(/\s+/);
+    const tail = rest.join(" ").trim();
+    const lower = verb.toLowerCase();
+    const current = this.goals.get(ck);
+
+    if (!arg || lower === "status" || lower === "show") {
+      await t.push(chatId, { text: renderGoalStatus(current) });
+      return;
+    }
+    if (lower === "clear") {
+      this.goals.delete(ck);
+      this.persistState();
+      await t.push(chatId, { text: "🎯 Goal cleared." });
+      return;
+    }
+    if (lower === "pause" || lower === "resume" || lower === "done") {
+      if (!current) return void (await t.push(chatId, { text: "No goal set." }));
+      const status = lower === "pause" ? "paused" : lower === "resume" ? "active" : "done";
+      this.goals.set(ck, { ...current, status });
+      this.persistState();
+      this.deps.events.log(agentId, "system", `goal ${status}: ${current.objective}`.slice(0, 200));
+      await t.push(chatId, { text: renderGoalStatus(this.goals.get(ck)) });
+      return;
+    }
+    if (lower === "sub" || lower === "subgoal") {
+      if (!current) return void (await t.push(chatId, { text: "No goal set — /goal <objective> first." }));
+      if (!tail) return void (await t.push(chatId, { text: "Usage: /goal sub <criterion>" }));
+      this.goals.set(ck, { ...current, subgoals: [...current.subgoals, tail] });
+      this.persistState();
+      await t.push(chatId, { text: `🎯 Added criterion ${current.subgoals.length + 1}: ${tail}` });
+      return;
+    }
+    if (lower === "max") {
+      if (!current) return void (await t.push(chatId, { text: "No goal set." }));
+      const n = parseInt(tail, 10);
+      if (!Number.isFinite(n)) return void (await t.push(chatId, { text: "Usage: /goal max <turns>" }));
+      this.goals.set(ck, { ...current, maxTurns: Math.max(1, Math.min(n, 50)) });
+      this.persistState();
+      await t.push(chatId, { text: renderGoalStatus(this.goals.get(ck)) });
+      return;
+    }
+
+    // setting a goal: "/goal draft <objective>" or "/goal <objective>"
+    const drafting = lower === "draft";
+    const objective = drafting ? tail : arg;
+    if (!objective) return void (await t.push(chatId, { text: "Usage: /goal <objective>  ·  /goal draft <objective>  ·  /goal status" }));
+
+    let contract = current?.objective === objective ? current.contract : {};
+    if (drafting && this.deps.goalIO) {
+      await t.setTyping?.(chatId, true);
+      try {
+        const drafted = await this.deps.goalIO.draftContract(objective);
+        if (drafted) contract = drafted;
+      } finally {
+        t.setTyping?.(chatId, false);
+      }
+    }
+    const goal = newGoal(objective, { contract, now: Date.now() });
+    this.goals.set(ck, goal);
+    this.persistState();
+    this.deps.events.log(agentId, "system", `goal set (${goal.maxTurns} turns${contract.outcome ? ", contract" : ""}): ${objective.slice(0, 140)}`);
+    await t.push(chatId, {
+      text:
+        `🎯 Goal set — ${objective}\n` +
+        (contract.outcome ? `outcome: ${contract.outcome}\n` : drafting ? "contract: could not be drafted — run with a plainer objective or set it directly\n" : "") +
+        `budget: ${goal.maxTurns} turns · /goal pause stops it · /goal status to check in`,
+    });
+    // kick the first step immediately so the owner sees motion
+    await this.promptAgent(t, chatId, agentId, `[goal] start: ${objective}`, { taskAckFrom: null });
+  }
+
+  /**
+   * The loop. One judged step per completed turn: `continue` re-prompts, `done`
+   * finishes, `wait` parks. Bounded by the goal's own turn budget, stopped by a
+   * newer owner message (their turn is the steering), deferred while snoozed, and
+   * auto-paused when the judge cannot be understood — an autonomous loop is the
+   * one feature that can spend money while nobody is watching.
+   */
+  private async continueGoal(t: Transport, chatId: string, agentId: string, ck: string, session: AgentSession): Promise<void> {
+    const goal = this.goals.get(ck);
+    if (!goal) return;
+    const sn = this.deps.scheduler.snoozeState?.(agentId);
+    const sneezed = Boolean(sn && (sn as { until?: number }).until && (sn as { until: number }).until > Date.now());
+    const decision = shouldContinue(goal, { snoozed: sneezed, lastOwnerMessageAt: this.ownerSpokeAt.get(ck) });
+    if (!decision.continue) {
+      if (goal.status === "active" && decision.reason !== "no_new_work") {
+        this.deps.events.log(agentId, "system", `goal loop held: ${decision.reason} (${goal.turnsUsed}/${goal.maxTurns})`);
+      }
+      return;
+    }
+    const reply = extractAssistantTextFromSession(session) ?? "";
+    const judged = this.deps.goalIO ? await this.deps.goalIO.judge(goal, reply) : null;
+    const next = advanceGoal(goal, judged, Date.now());
+    this.goals.set(ck, next);
+    this.persistState();
+    this.deps.events.log(agentId, "system", `goal turn ${next.turnsUsed}/${next.maxTurns}: ${next.lastVerdict ?? "unreadable"}${next.lastReason ? ` — ${next.lastReason}` : ""}`.slice(0, 220));
+
+    if (next.status === "done") {
+      await t.push(chatId, { text: `🎯 Goal complete — ${next.objective}${next.lastReason ? `\n${next.lastReason}` : ""}` });
+      return;
+    }
+    if (next.status === "paused") {
+      await t.push(chatId, { text: `⏸ Goal paused — ${next.lastReason ?? "the judge reply could not be read"}. /goal resume to continue.` });
+      return;
+    }
+    if (next.turnsUsed >= next.maxTurns) {
+      await t.push(chatId, { text: `🎯 Goal budget spent (${next.maxTurns} turns) — ${next.objective}. /goal max <n> to extend, or /goal done.` });
+      return;
+    }
+    if (judged?.verdict === "wait") {
+      await t.push(chatId, { text: `⏳ Goal waiting on something external — ${judged.reason}\n/goal resume when that clears.` });
+      return;
+    }
+    await this.promptAgent(t, chatId, agentId, `[goal] keep going: ${next.objective}`, { taskAckFrom: null });
   }
 
   /** /minimal [on|off|status] — minimal voice communication for this chat. */
