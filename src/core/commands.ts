@@ -30,6 +30,7 @@ const HELP = [
   `/consolidate [status] — distill the event log into durable memory`,
   `/status — what's running`,
   `/minimal on|off — minimal voice: terse, speakable replies (no URLs, code, paths)`,
+  `/goal <objective> — a bounded goal the agent works until a judge sees it done  ·  /goal draft, /goal status, /goal pause`,
 ].join("\n");
 
 /** The 3-button accept/reject/peek card for a staged candidate's review token. */

@@ -2225,7 +2225,11 @@ describe("/goal — a bounded autonomy loop", () => {
 
   it("stops at the turn budget even if the judge never says done", async () => {
     const t = makeBot();
-    wire(t);
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementation(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "step done" }] }] });
+    });
     (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = {
       draftContract: async () => null,
       judge: async () => ({ verdict: "continue" as const, reason: "still going" }),
@@ -2240,7 +2244,11 @@ describe("/goal — a bounded autonomy loop", () => {
 
   it("auto-pauses when the judge cannot be understood, instead of burning the budget", async () => {
     const t = makeBot();
-    wire(t);
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementation(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "step done" }] }] });
+    });
     (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = { draftContract: async () => null, judge: async () => null };
     await t.transport.say("/goal something vague");
     // three unreadable verdicts auto-pause it; it must not run the full budget
@@ -2270,7 +2278,11 @@ describe("/goal — a bounded autonomy loop", () => {
 
   it("a newer message from the owner steers instead of being looped over", async () => {
     const t = makeBot();
-    wire(t);
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementation(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "step done" }] }] });
+    });
     (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = {
       draftContract: async () => null,
       judge: async () => ({ verdict: "continue" as const, reason: "next" }),
@@ -2302,5 +2314,31 @@ describe("/goal — a bounded autonomy loop", () => {
     expect(last(t)).toMatch(/Added criterion 1: include pricing/);
     await t.bot.promptAgent(t.transport, "42", "assistant", "keep going");
     expect(seen).toContain("include pricing");
+  });
+});
+
+describe("/goal audit follow-ups", () => {
+  it("parks the goal loudly when a judged continuation throws (never a silent stall)", async () => {
+    const t = makeBot();
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementation(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "step done" }] }] });
+    });
+    (t.bot as unknown as { deps: { goalIO: unknown } }).deps.goalIO = {
+      draftContract: async () => null,
+      // any throw inside the loop — including a cascade exhaustion on a [goal] turn —
+      // must park the goal loudly rather than stall it with no judge and no notice
+      judge: async () => {
+        throw new Error("no permitted model available for assistant");
+      },
+    };
+    await t.transport.say("/goal something that cannot run");
+
+    const state = JSON.parse(fs.readFileSync(path.join(t.dir, "state.json"), "utf8")).goals["mock:42"];
+    expect(state.status).toBe("paused");
+    expect(state.lastReason).toMatch(/auto-paused/);
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal paused"))).toBe(true);
+    expect(t.events.log).toHaveBeenCalledWith("assistant", "system", expect.stringContaining("goal loop could not continue"));
   });
 });

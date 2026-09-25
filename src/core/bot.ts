@@ -953,7 +953,25 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       // owner turns and the loop's own continuations, never scheduler/heartbeat/handoff
       // traffic. Recursion IS the loop and is bounded by the goal's own turn budget.
       const drivesGoal = !["[scheduler]", "[heartbeat]", "[handoff from", "[cascade-recover]"].some((p) => styled.startsWith(p));
-      if (drivesGoal) await this.continueGoal(t, chatId, agentId, ck, session);
+      if (drivesGoal) {
+        // A [goal] continuation that exhausts the cascade THROWS ("internal prompt
+        // dropped, will re-fire") — but nothing re-fires a goal turn, so without this
+        // the goal stalled silently: no judge, no notice, no event. Park it loudly
+        // instead, which is the whole lesson of this codebase's silent-failure work.
+        try {
+          await this.continueGoal(t, chatId, agentId, ck, session);
+        } catch (e) {
+          const goal = this.goals.get(ck);
+          if (goal?.status === "active") {
+            this.goals.set(ck, { ...goal, status: "paused", lastReason: `auto-paused: ${errorMessage(e).slice(0, 120)}` });
+            this.persistState();
+            this.deps.events.log(agentId, "system", `goal loop could not continue (${errorMessage(e).slice(0, 120)}) — goal paused`);
+            await t.push(chatId, {
+              text: `⏸ Goal paused — the agent couldn't reach any model just now. Your goal is kept: /goal resume when a model is back.`,
+            }).catch(() => {});
+          }
+        }
+      }
       // implicit task acks: when this agent just accepted/declined/completed a task
       // handed to it in its chat (owner assignments), surface a passive line
       if (opts.taskAckFrom !== null) {

@@ -68,6 +68,7 @@ const BOT_COMMANDS = [
   { command: "help", description: "What pibot can do" },
   { command: "status", description: "Rhythm, snooze, next item" },
   { command: "minimal", description: "Minimal voice replies: /minimal on" },
+  { command: "goal", description: "Set a goal: /goal <objective>" },
   { command: "agents", description: "List your agents" },
   { command: "new", description: "Fresh session for the current agent" },
   { command: "agent", description: "Switch agent: /agent coach" },
