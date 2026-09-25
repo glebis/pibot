@@ -46,7 +46,10 @@ describe("the optional, configurable switch", () => {
     expect(jevGoalPermitted({ judge: "jev" }, { enabled: false, apiKey: "k" })).toEqual({ ok: false, reason: "flag_off" });
     expect(jevGoalPermitted({ judge: "jev", providers: ["typesafe-ai"] }, ask)).toEqual({ ok: false, reason: "scope_not_permitted" });
     expect(jevGoalPermitted({ judge: "jev", dataScope: "synthetic", providers: ["openai"] }, ask)).toEqual({ ok: false, reason: "provider_not_permitted" });
-    expect(jevGoalPermitted({ judge: "jev", dataScope: "synthetic", providers: ["typesafe-ai"] }, { enabled: true })).toEqual({ ok: false, reason: "missing_key" });
+    // inject the absence explicitly: reading the ambient env made this test pass in a
+    // shell (no key) and fail inside the daemon, which injects AI_GATEWAY_API_KEY from
+    // the encrypted store — an environment-dependent check, not a property of the code
+    expect(jevGoalPermitted({ judge: "jev", dataScope: "synthetic", providers: ["typesafe-ai"] }, { enabled: true, apiKey: "" })).toEqual({ ok: false, reason: "missing_key" });
     expect(jevGoalPermitted({ judge: "jev", dataScope: "synthetic", providers: ["typesafe-ai"] }, ask)).toEqual({ ok: true });
   });
 });
