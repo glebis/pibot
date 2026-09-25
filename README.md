@@ -1,5 +1,7 @@
 # pibot
 
+Notable changes: [CHANGELOG.md](CHANGELOG.md).
+
 Personal agent companions built on the [pi SDK](https://github.com/badlogic/pi-mono). Chat with agents over Telegram (or a local CLI); every agent has its own plugin system, memory, calendar awareness, a scheduling heartbeat, and goal-driven skill self-evolution.
 
 ## Design in one paragraph
@@ -45,7 +47,7 @@ AI_GATEWAY_API_KEY=<Vercel AI Gateway key>
 
 The feature defaults off. Focus text is capped at 500 characters. Use only public source descriptions that you are comfortable sending to the Gateway and TypeSafe AI; do not put private vault notes, credentials, or signed URLs into the focus statement. Missing focus, insufficient description, blocked sources, invalid local paths, malformed model replies, timeouts, and weak choice probabilities yield `review_needed`. A probability threshold of 0.75 is provisional and needs evaluation on owner-labeled links before it guides any action. The event log records only outcome categories and timings, not source content or URLs.
 
-PiBot currently has no typed scraper-completion event: scraping is agent-directed and its saved materials vary in format. The tool call is therefore an explicit post-save step, not an automatic hook. A future deterministic completion event would let the same evaluator run automatically. The reusable `jev-evaluator` supports bounded Boolean, Choice, and Score questions for later experiments in routing, pre-action review, post-action verification, heartbeat novelty, skill evaluation, and context selection; those hooks are not enabled here.
+PiBot currently has no typed scraper-completion event: scraping is agent-directed and its saved materials vary in format. The tool call is therefore an explicit post-save step, not an automatic hook. A future deterministic completion event would let the same evaluator run automatically. The reusable `jev-evaluator` supports bounded Boolean, Choice, and Score questions for later experiments in routing, pre-action review, post-action verification, heartbeat novelty, skill evaluation, and context selection. Two of those hooks now ship: the advisory **skill-evolution shadow observer** (see *Self-evolution*) and the **optional `/goal` judge** (see *Goals*), both default-off, both behind a per-agent grant plus a daemon switch, and neither able to change a decision while in shadow mode.
 
 The `herdr` capability (requires the `herdr` CLI and a running herdr instance) lets an agent run subagents in new tabs of the owner's herdr UI: `herdr_dispatch` spawns claude/codex/pi/opencode in a fresh tab with a self-contained brief, waits for `done`, and returns the transcript (`--detach` returns immediately; `herdr_read` and `herdr_wait` observe the pane afterwards). The target workspace resolves from the invoking herdr pane, `$PIBOT_HERDR_WORKSPACE`, or an explicit `workspace` argument; briefs are passed as temp files and never carry secrets.
 
@@ -92,11 +94,23 @@ Outgoing speech is local-only and opt-in per agent. Add `speech` to that agent's
 
 Speech is never generated or sent automatically, and it has no heartbeat, scheduler, replay, or automatic reply-conversion hook. No external TTS provider or credential is included in this foundation.
 
+### Minimal voice communication (`/minimal`)
+
+A per-chat mode for replies meant to be *listened to*. Off by default; turn it on per chat with `/minimal on`, back to the agent's manifest default with `/minimal default`, and `/minimal` reports both the state and where it came from.
+
+Two mechanisms, because they do different jobs. A prompt-side directive asks the model for speakable output (≤4 short sentences, no URLs/code/markdown/hashes/model names, a file by name rather than by path). A deterministic filter then guarantees what *leaves*: URLs dropped, markdown links keep their label, code fences keep their words, headings/bullets/quotes/emoji/hashes stripped, provider specs dropped, and paths shortened to the file name. Paths survive in full only when the request explicitly asked for one (full/exact path, which file, where is, путь) — remembered for that turn and cleared after it. Line breaks collapse, because speech has none.
+
+- **The cap applies to spoken output** (4 sentences / 400 characters, cut at a sentence boundary); text replies lose the technical detail but keep their length.
+- **Operational notices are exempt** (`⚠️ 🪫 🔑 ⛔️`): a mode that hid "your message was queued" would recreate exactly the silence the rest of this codebase works to avoid.
+- **It never empties a reply**: if the cap or the filter would leave nothing, the stripped text is sent uncapped.
+- Voice styling happens **before synthesis**, so the audio itself is minimal rather than just its caption.
+- Per-agent default: `speech.minimal: true` in `agent.json`. Per-chat `/minimal` always wins.
+
 The dashboard provides:
 agent CRUD, manifest editor (model/heartbeat/evolution/quiet hours), persona + memory editors,
 schedule table with cancel, snooze/wake, staged-skill review (promote/reject), run-evolution, event tail.
 
-Chat commands: `/help` `/agents` `/agent <name>` `/newagent <name> <persona>` `/handoff <agent> [note]` `/schedules` `/snooze 2h` `/wake` `/status` `/skills` `/evolve [goal]` `/evolve status|promote|reject`
+Chat commands: `/help` `/agents` `/agent <name>` `/newagent <name> <persona>` `/handoff <agent> [note]` `/schedules` `/snooze 2h` `/wake` `/status` `/skills` `/minimal on|off|default` `/goal …` `/evolve [goal]` `/evolve status|promote|reject`
 
 ### Handoff between agents
 
@@ -150,6 +164,41 @@ collect (events + persona + skills) → propose (cheap model)
 - **Manual**: `/evolve [goal]` runs a cycle now; `npm run evolve -- assistant "get better at morning briefings"`.
 - **Staging workflow**: `/evolve status` → `/evolve promote <name>` / `/evolve reject <name>`. Probes below 4 avg never auto-apply.
 - **Agents evolve themselves mid-chat** too: `skill_save` / `skill_patch` / `skill_list` (Hermes `skill_manage` style) after non-trivial workflows.
+
+## Goals (`/goal`)
+
+A bounded autonomy loop for work that takes more than one turn: the agent keeps going until a judge sees the goal *done*, and stops itself when it should. Set with `/goal <objective>` or `/goal draft <objective>` (a model expands the objective into a completion contract); `/goal`, `/goal sub <criterion>`, `/goal max <n>`, `/goal pause`, `/goal resume`, `/goal done`, `/goal clear` manage it. State is per chat and survives restarts.
+
+```
+/goal draft <objective>
+  → contract: outcome / verification / constraints / boundaries / stop_when
+  → each turn: the [goal] block rides the prompt (objective, contract, criteria, turn N/M)
+  → after the turn: a judge returns done | continue | wait
+       done     → announce completion and stop
+       continue → re-prompt for the next step (bounded)
+       wait     → park until something external changes
+```
+
+- **Bounds are the design, not a footnote**: default 8 turns (max 50 via `/goal max`), auto-pause after three unreadable judge replies, no second auto-turn in the same instant, a deferral while the agent is snoozed, and — per the owner's decision — a newer message from the owner *steers* rather than pauses: their turn is the next step and the loop resumes from it.
+- **A goal's creation is its first turn boundary**, so the message that set the goal cannot veto the loop it started.
+- **A judged continuation that throws parks loudly** — status paused, an event with the error, and an owner-visible `/goal resume` prompt — instead of stalling silently.
+- **The loop only judges chat-relevant turns**: owner turns and its own `[goal]` continuations, never scheduler, heartbeat, or handoff traffic.
+
+### Judging: local, Jev, or shadow
+
+The judge is one seam and three options, chosen per agent and gated by a daemon switch — default is local, with no external call:
+
+| `PIBOT_GOAL_JUDGE` | Behaviour |
+|---|---|
+| `off` (default) | local ephemeral judge only |
+| `shadow` | local is **authoritative**; Jev runs alongside and the two verdicts are logged as metadata |
+| `jev` | Jev judges (typed choice + two booleans); local is the fallback |
+
+To opt an agent in, its manifest carries `goal: { judge: "jev", dataScope: "redacted_approved", providers: ["typesafe-ai"] }` — a per-agent grant **and** the daemon switch, so a config change alone cannot start sending goal text off the machine. The goal objective and the agent's reply travel bounded and redacted, framed as untrusted data.
+
+Jev answers three typed questions: the verdict (`done`/`continue`/`wait`/`unclear`), whether the contract's stated **verification is visible in the reply**, and whether progress is externally blocked. Two rules make it stricter than a freeform judge, and both come from observed failures: a `done` whose verification is not visible is downgraded to `continue`, and a `done` below 0.6 confidence is refused as a verdict rather than finishing a goal on a coin flip. Every failure — timeout, invalid response, oversize state, provider denial — is typed, logged with its cause, and falls back to the local judge; an unavailable evaluator can never look like a verdict.
+
+`draftContract` always stays local: Jev is a judge, not a generator.
 
 ## Architecture
 
@@ -240,6 +289,8 @@ npx tsx scripts/telegram-live-test.mts                                  # full: 
 - Missing vars (`TELEGRAM_LIVE_TEST_TOKEN`, `TELEGRAM_LIVE_TEST_CHAT_ID`) are **requested via an AppleScript dialog** — hidden input for the token; plain input with the production allowlist id pre-filled for the chat id — and persisted to `data/telegram-test.env` (0600, gitignored): set once, prompted never again. `--no-prompt` disables the dialog. One-time prerequisites: a **test bot** via BotFather (never reuse the production token), `/start`-ed once from your account. The DM chat target is derived from the token itself, so `--chat` is unnecessary in spawn mode.
 
 ## Roadmap
+
+Shipped changes are recorded in [CHANGELOG.md](CHANGELOG.md); the items below are still open.
 
 - Skill Forge pattern-mining beyond the event log: mine session transcripts and staged-skill outcomes (the event-log distillation foundation ships in `consolidation.ts`)
 - Multi-strategy mutation archive (compress/quality/radical, from `@artale/pi-evolve`)
