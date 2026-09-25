@@ -27,6 +27,7 @@ import { applyCorrections, composeBias, loadDictionary } from "./dictionary.js";
 import { getMediaLinkKey, mediaBase, mediaLinkUrl, stashForLink } from "./media-links.js";
 import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
+import { applyVoiceStyle, isOperationalNotice, VOICE_STYLE_DIRECTIVE } from "./voice-style.js";
 import { classifyModelError, ModelCascade, specProvider } from "./cascade.js";
 import type { ModelErrorClass } from "./cascade.js";
 import type { ConsolidationEngine } from "./consolidation.js";
@@ -46,6 +47,8 @@ const SUBBOT_PROBE_EVERY_MS = 90e3;
 export interface PersistedBotState {
   chats?: Record<string, string>;
   agentChats?: Record<string, string[]>;
+  /** chatKey → minimal-voice override (/minimal on|off); absent = follow the agent's manifest */
+  minimalChats?: Record<string, boolean>;
   /** agentId → timestamp (ms) the pending request was armed at */
   pendingSubBots?: Record<string, number>;
   /** agentId → managed-bot user id, learned from the failed wiring's managed_bot
@@ -74,6 +77,8 @@ export class PiBot implements HeartbeatHost {
   /** agent::chat → identity of the turn currently running (see PushOptions.dedupeKey) */
   private turnKeys = new Map<string, string>();
   private chatAgent = new Map<string, string>(); // chatKey → agentId
+  /** chatKey → /minimal override. The manifest sets the agent default; this wins per chat. */
+  private minimalChats = new Map<string, boolean>();
   private agentChats = new Map<string, Set<string>>(); // agentId → chatKeys
   private wizardChats = new Set<string>(); // chats running /newagent interview
   private commandHandler: ((t: Transport, chatId: string, text: string) => Promise<void>) | null = null;
@@ -260,6 +265,7 @@ export class PiBot implements HeartbeatHost {
     const state = readJson<PersistedBotState>(this.statePath, {});
     for (const [ck, agentId] of Object.entries(state.chats ?? {})) this.chatAgent.set(ck, agentId);
     for (const [agentId, cks] of Object.entries(state.agentChats ?? {})) this.agentChats.set(agentId, new Set(cks));
+    for (const [ck, on] of Object.entries(state.minimalChats ?? {})) this.minimalChats.set(ck, on === true);
     this.reconcileChatMemories();
 
     // restore pending sub-bot creation requests (TTL-pruned) so a token
@@ -567,7 +573,9 @@ export class PiBot implements HeartbeatHost {
     for (const [k, ts] of this.pendingSubBotsArmed) pendingSubBots[k] = ts;
     const pendingSubBotIds: Record<string, number> = {};
     for (const [k, botId] of this.pendingSubBotIds) if (this.pendingSubBots.has(k)) pendingSubBotIds[k] = botId;
-    writeJsonAtomic(this.statePath, { chats, agentChats, pendingSubBots, pendingSubBotIds } as PersistedBotState);
+    const minimalChats: Record<string, boolean> = {};
+    for (const [k, v] of this.minimalChats) minimalChats[k] = v;
+    writeJsonAtomic(this.statePath, { chats, agentChats, minimalChats, pendingSubBots, pendingSubBotIds } as PersistedBotState);
   }
 
   /** Arm a pending sub-bot creation for agentId (durable across restarts). */
@@ -602,6 +610,7 @@ export class PiBot implements HeartbeatHost {
         if (transportName !== t.name || targetChatId !== chatId) throw new Error("Speech target does not match the invoking chat");
         const target = this.transports.get(transportName);
         if (!target) throw new Error("The invoking transport is unavailable");
+        if (caption) caption = this.shapeSpoken(agentId, ck, caption);
         if (kind === "voice") {
           if (!target.sendVoice) throw new Error("The invoking transport cannot send voice messages");
           await target.sendVoice(targetChatId, filePath, caption);
@@ -611,6 +620,7 @@ export class PiBot implements HeartbeatHost {
         }
       },
       this.telegramSendHooks(),
+      (text: string) => this.shapeSpoken(agentId, ck, text),
     );
     const wkey = `${agentId}::${ck}`;
     if (!this.wired.has(wkey)) {
@@ -680,7 +690,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
             );
           }
           if (!cleanText.trim()) return;
-          const delivery = t.push(chatId, { text: cleanText, dedupeKey: this.turnKeys.get(key) });
+          const delivery = t.push(chatId, { text: this.shapeOutbound(agentId, this.chatKey(t, chatId), cleanText), dedupeKey: this.turnKeys.get(key) });
           this.pendingPushes.set(key, delivery);
           void delivery.catch((e) => console.error("[bot] push failed:", e));
           this.deps.events.log(agentId, "message", truncate(cleanText, 200));
@@ -826,6 +836,63 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     }
   }
 
+  /**
+   * Is minimal voice communication on for this agent+chat? Per-chat override wins,
+   * then the agent's manifest, then off — the same precedence as chat→agent binding.
+   */
+  private minimalVoice(agentId: string, ck: string): boolean {
+    const override = this.minimalChats.get(ck);
+    if (override !== undefined) return override;
+    return this.deps.agents.getAgent(agentId)?.manifest.speech?.minimal === true;
+  }
+
+  /**
+   * Set + persist the per-chat override. An explicit `false` is STORED, not
+   * deleted: deleting would mean "follow the manifest", which makes /minimal off
+   * unable to override an agent whose manifest turns minimal on by default — a
+   * toggle that only works one way is not a toggle. Use `clearMinimalVoice` to go
+   * back to the agent default.
+   */
+  setMinimalVoice(ck: string, on: boolean): boolean {
+    this.minimalChats.set(ck, on);
+    this.persistState();
+    return on;
+  }
+
+  /** Drop the override so the chat follows the agent's manifest again. */
+  clearMinimalVoice(ck: string): void {
+    this.minimalChats.delete(ck);
+    this.persistState();
+  }
+
+  /** Status line for /minimal (source of truth matters when debugging "why is it terse?"). */
+  minimalVoiceStatus(agentId: string, ck: string): string {
+    const override = this.minimalChats.get(ck);
+    const manifest = this.deps.agents.getAgent(agentId)?.manifest.speech?.minimal === true;
+    const state = this.minimalVoice(agentId, ck) ? "on" : "off";
+    const why = override !== undefined ? `set here with /minimal (agent default: ${manifest ? "on" : "off"})` : manifest ? "the agent's manifest default" : "no override, manifest default off";
+    return `minimal voice: **${state}** (${why})`;
+  }
+
+  /**
+   * Outbound text shaping (bd: minimal voice communication). Operational notices
+   * are exempt — hiding "your message was queued" would recreate the silence this
+   * project spent a night removing. The cap is applied only where the text is
+   * SPOKEN; text replies lose the technical detail but keep their length.
+   */
+  private shapeOutbound(agentId: string, ck: string, text: string): string {
+    if (isOperationalNotice(text)) return text;
+    if (!this.minimalVoice(agentId, ck)) return text;
+    return applyVoiceStyle(text);
+  }
+
+  /** Spoken variant: same stripping plus the 4-sentence / 400-char cap. */
+  private shapeSpoken(agentId: string, ck: string, text: string): string {
+    if (isOperationalNotice(text)) return text;
+    if (!this.minimalVoice(agentId, ck)) return text;
+    return applyVoiceStyle(text, { maxSentences: 4, maxChars: 400 });
+  }
+
   /** Every prompt gets a subtle time envelope so the agent always knows the moment. */
   async promptAgent(
     t: Transport,
@@ -851,8 +918,11 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       // the reply this turn produces is deduped by turn identity, never by text:
       // answering two questions with the same words is normal, not a duplicate.
       this.turnKeys.set(`${agentId}::${ck}`, opts.incomingMessageId ? `${ck}:msg:${opts.incomingMessageId}` : `${ck}:turn:${uid("t")}`);
+      // The filter can strip a URL; only the model can decide that "the redirect bug
+      // in the auth middleware" is what "fixed src/auth/mw.ts:42" SOUNDS like.
+      const styled = this.minimalVoice(agentId, ck) ? `${text}\n\n${VOICE_STYLE_DIRECTIVE}` : text;
       // followUp: concurrent messages queue behind the running turn instead of erroring
-      await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, text), opts.recoveringDeadLetter ?? false);
+      await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, styled), opts.recoveringDeadLetter ?? false);
       // implicit task acks: when this agent just accepted/declined/completed a task
       // handed to it in its chat (owner assignments), surface a passive line
       if (opts.taskAckFrom !== null) {
@@ -1351,8 +1421,38 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
   // ── commands ──────────────────────────────────────────────────────────────
 
   handleCommand(t: Transport, chatId: string, text: string): Promise<void> {
+    // /minimal owns per-chat state, so it is handled here rather than in the
+    // command deps (which have no access to the bot's chat→policy maps).
+    const minimal = /^\/minimal(?:\s+(\S+))?$/i.exec(text.trim());
+    if (minimal) return this.commandMinimal(t, chatId, minimal[1]);
     this.commandHandler ??= createCommandHandler(this.commandContext());
     return this.commandHandler(t, chatId, text);
+  }
+
+  /** /minimal [on|off|status] — minimal voice communication for this chat. */
+  private async commandMinimal(t: Transport, chatId: string, arg?: string): Promise<void> {
+    const ck = this.chatKey(t, chatId);
+    const agentId = this.currentAgent(ck) ?? "";
+    const verb = (arg ?? "").trim().toLowerCase();
+    if (verb === "default" || verb === "auto") {
+      this.clearMinimalVoice(ck);
+      this.deps.events.log(agentId, "system", `minimal voice override cleared for ${ck} (following the agent default)`);
+      await t.push(chatId, { text: `🎙 Minimal voice now follows the agent's default — ${this.minimalVoiceStatus(agentId, ck)}` });
+      return;
+    }
+    if (verb === "on" || verb === "off") {
+      const on = this.setMinimalVoice(ck, verb === "on");
+      this.deps.events.log(agentId, "system", `minimal voice ${on ? "on" : "off"} for ${ck}`);
+      await t.push(chatId, {
+        text: on
+          ? "🎙 Minimal voice: **on** for this chat. Spoken replies are capped at four sentences; no URLs, code, markdown or path prefixes. Operational notices still come through in full."
+          : "🎙 Minimal voice: **off** for this chat — replies follow the agent's normal style.",
+      });
+      return;
+    }
+    await t.push(chatId, {
+      text: `${this.minimalVoiceStatus(agentId, ck)}\n\n/minimal on — terse, speakable replies · /minimal off — normal style · /minimal default — follow the agent manifest`,
+    });
   }
 
   // ── manual model switching (/model) ───────────────────────────────
@@ -2342,8 +2442,9 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       for (const ck of dedicated) {
         const { transport, chatId } = this.splitChatKey(ck);
         const t = this.transports.get(transport);
+        const shaped = this.shapeOutbound(agentId, ck, text);
         if (t) {
-          await t.push(chatId, { text, card, replyToMessageId: opts.replyToMessageId }).then(() => (delivered = true)).catch((e) => console.error("[bot] deliver failed:", e));
+          await t.push(chatId, { text: shaped, card, replyToMessageId: opts.replyToMessageId }).then(() => (delivered = true)).catch((e) => console.error("[bot] deliver failed:", e));
         }
       }
       if (opts.origin === "heartbeat") this.deps.commitments?.deliverHeartbeatSpeak(agentId, delivered, nudgeId);
@@ -2360,8 +2461,10 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     for (const ck of owned) {
       const { transport, chatId } = this.splitChatKey(ck);
       const t = this.transports.get(transport);
+      // shape FIRST: the filter strips markdown, and the attribution below is markdown
+      const shaped = this.shapeOutbound(agentId, ck, text);
       // shared-bot fallback: attribute the sender (a dedicated identity doesn't need it)
-      const shown = t && (t.boundAgentId === agentId || opts.selfAttributed) ? text : `**[${agentId}]** ${text}`;
+      const shown = t && (t.boundAgentId === agentId || opts.selfAttributed) ? shaped : `**[${agentId}]** ${shaped}`;
       if (t) {
         await t.push(chatId, { text: shown, card, replyToMessageId: opts.replyToMessageId }).then(() => (delivered = true)).catch((e) => console.error("[bot] deliver failed:", e));
       }
@@ -2374,8 +2477,11 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
   async pushChatRef(chat: ChatRef, text: string, card?: Card): Promise<boolean> {
     const t = this.transports.get(chat.transport);
     if (!t) return false;
+    // proactive text follows the same minimal rules as replies (no speech cap)
+    const ck = `${chat.transport}:${chat.chatId}`;
+    const shaped = this.shapeOutbound(this.chatAgent.get(ck) ?? "", ck, text);
     try {
-      await t.push(chat.chatId, { text, card });
+      await t.push(chat.chatId, { text: shaped, card });
       return true;
     } catch (e) {
       console.error("[bot] pushChatRef failed:", e);

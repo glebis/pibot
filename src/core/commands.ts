@@ -29,6 +29,7 @@ const HELP = [
   `/providers — cloud providers, keys & subscription logins`,
   `/consolidate [status] — distill the event log into durable memory`,
   `/status — what's running`,
+  `/minimal on|off — minimal voice: terse, speakable replies (no URLs, code, paths)`,
 ].join("\n");
 
 /** The 3-button accept/reject/peek card for a staged candidate's review token. */

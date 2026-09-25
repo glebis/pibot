@@ -184,6 +184,13 @@ export interface AgentManifest {
   speech?: {
     sttProviders?: Array<"whisperkit" | "local_whisper" | "groq">;
     allowExternalStt?: boolean;
+    /**
+     * Minimal voice communication: replies lose technical detail (URLs, code,
+     * markdown, hashes, emoji, path prefixes) and spoken output is capped at four
+     * sentences. A per-chat /minimal on|off overrides this default. Operational
+     * notices are never filtered.
+     */
+    minimal?: boolean;
   };
   heartbeat?: HeartbeatConfig;
   /** goal-driven skill self-evolution (Hermes-style propose → gate → eval → apply) */

@@ -9,6 +9,12 @@ export interface SpeechPluginOptions {
   providers: SpeechProviderRegistry;
   store: SpeechArtifactStore;
   send: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>;
+  /**
+   * Applied to `text` BEFORE synthesis. Filtering after the fact would leave the
+   * audio saying "slash Users slash gleb slash…" while the transcript looked clean
+   * — the artifact is the thing a human hears.
+   */
+  styleText?: (text: string) => string;
 }
 
 export function speechPlugin(options: SpeechPluginOptions): InlineExtension {
@@ -28,7 +34,11 @@ export function speechPlugin(options: SpeechPluginOptions): InlineExtension {
         }),
         async execute(_toolCallId, params) {
           const providerId = params.provider ?? "local";
-          const generated = await options.providers.generate(providerId, { text: params.text, kind: params.kind, voice: params.voice });
+          const spoken = options.styleText ? options.styleText(params.text) : params.text;
+          if (!spoken.trim()) {
+            return { content: [{ type: "text", text: "Nothing left to speak after minimal-voice filtering — write a shorter, plainer version." }], details: undefined };
+          }
+          const generated = await options.providers.generate(providerId, { text: spoken, kind: params.kind, voice: params.voice });
           const artifact = await options.store.save({
             ...scope,
             providerId,

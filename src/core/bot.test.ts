@@ -2051,3 +2051,117 @@ describe("acceptance acks for delegated work", () => {
     expect(texts[ackIdx]).toContain("[assistant]");
   });
 });
+
+describe("minimal voice communication", () => {
+  const TECH = "Fixed it — see https://github.com/glebis/pibot/pull/42 and the notes in /Users/gleb/ai_projects/pibot/src/core/bot.ts.";
+  function wire(t: ReturnType<typeof makeBot>, reply: string) {
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementation(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: reply }] }] });
+    });
+  }
+  const lastReply = (t: ReturnType<typeof makeBot>) => t.transport.pushed.at(-1)?.opts.text ?? "";
+
+  it("is off by default and leaves replies alone", async () => {
+    const t = makeBot();
+    wire(t, TECH);
+    await t.bot.promptAgent(t.transport, "42", "assistant", "what did you do");
+    expect(lastReply(t)).toBe(TECH);
+  });
+
+  it("/minimal on turns it on, persists it, and strips the reply", async () => {
+    const t = makeBot();
+    await t.transport.say("/minimal on");
+    expect(lastReply(t)).toContain("Minimal voice: **on**");
+    const reply = lastReply(t);
+
+    wire(t, TECH);
+    await t.bot.promptAgent(t.transport, "42", "assistant", "what did you do");
+    const out = lastReply(t);
+    expect(out).not.toContain("https://github.com");
+    expect(out).not.toContain("/Users/gleb/ai_projects/pibot/src/core/");
+    expect(out).toContain("bot.ts"); // file name survives, path does not
+    expect(out).not.toBe(reply);
+
+    // durable: the override is in the state file, not just in memory
+    const state = JSON.parse(fs.readFileSync(path.join(t.dir, "state.json"), "utf8")) as { minimalChats?: Record<string, boolean> };
+    expect(state.minimalChats).toEqual({ "mock:42": true });
+  });
+
+  it("reports where the current setting comes from, and turns back off", async () => {
+    const t = makeBot();
+    await t.transport.say("/minimal");
+    expect(lastReply(t)).toContain("minimal voice: **off**");
+    await t.transport.say("/minimal on");
+    await t.transport.say("/minimal");
+    expect(lastReply(t)).toContain("set here with /minimal");
+    await t.transport.say("/minimal off");
+    wire(t, TECH);
+    await t.bot.promptAgent(t.transport, "42", "assistant", "again");
+    expect(lastReply(t)).toBe(TECH);
+  });
+
+  it("a per-chat override beats the agent's manifest default", async () => {
+    const t = makeBot();
+    // production's getAgent returns the cached LoadedAgent; pin it so the manifest
+    // mutation is visible to later reads (the stub otherwise rebuilds the object)
+    const agentInstance = t.agents.getAgent("assistant")!;
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockReturnValue(agentInstance);
+    agentInstance.manifest.speech = { minimal: true };
+    wire(t, TECH);
+    await t.bot.promptAgent(t.transport, "42", "assistant", "with the manifest default on");
+    expect(lastReply(t)).toContain("bot.ts"); // filtered
+    expect(lastReply(t)).not.toContain("https://github.com");
+
+    await t.transport.say("/minimal off"); // explicit per-chat wins, even against the manifest
+    await t.bot.promptAgent(t.transport, "42", "assistant", "overridden off");
+    expect(lastReply(t)).toBe(TECH);
+
+    // ...and /minimal default hands control back to the agent's manifest
+    await t.transport.say("/minimal default");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "back to the manifest default");
+    expect(lastReply(t)).not.toContain("https://github.com");
+  });
+
+  it("never filters an operational notice — silence is not an option", async () => {
+    const t = makeBot();
+    await t.transport.say("/minimal on");
+    const notice = "⚠️ **assistant** finished that turn without a reply — ask again, or say “continue”.";
+    wire(t, "warm up the session listener");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "warm up");
+    t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: notice }] }] });
+    await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.opts.text === notice)).toBe(true));
+  });
+
+  it("hands the session a spoken-text styler that caps (so the AUDIO is minimal, not just the caption)", async () => {
+    const t = makeBot();
+    await t.transport.say("/minimal on");
+    wire(t, "ok");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "say it");
+    const call = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
+    const styler = call.at(-1) as (text: string) => string;
+    expect(typeof styler).toBe("function");
+    const spoken = styler(
+      "First sentence here. Second sentence here. Third one. Fourth one. Fifth one. " +
+      "Then a path /Users/gleb/ai_projects/pibot/src/core/bot.ts and https://x.com/y.",
+    );
+    expect(spoken).not.toContain("/Users/");
+    expect(spoken).not.toContain("https://");
+    expect(spoken.split(".").filter((s) => s.trim()).length).toBeLessThanOrEqual(4);
+  });
+
+  it("stamps the prompt with the speakable-style directive when on, and not when off", async () => {
+    const t = makeBot();
+    wire(t, "ok");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "plain ask");
+    const plain = (t.promptSpy.mock.calls.at(-1)![0] as string);
+    expect(plain).not.toMatch(/Replying for listening/);
+
+    await t.transport.say("/minimal on");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "styled ask");
+    const styled = (t.promptSpy.mock.calls.at(-1)![0] as string);
+    expect(styled).toMatch(/Replying for listening/);
+    expect(styled).toMatch(/full path only when the request explicitly asks/i);
+  });
+});

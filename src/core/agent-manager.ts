@@ -159,6 +159,9 @@ export class AgentManager {
     applyProfilePhoto?: (transport: string, filePath: string) => Promise<void>,
     sendSpeech?: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>,
     telegramSend?: TelegramSendHooks,
+    /** minimal-voice shaping applied to spoken text before synthesis (bd: minimal voice).
+     *  Last on purpose: the call site appends it without disturbing existing arg positions. */
+    styleSpeech?: (text: string) => string,
   ): Promise<AgentSession> {
     const key = `${agentId}::${chatKey}`;
     const cached = this.sessions.get(key);
@@ -200,6 +203,7 @@ export class AgentManager {
         providers: createDefaultSpeechProviders(),
         store: new SpeechArtifactStore(path.join(agent.dir, "runtime", "speech")),
         send: sendSpeech,
+        ...(styleSpeech ? { styleText: styleSpeech } : {}),
       } : undefined,
     });
     if (capabilitySet.unavailable.length) {

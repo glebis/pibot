@@ -67,6 +67,7 @@ function messageIdOf(sent: unknown): number | undefined {
 const BOT_COMMANDS = [
   { command: "help", description: "What pibot can do" },
   { command: "status", description: "Rhythm, snooze, next item" },
+  { command: "minimal", description: "Minimal voice replies: /minimal on" },
   { command: "agents", description: "List your agents" },
   { command: "new", description: "Fresh session for the current agent" },
   { command: "agent", description: "Switch agent: /agent coach" },
