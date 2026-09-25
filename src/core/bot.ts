@@ -27,7 +27,7 @@ import { applyCorrections, composeBias, loadDictionary } from "./dictionary.js";
 import { getMediaLinkKey, mediaBase, mediaLinkUrl, stashForLink } from "./media-links.js";
 import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
-import { applyVoiceStyle, isOperationalNotice, VOICE_STYLE_DIRECTIVE } from "./voice-style.js";
+import { applyVoiceStyle, isOperationalNotice, requestsFullPath, VOICE_STYLE_DIRECTIVE } from "./voice-style.js";
 import { classifyModelError, ModelCascade, specProvider } from "./cascade.js";
 import type { ModelErrorClass } from "./cascade.js";
 import type { ConsolidationEngine } from "./consolidation.js";
@@ -79,6 +79,8 @@ export class PiBot implements HeartbeatHost {
   private chatAgent = new Map<string, string>(); // chatKey → agentId
   /** chatKey → /minimal override. The manifest sets the agent default; this wins per chat. */
   private minimalChats = new Map<string, boolean>();
+  /** chatKey → the in-flight turn explicitly asked for a path, so don't shorten them. */
+  private wantsFullPath = new Map<string, boolean>();
   private agentChats = new Map<string, Set<string>>(); // agentId → chatKeys
   private wizardChats = new Set<string>(); // chats running /newagent interview
   private commandHandler: ((t: Transport, chatId: string, text: string) => Promise<void>) | null = null;
@@ -883,14 +885,14 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
   private shapeOutbound(agentId: string, ck: string, text: string): string {
     if (isOperationalNotice(text)) return text;
     if (!this.minimalVoice(agentId, ck)) return text;
-    return applyVoiceStyle(text);
+    return applyVoiceStyle(text, { allowFullPaths: this.wantsFullPath.get(ck) === true });
   }
 
   /** Spoken variant: same stripping plus the 4-sentence / 400-char cap. */
   private shapeSpoken(agentId: string, ck: string, text: string): string {
     if (isOperationalNotice(text)) return text;
     if (!this.minimalVoice(agentId, ck)) return text;
-    return applyVoiceStyle(text, { maxSentences: 4, maxChars: 400 });
+    return applyVoiceStyle(text, { maxSentences: 4, maxChars: 400, allowFullPaths: this.wantsFullPath.get(ck) === true });
   }
 
   /** Every prompt gets a subtle time envelope so the agent always knows the moment. */
@@ -920,6 +922,10 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       this.turnKeys.set(`${agentId}::${ck}`, opts.incomingMessageId ? `${ck}:msg:${opts.incomingMessageId}` : `${ck}:turn:${uid("t")}`);
       // The filter can strip a URL; only the model can decide that "the redirect bug
       // in the auth middleware" is what "fixed src/auth/mw.ts:42" SOUNDS like.
+      // an explicit path request is remembered for this turn: the directive allows a
+      // full path then, and the filter must not undo it
+      if (requestsFullPath(text)) this.wantsFullPath.set(ck, true);
+      else this.wantsFullPath.delete(ck);
       const styled = this.minimalVoice(agentId, ck) ? `${text}\n\n${VOICE_STYLE_DIRECTIVE}` : text;
       // followUp: concurrent messages queue behind the running turn instead of erroring
       await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, styled), opts.recoveringDeadLetter ?? false);
@@ -937,6 +943,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       }
     } finally {
       this.turnKeys.delete(`${agentId}::${ck}`);
+      this.wantsFullPath.delete(ck);
       t.setTyping?.(chatId, false);
     }
     await this.flushCards(t, chatId, agentId);

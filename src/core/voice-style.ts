@@ -25,7 +25,19 @@ export type VoiceStyleOptions = {
   maxSentences?: number;
   /** hard character ceiling, applied at a sentence boundary (omit for no cap) */
   maxChars?: number;
+  /**
+   * Keep full paths. Set for a turn whose request explicitly asked for a path —
+   * otherwise shortening would defeat the ask, and the directive's "full path only
+   * when asked" would be a promise the filter breaks.
+   */
+  allowFullPaths?: boolean;
 };
+
+/** Does this request explicitly ask for a path/location? Narrow on purpose. */
+const WANTS_PATH_RX = /\b(?:full|exact|absolute)\s+path\b|\bpaths?\b|\bfile ?(?:name|path)\b|\bwhere (?:is|are|does|do)\b|\blocation of\b|\bwhich file\b|\bпуть|полный путь|где (?:лежит|находится|файл)/i;
+export function requestsFullPath(text: string): boolean {
+  return WANTS_PATH_RX.test(text ?? "");
+}
 
 /**
  * Operational notices the bot sends about itself (failures, queueing, pairing).
@@ -89,7 +101,7 @@ export function applyVoiceStyle(text: string, opts: VoiceStyleOptions = {}): str
   out = out.replace(URL_RX, "");
   out = out.replace(PROVIDER_RX, "");
   out = out.replace(COMMIT_RX, "");
-  out = shortenPaths(out);
+  if (!opts.allowFullPaths) out = shortenPaths(out);
   out = out.replace(HEADING_RX, "").replace(QUOTE_RX, "").replace(BULLET_RX, "");
   out = out.replace(EMPHASIS_RX, "$2");
   out = out.replace(EMOJI_RX, "");

@@ -2151,6 +2151,17 @@ describe("minimal voice communication", () => {
     expect(spoken.split(".").filter((s) => s.trim()).length).toBeLessThanOrEqual(4);
   });
 
+  it("honours an explicit path request for that turn only, then shortens again", async () => {
+    const t = makeBot();
+    await t.transport.say("/minimal on");
+    wire(t, TECH);
+    await t.bot.promptAgent(t.transport, "42", "assistant", "what's the full path of the file you edited?");
+    expect(lastReply(t)).toContain("/Users/gleb/ai_projects/pibot/src/core/bot.ts");
+    await t.bot.promptAgent(t.transport, "42", "assistant", "thanks — and what did you change?");
+    expect(lastReply(t)).not.toContain("/Users/");
+    expect(lastReply(t)).toContain("bot.ts");
+  });
+
   it("stamps the prompt with the speakable-style directive when on, and not when off", async () => {
     const t = makeBot();
     wire(t, "ok");

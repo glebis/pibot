@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyVoiceStyle, isOperationalNotice, VOICE_STYLE_DIRECTIVE } from "./voice-style.js";
+import { applyVoiceStyle, isOperationalNotice, requestsFullPath, VOICE_STYLE_DIRECTIVE } from "./voice-style.js";
 
 describe("applyVoiceStyle: strip what cannot be listened to", () => {
   it("drops bare URLs but keeps the words around them", () => {
@@ -102,5 +102,23 @@ describe("the prompt-side directive", () => {
     expect(VOICE_STYLE_DIRECTIVE).toMatch(/no url|urls/i);
     expect(VOICE_STYLE_DIRECTIVE).toMatch(/file name|file names/i);
     expect(VOICE_STYLE_DIRECTIVE).toMatch(/only (if|when) .*ask/i);
+  });
+});
+
+describe("an explicit path request is honoured", () => {
+  it("keeps full paths when the turn asked for one", () => {
+    const text = "It lives in /Users/glebkalinin/ai_projects/pibot/data/jev-shadow.json.";
+    expect(applyVoiceStyle(text, { allowFullPaths: true })).toContain("/Users/glebkalinin/ai_projects/pibot/data/jev-shadow.json");
+    expect(applyVoiceStyle(text)).toContain("jev-shadow.json");
+    expect(applyVoiceStyle(text)).not.toContain("/Users/");
+  });
+
+  it("detects the ask, and does not mistake ordinary questions for one", () => {
+    for (const ask of ["what's the full path?", "give me exact path", "which file holds it", "where is the config", "какой полный путь", "где лежит конфиг"]) {
+      expect(requestsFullPath(ask), ask).toBe(true);
+    }
+    for (const other of ["how does it work", "summarise yesterday", "is it done yet"]) {
+      expect(requestsFullPath(other), other).toBe(false);
+    }
   });
 });
