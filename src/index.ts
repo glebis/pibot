@@ -226,17 +226,19 @@ async function main(): Promise<void> {
   // web dashboard (config CRUD) — always on unless disabled
   const webPort = config.webPort ?? parseInt(process.env.PIBOT_WEB_PORT || "7860", 10);
   if (process.env.PIBOT_WEB !== "0") {
+    // Prefer the encrypted store; an explicit env value still wins for one-off runs.
+    const webToken = config.webToken ?? secretStore.get().web?.token;
     const webApp = createWebApp({
       agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
       proactiveStore,
       commitments: { syncGovernance: (agentId) => commitments.syncPilotGovernance(agentId) },
-      webToken: config.webToken, webRpId: config.webRpId, webPort,
+      webToken, webRpId: config.webRpId, webPort,
       providers: providerManager,
       // same cascade control facade the /cascade chat command uses
       cascade: bot.commandContext().cascade,
     });
     const server = serve({ fetch: webApp.fetch, port: webPort, hostname: "127.0.0.1" });
-    console.log(`[pibot] dashboard → http://127.0.0.1:${webPort}${config.webToken ? " 🔒 token" : ""}${config.webRpId ? ` (rpId=${config.webRpId})` : ""}`);
+    console.log(`[pibot] dashboard → http://127.0.0.1:${webPort}${webToken ? " 🔒 token" : ""}${config.webRpId ? ` (rpId=${config.webRpId})` : ""}`);
     server.addListener("error", (e) => console.error("[web]", e.message));
   }
 

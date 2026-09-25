@@ -34,6 +34,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { encryptedTestEnvPath, legacyTestEnvPath, migrateLegacyTestEnv, readTestEnv, saveTestEnvVar } from "../src/core/test-env.js";
 
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url)) + "/..";
 const TG_CLI =
@@ -61,29 +62,37 @@ const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-live-"));
 
 // ─── test-env resolution (prompt via AppleScript dialog when missing) ───
 
-/** Gitignored runtime store — data/ is tracked-never, file mode 0600. */
-const testEnvFile = path.join(process.cwd(), "data", "telegram-test.env");
+/**
+ * Test credentials live sops-encrypted at data/telegram-test.enc.json (never the
+ * old plaintext data/telegram-test.env — bd pibot-z8w). Loaded once at startup so
+ * the resolution path below can stay synchronous; the legacy file, if it still
+ * exists, is folded into the encrypted store and removed.
+ */
+const runtimeDataDir = path.join(process.cwd(), "data");
+let persistedVars: Record<string, string> = {};
 
-function loadPersistedVars(): Record<string, string> {
-  try {
-    return Object.fromEntries(
-      fs
-        .readFileSync(testEnvFile, "utf8")
-        .split("\n")
-        .map((l) => l.trim())
-        .filter((l) => l.includes("="))
-        .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()])
-    );
-  } catch {
-    return {};
+async function loadPersistedVarsOnce(): Promise<void> {
+  if (fs.existsSync(legacyTestEnvPath(runtimeDataDir))) {
+    try {
+      const moved = await migrateLegacyTestEnv(runtimeDataDir);
+      console.log(`🔐 migrated ${moved.length} plaintext test credential(s) from ${path.basename(legacyTestEnvPath(runtimeDataDir))} → ${path.basename(encryptedTestEnvPath(runtimeDataDir))}`);
+    } catch (e) {
+      console.error(`⚠︎ could not migrate the legacy plaintext test env (${(e as Error).message}) — leaving it untouched`);
+    }
   }
+  persistedVars = await readTestEnv(runtimeDataDir);
 }
 
+function loadPersistedVars(): Record<string, string> {
+  return persistedVars;
+}
+
+/** Persists into the encrypted store. There is deliberately no plaintext writer. */
 function persistVar(key: string, value: string): void {
-  const vars = loadPersistedVars();
-  vars[key] = value;
-  fs.mkdirSync(path.dirname(testEnvFile), { recursive: true });
-  fs.writeFileSync(testEnvFile, Object.entries(vars).map(([k, v]) => `${k}=${v}`).join("\n") + "\n", { mode: 0o600 });
+  persistedVars = { ...persistedVars, [key]: value };
+  void saveTestEnvVar(runtimeDataDir, key, value).catch((e) =>
+    console.error(`⚠︎ could not persist ${key} to the encrypted store: ${(e as Error).message}`),
+  );
 }
 
 /** Pops a native dialog for the user to type the value. Never logs the result. */
@@ -306,7 +315,7 @@ function logTail(n = 20): string {
 }
 
 async function spawnDaemon(chatId: string, modelEnv: { PIBOT_DEFAULT_MODEL?: string; PIBOT_MODEL_CASCADE?: string } = {}): Promise<boolean> {
-  const token = process.env.TELEGRAM_LIVE_TEST_TOKEN ?? loadPersistedVars().TELEGRAM_LIVE_TEST_TOKEN;
+  const token = process.env.TELEGRAM_LIVE_TEST_TOKEN ?? persistedVars.TELEGRAM_LIVE_TEST_TOKEN;
   if (!token) return false;
   const dataDir = path.join(tmpRoot, "data");
   const agentsDir = path.join(tmpRoot, "agents");
@@ -530,8 +539,10 @@ async function main(): Promise<void> {
   let artifactsDir = "";
   let logSource: () => string;
 
+  await loadPersistedVarsOnce();
+
   if (!attach) {
-    // Spawn mode: creds resolve env → data/telegram-test.env → AppleScript prompt.
+    // Spawn mode: creds resolve env → encrypted store (data/telegram-test.enc.json) → AppleScript prompt.
     // The DM chat target is derived from the token (its bot id — the same peer
     // telethon used when you /start'ed the bot); the bot's allowlist needs YOUR
     // numeric id instead.

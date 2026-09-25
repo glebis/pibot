@@ -83,7 +83,7 @@ export function truncateErr(s: string): string {
   return s.trim().split("\n")[0]?.slice(0, 200) ?? "";
 }
 
-async function sopsEncrypt(obj: unknown, dataDir: string, encPath: string): Promise<void> {
+async function sopsEncryptTo(obj: unknown, dataDir: string, encPath: string): Promise<void> {
   ensureAgeKey();
   sopsConfigPath(dataDir); // write our creation rules if missing
   // sops matches creation rules against the FILE path — encrypt in place at the final path
@@ -92,6 +92,7 @@ async function sopsEncrypt(obj: unknown, dataDir: string, encPath: string): Prom
     ...process.env,
     SOPS_CONFIG: sopsConfigPath(dataDir),
   });
+  fs.chmodSync(encPath, 0o600);
 }
 
 /** Own creation rules — written once into dataDir so sops never consults ambient configs */
@@ -105,8 +106,26 @@ export function sopsConfigPath(dataDir: string): string {
 }
 
 async function sopsDecrypt(filePath: string): Promise<Settings> {
+  return decryptJsonWithSops<Settings>(filePath);
+}
+
+/**
+ * Decrypt any sops-encrypted JSON file (not just settings) — the one place the
+ * daemon and its tooling read an encrypted store, so `.enc.json` files all go
+ * through the same creation rules and the same age key.
+ */
+export async function decryptJsonWithSops<T = unknown>(filePath: string): Promise<T> {
   const out = await sopsRun(["-d", "--output-type", "json", filePath]);
-  return JSON.parse(out) as Settings;
+  return JSON.parse(out) as T;
+}
+
+/**
+ * Encrypt a JSON object IN PLACE at `encPath` (sops matches creation rules against
+ * the file path, so the plaintext must land at the final name first and be
+ * replaced by its ciphertext). Never leaves the plaintext behind on success.
+ */
+export async function encryptJsonWithSops(value: unknown, dataDir: string, encPath: string): Promise<void> {
+  await sopsEncryptTo(value, dataDir, encPath);
 }
 
 /** Fields that must never sit in plaintext */
@@ -226,7 +245,7 @@ export class SecretStore {
   }
 
   private async flushEncrypted(): Promise<void> {
-    await sopsEncrypt(this.mem, this.dataDir, this.encPath);
+    await sopsEncryptTo(this.mem, this.dataDir, this.encPath);
   }
 
   private async persist(merged: Settings): Promise<void> {

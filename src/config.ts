@@ -32,6 +32,12 @@ export interface Settings {
      *  allowlist (owner pairing) when not set per-agent. */
     subBots?: Record<string, { token: string; username?: string; allowedChats?: string[] }>;
   };
+  /**
+   * Dashboard token. Belongs here (settings.enc.json, sops-encrypted) rather than in
+   * the launchd plist or process env, where it is plaintext, visible to every child
+   * process and copied into ps/launchctl output.
+   */
+  web?: { token?: string };
 }
 
 // NOTE: SecretStore.save (core/secrets.ts) deep-merges the `telegram` level, so
