@@ -20,7 +20,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.84.4",
-    "@earendil-works/pi-coding-agent": "^0.84.3",
+    "@earendil-works/pi-coding-agent": "^1.0.0",
     "@hono/node-server": "^2.1.1",
     "@simplewebauthn/server": "^13.3.3",
     "grammy": "^1.46.0",
