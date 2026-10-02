@@ -12,9 +12,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createModels, type Models, type Provider } from "@earendil-works/pi-ai";
+import { createModels, type CredentialStore, type Provider } from "@earendil-works/pi-ai";
 import { Type } from "@earendil-works/pi-ai";
-import { Harness, createRegistry, defineTool } from "@earendil-works/pi-durable";
+import { Harness, createRegistry, defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
@@ -32,7 +32,7 @@ function listWorkspaceTool(workspaceDir: string) {
         .readdirSync(workspaceDir)
         .filter((n) => !n.startsWith("."))
         .slice(0, 200);
-      return { content: [{ type: "text", text: names.length ? names.join(", ") : "(empty workspace)" }] };
+      return { content: [{ type: "text", text: `WS-CONTENTS: ${names.length ? names.join(", ") : "(empty workspace)"}` }] };
     },
   });
 }
@@ -44,8 +44,12 @@ export interface SatelliteOptions {
   workspaceDir: string;
   /** storage directory; omit for in-memory (tests) */
   storageDir?: string;
+  /** credentials so provider auth resolves (shared pi auth store in production) */
+  credentials?: CredentialStore;
   /** working directory handed to the conversation's execution environment */
   cwd?: string;
+  /** override which provider model the satellite's root conversation uses (default: first) */
+  modelId?: string;
 }
 
 export interface Satellite {
@@ -64,23 +68,29 @@ export async function openSatellite(opts: SatelliteOptions): Promise<Satellite> 
     ? await openNodeJsonlStorage(opts.storageDir, BACKGROUND_CONTEXT)
     : new MemoryStorage();
 
-  const models = createModels();
+  const models = createModels({ credentials: opts.credentials });
   models.setProvider(opts.provider);
 
   const registry = createRegistry();
-  registry.install(listWorkspaceTool(opts.workspaceDir));
+  // tools live in a named extension: "an extension is a named bundle of tools" —
+  // installing a bare registration silently selects nothing
+  registry.install(defineExtension({ name: "satellite-tools", tools: [listWorkspaceTool(opts.workspaceDir)] }));
 
   const harness = await Harness.open(storage, {
     models,
     registry,
     env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? process.cwd() }),
   }, BACKGROUND_CONTEXT);
-  const model = opts.provider.getModels()[0];
-  if (!model) throw new Error("satellite provider exposes no models");
+  const model = opts.modelId
+    ? opts.provider.getModels().find((m) => m.id === opts.modelId)
+    : opts.provider.getModels()[0];
+  if (!model) throw new Error(`satellite provider exposes no model ${opts.modelId ?? "(first)"}`);
   const root = await harness.root(BACKGROUND_CONTEXT, {
     agent: {
       model: { provider: opts.provider.id, modelId: model.id },
       cwd: opts.cwd ?? opts.workspaceDir,
+      // a bare registry is not auto-selected: the conversation must opt into tools
+      tools: [listWorkspaceTool(opts.workspaceDir)],
     },
   });
 

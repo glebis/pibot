@@ -25,15 +25,26 @@ if (!ask) {
 }
 
 fs.mkdirSync(storageDir, { recursive: true, mode: 0o700 });
-const { createModels } = await import("@earendil-works/pi-ai");
-const models = createModels(); // same credential resolution the bot uses
-const provider = models.getProviders()[0];
-if (!provider) {
+// Credentials: the SAME shared auth store the bot uses (~/.pi/agent/auth.json)
+const { ReadOnlyAuthJsonStore } = await import("../src/durable/credentials.js");
+const { builtinModels, builtinProviders } = await import("@earendil-works/pi-ai/providers/all");
+const models = builtinModels({ credentials: new ReadOnlyAuthJsonStore() });
+const available = await models.getAvailable(); // providers with resolvable credentials
+const wantedProviderId = argOf("--provider");
+const chosen = wantedProviderId
+  ? available.find((m) => m.provider === wantedProviderId)
+  : available.find((m) => m.provider !== "vercel-ai-gateway") ?? available[0];
+if (!chosen) {
   console.error("no providers configured — log in via the dashboard (Providers) first");
   process.exit(3);
 }
-
-const satellite = await openSatellite({ provider, workspaceDir, storageDir });
-const requestId = `cli:${process.argv.includes("--again") ? "" : "once"}:${ask.slice(0, 60)}`;
+const provider = builtinProviders().find((p) => p.id === chosen.provider) ?? models.getProvider(chosen.provider);
+if (!provider) {
+  console.error(`provider ${chosen.provider} not registered`);
+  process.exit(3);
+}
+const satellite = await openSatellite({ provider, workspaceDir, storageDir, modelId: argOf("--model"), credentials: new ReadOnlyAuthJsonStore() });
+console.error(`[satellite] provider ${provider.id}${argOf("--model") ? ` · model ${argOf("--model")}` : ""} · storage ${storageDir}`);
+const requestId = `cli:${process.argv.includes("--again") ? `run-${Date.now()}` : "once"}:${ask.slice(0, 60)}`;
 console.log(await satellite.ask(ask, requestId));
 process.exit(0);
