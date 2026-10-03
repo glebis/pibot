@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { InputFile } from "grammy";
 import type { InputProfilePhoto } from "grammy/types";
-import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec, serviceMessageKind, toTelegramHtml } from "./telegram.js";
+import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec, serviceMessageKind, toTelegramHtml, stripAcpLeak } from "./telegram.js";
 
 describe("TelegramDuplicateGuard", () => {
   it("suppresses an identical payload to the same chat inside the window", () => {
@@ -683,5 +683,36 @@ describe("managed-bot token fetch (grammY wrapper shape)", () => {
     const token = await t.replaceManagedBotToken(8900661099, { attempts: 1 });
     expect(token).toBe("8900661099:AAE-new");
     expect(calls).toEqual([8900661099]);
+  });
+});
+
+describe("ACP bookkeeping leak guard", () => {
+  it("strips acp tags, compressed-section headers, and agent-message envelopes from push() output", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    const sent: string[] = [];
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendMessage: async (_cid: string, text: string) => {
+          sent.push(text);
+          return { message_id: 1 };
+        },
+        sendRichMessage: async (_cid: string, payload: { markdown: string }) => {
+          sent.push(payload.markdown);
+          return { message_id: 2 };
+        },
+      },
+    };
+    await t.push("42", { text: "Answer part.\n<acp tokens=\"3.2K\" type=\"text\">m00224</acp>\n[Compressed conversation section]\nSummary text for m00224–m00238.\nAnswer continues." });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("Answer part.");
+    expect(sent[0]).toContain("Answer continues.");
+    expect(sent[0]).not.toContain("<acp");
+    expect(sent[0]).not.toContain("Compressed conversation section");
+    expect(sent[0]).not.toContain("Summary text for");
+  });
+
+  it("keeps normal bracketed text that merely looks similar", async () => {
+    expect(stripAcpLeak("[see attached] details follow")).toBe("[see attached] details follow");
+    expect(stripAcpLeak("array index [42] matters")).toBe("array index [42] matters");
   });
 });

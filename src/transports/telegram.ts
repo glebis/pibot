@@ -81,7 +81,25 @@ const BOT_COMMANDS = [
   { command: "promises", description: "Open promises" },
 ];
 
-/** Rich-message detection: constructs the classic HTML entities cannot render (tables, ATX headings). */
+// ACP context-manager bookkeeping must never reach user-visible rendering —
+// the compression layer tags every message with <acp …>mNNNNN</acp> and folds
+// replaced ranges into marker headers; both are agent-side state.
+const ACP_LINE_RE = /^\s*<acp\s+[^>]*>\s*m\d+\s*<\/acp>\s*$/i;
+const ACP_COMPRESSED_HEADER_RE = /^\s*(?:📦\s*)?\[Compressed conversation section[^\]]*\].*$/i; // marker header lines
+const ACP_SUMMARY_RE = /^\s*(?:Summary|Distilled|Condensed)\s+(?:text|summary)\s+for\s+m\d+.*$/i; // compression-summary body lines
+
+/** Strip ACP context-manager bookkeeping (tags + compression headers) from outgoing text. */
+export function stripAcpLeak(text: string): string {
+  const lines = text.split("\n").filter((line) => {
+    const t = line.trim();
+    return !(ACP_LINE_RE.test(t) || ACP_COMPRESSED_HEADER_RE.test(t) || ACP_SUMMARY_RE.test(t) || /^\[agent-message from /i.test(t));
+  });
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/**
+ * Rich-message detection: constructs the classic HTML entities cannot render (tables, ATX headings).
+ */
 export function isRichTelegramContent(text: string): boolean {
   if (/^#{1,6} \S/m.test(text)) return true;
   const lines = text.split("\n");
@@ -839,7 +857,7 @@ export class TelegramTransport implements Transport {
 
   async push(chatId: string, opts: PushOptions): Promise<void> {
     return this.enqueue(chatId, async () => {
-      const text = truncate(opts.text, TG_LIMIT) + (opts.text.length > TG_LIMIT ? "\n\n…(truncated)" : "");
+      const text = stripAcpLeak(truncate(opts.text, TG_LIMIT) + (opts.text.length > TG_LIMIT ? "\n\n…(truncated)" : ""));
       const payload = JSON.stringify({ text, card: opts.card ?? null });
       // Dedupe key: a reply to a user turn carries its turn identity, so two identical
       // answers to two different messages both go out. A proactive push has no turn
