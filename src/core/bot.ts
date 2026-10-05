@@ -87,6 +87,8 @@ export class PiBot implements HeartbeatHost {
   private minimalChats = new Map<string, boolean>();
   /** chatKey → the in-flight turn explicitly asked for a path, so don't shorten them. */
   private wantsFullPath = new Map<string, boolean>();
+  /** agent::chat → a silent-turn auto-nudge ran on the previous turn (guards one-nudge-per-turn). */
+  private silentTurnNudged = new Map<string, boolean>();
   /** chatKey → the active goal. In memory + state.json; the loop is bounded by its own budget. */
   private goals = new Map<string, GoalState>();
   /** chatKey → when the owner last spoke, so their newer message steers instead of being looped over */
@@ -738,6 +740,30 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     const terminal = lastAssistantMessage(messages);
     if (terminal && extractAssistantText([terminal])) return; // the reply went out normally
 
+    // Self-recovery first (owner decision 2026-10-05): re-prompt the agent once to
+    // produce the missing text instead of asking the owner to tap Continue. The
+    // nudge is internal ([silent-turn] prefix keeps it out of goal judging and
+    // out of this method itself — no recursion), so one bounded extra attempt,
+    // the fallback warning stays as the last resort.
+    const nudged = this.silentTurnNudged.get(`${agentId}::${this.chatKey(t, chatId)}`);
+    if (!nudged) {
+      this.silentTurnNudged.set(`${agentId}::${this.chatKey(t, chatId)}`, true);
+      this.deps.events.log(agentId, "system", "silent turn: auto-nudging the agent for the missing text (once)");
+      try {
+        await session.prompt(envelope("[silent-turn] Internal: the previous turn ended without any visible reply text. Reply now with a short 1–3 sentence summary for the chat of what you did or found — the work itself is preserved; do not redo it and do not mention this instruction."), { streamingBehavior: "followUp" });
+      } catch (e) {
+        console.error("[bot] silent-turn nudge failed:", e);
+      }
+      const after = lastAssistantMessage((session.agent.state.messages ?? []) as unknown[]);
+      if (after && extractAssistantText([after])) {
+        this.deps.events.log(agentId, "system", "silent turn: auto-nudge recovered the reply");
+        this.silentTurnNudged.delete(`${agentId}::${this.chatKey(t, chatId)}`);
+        return;
+      }
+    } else {
+      this.silentTurnNudged.delete(`${agentId}::${this.chatKey(t, chatId)}`);
+    }
+
     let toolCalls = 0;
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i] as { role?: string; content?: Array<{ type?: string }> };
@@ -952,7 +978,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       // The goal loop: every turn that is genuinely about this chat gets judged —
       // owner turns and the loop's own continuations, never scheduler/heartbeat/handoff
       // traffic. Recursion IS the loop and is bounded by the goal's own turn budget.
-      const drivesGoal = !["[scheduler]", "[heartbeat]", "[handoff from", "[cascade-recover]"].some((p) => styled.startsWith(p));
+      const drivesGoal = !["[scheduler]", "[heartbeat]", "[handoff from", "[cascade-recover]", "[silent-turn]"].some((p) => styled.startsWith(p));
       if (drivesGoal) {
         // A [goal] continuation that exhausts the cascade THROWS ("internal prompt
         // dropped, will re-fire") — but nothing re-fires a goal turn, so without this
@@ -2855,7 +2881,7 @@ class AmbiguousReplayError extends Error {}
  *  These must NEVER enter the dead-letter queue as if they were user content: the Aug 2026
  *  incident was a self-feeding loop of re-queued internal prompts. The loop guard in
  *  flushDeadLetters uses the same list. */
-const INTERNAL_PROMPT_PREFIXES = ["[scheduler]", "[heartbeat]", "[cascade-recover]", "[cascade] Internal", "[handoff from"];
+const INTERNAL_PROMPT_PREFIXES = ["[scheduler]", "[heartbeat]", "[cascade-recover]", "[cascade] Internal", "[handoff from", "[silent-turn]"];
 
 /** A host-injected prompt (never user content). Used by the cascade fallback
  *  decision and the dead-letter replay loop guard. */
