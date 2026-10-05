@@ -157,7 +157,7 @@ function fakeAgentManager(promptSpy = vi.fn()) {
   return { agents, emitSessionEvent: (event: unknown) => sessionListeners.forEach((listener) => listener(event)) };
 }
 
-function makeBot(evolution?: unknown) {
+export function makeBot(evolution?: unknown) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-bot-"));
   const config: Config = {
     transport: "cli",
@@ -2268,9 +2268,9 @@ describe("/goal — a bounded autonomy loop", () => {
     const setPush = t.transport.pushed.find((p) => p.opts.text.includes("🎯 Goal set"));
     expect(setPush?.opts.card?.buttons.map((b) => b.action)).toEqual(["goal:pause"]);
 
-    // a wait notice offers Resume
+    // a wait notice offers Continue (nudge the agent) + Resume (reset to active)
     const waitPush = t.transport.pushed.find((p) => p.opts.text.includes("⏳ Goal waiting"));
-    expect(waitPush?.opts.card?.buttons.map((b) => b.action)).toEqual(["goal:resume"]);
+    expect(waitPush?.opts.card?.buttons.map((b) => b.action)).toEqual(["continue", "goal:resume"]);
 
     // tap: pause → paused with a Resume button; tap resume → active again
     await t.bot.handleAction(t.transport, "42", "goal:pause");

@@ -20,6 +20,7 @@ const HELP = [
   ``,
   `/agents — list agents  ·  /agent <name> — switch  ·  /new — fresh session  ·  /issue — file a tracked issue  ·  /newagent — guided wizard`,
   `/schedules — active and paused items  ·  /cancel <id>  ·  /resume <id>  ·  /new — fresh session`,
+  `/continue — nudge the current agent to resume interrupted work`,
   `/commit <text> by <when> — track a commitment (pre-check + deadline loop)`,
   `/model — pick this agent's model (tap)  ·  /model <spec|auto>`,
   `/evolve status — review staged skill proposals (accept/reject from the buttons)  ·  /evolve <goal> — run a cycle`,

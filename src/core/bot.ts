@@ -1357,6 +1357,10 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       await this.commandGoal(t, chatId, action.slice(5));
       return;
     }
+    if (action === "continue") {
+      await this.commandContinue(t, chatId);
+      return "▶️ Continuing…";
+    }
     if (action.startsWith("url:")) return; // URL buttons open in the client; no callback
     if (action.startsWith("nudge:") && this.deps.commitments) {
       return this.deps.commitments.handleNudgeAction(action, chatId);
@@ -1482,8 +1486,21 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     if (minimal) return this.commandMinimal(t, chatId, minimal[1]);
     const goal = /^\/goal(?:\s+([\s\S]*))?$/i.exec(text.trim());
     if (goal) return this.commandGoal(t, chatId, (goal[1] ?? "").trim());
+    const cont = /^\/continue$/i.exec(text.trim());
+    if (cont) return this.commandContinue(t, chatId);
     this.commandHandler ??= createCommandHandler(this.commandContext());
     return this.commandHandler(t, chatId, text);
+  }
+
+  /** /continue — send "continue" to the current chat agent (resume interrupted work). */
+  private async commandContinue(t: Transport, chatId: string): Promise<void> {
+    const ck = this.chatKey(t, chatId);
+    const agentId = this.currentAgent(ck);
+    if (!agentId) {
+      await t.notifyError(chatId, "No agent in this chat yet — send a message first, or /agents to pick one.");
+      return;
+    }
+    await this.promptAgent(t, chatId, agentId, "continue", { taskAckFrom: null });
   }
 
   /**

@@ -129,9 +129,12 @@ describe("goalCard — contextual pause/resume buttons", () => {
     expect(card?.buttons.map((b) => [b.label, b.action])).toEqual([["⏸ Pause", "goal:pause"]]);
   });
 
-  it("paused goal renders a Resume button", () => {
+  it("paused goal renders Continue (nudge) + Resume (unpause) buttons", () => {
     const card = goalCard(state({ status: "paused" }));
-    expect(card?.buttons.map((b) => [b.label, b.action])).toEqual([["▶️ Resume", "goal:resume"]]);
+    expect(card?.buttons.map((b) => [b.label, b.action])).toEqual([
+      ["▶️ Continue", "continue"],
+      ["▶️ Resume", "goal:resume"],
+    ]);
   });
 
   it("done or absent goals render no card", () => {
