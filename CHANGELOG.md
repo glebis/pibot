@@ -4,6 +4,28 @@ Notable changes to pibot. Format follows [Keep a Changelog](https://keepachangel
 dates are local. Entries here describe what shipped and what it costs the owner,
 not just what the commit touched.
 
+## 2026-10-05
+
+### Added
+
+- **Session auto-compaction for every agent.** Pi compacts above `contextWindow - reserveTokens`,
+  and pibot declares the ollama cloud models with a 1M window while the cascade's fallback peers
+  really accept ~163k. That gap let one mentalhealthtech run reach ~512k tokens on 2026-10-05
+  before anything fired: every call failed with a context overflow, and the owner saw a silent turn
+  instead of an answer. The host now wires an auto-compact extension into every agent session, so it
+  exists for agents created before it did, without editing private manifests.
+  - Percent trigger (default **78%**, clamped to 30–98) of the active model's declared window.
+  - Compacts **before** an idle prompt is sent (nothing is interrupted), and **between tool batches**
+    of a long run, where it also queues exactly one `[compaction-resume]` follow-up so the interrupted
+    work finishes instead of going silent. Prompts queued into a live run are left alone.
+  - It never fails closed: a compaction error is logged to the agent's event log and the owner's
+    message still goes through, because swallowing it would reproduce the silence this exists to fix.
+  - Tuned in `<data>/auto-compact.json` — `{ "enabled": true, "threshold": 78 }` — re-read before
+    every decision, so a change applies without restarting the daemon.
+  - **Still open:** with the ollama models declaring 1M, 78% is ~817k — far above the 163k their
+    fallback peers accept. Correcting those `contextWindow` values in `~/.pi/agent/models.json` is
+    what makes the trigger fire in time.
+
 ## 2026-09-26
 
 ### Added

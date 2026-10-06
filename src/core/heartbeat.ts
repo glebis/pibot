@@ -427,7 +427,7 @@ export class HeartbeatEngine {
           modelRuntime: this.deps.modelRuntime,
           model: choice.model,
           thinkingLevel: "off",
-          tools: opts.brief ? ["heartbeat_act", "calendar_today"] : ["heartbeat_act"],
+          tools: opts.brief ? ["heartbeat_act", "calendar_today"] : ["heartbeat_act", "read", "write", "edit"],
           customTools: [actTool],
           resourceLoader: loader,
           sessionManager: SessionManager.inMemory(agent.dir),

@@ -12,11 +12,13 @@ import {
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type { CommsHooks } from "../plugins/agent-comms-plugin.js";
+import { autoCompactPlugin } from "../plugins/auto-compact-plugin.js";
 import type { TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
 import { AvatarArtifactStore, createDefaultAvatarProviders } from "./avatar.js";
 import { createDefaultSpeechProviders, SpeechArtifactStore, type SpeechKind } from "./speech.js";
 import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext, type CapabilityDefinition, type CommitmentPluginEngine } from "./capabilities.js";
 import type { IntakeStore } from "./research-intake.js";
+import { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
 import { ensureDir, errorMessage, readJson, truncate, writeJsonAtomic } from "./util.js";
@@ -210,6 +212,8 @@ export class AgentManager {
       console.warn(`[${agentId}] unavailable capabilities skipped: ${capabilitySet.unavailable.join(", ")}`);
     }
 
+    // one sink for this session's compaction telemetry
+    const sessionEvents = new EventLog(this.agentsDir);
     const loader = new DefaultResourceLoader({
       cwd: sessionCwd,
       agentDir: getAgentDir(),
@@ -219,7 +223,15 @@ export class AgentManager {
       // per-agent evolved skills (+ staging during evolution)
       additionalSkillPaths: listSkillDirs(path.join(agent.dir, "skills")).map((s) => path.dirname(s.filePath)),
       // shared plugins bound to this agent + chat
-        extensionFactories: capabilitySet.extensions,
+        extensionFactories: [
+          ...capabilitySet.extensions,
+          // Host-level, not a capability: every agent needs compaction, and the guard has to
+          // exist for agents created before it did — without editing private manifests.
+          autoCompactPlugin({
+            dataDir: this.dataDir,
+            log: (summary) => sessionEvents.log(agentId, "system", summary),
+          }),
+        ],
       });
       await loader.reload();
 

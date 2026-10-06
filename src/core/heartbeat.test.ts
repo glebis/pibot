@@ -96,6 +96,19 @@ describe("HeartbeatEngine backoff", () => {
     await (engine as unknown as { tickInner: (agent: LoadedAgent, opts: {}) => Promise<void> }).tickInner(agent, {});
     expect(PiAgent.createAgentSession).not.toHaveBeenCalled();
   });
+
+  it("grants heartbeat ticks read/write/edit file tools but keeps briefs narrow", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const { engine } = makeEngine(agent, dir);
+    await (engine as unknown as { tickInner: (agent: LoadedAgent, opts: {}) => Promise<void> }).tickInner(agent, {});
+    const tickTools = (PiAgent.createAgentSession as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0].tools;
+    expect(tickTools).toEqual(["heartbeat_act", "read", "write", "edit"]);
+
+    queueActs([]);
+    await (engine as unknown as { tickInner: (agent: LoadedAgent, opts: { brief?: boolean }) => Promise<void> }).tickInner(agent, { brief: true });
+    const briefTools = (PiAgent.createAgentSession as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0].tools;
+    expect(briefTools).toEqual(["heartbeat_act", "calendar_today"]);
+  });
   describe("shouldTick", () => {
     it("allows ticks when under the backoff threshold", () => {
       const agent = makeAgent(dir);
