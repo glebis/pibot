@@ -6,6 +6,7 @@
 // The daemon attaches configured sub-bots at boot — restart afterwards.
 //
 // Usage: npx tsx scripts/attach-sub-bot.mts --agent creator [--token <t>] [--no-prompt]
+// Participant-bot flags: --allowed-chats <id,id> --mention-only --member-groups <id,id>
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -72,9 +73,15 @@ async function main(): Promise<void> {
   const store = new SecretStore(path.join(process.cwd(), "data"));
   await store.init(JSON.parse(fs.readFileSync(path.join(process.cwd(), "data", "settings.json"), "utf8")));
   const cur = store.get() as {
-    telegram?: { token?: string; subBots?: Record<string, { token: string; username?: string }> };
+    telegram?: { token?: string; subBots?: Record<string, { token: string; username?: string; allowedChats?: string[]; memberGroups?: string[]; groupMentionOnly?: boolean }> };
   };
-  const subBots = { ...(cur.telegram?.subBots ?? {}), [agentId]: { token, username } };
+  // participant-bot options: preserve previously persisted values unless explicitly overridden
+  const argList = (n: string) => (argVal(n) ? argVal(n)!.split(",").map((s) => s.trim()).filter(Boolean) : undefined);
+  const prev = cur.telegram?.subBots?.[agentId];
+  const allowedChats = argList("allowed-chats") ?? prev?.allowedChats;
+  const memberGroups = argList("member-groups") ?? (args.includes("--member-groups") && !argVal("member-groups") ? undefined : prev?.memberGroups);
+  const groupMentionOnly = args.includes("--mention-only") ? true : args.includes("--no-mention-only") ? undefined : prev?.groupMentionOnly;
+  const subBots = { ...(cur.telegram?.subBots ?? {}), [agentId]: { token, username, allowedChats, memberGroups, groupMentionOnly } };
   await store.save({ telegram: { ...cur.telegram, subBots } });
 
   const mask = `${token.split(":")[0]}:…(masked)`;

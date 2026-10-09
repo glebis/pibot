@@ -72,10 +72,10 @@ describe("mention-only group gate (participant bots)", () => {
     expect(ok).toBe(true);
   });
 
-  it("private DM from an allowed chat passes regardless of mention gate", async () => {
+  it("private DM on a mention-only bot (no memberGroups) passes if allowlisted", async () => {
     const t = mentionBot();
     const ok = await (t as unknown as { check: (c: Context) => Promise<boolean> }).check(
-      fakeGateCtx({ chatType: "private", chatId: 42, fromId: 42, text: "hello" })
+      fakeGateCtx({ chatType: "private", chatId: -100123, fromId: 42, text: "hello" })
     );
     expect(ok).toBe(true);
   });
@@ -156,8 +156,8 @@ describe("memberGroups + mention-only compose", () => {
     fakeApi(t, { getChatMember: async () => ({ status: "member" }) });
     const g = t as unknown as { check: (c: Context) => Promise<boolean> };
     expect(await g.check(fakeGateCtx({ chatType: "supergroup", chatId: -100123, fromId: 5, text: "@lab_course_bot hi" }))).toBe(true);
-    expect(await g.check(fakeGateCtx({ chatType: "private", chatId: 42, fromId: 42, text: "hi" }))).toBe(true); // in allowlist + member
-    expect(await g.check(fakeGateCtx({ chatType: "private", chatId: 55, fromId: 55, text: "hi" }))).toBe(false); // not in allowlist
+    expect(await g.check(fakeGateCtx({ chatType: "private", chatId: 42, fromId: 42, text: "hi" }))).toBe(true); // DM gate = membership, not allowlist
+    expect(await g.check(fakeGateCtx({ chatType: "private", chatId: 55, fromId: 55, text: "hi" }))).toBe(true); // any private DM gated by membership only
   });
 });
 

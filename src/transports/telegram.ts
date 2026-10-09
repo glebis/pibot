@@ -739,10 +739,16 @@ export class TelegramTransport implements Transport {
   }
 
   private async check(ctx: Context): Promise<boolean> {
-    if (!this.allowed.size) {
-      if (!this.openWhenEmpty) return false;
-    } else if (!this.allowed.has(String(ctx.chat?.id ?? ""))) {
-      return false;
+    // participant bots: a private DM's gate is group membership, not the chat-id
+    // allowlist (the allowlist can't enumerate every participant's user id — and
+    // it must keep gating group chats, e.g. the course group itself)
+    const isPrivate = ctx.chat?.type === "private";
+    if (!(isPrivate && this.memberGroups.size)) {
+      if (!this.allowed.size) {
+        if (!this.openWhenEmpty) return false;
+      } else if (!this.allowed.has(String(ctx.chat?.id ?? ""))) {
+        return false;
+      }
     }
     if (!this.mentionedInGroup(ctx)) return false;
     return this.dmAllowedByMembership(ctx);

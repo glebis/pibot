@@ -33,6 +33,7 @@ export function docsPlugin(deps: DocsPluginDeps): InlineExtension {
    */
   const resolveInsideDocs = (requested: string): string | null => {
     if (typeof requested !== "string" || requested.length === 0 || requested.includes("\0")) return null;
+    if (requested === "." || requested === "./") return docsDir;
     if (!fs.existsSync(docsDir)) return null;
     const resolved = path.resolve(docsDir, requested);
     const rel = path.relative(docsDir, resolved);

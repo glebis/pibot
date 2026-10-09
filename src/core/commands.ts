@@ -19,6 +19,7 @@ const HELP = [
   `**pibot** — your agents. Talk normally; ask to schedule anything ("remind me to stretch in 20m", "daily standup note at 9am").`,
   ``,
   `/agents — list agents  ·  /agent <name> — switch  ·  /new — fresh session  ·  /issue — file a tracked issue  ·  /newagent — guided wizard`,
+  `/id — show this chat's id (for allowlists/group pairing)`,
   `/schedules — active and paused items  ·  /cancel <id>  ·  /resume <id>  ·  /new — fresh session`,
   `/continue — nudge the current agent to resume interrupted work`,
   `/commit <text> by <when> — track a commitment (pre-check + deadline loop)`,
@@ -130,6 +131,11 @@ export function createCommandHandler(ctx: CommandContext) {
       case "start":
       case "help":
         await reply(HELP);
+        return;
+
+      case "id":
+        // pairing helper: show this chat's id (group admins use it for allowlists)
+        await reply(`Chat id: \`${chatId}\`${t.name ? ` · transport: ${t.name}` : ""}`);
         return;
 
       case "agents": {
