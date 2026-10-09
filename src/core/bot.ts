@@ -224,13 +224,22 @@ export class PiBot implements HeartbeatHost {
     try {
       const tg = t as import("../transports/telegram.js").TelegramTransport;
       const token = await tg.getManagedBotToken(info.botId);
+      const persisted = this.deps.secrets.get().telegram?.subBots?.[agentId];
+      // participant bots are open to their group: skip the owner-only restriction
+      // when a memberGroups gate is configured for this agent
+      const isParticipantBot = Boolean(persisted?.memberGroups?.length);
       const r = await this.attachSubBot(agentId, token);
       this.disarmPendingSubBot(agentId);
-      // managed sub-bots are private: only the manager's owner can use them
-      await tg.setManagedBotAccessSettings(info.botId, true).catch((e) => console.error("[telegram] access restriction failed:", errorMessage(e)));
+      // managed sub-bots are private: only the manager's owner can use them —
+      // unless this is a participant bot serving a whole course group
+      if (!isParticipantBot) {
+        await tg.setManagedBotAccessSettings(info.botId, true).catch((e) => console.error("[telegram] access restriction failed:", errorMessage(e)));
+      }
       if (r.ok) {
-        this.deps.events.log(agentId, "system", `sub-bot created: ${r.botName} (restricted to owner)`);
-        await this.deliverToAgent(agentId, `🟢 My own Telegram bot is live: **${r.botName}** — its own chat, its own identity, restricted to you.`);
+        this.deps.events.log(agentId, "system", `sub-bot created: ${r.botName}${isParticipantBot ? " (participant bot — group-gated)" : " (restricted to owner)"}`);
+        await this.deliverToAgent(agentId, isParticipantBot
+          ? `🟢 My own Telegram bot is live: **${r.botName}** — open to course-group members (DMs gated to group membership).`
+          : `🟢 My own Telegram bot is live: **${r.botName}** — its own chat, its own identity, restricted to you.`);
       } else {
         this.deps.events.log(agentId, "system", `sub-bot wiring failed: ${r.error}`);
         await this.deliverToAgent(agentId, `⚠︎ Bot **${botName}** was created but wiring failed: ${r.error}. Retry from the dashboard (request sub-bot creation again).`).catch(() => {});
@@ -338,9 +347,9 @@ export class PiBot implements HeartbeatHost {
 
   // ── sub-bots (per-agent Telegram identities) ──────────────────────────────
 
-  private async persistSubBot(agentId: string, token: string, username?: string, allowedChats?: string[]): Promise<void> {
+  private async persistSubBot(agentId: string, token: string, username?: string, allowedChats?: string[], memberGroups?: string[], groupMentionOnly?: boolean): Promise<void> {
     const cur = this.deps.secrets.get();
-    const subBots = { ...(cur.telegram?.subBots ?? {}), [agentId]: { token, username, allowedChats } };
+    const subBots = { ...(cur.telegram?.subBots ?? {}), [agentId]: { token, username, allowedChats, memberGroups, groupMentionOnly } };
     await this.deps.secrets.save({ telegram: { ...cur.telegram, subBots } });
   }
 
@@ -353,7 +362,13 @@ export class PiBot implements HeartbeatHost {
 
   /** Wire a dedicated bot for one agent (token verified against Telegram first).
    *  Allowlist resolution: explicit argument → per-agent entry in settings → main bot's allowlist. */
-  async attachSubBot(agentId: string, token: string, allowedChats?: string[]): Promise<{ ok: boolean; botName?: string; error?: string }> {
+  async attachSubBot(
+    agentId: string,
+    token: string,
+    allowedChats?: string[],
+    /** participant-bot options: memberGroups gates DMs to group members; groupMentionOnly keeps the group chat quiet */
+    opts?: { memberGroups?: string[]; groupMentionOnly?: boolean },
+  ): Promise<{ ok: boolean; botName?: string; error?: string }> {
     const existingName = `telegram:${agentId}`;
     if (this.transports.has(existingName)) {
       await this.transports.get(existingName)?.stop().catch(() => {});
@@ -362,9 +377,13 @@ export class PiBot implements HeartbeatHost {
     const secrets = this.deps.secrets.get();
     const persisted = secrets.telegram?.subBots?.[agentId];
     const allow = allowedChats ?? persisted?.allowedChats ?? secrets.telegram?.allowedChats ?? [];
+    // participant-bot opts: explicit argument → persisted → none. Persisted entries
+    // survive re-attach (token rotation) so group gating never silently drops.
+    const memberGroups = opts?.memberGroups ?? persisted?.memberGroups;
+    const groupMentionOnly = opts?.groupMentionOnly ?? persisted?.groupMentionOnly;
     // persist only an explicit/persisted choice — inheritance stays live so main-allowlist edits propagate
     const pinned = allowedChats ?? persisted?.allowedChats;
-    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0" });
+    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0", memberGroups, groupMentionOnly });
     let botName: string;
     try {
       botName = await t.verify();
@@ -378,7 +397,7 @@ export class PiBot implements HeartbeatHost {
       this.transports.delete(existingName);
       return { ok: false, error: `Started but polling failed: ${errorMessage(e)}` };
     }
-    await this.persistSubBot(agentId, token, botName.startsWith("@") ? botName.slice(1) : botName, pinned);
+    await this.persistSubBot(agentId, token, botName.startsWith("@") ? botName.slice(1) : botName, pinned, memberGroups, groupMentionOnly);
     this.deps.events.log("system", "system", `sub-bot attached for ${agentId} as ${botName}`);
     return { ok: true, botName };
   }

@@ -38,6 +38,8 @@ export class AgentManager {
   intake?: IntakeStore;
   private agentsDir: string;
   private vaultDir: string;
+  /** shared docs site source root (read-only course content); set by the host from config */
+  docsDir?: string;
   private repoRoot: string;
   private dataDir: string;
   private modelRuntime: ModelRuntime;
@@ -188,6 +190,7 @@ export class AgentManager {
       agent,
       workspace: sessionCwd,
       vaultDir: this.vaultDir,
+      docsDir: this.docsDir,
       scheduler,
       chat,
       ask,

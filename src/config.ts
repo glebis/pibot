@@ -9,6 +9,8 @@ export interface Config {
   agentsDir: string;
   /** the owner's Obsidian vault — ground truth for all agents; read-only unless an agent opts in to the "vault-file" capability */
   vaultDir: string;
+  /** optional shared docs site source (read-only, for participant-facing agents); enables the docs-file capability */
+  docsDir?: string;
   /** Optional Breeze TTS 2 staging: key file on remote hosts (0600), read by wrappers at runtime. */
   breezeApiKeyPath?: string;
   defaultAgentId?: string;
@@ -30,7 +32,7 @@ export interface Settings {
     allowedChats?: string[];
     /** per-agent dedicated bots (sub-bots). allowedChats defaults to the main bot's
      *  allowlist (owner pairing) when not set per-agent. */
-    subBots?: Record<string, { token: string; username?: string; allowedChats?: string[] }>;
+    subBots?: Record<string, { token: string; username?: string; allowedChats?: string[]; /** participant bots: DMs only for members of these group chat ids */ memberGroups?: string[]; /** in group chats answer mentions/replies only */ groupMentionOnly?: boolean }>;
   };
   /**
    * Dashboard token. Belongs here (settings.enc.json, sops-encrypted) rather than in
@@ -79,6 +81,7 @@ export function loadConfig(): Config {
     dataDir: path.resolve(process.env.PIBOT_DATA_DIR || "./data"),
     agentsDir: path.resolve(process.env.PIBOT_AGENTS_DIR || privateAgentsDir),
     vaultDir: path.resolve((process.env.PIBOT_VAULT_DIR || "~/Brains/brain").replace("~", os.homedir())),
+    docsDir: (process.env.PIBOT_DOCS_DIR || "").trim() ? path.resolve(process.env.PIBOT_DOCS_DIR!.trim().replace("~", os.homedir())) : undefined,
     defaultAgentId: process.env.PIBOT_DEFAULT_AGENT || undefined,
     heartbeatModel: process.env.PIBOT_HEARTBEAT_MODEL && process.env.PIBOT_HEARTBEAT_MODEL !== "same"
       ? process.env.PIBOT_HEARTBEAT_MODEL

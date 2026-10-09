@@ -412,6 +412,10 @@ export class TelegramTransport implements Transport {
   readonly boundAgentId?: string;
   private bot: Bot;
   private allowed: Set<string>;
+  private memberGroups: Set<string>;
+  private groupMentionOnly: boolean;
+  /** DM membership cache: userId → allowed until expiry (negative TTL re-checks sooner) */
+  private membershipCache = new Map<string, { ok: boolean; until: number }>();
   private openWhenEmpty: boolean;
   private me?: { id: number; username?: string; first_name: string; can_manage_bots?: boolean };
   private lastCallbackQuery?: { id: string; data?: string };
@@ -430,9 +434,17 @@ export class TelegramTransport implements Transport {
   private static WORK_CYCLE = ["🤔", "👀", "🔥"];
   private static WORK_MAX_MS = 180_000;
 
-  constructor(token: string, allowedChats: string[], opts: { nameSuffix?: string; boundAgentId?: string; openWhenEmpty?: boolean; mediaDir?: string; reactions?: boolean } = {}) {
+  constructor(token: string, allowedChats: string[], opts: {
+    nameSuffix?: string; boundAgentId?: string; openWhenEmpty?: boolean; mediaDir?: string; reactions?: boolean;
+    /** participant-facing bots: DMs are answered only when the sender is a member of this group chat (numeric id); owner allowlist entries always pass */
+    memberGroups?: string[];
+    /** in group chats, react to @mentions of this bot and replies to its messages only — not to every message (main-bot group behavior unchanged) */
+    groupMentionOnly?: boolean;
+  } = {}) {
     this.bot = new Bot(token);
     this.allowed = new Set(allowedChats);
+    this.memberGroups = new Set(opts.memberGroups ?? []);
+    this.groupMentionOnly = opts.groupMentionOnly ?? false;
     this.openWhenEmpty = opts.openWhenEmpty ?? false;
     this.name = opts.nameSuffix ? `telegram:${opts.nameSuffix}` : "telegram";
     this.boundAgentId = opts.boundAgentId;
@@ -440,8 +452,8 @@ export class TelegramTransport implements Transport {
     this.reactions = opts.reactions ?? true;
     this.cardTtlMs = Number(process.env.PIBOT_CARD_TTL_MS || 600_000);
 
-    this.bot.on("message:text", (ctx: Context) => {
-      if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
+    this.bot.on("message:text", async (ctx: Context) => {
+      if (!(await this.check(ctx))) { void this.handleDenied(ctx); return; }
       const msg = ctx.message;
       if (!msg || !this.onMessageCb) return;
       const text = msg.text?.trim();
@@ -461,7 +473,7 @@ export class TelegramTransport implements Transport {
     this.bot.on("message:document", (ctx) => void this.handleMediaMessage(ctx, "document").catch((e) => console.error("[telegram] document handler:", e)));
     // everything else the bot can't process — say so instead of dropping silently
     this.bot.on("message", async (ctx) => {
-      if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
+      if (!(await this.check(ctx))) { void this.handleDenied(ctx); return; }
       const m = ctx.message;
       // Service messages (managed-bot creation, chat events, payments, …) are
       // Telegram bookkeeping, not user content — never fall through to the
@@ -484,7 +496,7 @@ export class TelegramTransport implements Transport {
     this.bot.on("callback_query:data", async (ctx) => {
       console.log(`[telegram] callback received: ${ctx.callbackQuery?.data?.slice(0, 40)} at ${new Date().toISOString().slice(11, 19)}`);
       this.lastCallbackQuery = ctx.callbackQuery ?? undefined;
-      if (!this.check(ctx)) { void this.handleDenied(ctx); await ctx.answerCallbackQuery().catch(() => {}); return; }
+      if (!(await this.check(ctx))) { void this.handleDenied(ctx); await ctx.answerCallbackQuery().catch(() => {}); return; }
       const action = ctx.callbackQuery?.data;
       if (!action || !this.onActionCb) { await ctx.answerCallbackQuery().catch(() => {}); return; }
       // remove the buttons from the tapped message first — no double-taps, no stale clicks
@@ -672,13 +684,92 @@ export class TelegramTransport implements Transport {
     }
   }
 
-  private check(ctx: Context): boolean {
-    if (!this.allowed.size) return this.openWhenEmpty;
-    return this.allowed.has(String(ctx.chat?.id ?? ""));
+  private isGroupChat(ctx: Context): boolean {
+    const type = ctx.chat?.type;
+    return type === "group" || type === "supergroup";
+  }
+
+  /** In group chats with groupMentionOnly, react only to @mentions of this bot or replies to its messages. */
+  private mentionedInGroup(ctx: Context): boolean {
+    if (!this.groupMentionOnly || !this.isGroupChat(ctx)) return true;
+    const msg = ctx.message ?? ctx.channelPost;
+    if (!msg) return false;
+    // reply to one of this bot's messages (the bot's own messages have from.id === me.id)
+    const replyTo = (msg as { reply_to_message?: { from?: { id?: number } } }).reply_to_message;
+    if (replyTo?.from?.id && this.me?.id && replyTo.from.id === this.me.id) return true;
+    // text mention entity: "@username" spans exactly the mention
+    const username = this.me?.username;
+    if (!username) return false;
+    const text = (msg as { text?: string; caption?: string }).text ?? (msg as { caption?: string }).caption ?? "";
+    return text.toLowerCase().includes(`@${username.toLowerCase()}`);
+  }
+
+  /** DMs for participant bots (memberGroups set): the sender must be a member of
+   *  the configured group. Owner allowlist chats always pass. Membership is cached
+   *  (positive 10m / negative 60s) so a burst of DMs makes one API call at most. */
+  private async dmAllowedByMembership(ctx: Context): Promise<boolean> {
+    if (!this.memberGroups.size) return true;
+    const type = ctx.chat?.type;
+    if (type === "private") {
+      const userId = String(ctx.from?.id ?? "");
+      if (!userId) return false;
+      const now = Date.now();
+      const cached = this.membershipCache.get(userId);
+      if (cached && cached.until > now) return cached.ok;
+      let ok = false;
+      for (const groupId of this.memberGroups) {
+        try {
+          const member = await this.bot.api.getChatMember(Number(groupId), Number(userId));
+          const status = (member as { status?: string }).status;
+          if (status && status !== "left" && status !== "kicked") {
+            ok = true;
+            break;
+          }
+        } catch {
+          // API failure here must not lock participants out: fail open, short TTL
+          this.membershipCache.set(userId, { ok: true, until: now + 60_000 });
+          return true;
+        }
+      }
+      this.membershipCache.set(userId, { ok, until: now + (ok ? 10 * 60_000 : 60_000) });
+      return ok;
+    }
+    // group chats themselves pass the normal allowlist (mention-only governs noise)
+    return true;
+  }
+
+  private async check(ctx: Context): Promise<boolean> {
+    if (!this.allowed.size) {
+      if (!this.openWhenEmpty) return false;
+    } else if (!this.allowed.has(String(ctx.chat?.id ?? ""))) {
+      return false;
+    }
+    if (!this.mentionedInGroup(ctx)) return false;
+    return this.dmAllowedByMembership(ctx);
   }
 
   private async handleDenied(ctx: Context): Promise<void> {
     const chatId = String(ctx.chat?.id ?? ctx.from?.id ?? "unknown");
+    // quiet deny for mention-only groups: a participant just chatting in the group
+    // must not get "bot not paired" spam — silence is the right response
+    if (this.isGroupChat(ctx) && this.groupMentionOnly && !this.mentionedInGroup(ctx)) return;
+    if (!this.allowed.size && !this.openWhenEmpty) {
+      console.warn(`[telegram] (${this.name}) blocked chat ${chatId} — pairing mode`);
+      return;
+    }
+    // participant bot: non-member DM gets a short, non-revealing note (never the
+    // pairing help — that exposes owner configuration to strangers)
+    if (this.memberGroups.size && ctx.chat?.type === "private") {
+      const userId = String(ctx.from?.id ?? "");
+      const payload = `members-only:${userId}`;
+      if (this.duplicateGuard.shouldSend(chatId, payload)) {
+        try {
+          await this.sendTelegram(chatId, () => this.bot.api.sendMessage(ctx.chat!.id, "This companion answers only members of the course group. Please join the course group first, then try again here."));
+          this.duplicateGuard.markSent(chatId, payload);
+        } catch { /* ignore */ }
+      }
+      return;
+    }
     if (this.boundAgentId) {
       console.warn(`[telegram:${this.boundAgentId}] blocked chat ${chatId} — sub-bot allowlist empty/closed (pairing mode). Sub-bots inherit the main bot's allowlist unless a per-agent allowedChats is set.`);
     } else {
@@ -710,7 +801,7 @@ export class TelegramTransport implements Transport {
    * Shared media path: validate + download to mediaDir, then hand to the bot.
    */
   private async handleMediaMessage(ctx: Context, _kind: IncomingMedia["kind"]): Promise<void> {
-    if (!this.check(ctx)) { void this.handleDenied(ctx); return; }
+    if (!(await this.check(ctx))) { void this.handleDenied(ctx); return; }
     if (!this.onMediaCb) return; // bot not wired for media — ignore
     const m = ctx.message;
     if (!m) return;

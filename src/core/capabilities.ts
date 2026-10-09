@@ -8,6 +8,7 @@ import { attendPlugin, ATTEND_CLI } from "../plugins/attend-plugin.js";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
 import { delegatePlugin, DELEGATE_CLIS } from "../plugins/delegate-plugin.js";
 import { devToolsPlugin } from "../plugins/dev-tools-plugin.js";
+import { docsPlugin } from "../plugins/docs-plugin.js";
 import { execPlugin } from "../plugins/exec-plugin.js";
 import { herdrPlugin } from "../plugins/herdr-plugin.js";
 import { gmailPlugin } from "../plugins/gmail-plugin.js";
@@ -41,6 +42,8 @@ export interface CapabilityContext {
   vaultDir: string;
   scheduler: Scheduler;
   chat: ChatRef;
+  /** shared docs site source root (read-only course content for participant-facing agents) */
+  docsDir?: string;
   ask?: (spec: QuestionSpec) => Promise<QuestionAnswer | null>;
   comms?: CommsHooks;
   /** host-injected send hook for bot-identity Telegram sends */
@@ -198,6 +201,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     prompt: "vault_read and vault_write read and write files strictly inside the owner's Obsidian vault — the ground truth for personal context. Read freely; write only with owner intent or when following an established vault convention (e.g. Sources/ and Daily notes — match the existing note format exactly). Resolved paths must stay inside the vault; nothing outside it is accessible.",
     available: (ctx) => fs.existsSync(ctx.vaultDir),
     create: (ctx) => vaultPlugin({ vaultDir: ctx.vaultDir }),
+  },
+  {
+    id: "docs-file", defaultEnabled: false, tools: ["docs_read", "docs_list"],
+    prompt: "docs_read and docs_list read files strictly inside the shared docs site source (course content: schedule, meetings, materials, library). Read-only — never modify these files; they are shared with course participants. Check the docs before answering factual questions about the course; never invent dates, links, or prices.",
+    available: (ctx) => Boolean(ctx.docsDir && fs.existsSync(ctx.docsDir)),
+    create: (ctx) => docsPlugin({ docsDir: ctx.docsDir! }),
   },
   {
     id: "agent-comms", defaultEnabled: true, tools: ["agent_message", "agent_ask", "agent_list", "handoff"],
