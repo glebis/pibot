@@ -309,10 +309,21 @@ export function consolidationPanelLine(agentDir: string, now = Date.now()): stri
   const state = loadState(agentDir);
 
   let pending = 0;
+  let selfTicks = 0;
   try {
     const lines = fs.readFileSync(paths.events, "utf8").trimEnd().split("\n").filter(Boolean);
     const plan = planEventScan(lines, state.meta);
     pending = plan.rotation ? plan.rotation.pending : plan.pending.length + plan.deferred;
+    // every tick appends its own maintenance+heartbeat pair AFTER the cursor, so
+    // post-run pending counts are structurally ≥1 and the line reads as a stall
+    // (Oct 7 false incident). Ticks are the heartbeat's own residue, not input a
+    // human asked to be distilled — count only non-tick events as pending.
+    const freshEvents = lines
+      .slice(plan.startLine)
+      .map(tryParseEvent)
+      .filter((e): e is EventEntry => e !== null);
+    const selfTicks = freshEvents.filter((e) => e.type === "heartbeat" || e.type === "maintenance").length;
+    pending = Math.max(0, pending - selfTicks);
   } catch {
     /* no event log — nothing pending */
   }

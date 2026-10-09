@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "./agent-manager.js";
-import { ConsolidationEngine, consolidationPaths, MAX_EVENTS_PER_RUN, planEventScan, readConsolidatedDigest, renderConsolidatedMarkdown, type ConsolidatedBlock, type ConsolidationState, type DistillIO, type EventScanPlan, type CursorMeta } from "./consolidation.js";
+import { ConsolidationEngine, consolidationPanelLine, consolidationPaths, BLOCKS_FILE, MAX_EVENTS_PER_RUN, planEventScan, readConsolidatedDigest, renderConsolidatedMarkdown, type ConsolidatedBlock, type ConsolidationState, type DistillIO, type EventScanPlan, type CursorMeta } from "./consolidation.js";
 import { EventLog } from "./events.js";
 
 function tmpDir(): string {
@@ -424,5 +424,62 @@ describe("EventScanPlan structural sanity", () => {
     expect(plan.pending).toEqual([]);
     expect(plan.rotation).toBeNull();
     expect(plan.deferred).toBe(0);
+  });
+});
+
+describe("consolidationPanelLine", () => {
+  it("counts the agent's own tick residue as pending (no false stall)", () => {
+    // Regression (Oct 7 false incident): the panel showed "5 events pending, last
+    // run 21h" because every tick appends its own maintenance+heartbeat pair after
+    // the cursor — pending ≥1 by construction, reading as a stuck runner.
+    const dir = tmpDir();
+    try {
+      fs.mkdirSync(path.join(dir, "state"), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "state", "events.jsonl"),
+        [
+          { t: 1000, type: "maintenance", summary: "consolidate events" },
+          { t: 2000, type: "heartbeat", summary: "evening tick" },
+          { t: 3000, type: "heartbeat", summary: "morning tick" },
+        ]
+          .map((e) => JSON.stringify(e))
+          .join("\n"),
+      );
+      fs.mkdirSync(path.join(dir, "memory", "consolidated"), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, BLOCKS_FILE),
+        JSON.stringify({ meta: { offset: 1, lastT: 1000, lastRunAt: Date.now(), runs: 1 }, blocks: [] }),
+      );
+      const line = consolidationPanelLine(dir, 5000);
+      expect(line).toContain("up to date");
+      expect(line).not.toContain("2 events pending");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still counts real user-relevant events as pending", () => {
+    const dir = tmpDir();
+    try {
+      fs.mkdirSync(path.join(dir, "state"), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "state", "events.jsonl"),
+        [
+          { t: 1000, type: "system", summary: "sub-bot wired" },
+          { t: 2000, type: "message", summary: "owner asked for the report" },
+        ]
+          .map((e) => JSON.stringify(e))
+          .join("\n"),
+      );
+      fs.mkdirSync(path.join(dir, "memory", "consolidated"), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, BLOCKS_FILE),
+        JSON.stringify({ meta: { offset: 0, lastT: 0 }, blocks: [] }),
+      );
+      const line = consolidationPanelLine(dir, 5000);
+      expect(line).toContain("2 events pending");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
