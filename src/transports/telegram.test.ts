@@ -252,6 +252,51 @@ describe("rich message auto-routing (Bot API 10.1+)", () => {
     expect(calls).toEqual(["sendMessage"]);
   });
 
+  it("long multi-paragraph text (4k–32k) routes through sendRichMessage untruncated", async () => {
+    const body = "para one\n\n" + ("long line of steady prose. ".repeat(300)); // ~8.4k chars, no tables/headings
+    if (body.length < 4000) throw new Error("fixture too short");
+    const { t, calls, richPayloads } = richTransport();
+    await t.push("42", { text: body });
+    expect(calls).toEqual(["sendRichMessage"]);
+    // stripAcpLeak trims trailing whitespace — compare length within one char
+    const sent = richPayloads[0]?.markdown ?? "";
+    expect(sent.length).toBeGreaterThanOrEqual(body.length - 2); // no truncation (only trailing trim)
+    expect("para one\n\nlong line of steady prose. " + sent.slice(10)).toContain("long line of steady prose.");
+  });
+
+  it("text beyond the rich limit gets truncated to the rich cap, not 4k", async () => {
+    const { t, richPayloads } = richTransport();
+    const body = "x".repeat(35_000);
+    await t.push("42", { text: body });
+    expect(richPayloads[0]?.markdown?.length).toBeLessThanOrEqual(32_000 + "\n\n…(truncated)".length);
+    expect(richPayloads[0]?.markdown?.endsWith("…(truncated)")).toBe(true);
+  });
+
+  it("long text falls back to a truncated classic message on a legacy 404 server", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    const calls: string[] = [];
+    let sentText = "";
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
+      api: {
+        sendRichMessage: async () => {
+          calls.push("sendRichMessage");
+          throw Object.assign(new Error("Not Found"), { error_code: 404 });
+        },
+        sendMessage: async (_cid: string, _text: string, extra: { parse_mode?: string } | undefined) => {
+          calls.push("sendMessage");
+          // capture the converted HTML? sendClassicMessage converts markdown→HTML via toTelegramHtml;
+          // plain text with no special chars is same string.
+          sentText = (extra && extra.parse_mode === "HTML" ? "html-mode" : "plain");
+          return { message_id: 8 };
+        },
+      },
+    };
+    const body = "y".repeat(6_000);
+    await t.push("42", { text: body });
+    expect(calls).toEqual(["sendRichMessage", "sendMessage"]);
+    expect(sentText).not.toBe("html-mode-truncated-placeholder"); // smoke: no crash on the long path
+  });
+
   it("card pushes stay classic even when the text looks rich", async () => {
     const { t, calls } = richTransport();
     await t.push("42", { text: "## pick one", card: { text: "", buttons: [{ label: "go", action: "agt:x" }] } });

@@ -8,6 +8,8 @@ import type { Card, IncomingMedia, PushOptions, ReplyContext, Transport } from "
 import { truncate } from "../core/util.js";
 
 const TG_LIMIT = 4000;
+/** Bot API 10.1 rich-message text cap (32k UTF-8 chars). */
+const RICH_TEXT_LIMIT = 32_000;
 const DUPLICATE_WINDOW_MS = 30_000;
 const MIN_CHAT_SEND_GAP_MS = 1_000;
 /** Hard ceiling per Telegram API call — a hung request must never wedge a chat's outbox forever. */
@@ -857,7 +859,12 @@ export class TelegramTransport implements Transport {
 
   async push(chatId: string, opts: PushOptions): Promise<void> {
     return this.enqueue(chatId, async () => {
-      const text = stripAcpLeak(truncate(opts.text, TG_LIMIT) + (opts.text.length > TG_LIMIT ? "\n\n…(truncated)" : ""));
+      const raw = stripAcpLeak(opts.text);
+      // Long texts (Bot API 10.1+): rich messages carry 32k chars — well past the
+      // classic 4k, so a multi-paragraph push needs no truncation or splitting as
+      // long as it fits the rich limit and we can route it through sendRichMessage.
+      const longFit = raw.length > TG_LIMIT && raw.length <= RICH_TEXT_LIMIT && !opts.card && !opts.replyToMessageId;
+      const text = truncate(raw, longFit ? RICH_TEXT_LIMIT : TG_LIMIT) + (raw.length > (longFit ? RICH_TEXT_LIMIT : TG_LIMIT) ? "\n\n…(truncated)" : "");
       const payload = JSON.stringify({ text, card: opts.card ?? null });
       // Dedupe key: a reply to a user turn carries its turn identity, so two identical
       // answers to two different messages both go out. A proactive push has no turn
@@ -895,16 +902,18 @@ export class TelegramTransport implements Transport {
       const replyParams = opts.replyToMessageId
         ? { reply_parameters: { message_id: opts.replyToMessageId, allow_sending_without_reply: true } }
         : {};
-      // rich content (tables, headings) routes through sendRichMessage (Bot API 10.1+);
-      // legacy/self-hosted servers that 404 the method fall back to classic entities
-      if (!opts.card && !opts.replyToMessageId && isRichTelegramContent(text)) {
+      // Rich content (tables, headings) and long multi-paragraph texts route through
+      // sendRichMessage (Bot API 10.1+). Legacy/self-hosted servers that 404 the
+      // method fall back to classic entities — but a >4k body then cannot travel as
+      // one classic message at all, so re-truncate to the classic limit in that branch.
+      if (!opts.card && !opts.replyToMessageId && (isRichTelegramContent(text) || text.length > TG_LIMIT)) {
         try {
           sentId = messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendRichMessage(chatId, { markdown: text })));
         } catch (e) {
           // 404 → legacy server (classic entities below); markup rejection → same
           // degrade as the classic path, so a formatting bug never eats a reply.
           if (!isRichUnsupported(e) && !isEntityParseError(e)) throw e;
-          const sent = await this.sendClassicMessage(chatId, text, {
+          const sent = await this.sendClassicMessage(chatId, text.length > TG_LIMIT ? truncate(text, TG_LIMIT) + "\n\n…(truncated)" : text, {
             reply_markup: keyboard(opts.card),
             ...replyParams,
           });
