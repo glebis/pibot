@@ -35,6 +35,14 @@ const HELP = [
   `/goal <objective> — a bounded goal the agent works until a judge sees it done  ·  /goal draft, /goal status, /goal pause`,
 ].join("\n");
 
+/** Minimal help for participant-facing sub-bots (non-owner chats) — no owner tools. */
+const PARTICIPANT_HELP = [
+  `**Course companion** — answers questions about the course: schedule, zoom, recordings, materials.`,
+  ``,
+  `Just write your question as a normal message — in Russian or English.`,
+  `/minimal on|off — terse voice-style replies`,
+].join("\n");
+
 /** The 3-button accept/reject/peek card for a staged candidate's review token. */
 export function evolutionReviewCard(token: string): Card {
   return {
@@ -127,15 +135,28 @@ export function createCommandHandler(ctx: CommandContext) {
     const agentId = ctx.currentAgent(ck);
     const reply = (s: string) => t.push(chatId, { text: s });
 
+    // participant-facing sub-bots: non-owner chats get a minimal command surface —
+    // only /start, /help and the /minimal voice toggle. Owner chat = the global
+    // allowlist (owner pairing), which participants' chats are never part of.
+    const ownerChat = (ctx.config.allowedChats ?? []).includes(String(chatId));
+    if (t.boundAgentId && !ownerChat) {
+      const allowed = new Set(["start", "help", "minimal", "id"]);
+      if (!allowed.has(cmd)) {
+        await reply("This companion has no such commands — just write your question as a normal message.");
+        return;
+      }
+    }
+
     switch (cmd) {
       case "start":
       case "help":
-        await reply(HELP);
+        await reply(t.boundAgentId && !ownerChat ? PARTICIPANT_HELP : HELP);
         return;
 
       case "id":
-        // pairing helper: show this chat's id (group admins use it for allowlists)
-        await reply(`Chat id: \`${chatId}\`${t.name ? ` · transport: ${t.name}` : ""}`);
+        // pairing helper: show this chat's id (owner chats need it for allowlists);
+        // participants get their own id only, never transport internals
+        await reply(ownerChat ? `Chat id: \`${chatId}\`${t.name ? ` · transport: ${t.name}` : ""}` : `Your id: \`${chatId}\``);
         return;
 
       case "agents": {
