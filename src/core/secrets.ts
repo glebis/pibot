@@ -38,11 +38,28 @@ export function sopsAvailable(): boolean {
   });
 }
 
+/**
+ * A well-formed age recipient: "age1" + 58 bech32 payload chars = 62 total.
+ * Truncated keys (e.g. "age1g3q8r2h6") pass a naive startsWith check, so length
+ * is the guard that actually catches the corruption this module has to survive.
+ */
+const AGE_RECIPIENT_RE = /^age1[0-9a-z]{58}$/;
+
+export function isValidAgeRecipient(recipient: string): boolean {
+  return AGE_RECIPIENT_RE.test(recipient);
+}
+
 export function ageRecipient(): string {
   ensureAgeKey();
   const keyFile = getAgeKeyFile();
   const m = fs.readFileSync(keyFile, "utf8").match(/public key:\s*(age1[0-9a-z]+)/);
   if (!m) throw new Error("could not read the age public key from " + keyFile);
+  if (!isValidAgeRecipient(m[1])) {
+    throw new Error(
+      `malformed age public key in ${keyFile}: "${m[1]}" (expected "age1" + 58 chars). ` +
+        "Refusing to continue: encrypting against an invalid recipient would overwrite the encrypted store with plaintext."
+    );
+  }
   return m[1];
 }
 
@@ -85,22 +102,55 @@ export function truncateErr(s: string): string {
 
 async function sopsEncryptTo(obj: unknown, dataDir: string, encPath: string): Promise<void> {
   ensureAgeKey();
-  sopsConfigPath(dataDir); // write our creation rules if missing
-  // sops matches creation rules against the FILE path — encrypt in place at the final path
-  fs.writeFileSync(encPath, JSON.stringify(obj, null, 2), { mode: 0o600 });
-  await sopsRunEnv(["-e", "-i", encPath], undefined, {
-    ...process.env,
-    SOPS_CONFIG: sopsConfigPath(dataDir),
-  });
+  const cfg = sopsConfigPath(dataDir); // write our creation rules if missing
+  // Encrypt a temp sibling FIRST. sops matches creation rules against the file
+  // path, so the plaintext has to sit at a name ending in .enc.json — but writing
+  // it straight to encPath means a failed `sops -e` (e.g. an unreadable recipient)
+  // leaves the secrets in the clear at the final filename and destroys the
+  // previous ciphertext. Rename only after sops exits clean.
+  const tmp = tmpEncPath(encPath);
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  try {
+    await sopsRunEnv(["-e", "-i", tmp], undefined, {
+      ...process.env,
+      SOPS_CONFIG: cfg,
+    });
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, encPath);
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* best effort — never mask the real failure */
+    }
+    throw e;
+  }
   fs.chmodSync(encPath, 0o600);
+}
+
+/**
+ * Temp sibling that still matches the `\.enc\.json$` creation rule — the name
+ * must keep that suffix, otherwise sops reports "no matching creation rules".
+ */
+function tmpEncPath(encPath: string): string {
+  const dir = path.dirname(encPath);
+  const name = path.basename(encPath);
+  const stem = name.endsWith(".enc.json") ? name.slice(0, -".enc.json".length) : path.basename(name, ".json");
+  return path.join(dir, `${stem}.${process.pid}.tmp.enc.json`);
 }
 
 /** Own creation rules — written once into dataDir so sops never consults ambient configs */
 export function sopsConfigPath(dataDir: string): string {
   const file = path.join(dataDir, ".sops.yaml");
-  if (!fs.existsSync(file)) {
-    const recipient = ageRecipient();
-    fs.writeFileSync(file, `creation_rules:\n  - path_regex: \\.enc\\.json$\n    age: ${recipient}\n`);
+  const recipient = ageRecipient();
+  const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+  const found = existing.match(/age1[0-9a-z]+/);
+  // An existing config is only trustworthy if its recipient is well-formed.
+  // A truncated or missing recipient makes `sops -e` fail *after* the plaintext
+  // has already landed, so repair it rather than reuse it as-is.
+  if (!found || !isValidAgeRecipient(found[0]) || !existing.includes("creation_rules")) {
+    fs.writeFileSync(file, `creation_rules:\n  - path_regex: \\.enc\\.json$\n    age: ${recipient}\n`, { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
   }
   return file;
 }

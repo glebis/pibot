@@ -32,6 +32,7 @@ import {
   sopsConfigPath,
   isSecretSettings,
   stripSecrets,
+  encryptJsonWithSops,
   SECRET_ENV_RE,
   truncateErr,
   writeJsonAtomic,
@@ -55,7 +56,12 @@ function awaitImportActualFs() {
   return fs;
 }
 
-function seedAgeKey(homeDir: string, pub = "age1ql3z7hjpswm74pte6qy6ccgsdx7q0qf3hg6qzssky2") {
+// A well-formed 62-char age recipient (bech32 payload). Used by every test that
+// exercises recipient validation, so the fixtures can never drift back to a
+// truncated key that real `sops` would reject.
+const VALID_AGE_PUB = "age1v9atktywpyagpq9ddha330rttp3gp7aamzwd4t9v2x5hc8kejcxsemnt7k";
+
+function seedAgeKey(homeDir: string, pub = VALID_AGE_PUB) {
   const keyFile = path.join(homeDir, ".config/sops/age/keys.txt");
   fs.mkdirSync(path.dirname(keyFile), { recursive: true });
   fs.writeFileSync(keyFile, `# public key: ${pub}\nAGE-SECRET-KEY-...`);
@@ -223,9 +229,13 @@ describe("ageRecipient", () => {
   });
 
   it("reads public key from keys.txt", () => {
-    const pub = "age1ql3z7hjpswm74pte6qy6ccgsdx7q0qf3hg6qzssky2abc";
-    seedAgeKey(home, pub);
-    expect(ageRecipient()).toBe(pub);
+    seedAgeKey(home, VALID_AGE_PUB);
+    expect(ageRecipient()).toBe(VALID_AGE_PUB);
+  });
+
+  it("throws on a truncated recipient", () => {
+    seedAgeKey(home, "age1g3q8r2h6");
+    expect(() => ageRecipient()).toThrow(/malformed age public key/);
   });
 
   it("throws when public key not found", () => {
@@ -262,11 +272,79 @@ describe("sopsConfigPath", () => {
     expect(body).toContain("age1");
   });
 
-  it("returns existing file without overwriting", () => {
-    const cfg = sopsConfigPath(dataDir);
-    fs.writeFileSync(cfg, "custom");
+  it("preserves an existing config that already carries a valid recipient", () => {
+    const cfg = path.join(dataDir, ".sops.yaml");
+    fs.writeFileSync(cfg, `creation_rules:\n  - path_regex: \\.enc\\.json$\n    age: ${VALID_AGE_PUB}\n`);
     expect(sopsConfigPath(dataDir)).toBe(cfg);
-    expect(fs.readFileSync(cfg, "utf8")).toBe("custom");
+    expect(fs.readFileSync(cfg, "utf8")).toContain(VALID_AGE_PUB);
+  });
+
+  it("repairs a config whose recipient is truncated", () => {
+    const cfg = path.join(dataDir, ".sops.yaml");
+    fs.writeFileSync(cfg, "creation_rules:\n  - path_regex: \\.enc\\.json$\n    age: age1g3q8r2h6\n");
+    sopsConfigPath(dataDir);
+    const body = fs.readFileSync(cfg, "utf8");
+    expect(body).toContain(VALID_AGE_PUB);
+    expect(body).not.toContain("age1g3q8r2h6");
+  });
+
+  it("repairs a config that has no recipient at all", () => {
+    const cfg = path.join(dataDir, ".sops.yaml");
+    fs.writeFileSync(cfg, "custom");
+    sopsConfigPath(dataDir);
+    expect(fs.readFileSync(cfg, "utf8")).toContain(VALID_AGE_PUB);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// encryptJsonWithSops — a failed encryption must never expose plaintext
+// ---------------------------------------------------------------------------
+describe("encryptJsonWithSops", () => {
+  let home: string;
+  let dataDir: string;
+
+  beforeEach(() => {
+    home = tmpDirSync();
+    dataDir = tmpDirSync();
+    vi.mocked(os.homedir).mockReturnValue(home);
+    seedAgeKey(home);
+    vi.clearAllMocks();
+    vi.mocked(os.homedir).mockReturnValue(home);
+  });
+  afterEach(() => {
+    vi.clearAllMocks();
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("leaves the existing store untouched when encryption fails", async () => {
+    vi.mocked(fs.accessSync).mockImplementation(() => undefined as any);
+    const encPath = path.join(dataDir, "settings.enc.json");
+    fs.writeFileSync(encPath, "CIPHERTEXT-OLD", { mode: 0o600 });
+    mockSpawn({ stderr: "malformed recipient", exitCode: 1 });
+
+    await expect(
+      encryptJsonWithSops({ telegram: { token: "LEAKME" } }, dataDir, encPath)
+    ).rejects.toThrow(/sops -e failed/);
+
+    expect(fs.readFileSync(encPath, "utf8")).toBe("CIPHERTEXT-OLD");
+    const leaked = fs
+      .readdirSync(dataDir)
+      .filter((f) => fs.readFileSync(path.join(dataDir, f), "utf8").includes("LEAKME"));
+    expect(leaked).toEqual([]);
+  });
+
+  it("replaces the store only after encryption succeeds", async () => {
+    vi.mocked(fs.accessSync).mockImplementation(() => undefined as any);
+    const encPath = path.join(dataDir, "settings.enc.json");
+    fs.writeFileSync(encPath, "CIPHERTEXT-OLD", { mode: 0o600 });
+    mockSpawnSops({});
+
+    await encryptJsonWithSops({ telegram: { token: "NEW" } }, dataDir, encPath);
+
+    expect(fs.readFileSync(encPath, "utf8")).not.toBe("CIPHERTEXT-OLD");
+    expect(vi.mocked(fs.renameSync)).toHaveBeenCalled();
+    expect(fs.statSync(encPath).mode & 0o777).toBe(0o600);
   });
 });
 
@@ -505,6 +583,22 @@ describe("SecretStore", () => {
     } catch (e) {
       expect(String(e)).not.toContain("second line");
     }
+  });
+  it("encrypts through a path that still matches the creation rule", async () => {
+    vi.mocked(fs.accessSync).mockImplementation(() => undefined as any);
+    const encPath = path.join(dataDir, "settings.enc.json");
+    mockSpawnSops({});
+
+    await encryptJsonWithSops({ telegram: { token: "NEW" } }, dataDir, encPath);
+
+    const args = vi.mocked(cp.spawn).mock.calls.map((c) => (c[1] as string[]).join(" ")).join("\n");
+    const target = vi
+      .mocked(cp.spawn)
+      .mock.calls.map((c) => (c[1] as string[])[2])
+      .find((p) => typeof p === "string" && p.includes("settings"));
+    // sops refuses a file whose name does not match `\.enc\.json$`
+    expect(args).not.toContain("no matching creation rules");
+    expect(target).toMatch(/\.enc\.json$/);
   });
 });
 
