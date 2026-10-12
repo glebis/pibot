@@ -91,6 +91,16 @@ export class PiBot implements HeartbeatHost {
   private silentTurnNudged = new Map<string, boolean>();
   /** agent::chat → last time the silent-turn ⚠️ warning actually went out (cooldown gate). */
   private silentTurnWarnedAt = new Map<string, number>();
+
+  /** Wait until a session is no longer streaming (bounded). True = idle, false = gave up. */
+  private async waitSessionIdle(session: AgentSession, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!(session as { isStreaming?: boolean }).isStreaming) return true;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return !(session as { isStreaming?: boolean }).isStreaming;
+  }
   /** chatKey → the active goal. In memory + state.json; the loop is bounded by its own budget. */
   private goals = new Map<string, GoalState>();
   /** chatKey → when the owner last spoke, so their newer message steers instead of being looped over */
@@ -755,6 +765,15 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
    */
   private async notifySilentTurn(t: Transport, chatId: string, agentId: string, session: AgentSession, prompt: string): Promise<void> {
     if (INTERNAL_PROMPT_PREFIXES.some((p) => prompt.startsWith(p))) return;
+    // followUp queueing: a turn can be considered "delivered" while the session is
+    // still streaming (knower 2026-10-12 — the guard judged a mid-turn snapshot and
+    // every nudge instant-resolved as queued, never run). Judge nothing while busy:
+    // wait for idle, then re-read what the turn actually produced.
+    const settled = await this.waitSessionIdle(session, 120_000);
+    if (!settled) {
+      this.deps.events.log(agentId, "system", "silent turn: session still streaming after 120s — judgment deferred");
+      return;
+    }
     const messages = (session.agent.state.messages ?? []) as unknown[];
     const assistants = messages.filter((m) => (m as { role?: string })?.role === "assistant");
     if (assistants.length === 0) return; // nothing ran — not a silence we can explain
@@ -779,6 +798,10 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       } catch (e) {
         console.error("[bot] silent-turn nudge failed:", e);
       }
+      // the nudge may itself be queued behind a busy session — before checking its
+      // outcome, wait for it to actually run (knower 2026-10-12: without this all
+      // attempts "resolve" instantly and the loop burns out in one second)
+      await this.waitSessionIdle(session, 120_000);
       const after = lastAssistantMessage((session.agent.state.messages ?? []) as unknown[]);
       if (after && extractAssistantText([after])) {
         this.deps.events.log(agentId, "system", "silent turn: auto-nudge recovered the reply");

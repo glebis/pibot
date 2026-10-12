@@ -101,4 +101,27 @@ describe("silent turns — a turn that produces no text must not leave the owner
     const warns = t.transport.pushed.filter((p) => p.opts.text.includes("without a reply"));
     expect(warns.length).toBe(1); // still one
   });
+
+  it("a busy session defers judgment — no mid-turn false silent (knower 2026-10-12)", async () => {
+    const t = makeBot();
+    const messages: unknown[] = [userTurn, toolCallOnly];
+    let listener: ((ev: unknown) => void) | null = null;
+    const start = Date.now();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      agent: { state: { get messages() { return messages; } } },
+      prompt: t.promptSpy.mockImplementation(async () => {}),
+      setModel: vi.fn(async () => {}),
+      subscribe: vi.fn((cb: (ev: unknown) => void) => { listener = cb; return () => {}; }),
+      // streaming for ~100ms after the turn — the old code judged this instantly
+      get isStreaming() { return Date.now() < start + 100; },
+    } as never);
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    // the turn completes while the guard waits: terminal text lands on its own
+    setTimeout(() => messages.push({ role: "assistant", content: [{ type: "text", text: "Done: analysis pushed." }], stopReason: "stop" }), 40);
+    await t.bot.promptAgent(t.transport, "42", "assistant", "analyse the whole flow");
+    // judgment ran after settle → sees the final text → no nudges, no warning
+    expect(t.promptSpy).toHaveBeenCalledTimes(1); // the original turn only
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("without a reply"))).toBe(false);
+  });
 });
