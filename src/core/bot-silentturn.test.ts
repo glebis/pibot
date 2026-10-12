@@ -51,11 +51,12 @@ describe("silent turns — a turn that produces no text must not leave the owner
 
   it("the nudge is internal: it does not count as owner traffic and can not recurse", async () => {
     const t = makeBot();
-    // never recovers → the guard runs a second time; the nudge prompt must not
-    // re-enter the recovery logic (exactly one extra attempt, then the warning)
+    // never recovers → the guard loops all three nudge attempts, then the warning;
+    // the nudge prompt must not re-enter the recovery logic (the internal prefix
+    // is what keeps it out — none of the loop's prompts mentions the owner warn)
     wire(t, [userTurn, toolCallOnly], { recovers: false });
     await t.bot.promptAgent(t.transport, "42", "assistant", "analyse the whole flow");
-    expect(t.promptSpy).toHaveBeenCalledTimes(2);
+    expect(t.promptSpy).toHaveBeenCalledTimes(4); // original + NUDGE_ATTEMPTS (3)
     const nudge = String(t.promptSpy.mock.calls[1]?.[0] ?? "");
     expect(nudge).toContain("[silent-turn] Internal:"); // internal prefix survives the time envelope
   });
@@ -87,5 +88,17 @@ describe("silent turns — a turn that produces no text must not leave the owner
     await t.bot.promptAgent(t.transport, "42", "assistant", "analyse the whole flow");
     const warning = t.transport.pushed.find((p) => p.opts.text.includes("without a reply"));
     expect(warning?.opts.text).toContain("1 tool call"); // not the older turn's 2
+  });
+
+  it("owner warning is rate-limited: consecutive silent turns don't spam ⚠️ (mentalhealthtech 2026-10-12)", async () => {
+    const t = makeBot();
+    wire(t, [userTurn, toolCallOnly], { recovers: false });
+    // first turn: warning goes out
+    await t.bot.promptAgent(t.transport, "42", "assistant", "analyse the whole flow");
+    expect(t.transport.pushed.filter((p) => p.opts.text.includes("without a reply")).length).toBe(1);
+    // second turn right after: silent again, but within the cooldown → no second ⚠️
+    await t.bot.promptAgent(t.transport, "42", "assistant", "analyse again");
+    const warns = t.transport.pushed.filter((p) => p.opts.text.includes("without a reply"));
+    expect(warns.length).toBe(1); // still one
   });
 });

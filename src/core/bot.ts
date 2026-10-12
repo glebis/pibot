@@ -89,6 +89,8 @@ export class PiBot implements HeartbeatHost {
   private wantsFullPath = new Map<string, boolean>();
   /** agent::chat → a silent-turn auto-nudge ran on the previous turn (guards one-nudge-per-turn). */
   private silentTurnNudged = new Map<string, boolean>();
+  /** agent::chat → last time the silent-turn ⚠️ warning actually went out (cooldown gate). */
+  private silentTurnWarnedAt = new Map<string, number>();
   /** chatKey → the active goal. In memory + state.json; the loop is bounded by its own budget. */
   private goals = new Map<string, GoalState>();
   /** chatKey → when the owner last spoke, so their newer message steers instead of being looped over */
@@ -759,15 +761,19 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     const terminal = lastAssistantMessage(messages);
     if (terminal && extractAssistantText([terminal])) return; // the reply went out normally
 
-    // Self-recovery first (owner decision 2026-10-05): re-prompt the agent once to
+    // Self-recovery first (owner decision 2026-10-05): re-prompt the agent to
     // produce the missing text instead of asking the owner to tap Continue. The
     // nudge is internal ([silent-turn] prefix keeps it out of goal judging and
-    // out of this method itself — no recursion), so one bounded extra attempt,
-    // the fallback warning stays as the last resort.
-    const nudged = this.silentTurnNudged.get(`${agentId}::${this.chatKey(t, chatId)}`);
-    if (!nudged) {
-      this.silentTurnNudged.set(`${agentId}::${this.chatKey(t, chatId)}`, true);
-      this.deps.events.log(agentId, "system", "silent turn: auto-nudging the agent for the missing text (once)");
+    // out of this method itself — no recursion). The nudge itself can end on a
+    // toolUse with no text (mentalhealthtech 2026-10-12: model ran two tool calls
+    // and stopped), so the nudge loops up to N attempts — and once a turn keeps
+    // ending silent, the owner warning is rate-limited per chat (one per cooldown)
+    // instead of repeating for every turn the owner asks again.
+    const nkey = `${agentId}::${this.chatKey(t, chatId)}`;
+    const NUDGE_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= NUDGE_ATTEMPTS; attempt++) {
+      this.silentTurnNudged.set(nkey, true);
+      this.deps.events.log(agentId, "system", `silent turn: auto-nudging the agent for the missing text (attempt ${attempt}/${NUDGE_ATTEMPTS})`);
       try {
         await session.prompt(envelope("[silent-turn] Internal: the previous turn ended without any visible reply text. Reply now with a short 1–3 sentence summary for the chat of what you did or found — the work itself is preserved; do not redo it and do not mention this instruction."), { streamingBehavior: "followUp" });
       } catch (e) {
@@ -776,12 +782,11 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       const after = lastAssistantMessage((session.agent.state.messages ?? []) as unknown[]);
       if (after && extractAssistantText([after])) {
         this.deps.events.log(agentId, "system", "silent turn: auto-nudge recovered the reply");
-        this.silentTurnNudged.delete(`${agentId}::${this.chatKey(t, chatId)}`);
+        this.silentTurnNudged.delete(nkey);
         return;
       }
-    } else {
-      this.silentTurnNudged.delete(`${agentId}::${this.chatKey(t, chatId)}`);
     }
+    this.silentTurnNudged.delete(nkey);
 
     let toolCalls = 0;
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -792,6 +797,19 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     }
     const ran = toolCalls === 1 ? "1 tool call" : `${toolCalls} tool calls`;
     this.deps.events.log(agentId, "system", `silent turn: terminal message carried no text after ${ran}`);
+    // Rate-limit the owner-facing ⚠️ per agent::chat — a session stuck over the
+    // context threshold (116% + a 402 cascade) used to emit one per turn, which
+    // read as an unfixable loop. One honest warning per cooldown; every
+    // additionally-silent turn still lands in the event log.
+    const SILENT_WARN_COOLDOWN_MS = 30 * 60_000;
+    const wkey = `${agentId}::${this.chatKey(t, chatId)}`;
+    const lastWarn = this.silentTurnWarnedAt.get(wkey) ?? 0;
+    const now = Date.now();
+    if (now - lastWarn < SILENT_WARN_COOLDOWN_MS) {
+      this.deps.events.log(agentId, "system", "silent turn: warning suppressed (cooldown) — owner already notified recently");
+      return;
+    }
+    this.silentTurnWarnedAt.set(wkey, now);
     try {
       await t.push(chatId, {
         text: `⚠️ **${agentId}** finished that turn without a reply — the model ended on reasoning only after ${ran}, so nothing was sent. Ask again, or say “continue”.`,
