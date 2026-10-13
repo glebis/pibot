@@ -761,3 +761,50 @@ describe("ACP bookkeeping leak guard", () => {
     expect(stripAcpLeak("array index [42] matters")).toBe("array index [42] matters");
   });
 });
+
+describe("media download retry (transient network)", () => {
+  it("retries getFile/fetch after ECONNRESET and succeeds (worker 2026-10-13)", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    let getFileCalls = 0;
+    (t as unknown as { bot: { api: Record<string, unknown>; token: string } }).bot.api.getFile = async () => {
+      getFileCalls++;
+      return { file_path: "docs/file.mp4" };
+    };
+    let fetchCalls = 0;
+    const buf = Buffer.from("fakevideo");
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      fetchCalls++;
+      if (fetchCalls === 1) { const e = new Error("read ECONNRESET"); (e as unknown as { code: string }).code = "ECONNRESET"; throw e; }
+      return { ok: true, status: 200, headers: new Headers({ "content-length": String(buf.length) }), arrayBuffer: async () => buf } as unknown as Response;
+    }) as typeof fetch;
+    try {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tgdlt-"));
+      (t as unknown as { mediaDir: string }).mediaDir = dir;
+      const out = await (t as unknown as { downloadTelegramFile(fid: string, ext: string): Promise<string> }).downloadTelegramFile("fid", ".mp4");
+      expect(fs.existsSync(out)).toBe(true);
+      expect(getFileCalls).toBe(2); // attempt 2 re-resolves the file path
+      expect(fetchCalls).toBe(2);
+      fs.rmSync(dir, { recursive: true, force: true });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("does not retry permanent errors (HTTP 404)", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    let calls = 0;
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot.api.getFile = async () => { calls++; return { file_path: "docs/x" }; };
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () => ({ ok: false, status: 404, headers: new Headers() })) as unknown as typeof fetch;
+    try {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tgdlt-"));
+      (t as unknown as { mediaDir: string }).mediaDir = dir;
+      await expect((t as unknown as { downloadTelegramFile(fid: string, ext: string): Promise<string> }).downloadTelegramFile("fid", ".bin")).rejects.toThrow(/HTTP 404/);
+      expect(calls).toBe(1);
+      fs.rmSync(dir, { recursive: true, force: true });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});

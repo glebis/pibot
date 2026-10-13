@@ -767,6 +767,20 @@ export class TelegramTransport implements Transport {
     // pairing help — that exposes owner configuration to strangers)
     if (this.memberGroups.size && ctx.chat?.type === "private") {
       const userId = String(ctx.from?.id ?? "");
+      if (this.name === "telegram:lab" && this.boundAgentId === "lab" && this.publicRequestCb && /^[1-9]\d*$/.test(chatId) && chatId === userId) {
+        const request = ctx.callbackQuery?.data ?? ctx.message?.text ?? "/start";
+        try {
+          const spec = ctx.message ? telegramMediaSpec(ctx.message) : null;
+          if (spec && !spec.ok) { await this.push(chatId, { text: spec.error }); return; }
+          if (spec?.ok && this.mediaDir) {
+            if (!this.publicMediaAllowedCb?.(chatId, spec.kind)) { await this.push(chatId, { text: "Сначала откройте персональную ссылку для бесплатной записи или напишите /crypto." }); return; }
+            const filePath = await this.downloadTelegramFile(spec.fileId, spec.extension);
+            await this.publicRequestCb(chatId, ctx.message?.caption ?? "", { kind: spec.kind, chatId, filePath, fileId: spec.fileId, caption: ctx.message?.caption, durationSec: spec.durationSec, mimeType: spec.mimeType, fileSize: spec.fileSize });
+          } else await this.publicRequestCb(chatId, request);
+        }
+        catch { await this.push(chatId, { text: "Не удалось открыть оплату. Напишите [@glebkalinin](https://t.me/glebkalinin)." }); }
+        return;
+      }
       const payload = `members-only:${userId}`;
       if (this.duplicateGuard.shouldSend(chatId, payload)) {
         try {
@@ -828,8 +842,30 @@ export class TelegramTransport implements Transport {
     }
   }
 
-  /** Download a Telegram file by id into mediaDir (Telegram getFile API). */
+  /** Download a Telegram file by id into mediaDir (Telegram getFile API).
+   *  Transit network failures retry 3× — a download that broke mid-flight delivered
+   *  nothing, so a repeat cannot duplicate anything (worker 2026-10-13: one
+   *  ECONNRESET during the DNS flap turned into a permanent "Couldn't download
+   *  that file" for the owner even though the network recovered seconds later). */
   private async downloadTelegramFile(fileId: string, extension: string): Promise<string> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        if (attempt > 1) await new Promise((r) => setTimeout(r, NETWORK_RETRY_BACKOFF_MS[Math.min(attempt - 2, 1)]!));
+        return await this.downloadTelegramFileOnce(fileId, extension);
+      } catch (e) {
+        lastError = e;
+        const probe = String((e as { code?: string; errno?: string; cause?: { code?: string; errno?: string } })?.code ?? "") +
+          String((e as { cause?: { code?: string } })?.cause?.code ?? "");
+        if (!/ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EPIPE|fetch failed|name resolution/i.test(probe + String((e as Error)?.message ?? ""))) throw e;
+        if (attempt === 3) throw e;
+        console.warn(`[telegram] media download retry ${attempt}/2 after network error (${String((e as { code?: string })?.code ?? (e as Error)?.message?.slice(0, 40))})`);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private async downloadTelegramFileOnce(fileId: string, extension: string): Promise<string> {
     fs.mkdirSync(this.mediaDir, { recursive: true, mode: 0o700 });
     fs.chmodSync(this.mediaDir, 0o700);
     const file = await this.bot.api.getFile(fileId);
