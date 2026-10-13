@@ -426,6 +426,13 @@ export class TelegramTransport implements Transport {
   private outboxByChat = new Map<string, Promise<unknown>>();
   private lastSentAtByChat = new Map<string, number>();
 
+  private publicRequestCb?: (chatId: string, request: string, media?: IncomingMedia) => Promise<void>;
+  /** A fixed public sales flow; denied users never reach agent commands or sessions. */
+  onPublicRequest(cb: (chatId: string, request: string, media?: IncomingMedia) => Promise<void>): void { this.publicRequestCb = cb; }
+
+  private publicMediaAllowedCb?: (chatId: string, kind: IncomingMedia["kind"]) => boolean;
+  onPublicMediaAllowed(cb: (chatId: string, kind: IncomingMedia["kind"]) => boolean): void { this.publicMediaAllowedCb = cb; }
+
   private onMediaCb: ((media: IncomingMedia) => Promise<void>) | null = null;
   private mediaDir: string;
   private reactions: boolean;
