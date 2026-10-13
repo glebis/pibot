@@ -98,30 +98,35 @@ export async function openSatellite(opts: SatelliteOptions): Promise<Satellite> 
     const settled: SettledSubmissionRecord = await (
       await root.submit(requestId ? { type: "input", content, requestId } : { type: "input", content }, BACKGROUND_CONTEXT)
     ).wait(BACKGROUND_CONTEXT);
-    return answerText(harness, root, settled);
+    return answerText(root, settled);
   }
+
+  // Extensions/registry are installed and the root conversation is open: now it is
+  // safe to restart work a previous process left unfinished. resume() only flips
+  // the scheduler on and kicks it, so repeat calls (the public `resume`) are harmless.
+  harness.resume();
 
   return { ask, resume: () => harness.resume(), harness, root };
 }
 
 /** Extract the assistant text of a settled submission's answer entry. */
-async function answerText(
-  harness: OpenedHarness,
-  root: RootConversation,
-  settled: SettledSubmissionRecord,
-): Promise<string> {
+async function answerText(root: RootConversation, settled: SettledSubmissionRecord): Promise<string> {
   if (settled.status === "unanswered" || !settled.answer) {
     throw new Error(`satellite submission ${settled.id} did not answer: ${settled.status}${"reason" in settled ? ` — ${String(settled.reason)}` : ""}`);
   }
-  const page = await root.entries({}, 50, undefined, BACKGROUND_CONTEXT);
-  void harness;
-  for (const e of page.items) {
-    if (String(e.id) === String(settled.answer)) return entryText(e);
+  // EntryQuery bounds are inclusive, so min === max === answer id is an exact lookup
+  // (no paging, no "newest assistant entry" guess that could return an older turn).
+  const page = await root.entries(
+    { minEntryId: settled.answer, maxEntryId: settled.answer },
+    1,
+    undefined,
+    BACKGROUND_CONTEXT,
+  );
+  const entry = page.items.find((e) => String(e.id) === String(settled.answer));
+  if (!entry) {
+    throw new Error(`satellite submission ${settled.id}: answer entry ${String(settled.answer)} not found in transcript`);
   }
-  // fall back: newest assistant entry
-  const last = page.items.filter((e) => entryText(e)).at(-1);
-  if (last) return entryText(last);
-  throw new Error(`satellite answer entry ${settled.answer} not found in transcript`);
+  return entryText(entry);
 }
 
 /** Entries carry their messages on `model` (array for assistant entries, single for user). */

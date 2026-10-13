@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall, type AssistantMessage } from "@earendil-works/pi-ai";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openSatellite } from "./satellite.js";
 
 type FauxSteps = Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0];
@@ -57,12 +58,16 @@ describe("durable satellite (pi-durable harness prototype)", () => {
 
     // give process A a moment so both jobs are durably admitted
     await new Promise((r) => setTimeout(r, 50));
-    // "kill" A: drop all references without waiting for answers
+    // "kill" A: pi-durable has no public close(), so A's scheduler would keep writing to
+    // the same files and race B. Snapshot what A had on disk at this instant instead —
+    // that is exactly what a restarted process finds after a crash.
+    const crashedStorage = path.join(dir, "storage-at-crash");
+    fs.cpSync(storageDir, crashedStorage, { recursive: true });
 
-    // process B: reopens the same storage, resumes unfinished work
+    // process B: reopens the crashed storage, resumes unfinished work
     const fauxB = fauxProvider();
     fauxB.setResponses([fauxAssistantMessage([fauxText("answer one")]), fauxAssistantMessage([fauxText("answer two")])]);
-    const b = await openSatellite({ provider: fauxB.provider, workspaceDir: workspace, storageDir });
+    const b = await openSatellite({ provider: fauxB.provider, workspaceDir: workspace, storageDir: crashedStorage });
     b.resume();
 
     // the owner retries job-1 with the same requestId — must get the ORIGINAL submission, not a second run
@@ -72,6 +77,43 @@ describe("durable satellite (pi-durable harness prototype)", () => {
 
     expect(second).toContain("answer two");
     expect(again).toBe(retried); // exactly-once: the retry replays, never re-runs
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("returns the exact answer for the latest ask once the transcript exceeds one 50-entry page", async () => {
+    const rounds = 30; // 2 entries per round => 60 > 50
+    const steps = Array.from({ length: rounds }, (_, i) => fauxAssistantMessage([fauxText(`reply-number-${i}`)]));
+    const { sat } = scriptedSatellite(steps);
+    const s = await sat;
+    for (let i = 0; i < rounds; i++) {
+      expect(await s.ask(`question ${i}`, `req-${i}`)).toBe(`reply-number-${i}`);
+    }
+    const total = (await s.root.entries({}, 500, undefined, BACKGROUND_CONTEXT)).items.length;
+    expect(total).toBeGreaterThan(50);
+  });
+
+  it("calls harness.resume() on open, so interrupted work restarts without a new ask", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-durable-resume-"));
+    const storageDir = path.join(dir, "storage");
+    fs.mkdirSync(storageDir, { recursive: true });
+    const workspace = path.join(dir, "workspace");
+    fs.mkdirSync(workspace, { recursive: true });
+
+    // process A: submit a job, never await it
+    const fauxA = fauxProvider();
+    fauxA.setResponses([fauxAssistantMessage([fauxText("resumed answer")])]);
+    const a = await openSatellite({ provider: fauxA.provider, workspaceDir: workspace, storageDir });
+    const sub = await a.root.submit({ type: "input", content: "task", requestId: "r-1" }, BACKGROUND_CONTEXT);
+    const subId = sub.id;
+
+    // process B: reopen only; no ask(), no explicit resume()
+    const fauxB = fauxProvider();
+    fauxB.setResponses([fauxAssistantMessage([fauxText("resumed answer")])]);
+    const b = await openSatellite({ provider: fauxB.provider, workspaceDir: workspace, storageDir });
+    const resumed = await b.harness.submission(subId, BACKGROUND_CONTEXT);
+    expect(resumed).toBeDefined();
+    const settled = await resumed!.wait(BACKGROUND_CONTEXT);
+    expect(settled.status).not.toBe("unanswered");
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
