@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { deriveLabel, herdrPlugin, resolveWorkspaceId, type HerdrExecFn } from "./herdr-plugin.js";
+import { deriveLabel, herdrEnv, herdrPlugin, resolveWorkspaceId, type HerdrExecFn } from "./herdr-plugin.js";
 
 function factoryOf(ext: InlineExtension): (pi: ExtensionAPI) => void {
   return typeof ext === "function" ? ext : ext.factory;
@@ -265,5 +265,20 @@ describe("herdr plugin", () => {
     expect(deriveLabel("Fix the login bug in auth module")).toBe("fix-the-login");
     expect(deriveLabel("", "custom")).toBe("custom");
     expect(deriveLabel("!!!")).toBe("task");
+  });
+});
+describe("herdrEnv", () => {
+  it("scrubs secrets but keeps HERDR_* routing vars", () => {
+    process.env.FAKE_API_KEY = "x";
+    process.env.HERDR_ENV = "1";
+    try {
+      const e = herdrEnv();
+      expect(e.FAKE_API_KEY).toBeUndefined();
+      expect(e.HERDR_ENV).toBe("1");
+      expect(e.PATH).toBeDefined();
+    } finally {
+      delete process.env.FAKE_API_KEY;
+      delete process.env.HERDR_ENV;
+    }
   });
 });

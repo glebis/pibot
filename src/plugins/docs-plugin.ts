@@ -13,6 +13,8 @@ export interface DocsPluginDeps {
   docsDir: string;
   /** max bytes accepted by docs_read */
   maxBytes?: number;
+  /** Participant access: published content/docs and public only, never repository files. */
+  publicOnly?: boolean;
 }
 
 /**
@@ -23,6 +25,17 @@ export interface DocsPluginDeps {
  */
 export function docsPlugin(deps: DocsPluginDeps): InlineExtension {
   const docsDir = path.resolve(deps.docsDir);
+  const contentRoot = path.basename(docsDir) === "docs" && path.basename(path.dirname(docsDir)) === "content";
+  const publicText = new Set([".md", ".mdx", ".txt", ".json", ".html", ".htm", ".csv", ".ics", ".xml", ".yaml", ".yml"]);
+  const publishedPath = (relative: string, directory: boolean): boolean => {
+    if (!deps.publicOnly) return true;
+    const parts = relative.split(path.sep).filter(Boolean);
+    if (parts.some((part) => part.startsWith("."))) return false;
+    if (!contentRoot && relative !== "" && relative !== "content" &&
+        relative !== "content/docs" && !relative.startsWith(`content${path.sep}docs${path.sep}`) &&
+        relative !== "public" && !relative.startsWith(`public${path.sep}`)) return false;
+    return directory || publicText.has(path.extname(relative).toLowerCase());
+  };
   const maxBytes = deps.maxBytes ?? DEFAULT_MAX_BYTES;
 
   /**
@@ -38,6 +51,14 @@ export function docsPlugin(deps: DocsPluginDeps): InlineExtension {
     const resolved = path.resolve(docsDir, requested);
     const rel = path.relative(docsDir, resolved);
     if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+    if (!publishedPath(rel, true)) return null;
+    if (deps.publicOnly) {
+      let ancestor = docsDir;
+      for (const part of rel.split(path.sep)) {
+        ancestor = path.join(ancestor, part);
+        if (fs.lstatSync(ancestor, { throwIfNoEntry: false })?.isSymbolicLink()) return null;
+      }
+    }
     let probe = resolved;
     while (!fs.existsSync(probe)) {
       const parent = path.dirname(probe);
@@ -71,6 +92,7 @@ export function docsPlugin(deps: DocsPluginDeps): InlineExtension {
           try {
             const stat = fs.statSync(target);
             if (!stat.isFile()) return refuse("not a file");
+            if (!publishedPath(path.relative(docsDir, target), false)) return refuse("only published text content is accessible");
             if (stat.size > maxBytes) return refuse(`file is ${stat.size} bytes, docs_read caps at ${maxBytes}`);
             const raw = fs.readFileSync(target, "utf8");
             const text = raw.length > READ_CHAR_LIMIT ? `${truncate(raw, READ_CHAR_LIMIT)}\n\n[truncated — read in sections]` : raw;
@@ -95,7 +117,11 @@ export function docsPlugin(deps: DocsPluginDeps): InlineExtension {
           if (!target) return refuse("path must resolve to a directory inside the docs root");
           try {
             if (!fs.statSync(target).isDirectory()) return refuse("not a directory");
-            const entries = fs.readdirSync(target, { withFileTypes: true });
+            const entries = fs.readdirSync(target, { withFileTypes: true }).filter((entry) => {
+              if (!deps.publicOnly) return true;
+              if (entry.isSymbolicLink()) return false;
+              return publishedPath(path.relative(docsDir, path.join(target, entry.name)), entry.isDirectory());
+            });
             const lines = entries.slice(0, LIST_ENTRY_LIMIT).map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
             const suffix = entries.length > LIST_ENTRY_LIMIT ? `\n… (${entries.length - LIST_ENTRY_LIMIT} more)` : "";
             return { content: [{ type: "text", text: lines.join("\n") + suffix }], details: { ok: true, path: path.relative(docsDir, target), count: entries.length } };

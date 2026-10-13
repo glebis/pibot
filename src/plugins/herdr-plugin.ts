@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { childEnv } from "../core/child-env.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -233,14 +234,21 @@ export async function dispatchTask(deps: Required<HerdrPluginDeps>, params: {
   };
 }
 
+/** Scrubbed env for the herdr client: allowlisted base + HERDR_* and PIBOT_HERDR_WORKSPACE (non-secret routing). */
+export function herdrEnv(): NodeJS.ProcessEnv {
+  const names = Object.keys(process.env).filter((k) => k.startsWith("HERDR_") || k === "PIBOT_HERDR_WORKSPACE");
+  return childEnv({ passthrough: names });
+}
+
 export function herdrPlugin(deps: HerdrPluginDeps = {}): InlineExtension {
   const bin = deps.bin ?? "herdr";
-  const execFn = deps.exec ?? ((cmd, args, opts) => run(cmd, args, { timeout: opts.timeout, maxBuffer: 4 * 1024 * 1024 }));
+  const env = deps.env ?? herdrEnv();
+  const execFn = deps.exec ?? ((cmd, args, opts) => run(cmd, args, { timeout: opts.timeout, maxBuffer: 4 * 1024 * 1024, env }));
   const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
   const resolved: Required<HerdrPluginDeps> = {
     bin,
     exec: execFn,
-    env: deps.env ?? process.env,
+    env,
     settleMs: deps.settleMs ?? DEFAULT_SETTLE_MS,
     sleep,
   };

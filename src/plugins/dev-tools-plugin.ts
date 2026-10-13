@@ -10,10 +10,13 @@ import {
   type CheckResult,
   type StageLogEntry,
 } from "../core/dev-agent.js";
+import { childEnv } from "../core/child-env.js";
 import { errorMessage, truncate } from "../core/util.js";
 import { spawn } from "node:child_process";
 
-const runDefault = promisify(execFile);
+const execFileP = promisify(execFile);
+/** Default runner: scrubbed env — dev_test/dev_typecheck execute repo code the agent itself wrote. */
+const runDefault: ExecFn = (cmd, args, opts) => execFileP(cmd, args, { ...opts, env: childEnv() });
 
 const CHECK_TIMEOUT = 8 * 60_000; // full vitest suite can take a while
 const COMMIT_TIMEOUT = 30_000;
@@ -108,7 +111,7 @@ export function devToolsPlugin(deps: DevPluginDeps): InlineExtension {
       let out = "";
       let child: ReturnType<typeof spawn>;
       try {
-        child = spawn("ssh", [alias, "bash -s"], { stdio: ["pipe", "pipe", "pipe"] });
+        child = spawn("ssh", [alias, "bash -s"], { stdio: ["pipe", "pipe", "pipe"], env: childEnv({ passthrough: ["SSH_AUTH_SOCK"] }) });
       } catch (e) {
         resolve({ ok: false, out: "ssh spawn failed: " + errorMessage(e) });
         return;

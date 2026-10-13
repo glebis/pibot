@@ -16,6 +16,7 @@ import { Type } from "typebox";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
 import type { ModelCascade } from "./cascade.js";
 import { consolidationPanelLine } from "./consolidation.js";
+import { confinedFileTools } from "./confined-file-tools.js";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import type { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
@@ -64,6 +65,7 @@ Adaptive rhythm — you pace yourself:
 Maintenance rotation — keep your own house in order:
 - The digest includes a maintenance panel of freshness checks (memory, persona, notes, maintenance journal).
 - Service AT MOST ONE stale item per tick, rotating across ticks — never everything at once. What you did gets recorded via heartbeat_act "maintain" (a one-line durable note into your maintenance journal).
+- Your file tools can read the agent directory but write ONLY under memory/. Anything outside memory/ (persona, skills, scripts) cannot be edited from a tick: propose it with maintain "backlog: <summary>" or via speak instead.
 - If everything is fresh, record nothing and prefer a longer wakeup. Never let the same item stay stale for many cycles.
 
 Call the heartbeat_act tool exactly once with your decision.`;
@@ -197,10 +199,10 @@ export function buildMaintenancePanel(agentDir: string, now = Date.now()): strin
           ? `current (updated ${memoryAge}) — durable memory your digest carries; memory_save does NOT refresh this line (write with file tools)`
           : `STALE ${ageAgo(now - memoryHours * 3600e3, now)} — service this rotation (memory_save does NOT refresh this line; write with file tools)`;
       const personaLine = personaHours == null
-        ? "(missing) — write a persona paragraph now"
+        ? "(missing) — you cannot write AGENTS.md from a tick; record maintain \"backlog: write persona paragraph\""
         : personaHours < ROTATION_FLOOR_H
-          ? `current (updated ${personaAge}) — one paragraph on how you changed lately`
-          : `STALE ${ageAgo(now - personaHours * 3600e3, now)} — service this rotation (one paragraph on how you changed lately)`;
+          ? `current (updated ${personaAge}) — read-only from ticks`
+          : `STALE ${ageAgo(now - personaHours * 3600e3, now)} — service this rotation (read-only from ticks: if it has drifted, record maintain "backlog: persona refresh — <what changed>")`;
       return [
         `- memory (memory/MEMORY.md): ${memLine}`,
         `- persona (AGENTS.md): ${personaLine}`,
@@ -428,7 +430,11 @@ export class HeartbeatEngine {
           model: choice.model,
           thinkingLevel: "off",
           tools: opts.brief ? ["heartbeat_act", "calendar_today"] : ["heartbeat_act", "read", "write", "edit"],
-          customTools: [actTool],
+          // File tools are confined: read anywhere in the agent dir, write/edit ONLY memory/.
+          // Custom tools override same-named SDK built-ins (the allowlist above keeps the names).
+          customTools: opts.brief
+            ? [actTool]
+            : [actTool, ...confinedFileTools(agent.dir, { readRoots: [agent.dir], writeRoots: [path.join(agent.dir, "memory")] })],
           resourceLoader: loader,
           sessionManager: SessionManager.inMemory(agent.dir),
           settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } }),

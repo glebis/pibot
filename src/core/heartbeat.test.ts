@@ -109,6 +109,26 @@ describe("HeartbeatEngine backoff", () => {
     const briefTools = (PiAgent.createAgentSession as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0].tools;
     expect(briefTools).toEqual(["heartbeat_act", "calendar_today"]);
   });
+
+  it("confines heartbeat file tools: customTools override read/write/edit, writes only under memory/", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const { engine } = makeEngine(agent, dir);
+    await (engine as unknown as { tickInner: (agent: LoadedAgent, opts: {}) => Promise<void> }).tickInner(agent, {});
+    type T = { name: string; execute: (...a: unknown[]) => Promise<{ content: Array<{ text: string }> }> };
+    const custom = (PiAgent.createAgentSession as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0].customTools as T[];
+    expect(custom.map((t) => t.name)).toEqual(["heartbeat_act", "read", "write", "edit"]);
+    const run = (name: string, params: object) => custom.find((t) => t.name === name)!.execute("id", params, undefined, undefined, undefined);
+    expect((await run("write", { path: "AGENTS.md", content: "x" })).content[0].text).toMatch(/^refused:/);
+    expect((await run("write", { path: "~/pibot-heartbeat-test", content: "x" })).content[0].text).toMatch(/^refused:/);
+    expect((await run("read", { path: "/etc/hosts" })).content[0].text).toMatch(/^refused:/);
+    expect((await run("write", { path: "memory/notes/hb.md", content: "ok" })).content[0].text).toContain("Successfully wrote");
+    expect(fs.readFileSync(path.join(dir, "memory", "notes", "hb.md"), "utf8")).toBe("ok");
+
+    queueActs([]);
+    await (engine as unknown as { tickInner: (agent: LoadedAgent, opts: { brief?: boolean }) => Promise<void> }).tickInner(agent, { brief: true });
+    const briefCustom = (PiAgent.createAgentSession as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0].customTools as T[];
+    expect(briefCustom.map((t) => t.name)).toEqual(["heartbeat_act"]);
+  });
   describe("shouldTick", () => {
     it("allows ticks when under the backoff threshold", () => {
       const agent = makeAgent(dir);

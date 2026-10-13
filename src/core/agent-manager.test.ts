@@ -211,3 +211,25 @@ describe("agent capability integration", () => {
     expect(set.systemPrompt).not.toContain("mail_read is usable");
   });
 });
+
+describe("scrubbedBashTool", () => {
+  it("runs commands without host secrets but keeps PATH and PI_*", async () => {
+    const { scrubbedBashTool } = await import("./agent-manager.js");
+    process.env.FAKE_API_KEY = "s3cret";
+    try {
+      const tool = scrubbedBashTool(process.cwd());
+      expect(tool.name).toBe("bash");
+      const r = await tool.execute("id", { command: "env" }, undefined, undefined, {
+        cwd: process.cwd(), thinkingLevel: "off", model: { provider: "p", id: "m" },
+        sessionManager: { getSessionId: () => "sid", getSessionFile: () => undefined },
+      } as never);
+      const out = (r.content[0] as { text: string }).text;
+      expect(out).not.toContain("s3cret");
+      expect(out).not.toContain("FAKE_API_KEY");
+      expect(out).toMatch(/^PATH=/m);
+      expect(out).toMatch(/^PI_SESSION_ID=sid/m);
+    } finally {
+      delete process.env.FAKE_API_KEY;
+    }
+  });
+});

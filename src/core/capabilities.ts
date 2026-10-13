@@ -188,7 +188,7 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
   },
   {
     id: "skills", defaultEnabled: true, tools: ["skill_save", "skill_patch", "skill_list"],
-    prompt: "skill_save, skill_patch and skill_list manage this agent's own reusable skills.",
+    prompt: "skill_save and skill_patch only PROPOSE changes to this agent's own reusable skills: they are staged for owner review and become active only after the owner promotes them in the dashboard (Review changes). Never claim a skill is active or saved live. skill_list shows live skills and staged proposals.",
     create: (ctx) => skillManagePlugin({ agentDir: ctx.agent.dir, agentId: ctx.agent.id }),
   },
   {
@@ -206,7 +206,7 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     id: "docs-file", defaultEnabled: false, tools: ["docs_read", "docs_list"],
     prompt: "docs_read and docs_list read files strictly inside the shared docs site source (course content: schedule, meetings, materials, library). Read-only — never modify these files; they are shared with course participants. Check the docs before answering factual questions about the course; never invent dates, links, or prices.",
     available: (ctx) => Boolean(ctx.docsDir && fs.existsSync(ctx.docsDir)),
-    create: (ctx) => docsPlugin({ docsDir: ctx.docsDir! }),
+    create: (ctx) => docsPlugin({ docsDir: ctx.docsDir!, publicOnly: ctx.agent.id === "lab" }),
   },
   {
     id: "agent-comms", defaultEnabled: true, tools: ["agent_message", "agent_ask", "agent_list", "handoff"],
@@ -238,12 +238,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     id: "delegate", defaultEnabled: false, tools: ["delegate_cli"],
     prompt: "delegate_cli runs a selected local coding CLI with its own permissions; give it a self-contained task.",
     available: () => installedDelegateClis().length > 0,
-    create: (ctx) => delegatePlugin({ allowed: installedDelegateClis(), cwd: ctx.workspace, agentId: ctx.agent.id }),
+    create: (ctx) => delegatePlugin({ allowed: installedDelegateClis(), cwd: ctx.workspace, agentId: ctx.agent.id, envPassthrough: ctx.agent.manifest.envPassthrough }),
   },
   {
     id: "exec", defaultEnabled: false, tools: ["exec_run"],
     prompt: "exec_run runs commands from this agent's vetted exec allowlist: pass argv (array of strings, command first). NO shell — no pipes, redirections or substitutions; binaries are resolved and pinned, denied arguments (e.g. yt-dlp --exec, osascript -e) are refused, output is truncated and runs are time-capped. Use it for the vetted tooling (yt-dlp, whisperkit-cli, the youtube-transcript skill script, afplay, osascript wrappers); anything else is refused.",
-    create: (ctx) => execPlugin({ workspace: ctx.workspace, agentDir: ctx.agent.dir }),
+    create: (ctx) => execPlugin({ workspace: ctx.workspace, agentDir: ctx.agent.dir, envPassthrough: ctx.agent.manifest.envPassthrough }),
   },
   {
     id: "herdr", defaultEnabled: false, tools: ["herdr_dispatch", "herdr_read", "herdr_wait"],

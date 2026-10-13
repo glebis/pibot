@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   createAgentSession,
+  createBashToolDefinition,
   DefaultResourceLoader,
   getAgentDir,
   resolveCliModel,
@@ -10,6 +11,7 @@ import {
   SettingsManager,
   type AgentSession,
   type ModelRuntime,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { CommsHooks } from "../plugins/agent-comms-plugin.js";
 import { autoCompactPlugin } from "../plugins/auto-compact-plugin.js";
@@ -18,6 +20,7 @@ import { AvatarArtifactStore, createDefaultAvatarProviders } from "./avatar.js";
 import { createDefaultSpeechProviders, SpeechArtifactStore, type SpeechKind } from "./speech.js";
 import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext, type CapabilityDefinition, type CommitmentPluginEngine } from "./capabilities.js";
 import type { IntakeStore } from "./research-intake.js";
+import { childEnv } from "./child-env.js";
 import { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
@@ -255,6 +258,9 @@ export class AgentManager {
         tools: [
           ...capabilitySet.sessionTools,
         ],
+        customTools: capabilitySet.sessionTools.includes("bash")
+          ? [scrubbedBashTool(sessionCwd, agent.manifest.envPassthrough) as unknown as ToolDefinition]
+          : [],
         resourceLoader: loader,
         sessionManager: manager,
         settingsManager: SettingsManager.inMemory({}),
@@ -380,4 +386,20 @@ export function systemPromptFor(agent: LoadedAgent, vaultDir: string, capability
         ]
       : []),
   ].join("\n") + commonKnowledge(vaultDir);
+}
+
+/**
+ * Replacement for the SDK's built-in `bash` tool whose child env is an allowlist
+ * (see child-env.ts) rather than a copy of process.env, so decrypted secrets never
+ * reach the agent's shell. A customTool named "bash" overrides the built-in entry
+ * in the SDK's tool registry (Map.set by name), so there is no duplicate.
+ */
+export function scrubbedBashTool(cwd: string, passthrough?: string[]) {
+  return createBashToolDefinition(cwd, {
+    spawnHook: (ctx) => {
+      const pi: Record<string, string> = {};
+      for (const [k, v] of Object.entries(ctx.env)) if (k.startsWith("PI_") && v !== undefined) pi[k] = v;
+      return { ...ctx, env: childEnv({ passthrough, extra: pi }) };
+    },
+  });
 }

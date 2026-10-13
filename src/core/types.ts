@@ -55,6 +55,8 @@ export interface CardButton {
 }
 
 export interface Card {
+  /** Button columns; one gives each action the full message width. */
+  columns?: 1 | 2;
   text: string;
   buttons: CardButton[];
 }
@@ -176,6 +178,9 @@ export interface AgentManifest {
   telegram?: { token?: string };
   /** built-in + custom tool names; default excludes bash (safer for remote chats) */
   tools?: string[];
+  /** Names of host env vars (/^[A-Z][A-Z0-9_]*$/) that child processes (bash tool,
+   * delegate_cli, herdr) may inherit. Children get a minimal allowlisted env otherwise. */
+  envPassthrough?: string[];
   /** Host capability ids. Omit for the conservative default set; opt in to
    * external-data or mutation capabilities explicitly per agent. */
   capabilities?: string[];

@@ -3,6 +3,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { readJson, writeJsonAtomic } from "./core/util.js";
 
+/** WebAuthn challenge lifetime. */
+export const CHALLENGE_TTL_MS = 5 * 60_000;
+/** Server-side session lifetime — must match the cookie Max-Age, or a copied cookie outlives its browser expiry. */
+export const SESSION_TTL_MS = 12 * 3600_000;
+
 export interface StoredCredential {
   id: string; // base64url
   publicKey: string; // base64 (raw)
@@ -118,7 +123,7 @@ export class WebAuthStore {
   createChallenge(kind: "register" | "auth"): string {
     const chal = crypto.randomBytes(32).toString("base64url");
     // key by challenge itself; expectedChallenge function can also verify
-    this.challenges.set(chal, { challenge: chal, expires: Date.now() + 5 * 60_1000, kind });
+    this.challenges.set(chal, { challenge: chal, expires: Date.now() + CHALLENGE_TTL_MS, kind });
     return chal;
   }
 
@@ -137,7 +142,7 @@ export class WebAuthStore {
   // session tokens
   createSession(): string {
     const token = crypto.randomBytes(32).toString("hex");
-    const expires = Date.now() + 12 * 3600_1000;
+    const expires = Date.now() + SESSION_TTL_MS;
     this.sessions.set(token, expires);
     this.persistSessions();
     return token;
@@ -176,7 +181,7 @@ export class WebAuthStore {
 
   makeCookie(token: string): string {
     const signed = this.signSessionToken(token);
-    return `pibot_session=${signed}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${12 * 3600}`;
+    return `pibot_session=${signed}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_TTL_MS / 1000}`;
   }
 
   clearCookie(): string {

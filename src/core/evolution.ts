@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -88,13 +88,31 @@ export function applyPatch(raw: string, find: string, replace: string): { ok: bo
   return { ok: true, result: raw.slice(0, idx) + replace + raw.slice(idx + find.length) };
 }
 
+/** Refuse symlink components as well as lexical traversal for admin file operations. */
+function safeSkillPath(agent: LoadedAgent, ...parts: string[]): string | undefined {
+  const root = path.resolve(agent.dir);
+  let current = root;
+  try {
+    for (const part of ["skills", ...parts]) {
+      if (!part || part === "." || part === ".." || part.includes("/") || part.includes("\\")) return undefined;
+      current = path.join(current, part);
+      // lstat also identifies broken symlinks that existsSync would miss.
+      try { if (fs.lstatSync(current).isSymbolicLink()) return undefined; } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+      }
+    }
+    return current;
+  } catch { return undefined; }
+}
+
 // ─── proposal shape ─────────────────────────────────────────────────────────
 
 /** Staging sidecar: the backlog ids a staged candidate addresses (close-on-promote). */
 const STAGING_BACKLOG_SIDECAR = ".backlog.json";
 
 function readStagingBacklogIds(agent: LoadedAgent, skillName: string): string[] {
-  const sidecar = path.join(agent.dir, "skills", ".staging", skillName, STAGING_BACKLOG_SIDECAR);
+  const sidecar = safeSkillPath(agent, ".staging", skillName, STAGING_BACKLOG_SIDECAR);
+  if (!sidecar) return [];
   try {
     const ids = readJson<{ ids?: unknown }>(sidecar, {}) as { ids?: unknown };
     return Array.isArray(ids.ids) ? ids.ids.map(String).filter(Boolean) : [];
@@ -183,6 +201,17 @@ export function lastProbeScores(entries: Array<{ summary: string }>, skillName: 
   return undefined;
 }
 
+export interface EvolutionHistoryEntry {
+  t: number;
+  summary: string;
+}
+
+export interface EvolutionReviewDetail extends StagedCandidate {
+  currentContent?: string;
+  /** Actual bounded event records, not reconstructed versions or causal claims. */
+  history: EvolutionHistoryEntry[];
+}
+
 export interface StagedCandidate {
   name: string;
   /** "patch" when a live skill with this name exists, else "create" */
@@ -255,9 +284,10 @@ export class EvolutionEngine {
   // ── staging surface ───────────────────────────────────────────────────────
 
   staged(agentId: string): string[] {
-    const dir = path.join(this.deps.agents.getAgent(agentId)?.dir ?? "", "skills", ".staging");
-    if (!fs.existsSync(dir)) return [];
-    return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+    const agent = this.deps.agents.getAgent(agentId);
+    const dir = agent && safeSkillPath(agent, ".staging");
+    if (!dir || !fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && validateSkillName(e.name)).map((e) => e.name);
   }
 
   /** Rich view of what's staged for an agent — what the admin actually reviews. */
@@ -265,8 +295,10 @@ export class EvolutionEngine {
     const agent = this.deps.agents.getAgent(agentId);
     if (!agent) return [];
     const out: StagedCandidate[] = [];
+    const entries = this.deps.events.tail(agentId, 60);
     for (const name of this.staged(agentId)) {
-      const file = path.join(agent.dir, "skills", ".staging", name, "SKILL.md");
+      const file = safeSkillPath(agent, ".staging", name, "SKILL.md");
+      if (!file) continue;
       let raw: string;
       try {
         raw = fs.readFileSync(file, "utf8");
@@ -282,12 +314,12 @@ export class EvolutionEngine {
       }
       out.push({
         name,
-        mode: fs.existsSync(path.join(agent.dir, "skills", name, "SKILL.md")) ? "patch" : "create",
+        mode: this.currentContent(agentId, name) !== undefined ? "patch" : "create",
         description: parsed.description,
         preview: truncate(parsed.body.trim(), 500),
         content: raw,
         closesBacklog: readStagingBacklogIds(agent, name),
-        scores: lastProbeScores(this.deps.events.tail(agentId, 60), name),
+        scores: lastProbeScores(entries, name),
         stagedAt,
       });
     }
@@ -297,13 +329,119 @@ export class EvolutionEngine {
   /** Full staged SKILL.md content (peek action); undefined when nothing staged under that name. */
   stagedContent(agentId: string, skillName: string): string | undefined {
     const agent = this.deps.agents.getAgent(agentId);
-    if (!agent) return undefined;
-    const file = path.join(agent.dir, "skills", ".staging", skillName, "SKILL.md");
+    if (!agent || !validateSkillName(skillName)) return undefined;
+    const file = safeSkillPath(agent, ".staging", skillName, "SKILL.md");
+    if (!file) return undefined;
     try {
       return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : undefined;
     } catch {
       return undefined;
     }
+  }
+
+  /** Current installed content for comparison; absent for a newly created skill. */
+  currentContent(agentId: string, skillName: string): string | undefined {
+    const agent = this.deps.agents.getAgent(agentId);
+    if (!agent || !validateSkillName(skillName)) return undefined;
+    const file = safeSkillPath(agent, skillName, "SKILL.md");
+    try { return file && fs.existsSync(file) ? fs.readFileSync(file, "utf8") : undefined; }
+    catch { return undefined; }
+  }
+
+  /** Load a complete queue in one staging pass, with a shared bounded history snapshot. */
+  reviewDetails(agentId: string): EvolutionReviewDetail[] {
+    const candidates = this.stagedDetail(agentId);
+    const entries = this.deps.events.tail(agentId, 500);
+    return candidates.map((candidate) => ({
+      ...candidate,
+      currentContent: this.currentContent(agentId, candidate.name),
+      history: this.skillHistory(agentId, candidate.name, entries),
+    }));
+  }
+
+  reviewDetail(agentId: string, skillName: string): EvolutionReviewDetail | undefined {
+    if (!validateSkillName(skillName)) return undefined;
+    return this.reviewDetails(agentId).find((c) => c.name === skillName);
+  }
+
+  private skillHistory(agentId: string, skillName: string, entries = this.deps.events.tail(agentId, 500)): EvolutionHistoryEntry[] {
+    const escaped = skillName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mentionsSkill = new RegExp(`(?:^|[^a-z0-9-])${escaped}(?:$|[^a-z0-9-])`);
+    return entries
+      .filter((e) => e.summary.startsWith("evolution:") && mentionsSkill.test(e.summary))
+      .map(({ t, summary }) => ({ t, summary })).slice(-30);
+  }
+
+  /** Durable archive list for recovery after an Undo banner or process session ends. */
+  archivedDetail(agentId: string): Array<EvolutionReviewDetail & { archiveId: string }> {
+    const agent = this.deps.agents.getAgent(agentId);
+    const root = agent && safeSkillPath(agent, ".archive");
+    if (!agent || !root || !fs.existsSync(root)) return [];
+    const out: Array<EvolutionReviewDetail & { archiveId: string }> = [];
+    const entries = this.deps.events.tail(agentId, 500);
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !validateSkillName(entry.name)) continue;
+      const skillRoot = safeSkillPath(agent, ".archive", entry.name);
+      if (!skillRoot) continue;
+      for (const receipt of fs.readdirSync(skillRoot, { withFileTypes: true })) {
+        if (!receipt.isDirectory() || !/^[a-f0-9]{24}$/.test(receipt.name)) continue;
+        const file = safeSkillPath(agent, ".archive", entry.name, receipt.name, "SKILL.md");
+        const sidecar = safeSkillPath(agent, ".archive", entry.name, receipt.name, STAGING_BACKLOG_SIDECAR);
+        const snapshot = safeSkillPath(agent, ".archive", entry.name, receipt.name, ".archive-review.json");
+        if (!file || !sidecar || !snapshot) continue;
+        try {
+          const content = fs.readFileSync(file, "utf8");
+          const parsed = parseSkillFrontmatter(content);
+          const currentContent = this.currentContent(agentId, entry.name);
+          const data = readJson<{ ids?: unknown }>(sidecar, {});
+          const review = readJson<{ scores?: unknown }>(snapshot, {});
+          out.push({
+            name: entry.name, archiveId: receipt.name, content, currentContent,
+            mode: currentContent === undefined ? "create" : "patch",
+            description: parsed.description, preview: truncate(parsed.body.trim(), 500),
+            closesBacklog: Array.isArray(data.ids) ? data.ids.map(String).filter(Boolean) : [],
+            scores: Array.isArray(review.scores) && review.scores.every((n) => typeof n === "number" && Number.isFinite(n)) ? review.scores : undefined,
+            stagedAt: fs.statSync(file).mtimeMs, history: this.skillHistory(agentId, entry.name, entries),
+          });
+        } catch { /* skip corrupt or concurrently restored archive */ }
+      }
+    }
+    return out.sort((a, b) => b.stagedAt - a.stagedAt);
+  }
+
+  /** Archive the entire proposal, including sidecars; return an opaque Undo receipt. */
+  archive(agentId: string, skillName: string): string | undefined {
+    const agent = this.deps.agents.getAgent(agentId);
+    if (!agent || !validateSkillName(skillName)) return undefined;
+    const source = safeSkillPath(agent, ".staging", skillName);
+    const archiveId = randomBytes(12).toString("hex");
+    const destination = safeSkillPath(agent, ".archive", skillName, archiveId);
+    const snapshot = safeSkillPath(agent, ".staging", skillName, ".archive-review.json");
+    if (!source || !destination || !snapshot || this.stagedContent(agentId, skillName) === undefined) return undefined;
+    try {
+      // Capture scores now; later proposals with the same name must not rewrite archived evidence.
+      writeJsonAtomic(snapshot, { scores: lastProbeScores(this.deps.events.tail(agentId, 60), skillName) }, 0o600);
+      fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+      fs.renameSync(source, destination);
+      this.deps.events.log(agentId, "system", `evolution: archived staged skill ${skillName}`);
+      this.dropReviewTokensFor(agentId, skillName);
+      return archiveId;
+    } catch { return undefined; }
+  }
+
+  /** Restore only when staging is empty; a newer candidate must never be overwritten. */
+  restore(agentId: string, skillName: string, archiveId: string): boolean {
+    const agent = this.deps.agents.getAgent(agentId);
+    if (!agent || !validateSkillName(skillName) || !/^[a-f0-9]{24}$/.test(archiveId)) return false;
+    const source = safeSkillPath(agent, ".archive", skillName, archiveId);
+    const destination = safeSkillPath(agent, ".staging", skillName);
+    if (!source || !destination || !fs.existsSync(source) || fs.existsSync(destination)) return false;
+    try {
+      fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+      fs.renameSync(source, destination);
+      this.deps.events.log(agentId, "system", `evolution: restored staged skill ${skillName}`);
+      return true;
+    } catch { return false; }
   }
 
   // ── review-card tokens (compact callback targets for chat buttons) ──────
@@ -346,9 +484,9 @@ export class EvolutionEngine {
   /** Manually promote a staged candidate (skips probes, gates still apply) */
   promote(agentId: string, skillName: string): boolean {
     const agent = this.deps.agents.getAgent(agentId);
-    if (!agent) return false;
-    const stagedFile = path.join(agent.dir, "skills", ".staging", skillName, "SKILL.md");
-    if (!fs.existsSync(stagedFile)) return false;
+    if (!agent || !validateSkillName(skillName)) return false;
+    const stagedFile = safeSkillPath(agent, ".staging", skillName, "SKILL.md");
+    if (!stagedFile || !safeSkillPath(agent, skillName, "SKILL.md") || !fs.existsSync(stagedFile)) return false;
     // read the sidecar BEFORE promotion deletes the staging dir
     const backlogIds = readStagingBacklogIds(agent, skillName);
     if (!this.promoteCandidate(agent, skillName, fs.readFileSync(stagedFile, "utf8"), "manually promoted from staging")) return false;
@@ -358,15 +496,9 @@ export class EvolutionEngine {
     return true;
   }
 
+  /** Compatibility entry point: rejection is now reversible archival. */
   reject(agentId: string, skillName: string): boolean {
-    const agent = this.deps.agents.getAgent(agentId);
-    if (!agent) return false;
-    const stagedDir = path.join(agent.dir, "skills", ".staging", skillName);
-    if (!fs.existsSync(stagedDir)) return false;
-    fs.rmSync(stagedDir, { recursive: true, force: true });
-    this.deps.events.log(agentId, "system", `evolution: rejected staged skill ${skillName}`);
-    this.dropReviewTokensFor(agentId, skillName);
-    return true;
+    return this.archive(agentId, skillName) !== undefined;
   }
 
   // ── the loop ──────────────────────────────────────────────────────────────
@@ -629,7 +761,8 @@ export class EvolutionEngine {
   private promoteCandidate(agent: LoadedAgent, skillName: string, content: string, rationale: string): boolean {
     try {
       const skillsDir = path.join(agent.dir, "skills");
-      const target = path.join(skillsDir, skillName, "SKILL.md");
+      const target = validateSkillName(skillName) ? safeSkillPath(agent, skillName, "SKILL.md") : undefined;
+      if (!target || !safeSkillPath(agent, skillName, "SKILL.md.bak") || !safeSkillPath(agent, ".staging", skillName)) return false;
       fs.mkdirSync(path.dirname(target), { recursive: true });
       if (fs.existsSync(target)) fs.copyFileSync(target, `${target}.bak`); // belt & suspenders on top of git
       fs.writeFileSync(target, content);

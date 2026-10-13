@@ -133,3 +133,46 @@ describe("docs plugin root listing", () => {
     expect(res.content[0].text).toContain("content/");
   });
 });
+
+describe("participant public docs isolation", () => {
+  let root: string;
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pibot-public-docs-")));
+    for (const folder of ["content/docs/course", "public", "src", "scripts", "content/private", "content/docs/.private"]) fs.mkdirSync(path.join(root, folder), { recursive: true });
+    for (const file of [".env.production.local", "package.json", "src/server.ts", "scripts/deploy.ts", "content/private/key.md", "content/docs/.private/key.md", "content/docs/course/.env", "public/.secret.json"]) fs.writeFileSync(path.join(root, file), "SECRET");
+    fs.writeFileSync(path.join(root, "content/docs/course/lesson.mdx"), "Public lesson");
+    fs.writeFileSync(path.join(root, "public/info.json"), '{"public":true}');
+    fs.writeFileSync(path.join(root, "public/image.png"), Buffer.from([0, 1, 2]));
+    fs.symlinkSync(path.join(root, "content/private"), path.join(root, "content/docs/linked"));
+  });
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+  function toolsFor(docsDir = root) {
+    const { pi, tools } = captureTools();
+    factoryOf(docsPlugin({ docsDir, publicOnly: true }))(pi);
+    return tools;
+  }
+  it("refuses repository secrets, dot files, hidden directories and binary files", async () => {
+    const tools = toolsFor();
+    for (const file of [".env.production.local", "package.json", "src/server.ts", "scripts/deploy.ts", "content/private/key.md", "content/docs/.private/key.md", "content/docs/course/.env", "public/.secret.json", "public/image.png", "content/docs/linked/key.md"]) {
+      const result = await tools.get("docs_read")!.execute("x", { path: file });
+      expect(result.details.ok, file).toBe(false);
+      expect(result.content[0].text).not.toContain("SECRET");
+    }
+  });
+  it("exposes navigable published roots only and filters hidden/symlink entries", async () => {
+    const tools = toolsFor();
+    const list = async (requested: string) => (await tools.get("docs_list")!.execute("x", { path: requested })).content[0].text;
+    expect(await list(".")).toBe("content/\npublic/");
+    expect(await list("content")).toBe("docs/");
+    expect(await list("content/docs")).toBe("course/");
+    expect(await list("public")).toBe("info.json");
+    expect((await tools.get("docs_list")!.execute("x", { path: "src" })).details.ok).toBe(false);
+  });
+  it("reads published text and supports content/docs as configured root", async () => {
+    expect((await toolsFor().get("docs_read")!.execute("x", { path: "public/info.json" })).details.ok).toBe(true);
+    const tools = toolsFor(path.join(root, "content/docs"));
+    expect((await tools.get("docs_read")!.execute("x", { path: "course/lesson.mdx" })).content[0].text).toBe("Public lesson");
+    expect((await tools.get("docs_read")!.execute("x", { path: "../private/key.md" })).details.ok).toBe(false);
+    expect((await tools.get("docs_read")!.execute("x", { path: ".private/key.md" })).details.ok).toBe(false);
+  });
+});

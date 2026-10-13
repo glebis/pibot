@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { execPlugin, resolveExec, type ExecAllowEntry } from "./exec-plugin.js";
+import { DEFAULT_EXEC_ALLOWLIST, execPlugin, resolveExec, type ExecAllowEntry } from "./exec-plugin.js";
 
 function factoryOf(ext: InlineExtension): (pi: ExtensionAPI) => void {
   return typeof ext === "function" ? ext : ext.factory;
@@ -127,6 +127,204 @@ describe("exec plugin allowlist resolution", () => {
   it("refuses unknown binaries without throwing", async () => {
     const r = await resolveExec(["definitely-not-a-real-binary-xyz"], { workspace: agentDir, agentDir }, allow);
     expect(r.error).toMatch(/not on this agent's exec allowlist|command not found/);
+  });
+});
+
+describe("default allowlist hardening (bypass regressions)", () => {
+  let agentDir: string;
+  let bins: Record<string, string>;
+  let allow: ExecAllowEntry[];
+  const deps = () => ({ workspace: agentDir, agentDir });
+
+  beforeEach(() => {
+    agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-exec-hard-"));
+    const binDir = path.join(agentDir, "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    bins = {};
+    // clone each default entry onto a distinct fake binary so tests do not need the real tools installed
+    allow = DEFAULT_EXEC_ALLOWLIST.map((e, i) => {
+      const name = `fake-${i}`;
+      const p = path.join(binDir, name);
+      fs.writeFileSync(p, "#!/bin/sh\nexit 0\n");
+      fs.chmodSync(p, 0o755);
+      const key = e.pin ? `${e.bin}:${e.pin.join(" ")}` : e.bin;
+      bins[key] = p;
+      return { ...e, bin: p };
+    });
+    fs.mkdirSync(path.join(agentDir, "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(agentDir, "scripts", "good.scpt"), "stub");
+    fs.writeFileSync("/tmp/evil.scpt", "stub");
+  });
+
+  afterEach(() => {
+    fs.rmSync(agentDir, { recursive: true, force: true });
+    fs.rmSync("/tmp/evil.scpt", { force: true });
+  });
+
+  const run = (key: string, ...args: string[]) => resolveExec([bins[key], ...args], deps(), allow);
+  const yt = (...args: string[]) => run("yt-dlp", ...args);
+  const URL = "https://www.youtube.com/watch?v=abc123";
+
+  describe("yt-dlp", () => {
+    it("allows legitimate invocations", async () => {
+      for (const args of [
+        ["--list-subs", URL],
+        ["--skip-download", "--write-auto-subs", "--sub-langs", "en,ru", "--convert-subs", "srt", URL],
+        ["--skip-download", "--write-subs", "--sub-langs=en.*", "--sub-format", "vtt", "-o", "subs/%(id)s.%(ext)s", URL],
+        ["--print", "title", "--print", "%(channel)s", "--print", "upload_date", "--no-playlist", URL],
+        ["-O", "%(title)s", "-j", "-q", "--no-warnings", "--no-progress", URL],
+        ["-x", "--audio-format", "mp3", "-f", "bestaudio/best", "-o", "audio.%(ext)s", URL],
+        ["--playlist-items", "1:3,5", URL],
+      ]) {
+        const r = await yt(...args);
+        expect(r.error, args.join(" ")).toBeUndefined();
+      }
+    });
+
+    it("refuses command-execution and file/credential bypass flags", async () => {
+      for (const args of [
+        ["--downloader", "/bin/sh", URL],
+        ["--downloader=/bin/sh", URL],
+        ["--external-downloader", "/bin/sh", URL],
+        ["--downloader-args", "x", URL],
+        ["--ffmpeg-location", "/tmp/evil", URL],
+        ["--ffmpeg-location=/tmp/evil", URL],
+        ["--plugin-dirs", "/tmp/p", URL],
+        ["--config-locations", "/tmp/c.conf", URL],
+        ["--config-location=/tmp/c.conf", URL],
+        ["--cookies-from-browser", "chrome", URL],
+        ["--cookies-from-browser=chrome", URL],
+        ["--cookies", "/tmp/c.txt", URL],
+        ["--netrc", URL],
+        ["--username", "u", "--password", "p", URL],
+        ["--batch-file", "/etc/passwd"],
+        ["-a", "/etc/passwd"],
+        ["--load-info-json", "/tmp/i.json"],
+        ["--paths", "/etc", URL],
+        ["--print-to-file", "title", "/tmp/x", URL],
+        ["--exec", "id", URL],
+        ["--exec=id", URL],
+        ["--exec-before-download", "id", URL],
+        ["--postprocessor-args", "x", URL],
+        ["--ppa", "x", URL],
+        ["--use-postprocessor", "Exec", URL],
+        ["-qx", URL], // combined short flags are not parsed
+        ["--", "--exec", "id"],
+      ]) {
+        const r = await yt(...args);
+        expect(r.error, args.join(" ")).toBeTruthy();
+      }
+    });
+
+    it("-o/--output must stay workspace-relative", async () => {
+      for (const o of ["/etc/x", "../../x", "a/../../x", "~/x", "~"]) {
+        expect((await yt("-o", o, URL)).error, o).toMatch(/not allowed/);
+        expect((await yt(`--output=${o}`, URL)).error, o).toMatch(/not allowed/);
+      }
+      expect((await yt("-o", "out/%(id)s.%(ext)s", URL)).error).toBeUndefined();
+    });
+
+    it("-o refuses type prefixes (their template may be absolute)", async () => {
+      for (const o of ["subtitle:/Users/x/.zshrc", "infojson:/tmp/x", "pl_thumbnail:x", "SUBTITLE:x"]) {
+        expect((await yt("-o", o, URL)).error, o).toMatch(/not allowed/);
+        expect((await yt(`--output=${o}`, URL)).error, o).toMatch(/not allowed/);
+      }
+    });
+
+    it("-o never writes into dirs whose files are later executed (osascript scripts/, extensions/, skills/)", async () => {
+      for (const o of ["scripts/x.scpt", "./scripts/x", "Scripts/x", "scripts", "extensions/evil.ts", "skills/x/SKILL.md"]) {
+        expect((await yt("-o", o, URL)).error, o).toMatch(/not allowed/);
+      }
+      expect((await yt("-o", "materials/scripts-notes.%(ext)s", URL)).error).toBeUndefined();
+    });
+
+    it("positionals must be https URLs; value flags need a safe value", async () => {
+      expect((await yt("file:///etc/passwd")).error).toMatch(/not allowed/);
+      expect((await yt("http://example.com/v")).error).toMatch(/not allowed/);
+      expect((await yt("/etc/passwd")).error).toMatch(/not allowed/);
+      expect((await yt("--list-subs")).error).toMatch(/positional/);
+      expect((await yt("--sub-langs", URL)).error).toBeTruthy();
+      expect((await yt(URL, "--sub-langs")).error).toMatch(/requires a value/);
+      expect((await yt("--print", "$(id)", URL)).error).toBeTruthy();
+      expect((await yt("--convert-subs", "exe", URL)).error).toMatch(/not allowed/);
+      expect((await yt("--skip-download=1", URL)).error).toMatch(/takes no value/);
+    });
+  });
+
+  describe("osascript", () => {
+    const osa = (...args: string[]) => run("osascript", ...args);
+
+    it("runs a script file under <agentDir>/scripts", async () => {
+      const real = fs.realpathSync(path.join(agentDir, "scripts", "good.scpt"));
+      const r = await osa(path.join(agentDir, "scripts", "good.scpt"), "arg1");
+      expect(r.error).toBeUndefined();
+      expect(r.argv.slice(1)).toEqual([real, "arg1"]);
+    });
+
+    it("refuses scripts outside scripts/, flags, missing files, directories and symlink escapes", async () => {
+      expect((await osa("/tmp/evil.scpt")).error).toMatch(/must live under/);
+      expect((await osa(path.join(agentDir, "scripts", "../bin/fake-0"))).error).toMatch(/must live under/);
+      expect((await osa("-l", "JavaScript", path.join(agentDir, "scripts", "good.scpt"))).error).toMatch(/flags/);
+      expect((await osa("-e", 'do shell script "id"')).error).toMatch(/flags/);
+      expect((await osa("-i")).error).toMatch(/flags/);
+      expect((await osa()).error).toMatch(/requires a script file/);
+      expect((await osa(path.join(agentDir, "scripts", "nope.scpt"))).error).toMatch(/must exist/);
+      expect((await osa(path.join(agentDir, "scripts"))).error).toMatch(/regular file/);
+      fs.symlinkSync("/tmp/evil.scpt", path.join(agentDir, "scripts", "link.scpt"));
+      expect((await osa(path.join(agentDir, "scripts", "link.scpt"))).error).toMatch(/must live under/);
+    });
+  });
+
+  describe("gh", () => {
+    const api = (...args: string[]) => run("gh:api", "api", ...args);
+    const view = (...args: string[]) => run("gh:repo view", "repo", "view", ...args);
+
+    it("allows read-only api fetches and repo view", async () => {
+      expect((await api("repos/a/b")).error).toBeUndefined();
+      expect((await api("repos/a/b/contents/README.md?ref=main", "--jq", ".content")).error).toBeUndefined();
+      expect((await api("repos/a/b/issues?state=open", "--paginate", "-H", "Accept: application/vnd.github+json")).error).toBeUndefined();
+      expect((await view("openclaw/openclaw", "--json", "stargazersCount,forks")).error).toBeUndefined();
+      expect((await view("a/b", "--json", "forks", "--jq", ".forks")).error).toBeUndefined();
+    });
+
+    it("refuses mutations, inputs, fields and odd endpoints", async () => {
+      for (const args of [
+        ["-X", "DELETE", "repos/a/b"],
+        ["--method", "DELETE", "repos/a/b"],
+        ["--method=PATCH", "repos/a/b"],
+        ["repos/a/b", "-X", "DELETE"],
+        ["repos/a/b", "--input", "f"],
+        ["repos/a/b", "-f", "name=x"],
+        ["repos/a/b", "-F", "name=x"],
+        ["repos/a/b", "--field", "name=x"],
+        ["repos/a/b", "--raw-field", "name=x"],
+        ["repos/a/b", "-H", "Authorization: token x"],
+        ["repos/a/b", "--hostname", "evil.example"],
+        ["user"],
+        ["graphql"],
+        ["repos/a/b/../../user"],
+        ["repos/a/b", "repos/c/d"],
+        [],
+      ]) {
+        expect((await api(...args)).error, args.join(" ")).toBeTruthy();
+      }
+      expect((await view("--web", "a/b")).error).toMatch(/not allowlisted/);
+      expect((await view("a/b", "--web")).error).toMatch(/not allowlisted/);
+      expect((await view("https://github.com/a/b")).error).toMatch(/not allowed/);
+      expect((await view()).error).toMatch(/positional/);
+    });
+  });
+
+  describe("curl", () => {
+    const curl = (...args: string[]) => run("curl:-sL --max-time 15", ...args);
+    it("allows exactly one allowlisted URL; -L cannot be combined with extra args", async () => {
+      expect((await curl("-sL", "--max-time", "15", "https://api.github.com/repos/a/b")).error).toBeUndefined();
+      expect((await curl("-sL", "--max-time", "15", "https://api.github.com/x", "https://evil.example/y")).error).toMatch(/exactly one/);
+      expect((await curl("-sL", "--max-time", "15", "https://api.github.com/x", "-o", "/tmp/x")).error).toMatch(/exactly one/);
+      expect((await curl("-sL", "--max-time", "15", "-K", "/tmp/cfg", "https://api.github.com/x")).error).toMatch(/exactly one/);
+      expect((await curl("-sL", "--max-time", "15", "--next", "https://evil.example/y")).error).toMatch(/exactly one/);
+      expect((await curl("-sL", "https://api.github.com/x")).error).toMatch(/pinned/);
+    });
   });
 });
 
