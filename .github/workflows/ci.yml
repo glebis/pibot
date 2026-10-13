@@ -4,9 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_environment_smoke:
+        description: 'Run environment smoke tests'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  test:
+  typecheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,4 +23,66 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx tsc --noEmit
-      - run: npx vitest run --reporter=dot
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run --config vitest.config.ts --reporter=dot
+
+  test-env:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_environment_smoke == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:env
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - name: Run deterministic tests with coverage gate
+        run: npm run test:coverage
+      - name: Verify coverage summary artifact
+        run: test -f coverage/coverage-summary.json && echo "Coverage summary exists"
+
+  coverage-gate-proves-failure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Negative test — raising threshold above ceiling must fail (observes actual Vitest nonzero exit)
+        run: |
+          set +e
+          npx vitest run --config vitest.config.ts --coverage \
+            --coverage.thresholds.statements=99 \
+            --coverage.thresholds.branches=99 \
+            --coverage.thresholds.functions=99 \
+            --coverage.thresholds.lines=99
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "ERROR: Expected Vitest to fail the 99% coverage gate"
+            exit 1
+          fi
+          echo "Gate correctly enforced thresholds (Vitest exit code: $status)"

@@ -138,12 +138,12 @@ function fakeAgentManager(promptSpy = vi.fn()) {
     }),
   } as unknown as AgentSession;
   const agents = {
+    sessions: new Map<string, AgentSession>(),
     createAgent: vi.fn(() => undefined),
     resetSession: vi.fn(async () => {}),
     discover: vi.fn(async () => {}),
     getOrCreateSession: vi.fn(async (..._args: unknown[]) => fakeSession),
     resolveModel: vi.fn(() => undefined),
-    sessions: new Map(),
     getAgent: vi.fn((id: string) =>
       id === "pibot-dev"
         ? { id, dir: `/tmp/fake-${id}`, manifest: { name: id, description: "d", workspace: "repo" } }
@@ -2364,5 +2364,102 @@ describe("/goal audit follow-ups", () => {
     expect(state.lastReason).toMatch(/auto-paused/);
     expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal paused"))).toBe(true);
     expect(t.events.log).toHaveBeenCalledWith("assistant", "system", expect.stringContaining("goal loop could not continue"));
+  });
+});
+
+describe("PiBot host routing", () => {
+  const botDirs: string[] = [];
+  afterEach(() => {
+    for (const dir of botDirs) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // NOTE: exact originating-chat transcript selection is not guaranteed by this test.
+  // The exact chat from which context is sourced during handoff is residual architecture
+  // work and is NOT claimed or asserted by these tests.
+  it("asks the exact invoking transport and chat", async () => {
+    const t = makeBot();
+    botDirs.push(t.dir);
+    await t.transport.messageCb!("hello", "chat-a");
+    const askCallback = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls[0][4];
+    const promise = askCallback({ text: "Which account?", options: ["client", "personal"] });
+    await vi.waitFor(() => expect(t.transport.pushed).toHaveLength(1));
+    expect(t.transport.pushed[0]).toMatchObject({
+      chatId: "chat-a",
+      opts: { text: "Which account?", card: { text: "", buttons: expect.any(Array) } },
+    });
+    expect(t.transport.pushed[0].opts.card!.buttons).toEqual([
+      { label: "client", action: expect.any(String) },
+      { label: "personal", action: expect.any(String) },
+    ]);
+    const action = t.transport.pushed[0].opts.card!.buttons![1].action;
+    await t.transport.actionCb!(action, "chat-a");
+    expect(await promise).toMatchObject({ choice: "personal", via: "button" });
+    expect(t.transport.pushed.every(({ chatId }) => chatId === "chat-a")).toBe(true);
+  });
+
+  it("routes agent asks through injected hooks and raw pair keys", async () => {
+    const t = makeBot();
+    botDirs.push(t.dir);
+    const targetSessions = new Map<string, AgentSession>();
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => ({ id, dir: `/tmp/${id}`, manifest: { name: id } }));
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockImplementation(async (agentId: string, key: string) => {
+      if (agentId === "assistant") return {
+        prompt: vi.fn(async () => {}),
+        subscribe: vi.fn(() => () => {}),
+      } as unknown as AgentSession;
+      const session = {
+        prompt: vi.fn(async () => {}),
+        subscribe: vi.fn(() => () => {}),
+        agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: `${agentId} reply` }] }] } },
+      } as unknown as AgentSession;
+      targetSessions.set(key, session);
+      return session;
+    });
+    await t.transport.say("hello");
+    const hooks = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls[0][5] as {
+      askAgent: (from: string, to: string, text: string) => Promise<string>;
+    };
+    await hooks.askAgent("assistant", "tax", "first");
+    await hooks.askAgent("hr", "tax", "second");
+    expect(targetSessions.has("agent::tax::from-assistant")).toBe(true);
+    expect(targetSessions.has("agent::tax::from-hr")).toBe(true);
+    const first = targetSessions.get("agent::tax::from-assistant")!;
+    const second = targetSessions.get("agent::tax::from-hr")!;
+    expect((t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls).toEqual(expect.arrayContaining([
+      ["tax", "agent::tax::from-assistant", { transport: "agent", chatId: "assistant" }, expect.anything(), undefined, expect.any(Object)],
+      ["tax", "agent::tax::from-hr", { transport: "agent", chatId: "hr" }, expect.anything(), undefined, expect.any(Object)],
+    ]));
+    expect((first.prompt as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(expect.stringContaining("first"));
+    expect((second.prompt as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(expect.stringContaining("second"));
+  });
+
+  it("hands off without source cache and rejects when target creation fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = makeBot();
+      botDirs.push(t.dir);
+      const targetPrompt = vi.fn(async () => {});
+      (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => ({ id, dir: `/tmp/${id}`, manifest: { name: id } }));
+      (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        prompt: targetPrompt,
+        subscribe: vi.fn(() => () => {}),
+        agent: { state: { messages: [] } },
+      } as unknown as AgentSession);
+      await t.transport.say("hello");
+      const hooks = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls[0][5] as { handoffContext: (from: string, to: string, note: string) => Promise<string> };
+      const handoffPromise = hooks.handoffContext("assistant", "tax", "please continue");
+      await vi.runAllTimersAsync();
+      await handoffPromise;
+      expect(targetPrompt).toHaveBeenCalledWith(expect.stringContaining("# Handoff brief"));
+      expect(targetPrompt).toHaveBeenCalledWith(expect.stringContaining("(no prior conversation)"));
+      expect(targetPrompt).toHaveBeenCalledWith(expect.stringContaining("please continue"));
+      (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockClear();
+      (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("target unavailable"));
+      await expect(hooks.handoffContext("assistant", "tax", "note")).rejects.toThrow("target unavailable");
+      expect(t.agents.getOrCreateSession).toHaveBeenCalledTimes(1);
+      expect(t.agents.getOrCreateSession).toHaveBeenCalledWith("tax", "agent::tax::from-assistant", expect.objectContaining({ transport: "agent", chatId: "assistant" }), expect.anything(), undefined, expect.any(Object));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

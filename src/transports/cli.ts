@@ -37,14 +37,14 @@ export class CliTransport implements Transport {
       if (this.pendingCard && /^\d+$/.test(text)) {
         const idx = parseInt(text, 10) - 1;
         const btn = this.pendingCard.buttons[idx];
-        this.pendingCard = null;
         if (btn && this.onActionCb) {
+          this.pendingCard = null;
           console.log();
           const feedback = await this.onActionCb(btn.action, "local");
           if (feedback) console.log(`✓ ${feedback}\n`);
+          rl.prompt();
+          return;
         }
-        rl.prompt();
-        return;
       }
       this.pendingCard = null;
       console.log();

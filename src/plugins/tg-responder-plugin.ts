@@ -121,14 +121,17 @@ export function tgResponderPlugin(deps: { dbPath?: string } = {}): InlineExtensi
         description:
           "Write a reply DRAFT for an inbox message. It lands in the responder's review queue — the user approves and sends it there; you never send directly. Keep drafts in the user's voice, short.",
         parameters: Type.Object({
-          inboxId: Type.String({ description: "Inbox message id (from inbox_pending)" }),
+          inboxId: Type.String({
+            description: "Inbox message id (from inbox_pending)",
+            pattern: "^[1-9][0-9]*$"
+          }),
           text: Type.String({ description: "Draft reply text" }),
         }),
         async execute(_tcid, params) {
-          const inboxId = parseInt(params.inboxId, 10);
-          if (!Number.isInteger(inboxId)) {
-            return { content: [{ type: "text", text: "ERROR: inboxId must be a number." }], details: { ok: false } };
+          if (!/^[1-9][0-9]*$/.test(String(params.inboxId))) {
+            return { content: [{ type: "text", text: "ERROR: inboxId must be a positive integer." }], details: { ok: false } };
           }
+          const inboxId = parseInt(String(params.inboxId), 10);
           try {
             const rows = await query(dbPath, `SELECT chat_id FROM inbox WHERE id = ${inboxId}`);
             if (!rows.length) {
@@ -140,7 +143,7 @@ export function tgResponderPlugin(deps: { dbPath?: string } = {}): InlineExtensi
             await exec(
               dbPath,
               `INSERT INTO outbox (inbox_id, chat_id, draft_text, status, source, draft_created_at, created_at, updated_at)
-               VALUES (${inboxId}, '${chatId}', '${text}', 'draft', 'pibot', ${now}, datetime('now'), datetime('now'))`
+               VALUES (${inboxId}, '${chatId}', '${text}', 'draft', 'classification', ${now}, datetime('now'), datetime('now'))`
             );
             return {
               content: [{ type: "text", text: `Draft saved for review — the user approves and sends it from the responder flow.` }],

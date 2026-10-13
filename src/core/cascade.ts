@@ -118,6 +118,45 @@ export interface ProviderCreditHold {
   lastAt?: number;
 }
 
+const MODEL_ERROR_CLASSES: readonly ModelErrorClass[] = ["unavailable", "auth", "credits", "rate-limit", "transient", "context", "unknown"];
+
+function isCascadeEntry(v: unknown): v is CascadeEntry {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  if (typeof o.model !== "string") return false;
+  if (typeof o.openUntil !== "number" || !Number.isFinite(o.openUntil)) return false;
+  if (typeof o.failures !== "number" || !Number.isFinite(o.failures)) return false;
+  if (o.lastError !== undefined && typeof o.lastError !== "string") return false;
+  if (o.lastErrorClass !== undefined && !MODEL_ERROR_CLASSES.includes(o.lastErrorClass as ModelErrorClass)) return false;
+  if (o.lastFailureAt !== undefined && (typeof o.lastFailureAt !== "number" || !Number.isFinite(o.lastFailureAt))) return false;
+  if (o.lastSuccessAt !== undefined && (typeof o.lastSuccessAt !== "number" || !Number.isFinite(o.lastSuccessAt))) return false;
+  return true;
+}
+
+function isDeadLetter(v: unknown): v is DeadLetter {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  if (typeof o.id !== "string") return false;
+  if (typeof o.agentId !== "string") return false;
+  if (typeof o.transport !== "string") return false;
+  if (typeof o.chatId !== "string") return false;
+  if (typeof o.text !== "string") return false;
+  if (typeof o.createdAt !== "number" || !Number.isFinite(o.createdAt)) return false;
+  if (!Array.isArray(o.attempts) || !o.attempts.every((a) => typeof a === "string")) return false;
+  if (o.lastError !== undefined && typeof o.lastError !== "string") return false;
+  if (o.automaticReplayBlocked !== undefined && typeof o.automaticReplayBlocked !== "boolean") return false;
+  return true;
+}
+
+function isProviderCreditHold(v: unknown): v is ProviderCreditHold {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  if (typeof o.until !== "number" || !Number.isFinite(o.until)) return false;
+  if (o.lastError !== undefined && typeof o.lastError !== "string") return false;
+  if (o.lastAt !== undefined && (typeof o.lastAt !== "number" || !Number.isFinite(o.lastAt))) return false;
+  return true;
+}
+
 export interface CascadeState {
   entries: Record<string, CascadeEntry>;
   deadLetters: DeadLetter[];
@@ -151,10 +190,47 @@ export class ModelCascade {
   private state: CascadeState = { entries: {}, deadLetters: [] };
 
   constructor(private deps: ModelCascadeDeps) {
-    this.state = readJson<CascadeState>(deps.statePath, { entries: {}, deadLetters: [] });
-    if (!this.state.entries) this.state.entries = {};
-    if (!this.state.deadLetters) this.state.deadLetters = [];
-    if (!this.state.providerCreditHolds) this.state.providerCreditHolds = {};
+    const fallback: CascadeState = { entries: {}, deadLetters: [] };
+    const parsed = readJson<unknown>(deps.statePath, fallback);
+    const isPlainObject = (v: unknown) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+    let entries: Record<string, CascadeEntry> = {};
+    let deadLetters: DeadLetter[] = [];
+    let providerCreditHolds: Record<string, ProviderCreditHold> = {};
+
+    if (parsed !== fallback && isPlainObject(parsed)) {
+      const raw = parsed as Record<string, unknown>;
+
+      if (isPlainObject(raw.entries)) {
+        entries = {};
+        for (const [key, v] of Object.entries(raw.entries as Record<string, unknown>)) {
+          if (isCascadeEntry(v)) {
+            const entry = v as CascadeEntry;
+            const normalizedKey = key.trim().toLowerCase();
+            const normalizedModel = entry.model.trim().toLowerCase();
+            if (normalizedKey === normalizedModel) {
+              entries[normalizedKey] = entry;
+            }
+            // If they don't match, discard the entry (don't add it to entries)
+          }
+        }
+      }
+
+      if (isPlainObject(raw.providerCreditHolds)) {
+        for (const [provider, v] of Object.entries(raw.providerCreditHolds as Record<string, unknown>)) {
+          if (isProviderCreditHold(v)) providerCreditHolds[provider] = v;
+        }
+      }
+
+      if (Array.isArray(raw.deadLetters)) {
+        deadLetters = [];
+        for (const v of raw.deadLetters) {
+          if (isDeadLetter(v)) deadLetters.push(v);
+        }
+      }
+    }
+
+    this.state = { entries, deadLetters, providerCreditHolds };
   }
 
   // ── chain building ────────────────────────────────────────────────────────
@@ -420,8 +496,11 @@ export class ModelCascade {
         const ok = msg.stopReason !== "error" && msg.stopReason !== "aborted";
         out.push(ok ? { spec, ok } : { spec, ok: false, error: msg.errorMessage ?? `stopReason=${msg.stopReason}` });
         if (ok) this.noteSuccess(spec);
+        else this.noteFailure(spec, msg.errorMessage ?? `stopReason=${msg.stopReason}`);
       } catch (e) {
-        out.push({ spec, ok: false, error: errorMessage(e) });
+        const err = errorMessage(e);
+        out.push({ spec, ok: false, error: err });
+        this.noteFailure(spec, err);
       }
     }
     return out;
