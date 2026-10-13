@@ -20,6 +20,15 @@ function scriptedSatellite(steps: FauxSteps, dir?: { storage: string; workspace:
   return { faux, workspace, sat };
 }
 
+/** Reply keyed to the request, not to call order: under load process A may finish job-1 before the
+ *  crash snapshot, so B resumes only job-2 — a positional faux queue would hand job-2 "answer one". */
+function answerByTask(steps: number) {
+  return Array.from({ length: steps }, () => (ctx: { messages: Array<{ role: string; content: unknown }> }) => {
+    const lastUser = [...ctx.messages].reverse().find((m) => m.role === "user");
+    return fauxAssistantMessage([fauxText(JSON.stringify(lastUser?.content ?? "").includes("task two") ? "answer two" : "answer one")]);
+  });
+}
+
 describe("durable satellite (pi-durable harness prototype)", () => {
   it("answers a submitted input with the scripted model reply", async () => {
     const { sat } = scriptedSatellite([fauxAssistantMessage([fauxText("durable answer works")])]);
@@ -51,7 +60,7 @@ describe("durable satellite (pi-durable harness prototype)", () => {
 
     // process A: admits two jobs but is "killed" before their answers are awaited
     const fauxA = fauxProvider();
-    fauxA.setResponses([fauxAssistantMessage([fauxText("answer one")]), fauxAssistantMessage([fauxText("answer two")])]);
+    fauxA.setResponses(answerByTask(4));
     const a = await openSatellite({ provider: fauxA.provider, workspaceDir: workspace, storageDir });
     void a.ask("task one", "job-1").catch(() => {});
     void a.ask("task two", "job-2").catch(() => {});
@@ -66,7 +75,7 @@ describe("durable satellite (pi-durable harness prototype)", () => {
 
     // process B: reopens the crashed storage, resumes unfinished work
     const fauxB = fauxProvider();
-    fauxB.setResponses([fauxAssistantMessage([fauxText("answer one")]), fauxAssistantMessage([fauxText("answer two")])]);
+    fauxB.setResponses(answerByTask(4));
     const b = await openSatellite({ provider: fauxB.provider, workspaceDir: workspace, storageDir: crashedStorage });
     b.resume();
 
