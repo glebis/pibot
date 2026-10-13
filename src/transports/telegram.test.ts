@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { InputFile } from "grammy";
 import type { InputProfilePhoto } from "grammy/types";
-import { TelegramDuplicateGuard, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec } from "./telegram.js";
+import type { Card } from "../core/types.js";
+import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec } from "./telegram.js";
 
 describe("TelegramDuplicateGuard", () => {
   it("suppresses an identical payload to the same chat inside the window", () => {
@@ -187,5 +188,171 @@ describe("Telegram speech delivery", () => {
     expect(uploads).toHaveLength(2);
     expect(uploads[0] === uploads[1]).toBe(false);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("TelegramTransport outbound push path", () => {
+  function makeTransport(allowed: string[] = ["42", "84"]) {
+    const T = new TelegramTransport("123:test", allowed, { nameSuffix: "x" });
+    return T as unknown as {
+      push(chatId: string, opts: { text: string; card?: Card }): Promise<void>;
+      bot: { api: { [method: string]: (...args: unknown[]) => Promise<unknown> } };
+    };
+  }
+
+  it("sends the payload through Telegram sendMessage with HTML parse mode", async () => {
+    const transport = makeTransport();
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown) => ({ message_id: 1 }));
+    transport.bot.api.sendMessage = send as never;
+
+    await transport.push("42", { text: "hello **world**" });
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toBe("42");
+    expect(send.mock.calls[0][1]).toBe("hello <b>world</b>");
+    expect(send.mock.calls[0][2]).toMatchObject({ parse_mode: "HTML" });
+  });
+
+  it("keeps a failed push retry-eligible and delivers on explicit retry", async () => {
+    const transport = makeTransport();
+    let attempts = 0;
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown) => {
+      attempts++;
+      if (attempts === 1) throw new Error("transient");
+      return { message_id: 1 };
+    });
+    transport.bot.api.sendMessage = send as never;
+
+    await expect(transport.push("42", { text: "retry me" })).rejects.toThrow("transient");
+    expect(send).toHaveBeenCalledTimes(1);
+
+    // failed attempt was not marked sent — the identical payload is not suppressed
+    await transport.push("42", { text: "retry me" });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it("serializes pushes to the same chat and enforces the minimum send gap", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = makeTransport();
+      const sendTimes: number[] = [];
+      const send = vi.fn(async (chatId: string, text: string, options?: unknown) => {
+        sendTimes.push(Date.now());
+        return { message_id: 1 };
+      });
+      transport.bot.api.sendMessage = send as never;
+
+      const p1 = transport.push("42", { text: "first" });
+      const p2 = transport.push("42", { text: "second" });
+      await vi.runAllTimersAsync();
+      await Promise.all([p1, p2]);
+
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send.mock.calls[0][1]).toBe("first");
+      expect(send.mock.calls[1][1]).toBe("second");
+      expect(sendTimes[1] - sendTimes[0]).toBeGreaterThanOrEqual(1000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("honors Telegram 429 retry_after and retries once", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = makeTransport();
+      let attempts = 0;
+      const sendTimes: number[] = [];
+      const send = vi.fn(async (chatId: string, text: string, options?: unknown) => {
+        sendTimes.push(Date.now());
+        attempts++;
+        if (attempts === 1) throw { error_code: 429, parameters: { retry_after: 2 } };
+        return { message_id: 1 };
+      });
+      transport.bot.api.sendMessage = send as never;
+
+      const p = transport.push("42", { text: "throttled" });
+      await vi.runAllTimersAsync();
+      await p;
+
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(sendTimes[1] - sendTimes[0]).toBe(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry on non-429 errors and leaves the chat retry-eligible", async () => {
+    const transport = makeTransport();
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown): Promise<unknown> => {
+      throw { error_code: 500, parameters: { retry_after: 99 } };
+    });
+    transport.bot.api.sendMessage = send as never;
+
+    await expect(transport.push("42", { text: "fail" })).rejects.toMatchObject({ error_code: 500 });
+    expect(send).toHaveBeenCalledTimes(1);
+
+    // a different, non-throttled error still blocks until the caller retries
+    send.mockResolvedValueOnce({ message_id: 1 });
+    await transport.push("42", { text: "fail" });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it("delivers to each chat independently with no cross-chat coupling or serialization", async () => {
+    const transport = makeTransport();
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown) => ({ message_id: 1 }));
+    transport.bot.api.sendMessage = send as never;
+
+    await Promise.all([
+      transport.push("42", { text: "hello" }),
+      transport.push("84", { text: "world" }),
+    ]);
+
+    expect(send).toHaveBeenCalledTimes(2);
+    const byChat = Object.fromEntries(send.mock.calls.map((c) => [c[0], c[1]]));
+    expect(byChat).toEqual({ "42": "hello", "84": "world" });
+  });
+
+  it("isolates a slow chat so a fast chat is not held up", async () => {
+    const transport = makeTransport();
+    let releaseSlow: () => void = () => {};
+    const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+    const order: string[] = [];
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown) => {
+      order.push(`start:${chatId}`);
+      if (chatId === "84") await slowGate;
+      order.push(`done:${chatId}`);
+      return { message_id: 1 };
+    });
+    transport.bot.api.sendMessage = send as never;
+
+    // slow chat enqueued first
+    const p84 = transport.push("84", { text: "slow" });
+
+    // wait until slow chat's send has started (entered the mock)
+    await vi.waitFor(() => expect(order).toEqual(["start:84"]));
+
+    // now enqueue fast chat on a different chat
+    const p42 = transport.push("42", { text: "fast" });
+    await p42;
+
+    // fast chat completed while slow chat is still gated
+    expect(order).toEqual(["start:84", "start:42", "done:42"]);
+
+    releaseSlow();
+    await p84;
+
+    // slow chat completes after release
+    expect(order).toEqual(["start:84", "start:42", "done:42", "done:84"]);
+  });
+
+  it("suppresses an identical push within the duplicate window after a successful send", async () => {
+    const transport = makeTransport();
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown) => ({ message_id: 1 }));
+    transport.bot.api.sendMessage = send as never;
+
+    await transport.push("42", { text: "once" });
+    await transport.push("42", { text: "once" });
+
+    expect(send).toHaveBeenCalledTimes(1);
   });
 });
