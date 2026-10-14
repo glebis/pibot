@@ -11,7 +11,7 @@ const source={verified:true,checkedAt:now,expiresAt:now+30000,sourceContractId:'
 const servers:net.Server[]=[];
 afterEach(async()=>{await Promise.all(servers.splice(0).map(server=>new Promise<void>(resolve=>server.close(()=>resolve()))));});
 async function fixture(){
- const directory=fs.mkdtempSync('/private/tmp/voice-authority-');fs.chmodSync(directory,0o700);const tokenFile=path.join(directory,'token'),socketPath=path.join(directory,'rpc');fs.writeFileSync(tokenFile,'b'.repeat(64),{mode:0o600});
+ const directory=fs.mkdtempSync(path.join(fs.realpathSync('/tmp'),'voice-authority-'));fs.chmodSync(directory,0o700);const tokenFile=path.join(directory,'token'),socketPath=path.join(directory,'rpc');fs.writeFileSync(tokenFile,'b'.repeat(64),{mode:0o600});
  const state:{result:any;envelope?:(r:any)=>any;requests:any[];raw?:string;silent?:boolean}={result:{schemaVersion:1,allowed:true,reason:'ok',checkedAt:now,consent:{...consent}},requests:[]};
  const server=net.createServer(client=>{let data='';client.on('error',()=>{});client.on('data',chunk=>{data+=chunk;if(!data.includes('\n'))return;const request=JSON.parse(data.split('\n')[0]);state.requests.push(request);if(state.silent)return;const envelope={schemaVersion:1,requestId:request.requestId,ok:true,result:state.result};client.end(state.raw??JSON.stringify(state.envelope?.(envelope)??envelope)+'\n');});});servers.push(server);
  await new Promise<void>(resolve=>server.listen(socketPath,resolve));fs.chmodSync(socketPath,0o600);
