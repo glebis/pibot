@@ -119,3 +119,28 @@ describe("QuestionBus polls", () => {
     await promise;
   });
 });
+ it("rejects a callback from another chat without consuming the question", async () => {
+    const { bus, pushed } = makeBus();
+    const pending = bus.ask("lab", CHAT, spec());
+    const action = pushed[0].opts.card!.buttons[0].action;
+    expect(bus.resolveCallback(action, "mock:99")).toBeNull();
+    expect(bus.resolveCallback(action, "other:42")).toBeNull();
+    expect(bus.resolveCallback(action, "mock:42")?.choice).toBe("client");
+    expect((await pending)?.choice).toBe("client");
+ });
+
+describe('observed question lifecycle',()=>{
+ it('records acceptance only after actual push completion, never from a timeout',async()=>{
+  let release!:()=>void;const delivery=new Promise<void>(r=>{release=r;});const transport={push:vi.fn(()=>delivery)};const bus=new QuestionBus({getTransport:()=>transport as never});const events:import('./questions.js').QuestionSnapshot[]=[];bus.subscribeLifecycle(s=>events.push(s));
+  const pending=bus.ask('assistant',CHAT,spec({usefulUntil:Date.now()+600000,deadlineReason:'Explicit agent-declared deadline'}));
+  expect(events).toHaveLength(1);expect(events[0].acceptedMessageAt).toBeUndefined();release();await vi.waitFor(()=>expect(events).toHaveLength(2));expect(events[1].acceptedMessageAt).toBeTypeOf('number');expect(events[1].provenance).toBe('agent_declared_deadline');
+  bus.answerViaText('mock:42','client');await pending;expect(events.at(-1)?.status).toBe('answered');expect(bus.questionSnapshot(events[0].qid)).toBeUndefined();
+ });
+ it('does not infer useful deadlines and rejects missing reasons',async()=>{
+  const {bus}=makeBus();const events:import('./questions.js').QuestionSnapshot[]=[];bus.subscribeLifecycle(s=>events.push(s));const pending=bus.ask('assistant',CHAT,spec({timeoutMs:5000}));expect(events[0].usefulUntil).toBeUndefined();expect(events[0].provenance).toBeUndefined();bus.cancelPending('mock:42');await pending;
+  await expect(bus.ask('assistant',CHAT,spec({usefulUntil:Date.now()+600000}))).rejects.toThrow('reason');
+ });
+ it('never records a rejected or late superseded delivery as acceptance',async()=>{
+  let release!:()=>void;const delivery=new Promise<void>(r=>{release=r;});const bus=new QuestionBus({getTransport:()=>({push:()=>delivery}) as never});const events:import('./questions.js').QuestionSnapshot[]=[];bus.subscribeLifecycle(s=>events.push(s));const pending=bus.ask('assistant',CHAT,spec());bus.cancelPending('mock:42');release();await pending;await Promise.resolve();expect(events.some(s=>s.acceptedMessageAt!==undefined)).toBe(false);
+ });
+});

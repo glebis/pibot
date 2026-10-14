@@ -37,6 +37,8 @@ export function questionPlugin(deps: QuestionPluginDeps): InlineExtension {
         parameters: Type.Object({
           question: Type.String({ description: "Short, concrete question" }),
           options: Type.Array(Type.String({ description: "Short option label" }), { minItems: 2, maxItems: 10 }),
+          usefulUntil: Type.Optional(Type.String({description:"Explicit useful decision deadline as an absolute ISO-8601 timestamp with timezone, only when known. This is an agent-declared deadline, not proof of a real-world deadline or permission to call. Never derive it from timeoutMinutes."})),
+          deadlineReason: Type.Optional(Type.String({description:"Required with usefulUntil: explain the concrete consequence or source of the declared deadline."})),
           timeoutMinutes: Type.Optional(Type.String({ description: "How long to wait (default 10m)" })),
         }),
         async execute(_tcid, params) {
@@ -45,11 +47,17 @@ export function questionPlugin(deps: QuestionPluginDeps): InlineExtension {
             return { content: [{ type: "text", text: "ERROR: need at least 2 options." }], details: { choice: "", index: -1, via: "", timedOut: false } };
           }
           const timeoutMs = params.timeoutMinutes ? (parseFloat(params.timeoutMinutes) || 10) * 60e3 : undefined;
+          let usefulUntil:number|undefined;
+          if(params.usefulUntil!==undefined){
+            usefulUntil=Date.parse(params.usefulUntil);
+            if(!/T.*(?:Z|[+-]\d{2}:\d{2})$/.test(params.usefulUntil)||!Number.isSafeInteger(usefulUntil)||usefulUntil<=Date.now()||!params.deadlineReason?.trim()||params.deadlineReason.length>500) return {content:[{type:'text',text:'ERROR: usefulUntil must be a future absolute ISO timestamp with timezone and a concrete deadlineReason.'}],details:{choice:'',index:-1,via:'',timedOut:false}};
+          }
           const spec: QuestionSpec = {
             text: params.question,
             options,
             timeoutMs,
             poll: options.length > 6,
+            ...(usefulUntil!==undefined?{usefulUntil,deadlineReason:params.deadlineReason!.trim()}:{})
           };
           let res: QuestionAnswer | null = null;
           let err: string | null = null;

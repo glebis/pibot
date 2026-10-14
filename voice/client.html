@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Talk with your agent</title>
+<style>
+:root{color-scheme:light;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#292e29;background:#f5f3ec}*{box-sizing:border-box}body{margin:0;padding:32px 20px}main{max-width:680px;margin:5vh auto}h1{font-size:clamp(2rem,5vw,3rem);letter-spacing:-.055em;margin:12px 0}p{line-height:1.6}.eyebrow{font-size:.8rem;letter-spacing:.12em;text-transform:uppercase;color:#59705b}.intro{color:#586057;max-width:560px}.card{background:#fffefa;border:1px solid #deded2;border-radius:20px;padding:24px;margin-top:24px;box-shadow:0 10px 30px #292e2906}label{display:block;font-weight:600;margin-bottom:10px}select{width:100%;font:inherit;border:1px solid #a8b0a4;background:white;border-radius:9px;padding:12px}button{font:inherit;font-weight:600;border-radius:9px;padding:12px 18px;cursor:pointer;border:1px solid #a8b0a4;background:transparent;color:inherit}button.primary{background:#34533b;color:white;border-color:#34533b}button:disabled{opacity:.45;cursor:not-allowed}button:focus-visible,select:focus-visible{outline:3px solid #b58336;outline-offset:3px}.buttons{display:flex;flex-wrap:wrap;gap:10px;margin:20px 0}#status{min-height:1.6em;font-weight:600}small,.note{font-size:.88rem;color:#62685e;line-height:1.6}.transcript{margin-top:24px;max-height:320px;overflow:auto}.turn{padding:12px 0;border-top:1px solid #e6e7dd;white-space:pre-wrap;overflow-wrap:anywhere}.turn strong{display:block;font-size:.78rem;text-transform:uppercase;letter-spacing:.07em;color:#62705f;margin-bottom:5px}[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+<div class="eyebrow">PiBot · Voice preview</div>
+<h1>Talk with your agent.</h1>
+<p class="intro">Choose an agent, then start a conversation. Your microphone stays off until you press Start.</p>
+<section class="card" aria-label="Voice controls">
+<label for="agent">Your agent</label>
+<select id="agent" disabled><option>Loading agents…</option></select>
+<p id="agent-detail" class="note"></p>
+<div class="buttons"><button id="start" class="primary" disabled>Start conversation</button><button id="stop" disabled>Stop</button><button id="refresh" disabled>Refresh agents</button><button id="play" hidden>Play agent audio</button></div>
+<p id="status" role="status" aria-live="polite">Checking this session…</p>
+<audio id="audio" autoplay></audio>
+<div id="transcript" class="transcript" role="log" aria-label="Conversation transcript" aria-live="polite"></div>
+</section>
+<p class="note">Conversation only: no tools, actions or shared Telegram history. Deepgram processes audio for speech recognition and speech playback. Responses use your selected agent’s configured model provider. Sessions stop after 15 minutes.</p>
+<p class="note">Keep this page open while talking. Closing it stops your microphone. This preview will not reconnect automatically.</p>
+</main>
+<script>
+'use strict';
+(() => {
+  const $ = id => document.getElementById(id);
+  const secret = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+  history.replaceState(null, '', location.pathname + location.search);
+  const validToken = /^[a-f0-9]{64}$/i.test(secret);
+  const agentSelect = $('agent'), startButton = $('start'), stopButton = $('stop'), refreshButton = $('refresh'), audio = $('audio');
+  let agents = [], audioReady = false, pc = null, stream = null, active = false, stopping = false, generation = 0, timer = null, controller = null;
+  const status = text => { $('status').textContent = text; };
+  const selected = () => agents.find(agent => agent.id === agentSelect.value);
+  function controls() {
+    agentSelect.disabled = active || stopping || !agents.length;
+    startButton.disabled = active || stopping || !validToken || !audioReady || !selected()?.available;
+    stopButton.disabled = !active;
+    refreshButton.disabled = active || stopping || !validToken;
+    const agent = selected();
+    $('agent-detail').textContent = agent ? (agent.available ? 'Model: ' + agent.model : agent.reason || 'This agent is unavailable for voice.') : '';
+  }
+  async function api(path, options = {}) {
+    const response = await fetch(path, { ...options, signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(10000), credentials: 'omit', cache: 'no-store', headers: { 'Authorization': 'Bearer ' + secret, ...(options.body ? {'Content-Type':'application/json'} : {}) } });
+    if (!response.ok) throw new Error('request-failed');
+    return response;
+  }
+  function closeLocal() {
+    generation++;
+    controller?.abort(); controller = null;
+    clearTimeout(timer); timer = null;
+    if (pc) { pc.onconnectionstatechange = null; pc.ontrack = null; pc.close(); pc = null; }
+    if (stream) { stream.getTracks().forEach(track => track.stop()); stream = null; }
+    audio.pause(); audio.srcObject = null;
+    $('play').hidden = true; active = false; controls();
+  }
+  async function stop(text = 'Conversation ended. Your microphone is off.') {
+    if (stopping) return;
+    stopping = true; closeLocal(); status(text);
+    try { await api('/api/session', {method:'DELETE', keepalive:true}); }
+    catch { status(text + ' The server could not confirm the session closed.'); }
+    finally { stopping = false; controls(); }
+  }
+  async function refresh() {
+    refreshButton.disabled = true;
+    try {
+      const data = await (await api('/api/agents')).json();
+      if (!Array.isArray(data.agents)) throw new Error('invalid-agents');
+      audioReady = data.audioReady === true;
+      const previous = agentSelect.value;
+      agents = data.agents.filter(a => typeof a.id === 'string' && typeof a.name === 'string' && typeof a.model === 'string' && typeof a.available === 'boolean');
+      agentSelect.replaceChildren();
+      for (const agent of agents) {
+        const option = document.createElement('option'); option.value = agent.id; option.textContent = agent.name + (agent.available ? '' : ' — unavailable'); agentSelect.append(option);
+      }
+      const requested = new URLSearchParams(location.hash.slice(1)).get('agent');
+      if (agents.some(a => a.id === previous)) agentSelect.value = previous;
+      else if (requested && agents.some(a => a.id === requested && a.available)) agentSelect.value = requested;
+      else if (agents.some(a => a.available)) agentSelect.value = agents.find(a => a.available).id;
+      status(!audioReady ? 'Speech is not configured. Add the Deepgram credential to the local voice service, then refresh.' : agents.length ? 'Ready when you are.' : 'No agents are available.');
+    } catch { agents = []; agentSelect.replaceChildren(); status('Could not load agents. Check that the local voice service is running, then refresh.'); }
+    controls();
+  }
+  function waitForIce(connection, signal) {
+    return new Promise((resolve, reject) => {
+      let deadline;
+      const clean = () => { clearTimeout(deadline); connection.removeEventListener('icegatheringstatechange', changed); signal.removeEventListener('abort', aborted); };
+      const changed = () => { if (connection.iceGatheringState === 'complete') { clean(); resolve(); } };
+      const aborted = () => { clean(); reject(new Error('cancelled')); };
+      connection.addEventListener('icegatheringstatechange', changed); signal.addEventListener('abort', aborted, {once:true});
+      deadline = setTimeout(() => { clean(); reject(new Error('ice-timeout')); }, 10000);
+      if (signal.aborted) aborted(); else changed();
+    });
+  }
+  function receive(event) {
+    if (typeof event.data !== 'string' || event.data.length > 65536) return;
+    let message; try { message = JSON.parse(event.data); } catch { return; }
+    if (!message || typeof message.text !== 'string') return;
+    if (message.type === 'status') { status(message.text.slice(0, 500)); return; }
+    if (!['user','assistant'].includes(message.type)) return;
+    const turn = document.createElement('div'); turn.className = 'turn';
+    const name = document.createElement('strong'); name.textContent = message.type === 'user' ? 'You' : (selected()?.name || 'Agent');
+    const content = document.createElement('span'); content.textContent = message.text.slice(0, 16000); turn.append(name, content);
+    const transcript = $('transcript'); transcript.append(turn);
+    while (transcript.childElementCount > 100) transcript.firstElementChild.remove();
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+  async function start() {
+    if (active || stopping || !selected()?.available || !validToken || !audioReady) return;
+    active = true; const current = ++generation; controller = new AbortController(); const signal = controller.signal;
+    timer = setTimeout(() => void stop('The 15-minute session has ended. Your microphone is off.'), 15 * 60 * 1000);
+    controls(); $('transcript').replaceChildren(); status('Allow microphone access to begin…');
+    try {
+      const media = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
+      if (current !== generation) { media.getTracks().forEach(track => track.stop()); return; }
+      stream = media; pc = new RTCPeerConnection({iceServers:[]}); const connection = pc;
+      connection.createDataChannel('chat').onmessage = receive;
+      connection.ondatachannel = event => { event.channel.onmessage = receive; };
+      connection.ontrack = event => {
+        audio.srcObject = event.streams[0] || new MediaStream([event.track]);
+        audio.play().catch(() => { if (current === generation) $('play').hidden = false; });
+      };
+      connection.onconnectionstatechange = () => {
+        if (current !== generation) return;
+        if (connection.connectionState === 'connected') status('Connected. You can speak now.');
+        if (['failed','disconnected','closed'].includes(connection.connectionState)) void stop('Connection ended. Your microphone is off.');
+      };
+      stream.getTracks().forEach(track => connection.addTrack(track, stream));
+      status('Connecting to your agent…');
+      await connection.setLocalDescription(await connection.createOffer());
+      await waitForIce(connection, signal);
+      if (current !== generation) return;
+      const response = await api('/api/offer', {method:'POST', signal, body:JSON.stringify({agentId:agentSelect.value, sdp:connection.localDescription.sdp, type:'offer'})});
+      const answer = await response.json();
+      if (current !== generation) return;
+      if (answer.type !== 'answer' || typeof answer.sdp !== 'string') throw new Error('invalid-answer');
+      await connection.setRemoteDescription({type:answer.type,sdp:answer.sdp});
+      if (current !== generation) return;
+    } catch (error) {
+      if (current !== generation) return;
+      const message = error?.name === 'NotAllowedError' ? 'Microphone access was not allowed. Your microphone is off.' : 'Could not start the conversation. Your microphone is off. Check the local voice service and agent configuration.';
+      await stop(message);
+    }
+  }
+  agentSelect.addEventListener('change', controls);
+  startButton.addEventListener('click', () => void start());
+  stopButton.addEventListener('click', () => void stop());
+  refreshButton.addEventListener('click', () => void refresh());
+  $('play').addEventListener('click', () => { audio.play().then(() => { $('play').hidden = true; }).catch(() => status('Audio playback is blocked. Check your browser’s audio permission.')); });
+  window.addEventListener('pagehide', () => { const wasActive = active; closeLocal(); if (wasActive) void api('/api/session', {method:'DELETE',keepalive:true}).catch(() => {}); });
+  if (!validToken) { status('Open the private launch link from your local voice service to begin.'); controls(); }
+  else if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) { status('This browser does not support local voice sessions. Open the launch link in a current browser.'); }
+  else void refresh();
+})();
+</script>
+</body>
+</html>

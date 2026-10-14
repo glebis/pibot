@@ -1,0 +1,11 @@
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { CoordinatorStore } from '../store.js';
+import { Coordinator } from '../coordinator.js';
+import type { Mandate } from '../types.js';
+const directory=process.argv[2]!; const store=new CoordinatorStore(directory);
+const m: Mandate={id:'m',digest:'sha256:test',ownerCapsVersion:1,lineageId:'line',version:1,status:'active',ownerId:'owner',coordinatorId:'coord',recipient:{botId:'b',chatId:'c',userId:'u'},purpose:'contract_decision',notBefore:0,expiresAt:9e15,windowMs:3600000,maxMessages:3,ownerWindowMs:3600000,ownerMaxMessages:3,quietHours:{startMinute:0,endMinute:1,timeZone:'Europe/Berlin'},acknowledgeMs:1000,maxResends:0,retryDelayMs:0};
+const now=Date.parse('2026-10-13T12:00:00Z');
+const coordinator=new Coordinator({store,clock:()=>now,authority:{async check(){return {schemaVersion:1,allowed:true,reason:'ok',checkedAt:now,mandate:m};}},sender:{async send(){writeFileSync(join(directory,'provider-accepted'),'42',{mode:0o600});process.exit(73);}}});
+coordinator.create({id:'crash-decision',sourceContractId:'source',question:'Choose?',choices:['Yes'],mandateId:'m',ownerId:'owner',coordinatorId:'coord',recipient:m.recipient,deadline:now+100000});
+await coordinator.tick();
