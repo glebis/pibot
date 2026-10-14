@@ -1,3 +1,7 @@
+import { urgentSourceReceipt } from '../voice/urgent-sources.js';
+import type { UrgentSourceStore, SourceScope, BlockedDecisionProjection } from '../voice/urgent-sources.js';
+import { CanonicalTurnGate, type ActiveVoiceTurn, type BotVoiceInput, type BotVoiceResult } from '../voice/session-control.js';
+import type { VoiceOwnerCommands } from '../voice/owner-commands.js';
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildManifest, buildPersona, validateAgentName, type AgentDraft, type Proactivity } from "./agent-factory.js";
@@ -145,6 +149,84 @@ export class PiBot implements HeartbeatHost {
   private get cachedSessions(): Map<string, AgentSession> {
     return (this.deps.agents as unknown as { sessions: Map<string, AgentSession> }).sessions;
   }
+  private canonicalTurns = new CanonicalTurnGate();
+  private activeVoiceTurns = new Map<string, ActiveVoiceTurn>();
+
+  /** Only existing, live, owner-private bindings can attach to full agent history/tools. */
+  voiceBindings(): Array<{ agentId: string; chatKey: string }> {
+    const configured=this.deps.config.allowedChats;
+    const owners=configured.length ? configured : this.deps.secrets.get().telegram?.allowedChats ?? [];
+    return this.chatBindings().filter(({chat,agent}) => {
+      const idx=chat.lastIndexOf(':'); const name=chat.slice(0,idx); const id=chat.slice(idx+1);
+      const transport=this.transports.get(name) as (Transport & {allowedChats?:()=>string[]}) | undefined;
+      const transportAllows=transport?.allowedChats ? transport.allowedChats().includes(id) : true;
+      return /^telegram(?::[^:]+)?$/.test(name) && /^[1-9]\d*$/.test(id)
+        && owners.includes(id) && Boolean(transport) && transportAllows
+        && this.currentAgent(chat)===agent && Boolean(this.deps.agents.getAgent(agent));
+    }).map(({chat,agent})=>({agentId:agent,chatKey:chat}));
+  }
+
+  voicePendingDecision(input:{agentId:string;chatKey:string}):{decisionId:string;question:string;options:string[]}|undefined {
+    if(!this.voiceBindings().some(b=>b.agentId===input.agentId&&b.chatKey===input.chatKey))return undefined;
+    const now=Date.now();const q=this.questions.pendingSnapshots().find(q=>q.agentId===input.agentId&&q.canonicalChatId===input.chatKey&&q.status==='pending'&&q.pendingUntil>now&&q.usefulUntil!==undefined&&q.usefulUntil>now&&q.provenance==='agent_declared_deadline'&&!!q.deadlineReason&&q.acceptedMessageAt!==undefined&&q.acceptedMessageAt<=now);
+    return q?{decisionId:q.qid,question:q.question,options:[...q.options]}:undefined;
+  }
+
+  async voiceTurn(input: BotVoiceInput): Promise<BotVoiceResult> {
+    const valid=()=>this.voiceBindings().some(b=>b.agentId===input.agentId&&b.chatKey===input.chatKey);
+    if(!valid() || input.signal?.aborted || !input.text.trim() || input.text.length>4000) return {status:'denied'};
+    const key=`${input.agentId}::${input.chatKey}`;
+    const run=this.canonicalTurns.tryRun(key,async (): Promise<BotVoiceResult> => {
+      if(!valid() || input.signal?.aborted) return {status:'denied'};
+      const idx=input.chatKey.lastIndexOf(':'); const t=this.transports.get(input.chatKey.slice(0,idx))!; const chatId=input.chatKey.slice(idx+1);
+      const context: ActiveVoiceTurn={input,replies:[],detached:false};
+      const detach=()=>{context.detached=true;}; input.signal?.addEventListener('abort',detach,{once:true});
+      this.activeVoiceTurns.set(key,context);
+      try {
+        this.lastUserMessage.set(input.agentId,Date.now()); this.ownerSpokeAt.set(input.chatKey,Date.now());
+        this.deps.heartbeat.noteUserMessage?.(input.agentId);
+        await this.promptAgentUnlocked(t,chatId,input.agentId,input.text,{taskAckFrom:null,voiceTurn:true});
+        if(context.detached) return {status:'detached'};
+        return context.replies.length ? {status:'completed',text:context.replies.join('\n')} : {status:'no_reply'};
+      } catch(error) { return {status:context.detached?'detached':error instanceof Error && error.message==='voice_session_busy'?'busy':'failed'}; }
+      finally { input.signal?.removeEventListener('abort',detach); this.activeVoiceTurns.delete(key); }
+    });
+    return run ?? {status:'busy'};
+  }
+
+  private async deliverTurnText(t: Transport,chatId:string,agentId:string,text:string): Promise<void> {
+    const key=`${agentId}::${this.chatKey(t,chatId)}`; const voice=this.activeVoiceTurns.get(key);
+    if(voice && !this.voiceBindings().some(b=>b.agentId===agentId&&b.chatKey===voice.input.chatKey)) {voice.detached=true;return;}
+    if(voice && !voice.detached && !voice.input.signal?.aborted) {
+      const spoken=applyVoiceStyle(text,{maxSentences:4,maxChars:900,allowFullPaths:false}).slice(0,900);
+      voice.replies.push(spoken);
+      try { await voice.input.onOutput?.(spoken); return; } catch { voice.detached=true; }
+    }
+    await t.push(chatId,{text:this.shapeOutbound(agentId,this.chatKey(t,chatId),text),dedupeKey:this.turnKeys.get(key)});
+  }
+
+  private urgentSourceStores=new Set<UrgentSourceStore>();
+  urgentQuestionSnapshot(qid:string){return this.questions.questionSnapshot(qid);}
+  attachUrgentSources(store:UrgentSourceStore):()=>void {
+    if(this.urgentSourceStores.has(store))throw new Error('Urgent source feed already attached');
+    this.urgentSourceStores.add(store);
+    const unsubscribe=this.questions.subscribeLifecycle(q=>store.observeQuestion(q));
+    for(const q of this.questions.pendingSnapshots())store.observeQuestion(q);
+    return ()=>{unsubscribe();this.urgentSourceStores.delete(store);};
+  }
+  async sendUrgentSourceMessage(input:{agentId:string;canonicalChatId:string;text:string;decisionId:string;questionVersion:number;revision:string;deadline:number}):Promise<{status:'accepted';messageId:string}|{status:'rejected'|'unknown'}> {
+    const valid=()=>this.voiceBindings().some(b=>b.agentId===input.agentId&&b.chatKey===input.canonicalChatId);
+    if(!valid()||!this.urgentSourceStores.size||!input.text.trim()||input.text.length>2500||!Number.isSafeInteger(input.deadline)||input.deadline<=Date.now()||!input.decisionId||!input.revision||!Number.isSafeInteger(input.questionVersion)||input.questionVersion<1)return {status:'rejected'};
+    const {transport,chatId}=this.splitChatKey(input.canonicalChatId);const t=this.transports.get(transport);if(!t)return {status:'rejected'};
+    const receipt=urgentSourceReceipt(input);const messageId=`urgent-source:${receipt}`;
+    const deadline=new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Berlin',dateStyle:'medium',timeStyle:'short'}).format(new Date(input.deadline));
+    try{await t.push(chatId,{text:`Personal Contracts deadline: ${deadline} (Europe/Berlin)\n${input.text}\nAcknowledge below to stop call escalation for this reminder. This does not resolve the contract.`,dedupeKey:messageId,card:{text:'',buttons:[{label:'Acknowledged — no call',action:`usack:${receipt}`} ]}});return valid()?{status:'accepted',messageId}:{status:'unknown'};}catch{return {status:'unknown'};}
+  }
+  blockedDecisionProjection(scope:SourceScope):BlockedDecisionProjection|undefined {
+    if(!this.voiceBindings().some(b=>b.agentId===scope.agentId&&b.chatKey===scope.canonicalChatId))return undefined;
+    return [...this.urgentSourceStores].map(store=>store.projection(scope)).find(p=>p.available);
+  }
+
   private questions = new QuestionBus({
     getTransport: (name) => this.transports.get(name),
     notify: (chatKey, text) => {
@@ -649,7 +731,13 @@ export class PiBot implements HeartbeatHost {
       ck,
       { transport: t.name, chatId },
       this.deps.scheduler,
-      (spec: QuestionSpec) => this.questions.ask(agentId, { transport: t.name, chatId }, spec),
+      (spec: QuestionSpec) => {
+        const voice=this.activeVoiceTurns.get(`${agentId}::${ck}`);
+        if(voice && !this.voiceBindings().some(b=>b.agentId===agentId&&b.chatKey===ck)) {voice.detached=true;return Promise.resolve(null);}
+        if(voice && !voice.detached) { try { voice.input.onApprovalRequired?.(); } catch { voice.detached=true; } }
+        if(voice && !voice.detached) void Promise.resolve().then(()=>voice.input.onOutput?.("Please confirm this request in your existing chat. I will wait for your answer there.")).catch(()=>{voice.detached=true;});
+        return this.questions.ask(agentId, { transport: t.name, chatId }, spec);
+      },
       this.commsHooks(),
       async (transportName, filePath) => {
         if (transportName !== t.name) throw new Error("Avatar target does not match the invoking transport");
@@ -682,6 +770,8 @@ export class PiBot implements HeartbeatHost {
   }
 
   private onSessionEvent(t: Transport, chatId: string, agentId: string, ev: AgentSessionEvent): void {
+    const voice=this.activeVoiceTurns.get(`${agentId}::${this.chatKey(t,chatId)}`);
+    if(voice && !this.voiceBindings().some(b=>b.agentId===agentId&&b.chatKey===voice.input.chatKey)) {voice.detached=true;return;}
     if (ev.type === "agent_start") {
       t.setTyping?.(chatId, true);
       // Dev-turn confirmation: the owner must always see that development started —
@@ -741,7 +831,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
             );
           }
           if (!cleanText.trim()) return;
-          const delivery = t.push(chatId, { text: this.shapeOutbound(agentId, this.chatKey(t, chatId), cleanText), dedupeKey: this.turnKeys.get(key) });
+          const delivery = this.deliverTurnText(t, chatId, agentId, cleanText);
           this.pendingPushes.set(key, delivery);
           void delivery.catch((e) => console.error("[bot] push failed:", e));
           this.deps.events.log(agentId, "message", truncate(cleanText, 200));
@@ -1004,10 +1094,20 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     chatId: string,
     agentId: string,
     text: string,
-    opts: { recoveringDeadLetter?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
+    opts: { recoveringDeadLetter?: boolean; voiceTurn?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
+  ): Promise<void> {
+    return this.canonicalTurns.run(`${agentId}::${this.chatKey(t,chatId)}`,()=>this.promptAgentUnlocked(t,chatId,agentId,text,opts));
+  }
+
+  private async promptAgentUnlocked(
+    t: Transport,
+    chatId: string,
+    agentId: string,
+    text: string,
+    opts: { recoveringDeadLetter?: boolean; voiceTurn?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
   ): Promise<void> {
     const ck = this.chatKey(t, chatId);
-    this.rememberChat(agentId, ck);
+    if(!opts.voiceTurn) this.rememberChat(agentId, ck);
 
     let session: AgentSession;
     try {
@@ -1017,6 +1117,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       throw e;
     }
 
+    if(opts.voiceTurn && (session as {isStreaming?:boolean}).isStreaming) throw new Error('voice_session_busy');
     t.setTyping?.(chatId, true);
     try {
       this.pendingPushes.delete(`${agentId}::${ck}`);
@@ -1032,13 +1133,13 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       let styled = this.minimalVoice(agentId, ck) ? `${text}\n\n${VOICE_STYLE_DIRECTIVE}` : text;
       // an active goal rides every turn (suffix: internal-prefix detection looks at the start)
       const activeGoal = this.goals.get(ck);
-      if (activeGoal && activeGoal.status === "active") styled = `${styled}\n\n${renderGoalBlock(activeGoal)}`;
+      if (!opts.voiceTurn && activeGoal && activeGoal.status === "active") styled = `${styled}\n\n${renderGoalBlock(activeGoal)}`;
       // followUp: concurrent messages queue behind the running turn instead of erroring
-      await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, styled), opts.recoveringDeadLetter ?? false);
+      await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, styled), opts.recoveringDeadLetter ?? false, opts.voiceTurn ?? false);
       // The goal loop: every turn that is genuinely about this chat gets judged —
       // owner turns and the loop's own continuations, never scheduler/heartbeat/handoff
       // traffic. Recursion IS the loop and is bounded by the goal's own turn budget.
-      const drivesGoal = !["[scheduler]", "[heartbeat]", "[handoff from", "[cascade-recover]", "[silent-turn]"].some((p) => styled.startsWith(p));
+      const drivesGoal = !opts.voiceTurn && !["[scheduler]", "[heartbeat]", "[handoff from", "[cascade-recover]", "[silent-turn]"].some((p) => styled.startsWith(p));
       if (drivesGoal) {
         // A [goal] continuation that exhausts the cascade THROWS ("internal prompt
         // dropped, will re-fire") — but nothing re-fires a goal turn, so without this
@@ -1075,7 +1176,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       this.wantsFullPath.delete(ck);
       t.setTyping?.(chatId, false);
     }
-    await this.flushCards(t, chatId, agentId);
+    if(!opts.voiceTurn) await this.flushCards(t, chatId, agentId);
   }
 
   /**
@@ -1094,12 +1195,15 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     ck: string,
     text: string,
     recoveringDeadLetter = false,
+    noReplay = false,
   ): Promise<void> {
     const cascade = this.deps.cascade;
     const attempts: string[] = [];
     const failures: Array<{ spec: string; cls: ModelErrorClass }> = [];
     if (!cascade) {
-      await session.prompt(envelope(text), { streamingBehavior: "followUp" });
+      this.sessionTurnFailures.delete(`${agentId}::${ck}`);
+      await session.prompt(envelope(text), noReplay ? undefined : { streamingBehavior: "followUp" });
+      if(noReplay && this.sessionTurnFailures.has(`${agentId}::${ck}`)) throw new Error('voice_turn_failed');
       return;
     }
 
@@ -1148,6 +1252,17 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
           }
         }
       }
+    }
+
+    if(noReplay) {
+      if(!canPrompt || !spec || !chain.includes(spec)) throw new Error('voice_model_unavailable');
+      const voiceModel=cascade.resolveModel(spec);
+      if(!voiceModel) throw new Error('voice_model_unavailable');
+      await session.setModel(voiceModel);
+      this.sessionTurnFailures.delete(wkey);
+      await session.prompt(envelope(text));
+      if(this.sessionTurnFailures.has(wkey)) throw new Error('voice_turn_failed');
+      return;
     }
 
     let landed = false; // has the user's text entered the session history?
@@ -1438,6 +1553,12 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
 
   /** Returns a short toast string for Telegram callback feedback */
   async handleAction(t: Transport, chatId: string, action: string): Promise<string | void> {
+    if(action.startsWith('usack:')) {
+      const chatKey=this.chatKey(t,chatId);
+      if(!this.voiceBindings().some(b=>b.chatKey===chatKey))return 'This reminder is no longer available.';
+      return [...this.urgentSourceStores].some(store=>store.acknowledge(action.slice(6),chatKey))?'Acknowledged. No call for this reminder.':'This reminder is no longer available.';
+    }
+    if (action.startsWith("vcall:")) return this.voiceCallAction(t, chatId, action);
     // goal control buttons reuse the /goal verbs directly
     if (action === "goal:pause" || action === "goal:resume" || action === "goal:done") {
       await this.commandGoal(t, chatId, action.slice(5));
@@ -1483,7 +1604,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       return "📋 pulling it up…";
     }
     if (action.startsWith("q:")) {
-      const answer = this.questions.resolveCallback(action); // stale/unknown ids → null
+      const answer = this.questions.resolveCallback(action, this.chatKey(t, chatId)); // stale/unknown ids → null
       this.deps.events.log("system", "system", `question tap: ${action} → ${answer ? `resolved: ${answer.choice}` : "stale (ignored)"}`);
       return answer ? `✅ ${answer.choice}` : "⏳ This question expired";
     }
@@ -1815,9 +1936,37 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
 
   /** @internal narrow surface for the command layer */
   /** Public: the dashboard reuses the same cascade control facade as /cascade. */
+  private voiceCommands?: VoiceOwnerCommands;
+  /** Owner-only /call and /voicetest; wired after the voice runtime starts (it needs this bot as host). */
+  setVoiceCommands(v: VoiceOwnerCommands | undefined): void { this.voiceCommands = v; }
+
+  /** ✅/✖ taps on a /call confirmation card — owner chats only, single-use, same chat. */
+  private async voiceCallAction(t: Transport, chatId: string, action: string): Promise<string | void> {
+    const [, verb, id = ""] = action.split(":");
+    const voice = this.voiceCommands;
+    if (!voice || !this.deps.config.allowedChats.includes(String(chatId))) return;
+    const ck = this.chatKey(t, chatId);
+    if (verb === "x") return voice.cancel(id, ck) ? "Call cancelled." : "Nothing to cancel.";
+    if (verb !== "go") return;
+    const r = await voice.confirmCall(id, ck);
+    if (r.ok) {
+      await t.push(chatId, { text: `📞 Calling your phone (${r.state}). Answer and enter your PIN. Attempt \`${r.attemptId}\`.` });
+      return "Calling…";
+    }
+    const why: Record<string, string> = {
+      expired: "⌛ That call request expired or was already used — send /call again.",
+      not_configured: "Phone calls aren't configured (no phone control token in the voice secrets).",
+      not_bound: "This chat lost its voice binding — the call was not placed.",
+      service_down: "📵 The phone service isn't running — the call was not placed.",
+      unknown_outcome: `⚠️ The call outcome is unknown${r.attemptId ? ` (attempt \`${r.attemptId}\`)` : ""}. Don't repeat it — check the attempt status first.`,
+    };
+    await t.push(chatId, { text: why[r.reason] ?? "The call was not placed." });
+  }
+
   commandContext(): CommandContext {
     return {
       config: this.deps.config,
+      voice: () => this.voiceCommands,
       agents: this.deps.agents,
       scheduler: this.deps.scheduler,
       events: this.deps.events,

@@ -291,6 +291,22 @@ async function main(): Promise<void> {
   // per-agent sub-bots attach INDEPENDENTLY of the main bot's transport source.
   // Retried per bot: a boot-time network blip must not leave a bot silent for days.
   const subBoot = await bot.attachConfiguredSubBots();
+  // Voice attaches to this daemon's canonical sessions; never starts another AgentManager.
+  const voiceRuntime = process.env.PIBOT_VOICE_CONFIG
+    ? await (await import('./voice/runtime.js')).startCanonicalVoiceRuntime(bot, process.env.PIBOT_VOICE_CONFIG)
+    : undefined;
+
+  // Owner-only /call + /voicetest. /voicetest works without the runtime (it only reads the test page URL).
+  bot.setVoiceCommands(new (await import('./voice/owner-commands.js')).VoiceOwnerCommands({
+    phone: voiceRuntime?.phone,
+    testUrlFile: path.join(config.dataDir, 'voice', 'test-launch.url'),
+  }));
+
+  const voiceEscalation = process.env.PIBOT_VOICE_ESCALATION_CONFIG
+    ? await (await import('./voice/escalation-runtime.js')).createVoiceEscalationRuntime({host:bot,coordinator,configFile:process.env.PIBOT_VOICE_ESCALATION_CONFIG})
+    : undefined;
+  await voiceEscalation?.start();
+
   // post-boot confirmation (owner request, Sep 20): one line, every boot —
   // the restart verdict reaches the owner's chat without anyone asking
   await bot.notifyBoot(subBoot).catch(() => {});
@@ -299,7 +315,9 @@ async function main(): Promise<void> {
     console.log("\n[pibot] stopping…");
     scheduler.stop();
     void (async () => {
+      await voiceEscalation?.close();
       await coordinator?.stopDispatch();
+      await voiceRuntime?.close();
       await bot.stop();
       coordinator?.close();
     })()

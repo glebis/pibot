@@ -1,0 +1,11 @@
+{
+  "name": "pibot-voice-gateway",
+  // Account: set CLOUDFLARE_ACCOUNT_ID when deploying (not committed).
+  // Upstream: `wrangler secret put VOICE_ORIGIN` = https://<machine>.<tailnet>.ts.net:8443
+  "main": "gateway.mjs",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": {
+    "enabled": false
+  }
+}
