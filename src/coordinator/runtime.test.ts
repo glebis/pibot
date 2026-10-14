@@ -8,7 +8,7 @@ const config=(dataDir:string):CoordinatorConfig=>({ownerId:'owner',coordinatorId
 const deps=()=>({authority:{check:vi.fn(async()=>({schemaVersion:1 as const,allowed:false,reason:'test',checkedAt:Date.now(),mandate:null}))},sender:{send:vi.fn(async()=>({status:'accepted' as const,messageId:'7'}))}});
 describe('coordinator runtime',()=>{
  it('is disabled without a config and rejects public config files',()=>{
-  expect(loadCoordinatorConfig(undefined)).toBeUndefined();const file=path.join(dir(),'config.json');fs.writeFileSync(file,JSON.stringify(config(dir())),{mode:0o644});expect(()=>loadCoordinatorConfig(file)).toThrow('private owner file');fs.chmodSync(file,0o600);expect(loadCoordinatorConfig(file)?.botId).toBe('123');
+  expect(loadCoordinatorConfig(undefined)).toBeUndefined();const file=path.join(dir(),'config.json');fs.writeFileSync(file,JSON.stringify(config(dir())));fs.chmodSync(file,0o644);expect(()=>loadCoordinatorConfig(file)).toThrow('private owner file');fs.chmodSync(file,0o600);expect(loadCoordinatorConfig(file)?.botId).toBe('123');
  });
  it('captures only coordinator controls and replays persisted updates before outbound work',async()=>{
   const c=config(dir()),d=deps();let r=new CoordinatorRuntime(c,'123:test',d);
