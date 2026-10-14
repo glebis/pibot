@@ -19,6 +19,9 @@ if [ "$1" = "--uninstall" ]; then
   exit 0
 fi
 
+# No built-in default: the repository is public, and an allowlist must never be guessed.
+: "${TELEGRAM_ALLOWED_CHATS:?set TELEGRAM_ALLOWED_CHATS to the owner chat ID(s), comma-separated}"
+
 mkdir -p "$HOME/Library/LaunchAgents" "$ROOT/data"
 
 cat > "$PLIST" <<PLIST
@@ -42,7 +45,7 @@ cat > "$PLIST" <<PLIST
     <key>PIBOT_TRANSPORT</key><string>telegram</string>
     <key>PIBOT_DEFAULT_MODEL</key><string>${PIBOT_DEFAULT_MODEL:-ollama/glm-5.3-flash:cloud}</string>
     <key>PIBOT_MODEL_CASCADE</key><string>${PIBOT_MODEL_CASCADE:-ollama/minimax-m3:cloud}</string>
-    <key>TELEGRAM_ALLOWED_CHATS</key><string>${TELEGRAM_ALLOWED_CHATS:-161427550}</string>
+    <key>TELEGRAM_ALLOWED_CHATS</key><string>${TELEGRAM_ALLOWED_CHATS}</string>
     <key>PIBOT_WEB</key><string>1</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>

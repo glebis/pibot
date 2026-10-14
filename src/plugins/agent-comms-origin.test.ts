@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { InlineExtension, ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { agentCommsPlugin, type CommsHooks } from "./agent-comms-plugin.js";
+import { OWNER_CHAT_ID } from "../test-fixtures.js";
 
 type Tool = ToolDefinition & { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }> };
 
@@ -20,7 +21,7 @@ function toolsOf(ext: InlineExtension): Map<string, Tool> {
 }
 
 describe("agent-comms plugin origin-chat routing", () => {
-  const CHAT = { transport: "telegram", chatId: "161427550" };
+  const CHAT = { transport: "telegram", chatId: OWNER_CHAT_ID };
 
   function makePlugin(over: Partial<CommsHooks> = {}) {
     const askAgent = vi.fn(async () => "ok");

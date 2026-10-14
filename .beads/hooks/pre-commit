@@ -1,5 +1,7 @@
 #!/bin/sh
 # TDD guard: typecheck + tests must pass before every commit
+echo "▸ private ids"
+sh scripts/check-private-ids.sh || exit 1
 echo "▸ typecheck"
 npm run --silent typecheck || exit 1
 echo "▸ tests"

@@ -11,6 +11,7 @@ import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
 import type { ModelCascade } from "./cascade.js";
 import type { PushOptions, ReplyContext, Schedule, Transport, IncomingMedia } from "./types.js";
+import { OWNER_CHAT_ID, ownerChatKey } from "../test-fixtures.js";
 
 // The /newagent wizard runs the LLM-backed ambiguity gate before creating the
 // agent. With no modelRuntime stub the SDK falls back to the machine's real
@@ -1663,13 +1664,13 @@ describe("chat routing ownership", () => {
     const b = bot(t);
     b.transports.set("telegram", { name: "telegram" } as unknown as Transport);
     b.transports.set("telegram:coach", { name: "telegram:coach", boundAgentId: "coach" } as unknown as Transport);
-    b.chatAgent.set("telegram:161427550", "assistant"); // main chat rebound to assistant
-    b.agentChats.set("coach", new Set(["telegram:161427550", "telegram:coach:161427550"]));
-    expect(b.primaryChat({ agentId: "coach", chat: { transport: "internal", chatId: "brief" } })).toBe("telegram:coach:161427550");
+    b.chatAgent.set(ownerChatKey(), "assistant"); // main chat rebound to assistant
+    b.agentChats.set("coach", new Set([ownerChatKey(), ownerChatKey("coach")]));
+    expect(b.primaryChat({ agentId: "coach", chat: { transport: "internal", chatId: "brief" } })).toBe(ownerChatKey("coach"));
     // captured concrete chat the agent no longer owns → falls back to the owned one
-    expect(b.primaryChat({ agentId: "coach", chat: { transport: "telegram", chatId: "161427550" } })).toBe("telegram:coach:161427550");
+    expect(b.primaryChat({ agentId: "coach", chat: { transport: "telegram", chatId: OWNER_CHAT_ID } })).toBe(ownerChatKey("coach"));
     // still-owned captured chat → honored
-    expect(b.primaryChat({ agentId: "coach", chat: { transport: "telegram:coach", chatId: "161427550" } })).toBe("telegram:coach:161427550");
+    expect(b.primaryChat({ agentId: "coach", chat: { transport: "telegram:coach", chatId: OWNER_CHAT_ID } })).toBe(ownerChatKey("coach"));
     // nothing owned at all → null (caller suppresses instead of misdelivering)
     b.agentChats.delete("coach");
     expect(b.primaryChat({ agentId: "coach", chat: { transport: "internal", chatId: "brief" } })).toBeNull();
@@ -1678,26 +1679,26 @@ describe("chat routing ownership", () => {
   it("rebinding a chat drops it from the previous owner's memory", () => {
     const t = makeBot();
     const b = bot(t);
-    b.chatAgent.set("telegram:161427550", "assistant");
-    b.agentChats.set("assistant", new Set(["telegram:161427550"]));
-    b.rememberChat("knower", "telegram:161427550");
-    expect(b.chatAgent.get("telegram:161427550")).toBe("knower");
-    expect(b.agentChats.get("assistant")?.has("telegram:161427550")).toBe(false);
-    expect(b.agentChats.get("knower")?.has("telegram:161427550")).toBe(true);
+    b.chatAgent.set(ownerChatKey(), "assistant");
+    b.agentChats.set("assistant", new Set([ownerChatKey()]));
+    b.rememberChat("knower", ownerChatKey());
+    expect(b.chatAgent.get(ownerChatKey())).toBe("knower");
+    expect(b.agentChats.get("assistant")?.has(ownerChatKey())).toBe(false);
+    expect(b.agentChats.get("knower")?.has(ownerChatKey())).toBe(true);
   });
 
   it("boot reconcile prunes stale memories and keeps owned ones", () => {
     const t = makeBot();
     const b = bot(t);
     b.transports.set("telegram:creator", { name: "telegram:creator", boundAgentId: "creator" } as unknown as Transport);
-    b.chatAgent.set("telegram:161427550", "knower");
-    b.agentChats.set("focuscoach", new Set(["telegram:161427550"]));
-    b.agentChats.set("creator", new Set(["telegram:creator:161427550"]));
-    b.agentChats.set("knower", new Set(["telegram:161427550"]));
+    b.chatAgent.set(ownerChatKey(), "knower");
+    b.agentChats.set("focuscoach", new Set([ownerChatKey()]));
+    b.agentChats.set("creator", new Set([ownerChatKey("creator")]));
+    b.agentChats.set("knower", new Set([ownerChatKey()]));
     b.reconcileChatMemories();
     expect(b.agentChats.get("focuscoach")).toBeUndefined();
-    expect(b.agentChats.get("creator")?.has("telegram:creator:161427550")).toBe(true);
-    expect(b.agentChats.get("knower")?.has("telegram:161427550")).toBe(true);
+    expect(b.agentChats.get("creator")?.has(ownerChatKey("creator"))).toBe(true);
+    expect(b.agentChats.get("knower")?.has(ownerChatKey())).toBe(true);
   });
 });
 
@@ -1760,9 +1761,9 @@ describe("schedule failure notices", () => {
     const phantom = new MockTransport("telegram");
     b.transports.set("telegram", phantom);
     // assistant "owns" the phantom chat (telegram:123) and one real chat
-    b.agentChats.set("assistant", new Set(["telegram:123", "telegram:161427550"]));
+    b.agentChats.set("assistant", new Set(["telegram:123", ownerChatKey()]));
     b.chatAgent.set("telegram:123", "assistant");
-    b.chatAgent.set("telegram:161427550", "assistant");
+    b.chatAgent.set(ownerChatKey(), "assistant");
 
     const job = {
       id: "sc_x",
@@ -1773,7 +1774,7 @@ describe("schedule failure notices", () => {
     await bot.notifyScheduleFailure(job, "could not be delivered");
 
     expect(phantom.pushed.some((p) => p.chatId === "123")).toBe(false); // nothing into the failing chat
-    expect(phantom.pushed.some((p) => p.chatId === "161427550")).toBe(true); // the real chat gets it
+    expect(phantom.pushed.some((p) => p.chatId === OWNER_CHAT_ID)).toBe(true); // the real chat gets it
   });
 
   it("suppresses the notice when the agent owns no real chat", async () => {

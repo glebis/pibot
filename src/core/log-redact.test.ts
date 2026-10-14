@@ -51,7 +51,7 @@ describe("redactSecrets", () => {
     const ordinary = [
       "evolution: create \"morning-brief\" staged, probes [5, 3]",
       "usage: 500 tokens, 12:30 elapsed",
-      "chat 161427550 blocked — not in allowlist",
+      "chat 100000001 blocked — not in allowlist",
       "the model scored 5 of 5 on 3 probes",
     ];
     for (const text of ordinary) expect(redactSecrets(text), text).toBe(text);
