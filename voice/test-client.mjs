@@ -6,7 +6,7 @@ import test from 'node:test';
 const script = fs.readFileSync(new URL('./client.html', import.meta.url), 'utf8').match(/<script>([\s\S]*?)<\/script>/)[1];
 const token = 'a'.repeat(64);
 const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
-function setup({ hash = '#token=' + token, audioReady = true, available = true } = {}) {
+function setup({ hash = '#token=' + token, audioReady = true, available = true, storage } = {}) {
   class Element {
     constructor(id = '') { this.id = id; this.children = []; this.value = ''; this.disabled = ['start','stop','refresh','agent'].includes(id); this.hidden = id === 'play'; this.handlers = {}; this.textContent = ''; }
     addEventListener(name, fn) { this.handlers[name] = fn; }
@@ -16,7 +16,7 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true }
     play() { return Promise.resolve(); }
     pause() { this.paused = true; }
   }
-  const elements = Object.fromEntries(['agent','start','stop','refresh','audio','status','agent-detail','play','transcript'].map(id => [id,new Element(id)]));
+  const elements = Object.fromEntries(['agent','start','stop','refresh','audio','status','agent-detail','play','transcript','mic','levels','mic-level','agent-level','device','scope-note'].map(id => [id,new Element(id)]));
   const requests = [], replaced = [], timers = new Map();
   let microphoneCalls = 0, tracksStopped = 0, rtcClosed = 0;
   const track = {stop() { tracksStopped++; }};
@@ -35,7 +35,7 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true }
   const context = {
     document:{getElementById:id => elements[id],createElement:() => new Element()},
     location:{hash,pathname:'/',search:''},history:{replaceState(...args) { replaced.push(args); }},
-    URLSearchParams,AbortController,AbortSignal,RTCPeerConnection:RTC,window,
+    ...(storage ? {sessionStorage:storage} : {}),URLSearchParams,AbortController,AbortSignal,RTCPeerConnection:RTC,window,
     navigator:{mediaDevices:{async getUserMedia() { microphoneCalls++; return {getTracks:() => [track]}; }}},
     setTimeout(fn,ms) { const id = timers.size + 1; timers.set(id,{fn,ms}); return id; },clearTimeout(id) { timers.delete(id); },
     async fetch(path,opts) {
@@ -53,6 +53,13 @@ test('missing token fails closed, strips fragment and makes no request',async ()
   assert.match(ui.elements.status.textContent,/private launch link/);
   assert.equal(ui.requests.length,0);
   assert.equal(ui.replaced[0][2],'/');
+});
+test('reload without fragment reuses the tab-scoped key',async () => {
+  const map = new Map(), storage = {getItem:k => map.get(k) ?? null,setItem:(k,v) => map.set(k,v),removeItem:k => map.delete(k)};
+  setup({storage}); await settle();
+  const reloaded = setup({hash:'',storage}); await settle();
+  assert.equal(reloaded.requests[0].opts.headers.Authorization,'Bearer ' + token);
+  assert.equal(reloaded.elements.start.disabled,false);
 });
 test('missing Deepgram credential disables Start with actionable status',async () => {
   const ui = setup({audioReady:false}); await settle();

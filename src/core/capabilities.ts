@@ -17,6 +17,8 @@ import { linearPlugin } from "../plugins/linear-plugin.js";
 import { memoryPlugin } from "../plugins/memory-plugin.js";
 import { questionPlugin } from "../plugins/question-plugin.js";
 import { schedulerPlugin } from "../plugins/scheduler-plugin.js";
+import { tasksPlugin } from "../plugins/tasks-plugin.js";
+import type { TaskLedger } from "../durable/task-ledger.js";
 import { skillManagePlugin } from "../plugins/skill-manage-plugin.js";
 import { vaultPlugin } from "../plugins/vault-plugin.js";
 import { speechPlugin } from "../plugins/speech-plugin.js";
@@ -66,6 +68,8 @@ export interface CapabilityContext {
   commitments?: CommitmentPluginEngine;
   /** durable research-intake sessions (wizard persistence) */
   intake?: IntakeStore;
+  /** durable background-task ledger (pi-durable); absent when not wired */
+  tasks?: TaskLedger;
 }
 
 export type { CommitmentPluginEngine };
@@ -150,6 +154,14 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     tools: ["schedule_create", "schedule_list", "schedule_cancel", "schedule_resume", "snooze", "promise_make", "promise_keep"],
     prompt: "REMINDERS ARE NEVER DISCUSSIONS: when the owner asks for a reminder, call schedule_create immediately with exactly what they said, then confirm in one line—do not look up context, reinterpret, or ask for confirmation. schedule_list, schedule_cancel, schedule_resume, snooze, promise_make and promise_keep manage commitments; recurring items must be at least 15 minutes apart and each agent may have at most 20 active items. A repeatedly failing item pauses automatically; explain the last error and use schedule_resume only after the delivery problem is fixed. Important items still fire through snooze. `when` accepts forms like `in 20m`, `tomorrow 9am`, `daily at 08:00`, `every 2h`, or `friday 18:00`; kind is reminder, task, note, subject, or custom; `delivery: direct` sends a host ping and `delivery: agent` wakes the agent to compose it; reserve `wake: important` for hard commitments.",
     create: (ctx) => schedulerPlugin({ scheduler: ctx.scheduler, agentId: ctx.agent.id, chat: ctx.chat, getQuietHours: () => ctx.agent.manifest.heartbeat?.quietHours }),
+  },
+  {
+    id: "tasks", defaultEnabled: true,
+    tools: ["start_task", "task_status", "list_tasks", "cancel_task"],
+    prompt: "start_task hands longer work (research, drafting, multi-step tool work) to a durable background run of you that survives restarts and posts its result to this chat; give it self-contained instructions. When the owner asks how a task is going or what came back, use list_tasks / task_status rather than guessing. cancel_task stops one. In a voice conversation, prefer start_task over long work inside the turn, and say the result will arrive in the chat.",
+    // never inside agent-only sessions (a task's own run, agent-to-agent): no tasks spawning tasks
+    available: (ctx) => Boolean(ctx.tasks) && ctx.chat.transport !== "agent",
+    create: (ctx) => tasksPlugin({ ledger: ctx.tasks!, agentId: ctx.agent.id, chat: ctx.chat }),
   },
   {
     id: "commitments", defaultEnabled: true,
@@ -272,6 +284,8 @@ export function capabilityIdsForTools(tools: readonly string[], registry: readon
 
 export function resolveCapabilities(ctx: CapabilityContext, registry: readonly CapabilityDefinition[] = CAPABILITY_REGISTRY, selectedIds?: readonly string[]): ResolvedCapabilities {
   const wanted = selectedIds ? [...selectedIds] : registry.filter((entry) => entry.defaultEnabled).map((entry) => entry.id);
+  // background tasks belong with scheduling: agents that pick the scheduler get them too
+  if (wanted.includes("scheduler") && !wanted.includes("tasks")) wanted.push("tasks");
   if (ctx.agent.id === DEV_AGENT_ID) {
     if (!wanted.includes("developer")) wanted.push("developer");
     if (!wanted.includes("remote-workshop")) wanted.push("remote-workshop");

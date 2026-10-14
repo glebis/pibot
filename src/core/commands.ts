@@ -34,7 +34,7 @@ const HELP = [
   `/status — what's running`,
   `/minimal on|off — minimal voice: terse, speakable replies (no URLs, code, paths)`,
   `/call — ring your phone as this chat's agent (asks to confirm first)`,
-  `/voicetest — link to the private Pipecat voice test page for this agent`,
+  `/voice — talk to this agent by voice (private browser page on your Mac)`,
   `/goal <objective> — a bounded goal the agent works until a judge sees it done  ·  /goal draft, /goal status, /goal pause`,
 ].join("\n");
 
@@ -93,7 +93,7 @@ export interface CommandContext {
     detachSubBot(agentId: string): Promise<boolean>;
     requestSubBotCreation(agentId: string, fromChat?: { transport: string; chatId: string }): Promise<void>;
   };
-  /** owner-only voice commands (/call, /voicetest); undefined when voice is not wired */
+  /** owner-only voice commands (/call, /voice); undefined when voice is not wired */
   voice?: () => VoiceOwnerCommands | undefined;
   currentAgent(ck: string): string | undefined;
   chatKey(t: Transport, chatId: string): string;
@@ -159,7 +159,7 @@ export function createCommandHandler(ctx: CommandContext) {
         return;
 
       case "call":
-      case "voicetest": {
+      case "voice": {
         // admin-only: the owner's own private chat, never groups or participant chats
         if (!ownerChat || !/^[1-9]\d*$/.test(String(chatId))) {
           await reply("This command is available only in your private owner chat.");
@@ -174,11 +174,18 @@ export function createCommandHandler(ctx: CommandContext) {
           await reply("Voice isn't set up on this bot.");
           return;
         }
-        if (cmd === "voicetest") {
-          const url = voice.testPageUrl(agentId);
-          await reply(url
-            ? `🎙 Voice test with **${agentId}** — an isolated copy (persona and model only; no tools, memory or chat history). Opens only on your Mac:\n${url}`
-            : "🎙 The voice test page isn't running. Start it on your Mac with `./scripts/start-voice.sh`, then send /voicetest again.");
+        if (cmd === "voice") {
+          const links = voice.pageLinks(agentId);
+          if (!links) {
+            await reply("🎙 The voice page isn't running. Start it on your Mac with `./scripts/start-voice.sh`, then send /voice again.");
+            return;
+          }
+          // Telegram rejects loopback URLs in buttons: the Mac link stays a text link, the tailnet one is a button.
+          await t.push(chatId, {
+            text: `🎙 Talk to **${agentId}** by voice — shared with this chat (recent history and tools; approvals stay here).\n\n💻 [Open on this Mac](${links.local})` +
+              (links.tailnet ? `\n📱 Other devices on your tailnet: use the button.` : `\n📱 No Tailscale link: run \`tailscale serve --bg --https=8444 http://127.0.0.1:8788\` and restart the page.`),
+            ...(links.tailnet ? { card: { text: "", buttons: [{ label: "📱 Open via Tailscale", action: "voice:tailnet", url: links.tailnet }] } } : {}),
+          });
           return;
         }
         const availability = voice.callAvailability(agentId, ck);

@@ -3,7 +3,7 @@ import type { Transport } from "./types.js";
 import { createCommandHandler, type CommandContext } from "./commands.js";
 import type { VoiceOwnerCommands } from "../voice/owner-commands.js";
 
-// /call and /voicetest are admin-only: the owner's private chat, never groups or participants.
+// /call and /voice are admin-only: the owner's private chat, never groups or participants.
 
 const OWNER = "100000001";
 
@@ -17,7 +17,7 @@ function makeCtx(opts: { boundAgentId?: string; voice?: Partial<VoiceOwnerComman
   const voice = opts.voice === null ? undefined : {
     callAvailability: vi.fn(() => "ok" as const),
     armCall: vi.fn(() => "tok123"),
-    testPageUrl: vi.fn((a: string) => `http://127.0.0.1:8788/#token=${"a".repeat(64)}&agent=${a}`),
+    pageLinks: vi.fn((a: string) => ({ local: `http://127.0.0.1:8788/#token=${"a".repeat(64)}&agent=${a}`, tailnet: `https://box.tail1.ts.net:8444/#token=${"a".repeat(64)}&agent=${a}` })),
     ...opts.voice,
   };
   const ctx = {
@@ -78,23 +78,24 @@ describe("/call", () => {
   });
 });
 
-describe("/voicetest", () => {
+describe("/voice", () => {
   it("sends the private page link preselected with the current agent", async () => {
     const { handler, transport, pushed } = makeCtx({ agent: "knower" });
-    await handler(transport, OWNER, "/voicetest");
+    await handler(transport, OWNER, "/voice");
     expect(pushed.at(-1)?.text).toContain("&agent=knower");
-    expect(pushed.at(-1)?.text).toContain("isolated copy");
+    expect(pushed.at(-1)?.text).toContain("shared with this chat");
+    expect((pushed.at(-1)?.card?.buttons[0] as { url?: string } | undefined)?.url).toContain("ts.net:8444/#token=");
   });
 
   it("explains how to start the page when it isn't running", async () => {
-    const { handler, transport, pushed } = makeCtx({ voice: { testPageUrl: vi.fn(() => undefined) } });
-    await handler(transport, OWNER, "/voicetest");
+    const { handler, transport, pushed } = makeCtx({ voice: { pageLinks: vi.fn(() => undefined) } });
+    await handler(transport, OWNER, "/voice");
     expect(pushed.at(-1)?.text).toContain("start-voice.sh");
   });
 
   it("is refused in groups", async () => {
     const { handler, transport, pushed } = makeCtx();
-    await handler(transport, "-100123", "/voicetest");
+    await handler(transport, "-100123", "/voice");
     expect(pushed.at(-1)?.text).toContain("only in your private owner chat");
   });
 });

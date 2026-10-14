@@ -69,7 +69,7 @@ function messageIdOf(sent: unknown): number | undefined {
 
 const BOT_COMMANDS = [
   { command: "call", description: "Ring my phone as this agent (confirm first)" },
-  { command: "voicetest", description: "Pipecat voice test page for this agent" },
+  { command: "voice", description: "Talk to this agent by voice" },
   { command: "help", description: "What pibot can do" },
   { command: "status", description: "Rhythm, snooze, next item" },
   { command: "minimal", description: "Minimal voice replies: /minimal on" },

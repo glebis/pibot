@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 
 /**
  * Owner-only voice commands: `/call` rings the owner's phone as the current chat's agent
- * (after an explicit confirm tap), `/voicetest` hands back the private browser test page
+ * (after an explicit confirm tap), `/voice` hands back the private browser test page
  * preselected with that agent. Admin gating lives in commands.ts; this module re-checks
  * that a confirmed call still targets the chat that asked for it.
  */
@@ -13,6 +13,8 @@ const CALL_STATES = new Set(['dispatching', 'accepted', 'authenticated', 'stream
 const PRIVATE_CHAT_KEY = /^telegram(?::[A-Za-z0-9_-]+)?:[1-9][0-9]{0,19}$/;
 const AGENT_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const TEST_URL = /^http:\/\/127\.0\.0\.1:([0-9]{4,5})\/#token=([0-9a-f]{64})$/;
+/** tailnet-only `tailscale serve` page (MagicDNS name, real cert) carrying the same private key */
+const TAILNET_URL = /^https:\/\/[a-z0-9-]{1,63}\.[a-z0-9-]{1,63}\.ts\.net(?::[0-9]{2,5})?\/#token=([0-9a-f]{64})$/;
 const CONFIRM_TTL_MS = 120_000;
 const MAX_DURATION_S = 180;
 
@@ -85,7 +87,8 @@ export class VoiceOwnerCommands {
   }
 
   /** Private loopback test-page URL preselected with the agent, or undefined when the page isn't running. */
-  testPageUrl(agentId: string): string | undefined {
+  /** Page links for the agent: loopback always, tailnet when the launcher found a private serve. */
+  pageLinks(agentId: string): { local: string; tailnet?: string } | undefined {
     if (!AGENT_ID.test(agentId)) return undefined;
     let raw: string;
     try {
@@ -96,8 +99,12 @@ export class VoiceOwnerCommands {
         raw = fs.readFileSync(fd, 'utf8').trim();
       } finally { fs.closeSync(fd); }
     } catch { return undefined; }
-    if (!TEST_URL.test(raw)) return undefined;
-    return `${raw}&agent=${encodeURIComponent(agentId)}`;
+    const [local = '', tailnet = ''] = raw.split('\n').map((l) => l.trim());
+    const key = TEST_URL.exec(local)?.[2];
+    if (!key) return undefined;
+    const agent = `&agent=${encodeURIComponent(agentId)}`;
+    // the tailnet line must carry the same key, so a stale or foreign line is ignored
+    return { local: local + agent, ...(TAILNET_URL.exec(tailnet)?.[1] === key ? { tailnet: tailnet + agent } : {}) };
   }
 }
 

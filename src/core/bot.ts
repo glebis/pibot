@@ -2,6 +2,7 @@ import { urgentSourceReceipt } from '../voice/urgent-sources.js';
 import type { UrgentSourceStore, SourceScope, BlockedDecisionProjection } from '../voice/urgent-sources.js';
 import { CanonicalTurnGate, type ActiveVoiceTurn, type BotVoiceInput, type BotVoiceResult } from '../voice/session-control.js';
 import type { VoiceOwnerCommands } from '../voice/owner-commands.js';
+import type { TaskRun } from '../durable/task-ledger.js';
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildManifest, buildPersona, validateAgentName, type AgentDraft, type Proactivity } from "./agent-factory.js";
@@ -1937,7 +1938,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
   /** @internal narrow surface for the command layer */
   /** Public: the dashboard reuses the same cascade control facade as /cascade. */
   private voiceCommands?: VoiceOwnerCommands;
-  /** Owner-only /call and /voicetest; wired after the voice runtime starts (it needs this bot as host). */
+  /** Owner-only /call and /voice; wired after the voice runtime starts (it needs this bot as host). */
   setVoiceCommands(v: VoiceOwnerCommands | undefined): void { this.voiceCommands = v; }
 
   /** ✅/✖ taps on a /call confirmation card — owner chats only, single-use, same chat. */
@@ -2732,6 +2733,45 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     }
     this.maybeEmitTaskAck(agentId, fromAgent, text, finalReply);
     return finalReply;
+  }
+
+  /** Durable task runner (pibot-e9t): one background turn of the agent in the task's own
+   *  session (full tools; questions route to the owner chat). The ledger owns retries,
+   *  status and the result post; cancelling or shutting down aborts the turn. */
+  async runLedgerTask(run: TaskRun): Promise<string> {
+    if (!this.deps.agents.getAgent(run.agentId)) throw new Error(`unknown agent "${run.agentId}"`);
+    const originChat = this.splitChatKey(run.chatKey);
+    const ck = `agent::${run.agentId}::task-${run.taskId}`;
+    const session = await this.deps.agents.getOrCreateSession(
+      run.agentId, ck, { transport: "agent", chatId: `task-${run.taskId}` }, this.deps.scheduler,
+      (spec: QuestionSpec) => this.questions.ask(run.agentId, originChat, spec), this.commsHooks(),
+    );
+    if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("task session is busy");
+    const resume = run.resumed
+      ? "\n\nNote: an earlier attempt of this task was interrupted by a restart. This session shows what it already did — check before repeating any action (messages, writes, bookings)."
+      : "";
+    const stop = new Promise<never>((_, reject) => {
+      const cancel = () => { void session.abort().catch(() => {}); reject(new Error("cancelled")); };
+      if (run.signal.aborted) cancel(); else run.signal.addEventListener("abort", cancel, { once: true });
+    });
+    let timer: NodeJS.Timeout | undefined;
+    const limit = new Promise<never>((_, reject) => { timer = setTimeout(() => { void session.abort().catch(() => {}); reject(new Error("Task took longer than 30 minutes and was stopped.")); }, 30 * 60_000); });
+    try {
+      await Promise.race([
+        session.prompt(envelope(`[background task ${run.taskId}: "${run.title}" — requested from the owner's chat]\n\n${run.instructions}${resume}\n\nWork on it now with your tools. Finish with a short result summary for the owner; it is posted to their chat.`)),
+        stop, limit,
+      ]);
+      this.deps.events.log(run.agentId, "system", `task done ${run.taskId}: ${truncate(run.title, 60)}`);
+      return extractAssistantTextFromSession(session) ?? "";
+    } finally { clearTimeout(timer); }
+  }
+
+  /** Post a ledger notice (task result, failure, cancellation) to an owner chat. */
+  async notifyChat(chatKey: string, text: string): Promise<void> {
+    const { transport, chatId } = this.splitChatKey(chatKey);
+    const t = this.transports.get(transport);
+    if (!t) throw new Error(`no transport "${transport}"`);
+    await t.push(chatId, { text: truncate(text, 4000) });
   }
 
   /** Agent-initiated handoff: move the sender's conversation to the target when the sender owns a rebindable (non-subbot) chat; otherwise deliver the brief into the target's pair session (status routes back to the origin chat). */

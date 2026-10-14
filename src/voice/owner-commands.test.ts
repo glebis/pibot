@@ -71,27 +71,40 @@ describe('VoiceOwnerCommands /call', () => {
   });
 });
 
-describe('VoiceOwnerCommands /voicetest', () => {
+describe('VoiceOwnerCommands /voice', () => {
   const URL = `http://127.0.0.1:8788/#token=${'a'.repeat(64)}`;
 
   it('returns the private URL preselected with the agent', () => {
     const file = tmpUrlFile();
     fs.writeFileSync(file, URL + '\n', { mode: 0o600 });
-    expect(new VoiceOwnerCommands({ testUrlFile: file }).testPageUrl('assistant')).toBe(`${URL}&agent=assistant`);
+    expect(new VoiceOwnerCommands({ testUrlFile: file }).pageLinks('assistant')).toEqual({ local: `${URL}&agent=assistant` });
+  });
+
+  it('adds the tailnet link only when it carries the same key', () => {
+    const TS = `https://box.tail1.ts.net:8444/#token=${'a'.repeat(64)}`;
+    const file = tmpUrlFile();
+    fs.writeFileSync(file, `${URL}\n${TS}\n`, { mode: 0o600 });
+    expect(new VoiceOwnerCommands({ testUrlFile: file }).pageLinks('coach')).toEqual({ local: `${URL}&agent=coach`, tailnet: `${TS}&agent=coach` });
+    const foreign = tmpUrlFile();
+    fs.writeFileSync(foreign, `${URL}\nhttps://evil.example/#token=${'a'.repeat(64)}\n`, { mode: 0o600 });
+    expect(new VoiceOwnerCommands({ testUrlFile: foreign }).pageLinks('coach')?.tailnet).toBeUndefined();
+    const stale = tmpUrlFile();
+    fs.writeFileSync(stale, `${URL}\nhttps://box.tail1.ts.net:8444/#token=${'b'.repeat(64)}\n`, { mode: 0o600 });
+    expect(new VoiceOwnerCommands({ testUrlFile: stale }).pageLinks('coach')?.tailnet).toBeUndefined();
   });
 
   it('returns nothing when the page is not running or the pointer is unsafe', () => {
-    expect(new VoiceOwnerCommands({ testUrlFile: tmpUrlFile() }).testPageUrl('assistant')).toBeUndefined();
+    expect(new VoiceOwnerCommands({ testUrlFile: tmpUrlFile() }).pageLinks('assistant')).toBeUndefined();
     const loose = tmpUrlFile();
     fs.writeFileSync(loose, URL, { mode: 0o644 });
     fs.chmodSync(loose, 0o644);
-    expect(new VoiceOwnerCommands({ testUrlFile: loose }).testPageUrl('assistant')).toBeUndefined();
+    expect(new VoiceOwnerCommands({ testUrlFile: loose }).pageLinks('assistant')).toBeUndefined();
     const remote = tmpUrlFile();
     fs.writeFileSync(remote, `http://evil.example:8788/#token=${'a'.repeat(64)}`, { mode: 0o600 });
-    expect(new VoiceOwnerCommands({ testUrlFile: remote }).testPageUrl('assistant')).toBeUndefined();
+    expect(new VoiceOwnerCommands({ testUrlFile: remote }).pageLinks('assistant')).toBeUndefined();
     const ok = tmpUrlFile();
     fs.writeFileSync(ok, URL, { mode: 0o600 });
-    expect(new VoiceOwnerCommands({ testUrlFile: ok }).testPageUrl('../x')).toBeUndefined();
+    expect(new VoiceOwnerCommands({ testUrlFile: ok }).pageLinks('../x')).toBeUndefined();
   });
 });
 

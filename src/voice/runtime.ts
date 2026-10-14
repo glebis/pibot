@@ -58,6 +58,15 @@ export function createCanonicalVoiceBridge(host:VoiceHost,token:string,clock=Dat
     sessions.set(sessionId,{agentId:b.agentId,chatKey:b.chatKey,callSid:b.callSid,expires:clock()+180000,controller:new AbortController(),requests:new Map(),busy:false});
     const greeting=pendingSummary(b);return c.json({sessionId,...(greeting?{greeting}: {})});
   });
+  // Owner browser page (/voice): same canonical session and binding checks as a phone call, no Twilio call id.
+  app.post('/voice/browser-sessions',async c=>{
+    let b:any;try{b=await body(c);}catch{return c.json({error:'invalid_body'},400);}
+    if(!b||typeof b.agentId!=='string'||typeof b.chatKey!=='string'||!allowed(b))return c.json({error:'binding_denied'},403);
+    if(sessions.size)return c.json({error:'session_unavailable'},409);
+    const sessionId=randomUUID();
+    sessions.set(sessionId,{agentId:b.agentId,chatKey:b.chatKey,callSid:'browser',expires:clock()+15*60000,controller:new AbortController(),requests:new Map(),busy:false});
+    const greeting=pendingSummary(b);return c.json({sessionId,...(greeting?{greeting}: {})});
+  });
   app.delete('/voice/sessions/:id',c=>{const id=c.req.param('id'),s=sessions.get(id);s?.controller.abort();sessions.delete(id);return c.json({closed:true});});
   app.post('/voice/sessions/:id/turn',async c=>{
     const sessionId=c.req.param('id'),s=sessions.get(sessionId);if(!s)return c.json({error:'session_expired'},404);

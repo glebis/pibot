@@ -29,6 +29,8 @@ export function readVoiceToken(file: string): string {
 export function createVoiceBridge(opts: {
   agentsDir: string; token: string; runtime: VoiceRuntime;
   resolve?: (spec: string) => Model<Api> | undefined; modelAvailable?: (model: Model<Api>) => boolean; now?: () => number; timeoutMs?: number;
+  /** Voice-only first choice (e.g. a fast model); still subject to each agent's providers policy and auth. */
+  preferredModel?: string;
 }) {
   if (!/^[a-f0-9]{64}$/.test(opts.token)) throw new Error('invalid_token');
   const now = opts.now ?? Date.now;
@@ -47,7 +49,7 @@ export function createVoiceBridge(opts: {
     const m = JSON.parse(raw);
     if (!m || typeof m !== 'object') throw new Error('invalid_manifest');
     if(m.providers!==undefined && (!Array.isArray(m.providers)||!m.providers.every((p:unknown)=>typeof p==='string'))) throw new Error('invalid_providers');
-    const specs: string[]=[...(typeof m.model==='string'?[m.model]:[]),...(Array.isArray(m.cascade)?m.cascade.filter((s:unknown)=>typeof s==='string'):[])];
+    const specs: string[]=[...(opts.preferredModel?[opts.preferredModel]:[]),...(typeof m.model==='string'?[m.model]:[]),...(Array.isArray(m.cascade)?m.cascade.filter((s:unknown)=>typeof s==='string'):[])];
     if(Array.isArray(m.providers)) for(const candidate of opts.runtime.getModels?.() ?? []) {
       if(m.providers.includes(candidate.provider)&&opts.runtime.hasConfiguredAuth(candidate.provider)) specs.push(`${candidate.provider}/${candidate.id}`);
     }

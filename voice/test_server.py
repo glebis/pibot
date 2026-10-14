@@ -80,3 +80,32 @@ def test_private_credentials():
         assert private_token(str(p))==TOKEN
         p.chmod(0o644)
         with pytest.raises(ValueError):private_token(str(p))
+
+class CanonicalBridge(Bridge):
+    async def get(self, path):
+        self.calls.append(('get', path))
+        return httpx.Response(200, json={'bindings': [{'agentId':'coach','chatKey':'telegram:42'}]}, request=httpx.Request('GET','http://test'))
+    async def post(self, path, json):
+        self.calls.append(('post', path, json))
+        return httpx.Response(200, json={'sessionId':'s-1'}, request=httpx.Request('POST','http://test'))
+
+def test_canonical_mode_uses_bound_shared_session():
+    b=CanonicalBridge()
+    app=create_app(TOKEN,'cd'*32,client=b,rtc_factory=RTC,pipeline=pipeline,canonical=True)
+    with patch.dict(os.environ,{'DEEPGRAM_API_KEY':'k'}),TestClient(app,base_url='http://127.0.0.1:8788') as c:
+        data=c.get('/api/agents',headers=HEADERS).json()
+        assert data['mode']=='shared' and [a['id'] for a in data['agents']]==['coach']
+        assert c.post('/api/offer',headers=HEADERS,json={'agentId':'other','sdp':'v=0','type':'offer'}).status_code==503
+        assert c.post('/api/offer',headers=HEADERS,json={'agentId':'coach','sdp':'v=0','type':'offer'}).status_code==200
+        assert ('post','/voice/browser-sessions',{'agentId':'coach','chatKey':'telegram:42'}) in b.calls
+        c.delete('/api/session',headers=HEADERS)
+        assert ('delete','/voice/sessions/s-1') in b.calls
+
+def test_public_origin_is_exact_and_https_only():
+    with pytest.raises(ValueError):
+        create_app(TOKEN,'cd'*32,client=Bridge(),public_origins=('http://box.ts.net',))
+    app=create_app(TOKEN,'cd'*32,client=Bridge(),public_origins=('https://box.tail1.ts.net:8444',))
+    with TestClient(app,base_url='http://127.0.0.1:8788') as c:
+        ok={**HEADERS,'host':'box.tail1.ts.net:8444','origin':'https://box.tail1.ts.net:8444'}
+        assert c.get('/api/agents',headers=ok).status_code==200
+        assert c.get('/api/agents',headers={**ok,'origin':'https://box.tail1.ts.net'}).status_code==403

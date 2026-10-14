@@ -12,7 +12,7 @@ PiBot agents can be reached by voice in three ways. They differ in which agent y
 
 Both commands work only in your private owner chat. Groups, including allowlisted ones, and participant chats of sub-bots are refused.
 
-- **`/voicetest`** replies with the private link to the browser test page, with the chat's current agent preselected. The link points at `127.0.0.1`, so it only opens on this Mac. It contains the page's private key, which then stays in the chat; delete the message if you'd rather not keep it. If the page isn't running, the bot tells you how to start it.
+- **`/voice`** replies with the private link to the browser test page, with the chat's current agent preselected. The link points at `127.0.0.1`, so it only opens on this Mac. It contains the page's private key, which then stays in the chat; delete the message if you'd rather not keep it. If the page isn't running, the bot tells you how to start it.
 - **`/call`** asks "Call your phone as *agent*?" with **✅ Call** and **✖ Cancel** buttons. Nothing dials until you tap ✅.
   - The confirmation can be used once, only from the chat that asked, and expires after 2 minutes.
   - On ✅ the bot re-checks that the chat still has a voice binding, then asks the phone service to ring your configured number. You answer and enter your PIN.
@@ -32,7 +32,7 @@ Start it from the project:
 
 The launcher reads only the speech key from that file and never prints it. Alternatively, supply `DEEPGRAM_API_KEY` through the environment and omit the option. Use `--check` for dependency, credential-presence and free-port checks without starting anything. Ctrl+C stops only the two test processes.
 
-While it runs, the launcher writes the private page link to `data/voice/test-launch.url` (owner-only) so `/voicetest` can hand it out, and removes it on exit. A link ending in `&agent=<id>` preselects that agent.
+While it runs, the launcher writes the private page link to `data/voice/test-launch.url` (owner-only) so `/voice` can hand it out, and removes it on exit. A link ending in `&agent=<id>` preselects that agent.
 
 Press **Start**, allow microphone access, and speak. **Stop** releases the microphone and closes the session. Each session is limited to 15 minutes and 20 agent turns; inactivity also ends it. Nothing reconnects or retries automatically.
 
@@ -82,7 +82,7 @@ The gateway's upstream address is a Worker secret, never committed. Set it with 
 ## Safeguards
 
 - Separate credentials for the browser page, the bridge and call control; constant-time token checks; loopback binding; Host/Origin checks; bounded request bodies.
-- `/call` and `/voicetest`: owner private chat only; single-use, chat-bound, expiring call confirmation; binding re-checked before dialing.
+- `/call` and `/voice`: owner private chat only; single-use, chat-bound, expiring call confirmation; binding re-checked before dialing.
 - Browser test: provider-policy checks, isolated in-memory history, no tools, not registered in PiBot's proactive routing.
 - Phone: Twilio signature check, PIN gate, fixed owner number, one session per call, hard duration cap, no automatic retry.
 - No speech-provider credentials in browser code; normal logs exclude transcripts and provider error payloads.
@@ -90,7 +90,7 @@ The gateway's upstream address is a Worker secret, never committed. Set it with 
 ## Verification status
 
 - **Automated (14 October 2026):** 100 TypeScript voice tests (bridge, escalation, coordinator runtime, owner commands, runtime) and 41 Python tests (browser server, pipeline, phone service, launcher, call script) pass offline. They don't contact speech providers or Twilio.
-- **Live, 14 October 2026:** on the running bot, `/voicetest` returned the page link preselected with the agent, and `/call` showed the confirmation card; tapping ✖ Cancel cancelled it, and no call was placed.
+- **Live, 14 October 2026:** on the running bot, `/voice` returned the page link preselected with the agent, and `/call` showed the confirmation card; tapping ✖ Cancel cancelled it, and no call was placed.
 - **Not yet verified here:** a real `/call` through to a ringing phone and a spoken round trip, and a live microphone → Deepgram → agent → spoken reply round trip on the browser page. A listening port or a passing offline test doesn't prove audio delivery.
 
 The browser transport follows [Pipecat's SmallWebRTC design](https://docs.pipecat.ai/client/concepts/choosing-a-transport), tested with Pipecat 1.0.0. It is independent of the Pipecat MCP conversation tools.

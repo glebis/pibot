@@ -32,7 +32,10 @@ async function main() {
     }
     if(!localTags.get(origin)?.has(model.id)) unavailableLocalModels.add(`${model.provider}/${model.id}`);
   }
-  const bridge=createVoiceBridge({token,runtime,modelAvailable:model=>!unavailableLocalModels.has(`${model.provider}/${model.id}`),agentsDir:path.resolve(process.env.PIBOT_AGENTS_DIR || path.join(os.homedir(),'.local/share/pibot/agents'))});
+  // Voice wants a fast replier; agents whose providers policy forbids it fall back to their own model.
+  const preferredModel=(process.env.PIBOT_VOICE_MODEL ?? 'openrouter/deepseek/deepseek-v4.1-flash').trim()||undefined;
+  if(preferredModel && !/^[-a-zA-Z0-9_]+\/[^\s]{1,200}$/.test(preferredModel)) throw new Error('invalid_voice_model');
+  const bridge=createVoiceBridge({token,runtime,preferredModel,modelAvailable:model=>!unavailableLocalModels.has(`${model.provider}/${model.id}`),agentsDir:path.resolve(process.env.PIBOT_AGENTS_DIR || path.join(os.homedir(),'.local/share/pibot/agents'))});
   const server=serve({fetch:bridge.app.fetch,hostname:'127.0.0.1',port});
   server.on('listening',()=>console.log(`Voice agent bridge ready on 127.0.0.1:${port}; isolated conversations, no tools.`));
   server.on('error',()=>{console.error('Voice agent bridge could not bind its local port.');bridge.close();process.exitCode=1;});

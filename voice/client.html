@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Talk with your agent</title>
 <style>
-:root{color-scheme:light;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#292e29;background:#f5f3ec}*{box-sizing:border-box}body{margin:0;padding:32px 20px}main{max-width:680px;margin:5vh auto}h1{font-size:clamp(2rem,5vw,3rem);letter-spacing:-.055em;margin:12px 0}p{line-height:1.6}.eyebrow{font-size:.8rem;letter-spacing:.12em;text-transform:uppercase;color:#59705b}.intro{color:#586057;max-width:560px}.card{background:#fffefa;border:1px solid #deded2;border-radius:20px;padding:24px;margin-top:24px;box-shadow:0 10px 30px #292e2906}label{display:block;font-weight:600;margin-bottom:10px}select{width:100%;font:inherit;border:1px solid #a8b0a4;background:white;border-radius:9px;padding:12px}button{font:inherit;font-weight:600;border-radius:9px;padding:12px 18px;cursor:pointer;border:1px solid #a8b0a4;background:transparent;color:inherit}button.primary{background:#34533b;color:white;border-color:#34533b}button:disabled{opacity:.45;cursor:not-allowed}button:focus-visible,select:focus-visible{outline:3px solid #b58336;outline-offset:3px}.buttons{display:flex;flex-wrap:wrap;gap:10px;margin:20px 0}#status{min-height:1.6em;font-weight:600}small,.note{font-size:.88rem;color:#62685e;line-height:1.6}.transcript{margin-top:24px;max-height:320px;overflow:auto}.turn{padding:12px 0;border-top:1px solid #e6e7dd;white-space:pre-wrap;overflow-wrap:anywhere}.turn strong{display:block;font-size:.78rem;text-transform:uppercase;letter-spacing:.07em;color:#62705f;margin-bottom:5px}[hidden]{display:none!important}
+:root{color-scheme:light;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#292e29;background:#f5f3ec}*{box-sizing:border-box}body{margin:0;padding:32px 20px}main{max-width:680px;margin:5vh auto}h1{font-size:clamp(2rem,5vw,3rem);letter-spacing:-.055em;margin:12px 0}p{line-height:1.6}.eyebrow{font-size:.8rem;letter-spacing:.12em;text-transform:uppercase;color:#59705b}.intro{color:#586057;max-width:560px}.card{background:#fffefa;border:1px solid #deded2;border-radius:20px;padding:24px;margin-top:24px;box-shadow:0 10px 30px #292e2906}label{display:block;font-weight:600;margin-bottom:10px}select{width:100%;font:inherit;border:1px solid #a8b0a4;background:white;border-radius:9px;padding:12px}button{font:inherit;font-weight:600;border-radius:9px;padding:12px 18px;cursor:pointer;border:1px solid #a8b0a4;background:transparent;color:inherit}button.primary{background:#34533b;color:white;border-color:#34533b}button:disabled{opacity:.45;cursor:not-allowed}button:focus-visible,select:focus-visible{outline:3px solid #b58336;outline-offset:3px}.buttons{display:flex;flex-wrap:wrap;gap:10px;margin:20px 0}#status{min-height:1.6em;font-weight:600}small,.note{font-size:.88rem;color:#62685e;line-height:1.6}.transcript{margin-top:24px;max-height:320px;overflow:auto}.turn{padding:12px 0;border-top:1px solid #e6e7dd;white-space:pre-wrap;overflow-wrap:anywhere}.turn strong{display:block;font-size:.78rem;text-transform:uppercase;letter-spacing:.07em;color:#62705f;margin-bottom:5px}.mic-label{margin-top:18px}#levels meter{width:90px;vertical-align:middle}#device{display:block;margin-top:4px}[hidden]{display:none!important}
 </style>
 </head>
 <body>
@@ -17,27 +17,37 @@
 <label for="agent">Your agent</label>
 <select id="agent" disabled><option>Loading agents…</option></select>
 <p id="agent-detail" class="note"></p>
+<label for="mic" class="mic-label">Microphone</label>
+<select id="mic"><option value="">System default</option></select>
 <div class="buttons"><button id="start" class="primary" disabled>Start conversation</button><button id="stop" disabled>Stop</button><button id="refresh" disabled>Refresh agents</button><button id="play" hidden>Play agent audio</button></div>
 <p id="status" role="status" aria-live="polite">Checking this session…</p>
+<p id="levels" class="note" hidden>Your mic <meter id="mic-level" min="0" max="1" value="0"></meter> · Agent <meter id="agent-level" min="0" max="1" value="0"></meter><span id="device"></span></p>
 <audio id="audio" autoplay></audio>
 <div id="transcript" class="transcript" role="log" aria-label="Conversation transcript" aria-live="polite"></div>
 </section>
-<p class="note">Conversation only: no tools, actions or shared Telegram history. Deepgram processes audio for speech recognition and speech playback. Responses use your selected agent’s configured model provider. Sessions stop after 15 minutes.</p>
+<p class="note" id="scope-note">Conversation only: no tools, actions or shared Telegram history. Deepgram processes audio for speech recognition and speech playback. Responses use your selected agent’s configured model provider. Sessions stop after 15 minutes.</p>
 <p class="note">Keep this page open while talking. Closing it stops your microphone. This preview will not reconnect automatically.</p>
 </main>
 <script>
 'use strict';
 (() => {
   const $ = id => document.getElementById(id);
-  const secret = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+  const params = new URLSearchParams(location.hash.slice(1));
+  const requestedAgent = params.get('agent');
+  let secret = params.get('token') || '';
+  // Keep the key for this tab only, so a reload still works while the URL stays clean.
+  try { if (secret) sessionStorage.setItem('pibot-voice-token', secret); else secret = sessionStorage.getItem('pibot-voice-token') || ''; } catch {}
   history.replaceState(null, '', location.pathname + location.search);
+  // Opening a fresh launch link in an already-open tab only changes the fragment; reload to pick it up.
+  window.addEventListener('hashchange', () => { if (new URLSearchParams(location.hash.slice(1)).has('token')) location.reload(); });
   const validToken = /^[a-f0-9]{64}$/i.test(secret);
-  const agentSelect = $('agent'), startButton = $('start'), stopButton = $('stop'), refreshButton = $('refresh'), audio = $('audio');
-  let agents = [], audioReady = false, pc = null, stream = null, active = false, stopping = false, generation = 0, timer = null, controller = null;
+  const micSelect = $('mic'), agentSelect = $('agent'), startButton = $('start'), stopButton = $('stop'), refreshButton = $('refresh'), audio = $('audio');
+  let agents = [], audioReady = false, pc = null, stream = null, active = false, stopping = false, generation = 0, timer = null, controller = null, meterContext = null, silenceTimer = null;
   const status = text => { $('status').textContent = text; };
   const selected = () => agents.find(agent => agent.id === agentSelect.value);
   function controls() {
     agentSelect.disabled = active || stopping || !agents.length;
+    micSelect.disabled = active || stopping;
     startButton.disabled = active || stopping || !validToken || !audioReady || !selected()?.available;
     stopButton.disabled = !active;
     refreshButton.disabled = active || stopping || !validToken;
@@ -46,7 +56,7 @@
   }
   async function api(path, options = {}) {
     const response = await fetch(path, { ...options, signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(10000), credentials: 'omit', cache: 'no-store', headers: { 'Authorization': 'Bearer ' + secret, ...(options.body ? {'Content-Type':'application/json'} : {}) } });
-    if (!response.ok) throw new Error('request-failed');
+    if (!response.ok) throw Object.assign(new Error('request-failed'), {status: response.status});
     return response;
   }
   function closeLocal() {
@@ -56,6 +66,8 @@
     if (pc) { pc.onconnectionstatechange = null; pc.ontrack = null; pc.close(); pc = null; }
     if (stream) { stream.getTracks().forEach(track => track.stop()); stream = null; }
     audio.pause(); audio.srcObject = null;
+    clearTimeout(silenceTimer); silenceTimer = null;
+    meterContext?.close().catch(() => {}); meterContext = null; $('levels').hidden = true;
     $('play').hidden = true; active = false; controls();
   }
   async function stop(text = 'Conversation ended. Your microphone is off.') {
@@ -65,24 +77,60 @@
     catch { status(text + ' The server could not confirm the session closed.'); }
     finally { stopping = false; controls(); }
   }
+  // Live input/output level; returns a reader for the loudest sample seen so far.
+  function meter(source, id) {
+    const Context = window.AudioContext || window.webkitAudioContext;
+    if (!Context) return null;
+    meterContext ??= new Context();
+    const context = meterContext, analyser = context.createAnalyser();
+    context.createMediaStreamSource(source).connect(analyser);
+    const data = new Float32Array(analyser.fftSize), element = $(id);
+    let peak = 0;
+    const tick = () => {
+      if (meterContext !== context) return;
+      analyser.getFloatTimeDomainData(data);
+      let level = 0; for (const v of data) level = Math.max(level, Math.abs(v));
+      peak = Math.max(peak, level); element.value = Math.min(1, level * 3);
+      requestAnimationFrame(tick);
+    };
+    tick();
+    return () => peak;
+  }
+  async function listMicrophones() {
+    try {
+      const inputs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId && d.deviceId !== 'default');
+      let wanted = micSelect.value; try { wanted ||= localStorage.getItem('pibot-voice-mic') || ''; } catch {}
+      const fallback = document.createElement('option'); fallback.value = ''; fallback.textContent = 'System default';
+      micSelect.replaceChildren(fallback);
+      for (const input of inputs) { const option = document.createElement('option'); option.value = input.deviceId; option.textContent = input.label || 'Microphone'; micSelect.append(option); }
+      micSelect.value = inputs.some(d => d.deviceId === wanted) ? wanted : '';
+    } catch {}
+  }
   async function refresh() {
     refreshButton.disabled = true;
     try {
       const data = await (await api('/api/agents')).json();
       if (!Array.isArray(data.agents)) throw new Error('invalid-agents');
       audioReady = data.audioReady === true;
+      if (data.mode === 'shared') $('scope-note').textContent = 'Shared with your Telegram chat: the agent sees the recent conversation and can use its tools. What you say appears in that chat, and approvals stay there. Deepgram processes audio for speech recognition and playback. Sessions stop after 15 minutes.';
       const previous = agentSelect.value;
       agents = data.agents.filter(a => typeof a.id === 'string' && typeof a.name === 'string' && typeof a.model === 'string' && typeof a.available === 'boolean');
       agentSelect.replaceChildren();
       for (const agent of agents) {
         const option = document.createElement('option'); option.value = agent.id; option.textContent = agent.name + (agent.available ? '' : ' — unavailable'); agentSelect.append(option);
       }
-      const requested = new URLSearchParams(location.hash.slice(1)).get('agent');
-      if (agents.some(a => a.id === previous)) agentSelect.value = previous;
-      else if (requested && agents.some(a => a.id === requested && a.available)) agentSelect.value = requested;
+            if (agents.some(a => a.id === previous)) agentSelect.value = previous;
+      else if (requestedAgent && agents.some(a => a.id === requestedAgent && a.available)) agentSelect.value = requestedAgent;
       else if (agents.some(a => a.available)) agentSelect.value = agents.find(a => a.available).id;
       status(!audioReady ? 'Speech is not configured. Add the Deepgram credential to the local voice service, then refresh.' : agents.length ? 'Ready when you are.' : 'No agents are available.');
-    } catch { agents = []; agentSelect.replaceChildren(); status('Could not load agents. Check that the local voice service is running, then refresh.'); }
+      void listMicrophones();
+    } catch (error) {
+      agents = []; agentSelect.replaceChildren();
+      if (error?.status === 401) {
+        try { sessionStorage.removeItem('pibot-voice-token'); } catch {}
+        status('This voice link has expired (the voice service restarted). Send /voice again for a fresh link.');
+      } else status('Could not load agents. Check that the local voice service is running, then refresh.');
+    }
     controls();
   }
   function waitForIce(connection, signal) {
@@ -115,13 +163,21 @@
     timer = setTimeout(() => void stop('The 15-minute session has ended. Your microphone is off.'), 15 * 60 * 1000);
     controls(); $('transcript').replaceChildren(); status('Allow microphone access to begin…');
     try {
-      const media = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
+      const media = await navigator.mediaDevices.getUserMedia({audio: micSelect.value ? {deviceId:{exact:micSelect.value}} : true, video:false});
       if (current !== generation) { media.getTracks().forEach(track => track.stop()); return; }
+      const input = media.getAudioTracks?.()[0], inputName = input?.label || 'your microphone';
+      $('levels').hidden = false; $('device').textContent = 'Using: ' + inputName + (input?.muted ? ' — muted by the system' : '');
+      const micPeak = meter(media, 'mic-level');
+      if (micPeak) silenceTimer = setTimeout(() => {
+        if (current === generation && micPeak() < 0.01) $('device').textContent = 'No sound is reaching this page from “' + inputName + '”. Pick another microphone, or check System Settings → Privacy & Security → Microphone for this browser.';
+      }, 6000);
+      void listMicrophones();
       stream = media; pc = new RTCPeerConnection({iceServers:[]}); const connection = pc;
       connection.createDataChannel('chat').onmessage = receive;
       connection.ondatachannel = event => { event.channel.onmessage = receive; };
       connection.ontrack = event => {
         audio.srcObject = event.streams[0] || new MediaStream([event.track]);
+        meter(audio.srcObject, 'agent-level');
         audio.play().catch(() => { if (current === generation) $('play').hidden = false; });
       };
       connection.onconnectionstatechange = () => {
@@ -142,11 +198,14 @@
       if (current !== generation) return;
     } catch (error) {
       if (current !== generation) return;
-      const message = error?.name === 'NotAllowedError' ? 'Microphone access was not allowed. Your microphone is off.' : 'Could not start the conversation. Your microphone is off. Check the local voice service and agent configuration.';
+      const detail = error?.name ? error.name + (error?.message ? ' — ' + error.message : '') : String(error ?? 'unknown');
+      const message = error?.name === 'NotAllowedError' ? 'Microphone access was not allowed. Your microphone is off.' : 'Could not start the conversation (' + detail + ').';
+      console.error('[voice] start() failed:', detail, error);
       await stop(message);
     }
   }
   agentSelect.addEventListener('change', controls);
+  micSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-mic', micSelect.value); } catch {} });
   startButton.addEventListener('click', () => void start());
   stopButton.addEventListener('click', () => void stop());
   refreshButton.addEventListener('click', () => void refresh());

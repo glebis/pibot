@@ -78,5 +78,13 @@ describe('isolated voice agent bridge',()=>{
   await h.req(`/v1/sessions/${sessionId}/turn`,'POST',{requestId:'fallback',text:'Hi'});
   expect((runtime.completeSimple.mock.calls[0] as unknown as any[])[0]).toBe(fallback);
  });
+ it('prefers the voice model only where the agent providers policy allows it',async()=>{
+  const fast={provider:'fast',id:'voice'} as any;
+  const h=setup({preferredModel:'fast/voice',resolve:(spec:string)=>spec==='fast/voice'?fast:model});
+  fs.writeFileSync(path.join(h.dir,'coach/agent.json'),JSON.stringify({model:'test/model',providers:['test','fast']}));
+  expect(((await(await h.req('/v1/agents')).json()) as any).agents[0].model).toBe('fast/voice');
+  fs.writeFileSync(path.join(h.dir,'coach/agent.json'),JSON.stringify({model:'test/model',providers:['test']}));
+  expect(((await(await h.req('/v1/agents')).json()) as any).agents[0].model).toBe('test/model');
+ });
  it('validates token file permissions and shape',()=>{const h=setup();const p=path.join(h.dir,'token');fs.writeFileSync(p,token,{mode:0o600});expect(readVoiceToken(p)).toBe(token);fs.chmodSync(p,0o644);expect(()=>readVoiceToken(p)).toThrow();});
 });
