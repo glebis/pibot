@@ -10,6 +10,7 @@ import { Scheduler } from "./core/scheduler.js";
 import { loadSettings, saveSettings } from "./config.js";
 import { ProactiveStore } from "./core/proactive-store.js";
 import { createWebApp, type TelegramControl, type WebDeps } from "./web.js";
+import { ownerChatKey } from "./test-fixtures.js";
 
 function fakeControl(over: Partial<TelegramControl> = {}): TelegramControl & { enableSpy: ReturnType<typeof vi.fn> } {
   const enableSpy = vi.fn(async () => ({ ok: true, botName: "@test_bot" }));
@@ -418,10 +419,10 @@ describe("web /telegram", () => {
       subBotFor: vi.fn(() => undefined),
       managerMode: vi.fn(() => true),
       chatBindings: vi.fn(() => [
-        { chat: "telegram:161427550", agent: "knower", dedicated: false },
-        { chat: "telegram:creator:161427550", agent: "creator", dedicated: true },
+        { chat: ownerChatKey(), agent: "knower", dedicated: false },
+        { chat: ownerChatKey("creator"), agent: "creator", dedicated: true },
       ]),
-      mainChat: vi.fn(() => "telegram:161427550"),
+      mainChat: vi.fn(() => ownerChatKey()),
       rebind: vi.fn(() => ({ ok: true })),
     });
     const res = await app.request("/agents/assistant");
@@ -433,7 +434,7 @@ describe("web /telegram", () => {
 
     const form = new FormData();
     form.set("_csrf", withCsrf(new FormData(), app).get("_csrf") ?? "");
-    form.set("chat", "telegram:161427550");
+    form.set("chat", ownerChatKey());
     const r = await app.request("/agents/assistant/rebind", { method: "POST", body: form, redirect: "manual" });
     expect(r.status).toBe(302);
   });

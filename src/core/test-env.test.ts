@@ -6,6 +6,7 @@ import {
   encryptedTestEnvPath, legacyTestEnvPath, migrateLegacyTestEnv, readLegacyTestEnv, readTestEnv, saveTestEnvVar,
 } from "./test-env.js";
 import { sopsAvailable } from "./secrets.js";
+import { OWNER_CHAT_ID } from "../test-fixtures.js";
 
 const dirs: string[] = [];
 function tmp(): string {
@@ -47,8 +48,8 @@ describe("live-test credentials at rest", () => {
   it.runIf(HAS_SOPS)("round-trips values and merges new ones", async () => {
     const dir = tmp();
     await saveTestEnvVar(dir, "TELEGRAM_LIVE_TEST_TOKEN", "token-one");
-    await saveTestEnvVar(dir, "TELEGRAM_LIVE_TEST_CHAT_ID", "161427550");
-    expect(await readTestEnv(dir)).toEqual({ TELEGRAM_LIVE_TEST_TOKEN: "token-one", TELEGRAM_LIVE_TEST_CHAT_ID: "161427550" });
+    await saveTestEnvVar(dir, "TELEGRAM_LIVE_TEST_CHAT_ID", OWNER_CHAT_ID);
+    expect(await readTestEnv(dir)).toEqual({ TELEGRAM_LIVE_TEST_TOKEN: "token-one", TELEGRAM_LIVE_TEST_CHAT_ID: OWNER_CHAT_ID });
   });
 
   it.runIf(HAS_SOPS)("migrates the legacy file, verifies, then removes it", async () => {

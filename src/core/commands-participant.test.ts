@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Transport } from "./types.js";
 import { createCommandHandler, type CommandContext } from "./commands.js";
+import { OWNER_CHAT_ID } from "../test-fixtures.js";
 
 // ─── participant sub-bot command gate ───────────────────────────────────────
 // boundAgentId present + chat NOT on the owner allowlist → only /start /help
@@ -14,7 +15,7 @@ function makeCtx(opts: { allowedChats?: string[] } = {}) {
     push: vi.fn(async (chatId: string, p: { text: string }) => pushed.push({ chatId, text: p.text })),
   } as unknown as Transport;
   const ctx = {
-    config: { allowedChats: opts.allowedChats ?? ["161427550"], allowedChatsReal: undefined } as never,
+    config: { allowedChats: opts.allowedChats ?? [OWNER_CHAT_ID], allowedChatsReal: undefined } as never,
     agents: { list: () => [], getAgent: () => undefined, discover: async () => {} } as never,
     scheduler: { list: () => [], snoozeState: () => ({}) } as never,
     events: { log: () => {} } as never,

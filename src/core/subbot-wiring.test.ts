@@ -12,6 +12,7 @@ import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
 import type { ModelCascade } from "./cascade.js";
 import type { PushOptions, Transport } from "./types.js";
+import { OWNER_CHAT_ID } from "../test-fixtures.js";
 
 // ─── pure helpers ───────────────────────────────────────────────────────────
 
@@ -198,7 +199,7 @@ describe("managed sub-bot wiring", () => {
     await bot.start();
 
     // restart simulated: the managed-bot update for the never-wired bot arrives
-    await tg.fire({ creatorId: "161427550", botId: 8802922531, botUsername: "pimother_assistant_bot" });
+    await tg.fire({ creatorId: OWNER_CHAT_ID, botId: 8802922531, botUsername: "pimother_assistant_bot" });
 
     // user is told what went wrong and how recovery works
     console.log("PUSHED:", JSON.stringify(tg.pushed.map((p) => p.opts.text?.slice(0, 40))));
@@ -246,7 +247,7 @@ describe("managed sub-bot wiring", () => {
     const { bot } = makeWiringBot(dir, tg);
     await bot.start();
 
-    await tg.fire({ creatorId: "161427550", botId: 8802922531, botUsername: "pimother_assistant2_bot" });
+    await tg.fire({ creatorId: OWNER_CHAT_ID, botId: 8802922531, botUsername: "pimother_assistant2_bot" });
 
     expect(tg.lastText()).toBe(""); // no notification — nobody asked for this bot
     const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
@@ -267,7 +268,7 @@ describe("managed sub-bot wiring", () => {
     const tg = new FakeTelegramTransport();
     const { bot, scheduler } = makeWiringBot(dir, tg);
     await bot.start();
-    await tg.fire({ creatorId: "161427550", botId: 8802922531, botUsername: "pimother_assistant_bot" });
+    await tg.fire({ creatorId: OWNER_CHAT_ID, botId: 8802922531, botUsername: "pimother_assistant_bot" });
 
     // the learned bot id survives a restart so the re-probe can fetch without a new event
     const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
