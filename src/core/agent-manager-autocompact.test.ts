@@ -76,6 +76,21 @@ describe("AgentManager host wiring", () => {
     expect(names).toContain("auto-compact");
   });
 
+  it("never loads the owner's global pi extensions into daemon agents", async () => {
+    // A global extension registering a same-named tool (e.g. an interactive ask_user)
+    // would shadow pibot's own and silently reroute questions away from the chat.
+    const mgr = new AgentManager(dir, { getModels: () => [] } as never, undefined, undefined, dir);
+    mgr.createAgent("alpha");
+    await mgr.discover();
+    await mgr.getOrCreateSession("alpha", "telegram:1", { transport: "telegram", chatId: "1" }, schedulerStub);
+
+    const opts = captured.loaderOpts as { noExtensions?: boolean; additionalExtensionPaths?: unknown; extensionFactories?: Array<{ name?: string }> };
+    expect(opts.noExtensions).toBe(true);
+    // per-agent private plugins and host extensions still load
+    expect(Array.isArray(opts.additionalExtensionPaths)).toBe(true);
+    expect((opts.extensionFactories ?? []).map((extension) => extension?.name)).toContain("auto-compact");
+  });
+
   it("logs compaction decisions to the agent's own event log", async () => {
     const mgr = new AgentManager(dir, { getModels: () => [] } as never, undefined, undefined, dir);
     mgr.createAgent("alpha");
