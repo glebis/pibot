@@ -1,3 +1,4 @@
+import { registerCoordinatorRoutes, type CoordinatorControl } from './web-coordinator-routes.js';
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -45,6 +46,7 @@ export interface TelegramControl {
 }
 
 export interface WebDeps {
+  coordinator?: CoordinatorControl;
   agents: AgentManager;
   scheduler: Scheduler;
   events: EventLog;
@@ -454,7 +456,7 @@ export function createWebApp(deps: WebDeps): Hono {
 
   function isApiRequest(c: any): boolean {
     const accept = c.req.header("accept") ?? "";
-    return accept.includes("application/json") || c.req.header("content-type")?.includes("application/json") || false;
+    return c.req.path.startsWith("/api/") || accept.includes("application/json") || c.req.header("content-type")?.includes("application/json") || false;
   }
 
   // WebAuthn RP ID is a domain ("localhost" by default) and must match the page host. Browsers
@@ -773,11 +775,14 @@ ${hasToken ? `<div class="card">
     const p = c.req.path;
     if (openAuthPaths.has(p)) return next();
     if (p.startsWith("/auth/webauthn/")) return next();
+    if (!authRequired() && (p === '/coordinator' || p.startsWith('/api/coordinator'))) return c.json({ error: 'Coordinator requires dashboard authentication.' }, 503);
     if (!authRequired()) return next();
     if (isAuthenticated(c)) return next();
     if (isApiRequest(c)) return c.json({ error: "unauthorized" }, 401);
     return c.redirect("/auth?msg=" + encodeURIComponent("Please unlock with Touch ID or token"));
   });
+
+  registerCoordinatorRoutes(app, deps, csrfToken, expectedOrigins());
 
   const agentOr404 = (id: string): LoadedAgent | null => {
     const a = deps.agents.getAgent(id);
@@ -1468,6 +1473,7 @@ ${enabled
   });
 
   app.post("/telegram", async (c) => {
+    if (deps.coordinator) return c.text("Stop the message coordinator and restart before changing its Telegram account.", 409);
     if (!deps.telegram) {
       return c.redirect(`/telegram?msg=${encodeURIComponent("Telegram control not wired")}`);
     }
@@ -1495,6 +1501,7 @@ ${enabled
   });
 
   app.post("/telegram/disable", async (c) => {
+    if (deps.coordinator) return c.text("Stop the message coordinator and restart before changing its Telegram account.", 409);
     const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
     if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     if (deps.telegram) await deps.telegram.disableTelegram();

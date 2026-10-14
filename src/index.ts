@@ -210,10 +210,16 @@ async function main(): Promise<void> {
   const allowedChats = config.allowedChats.length
     ? config.allowedChats
     : settings.telegram?.allowedChats ?? [];
+  const coordinatorModule = process.env.PIBOT_COORDINATOR_CONFIG ? await import('./coordinator/runtime.js') : undefined;
+  const coordinatorConfig = coordinatorModule?.loadCoordinatorConfig(process.env.PIBOT_COORDINATOR_CONFIG);
+  if (coordinatorConfig && (!telegramToken || config.transport === 'cli' || !allowedChats.includes(coordinatorConfig.chatId))) {
+    throw new Error('Coordinator requires the configured main Telegram bot and an allowlisted private recipient');
+  }
+  const coordinator = coordinatorConfig ? new coordinatorModule!.CoordinatorRuntime(coordinatorConfig, telegramToken!) : undefined;
   const mediaDir = path.join(config.dataDir, "media");
   const transports =
     telegramToken && config.transport !== "cli"
-      ? [new TelegramTransport(telegramToken, allowedChats, { openWhenEmpty: config.telegramOpen, mediaDir, reactions: process.env.PIBOT_REACTIONS !== "0" })]
+      ? [new TelegramTransport(telegramToken, allowedChats, { coordinatorIngress: coordinator, openWhenEmpty: config.telegramOpen, mediaDir, reactions: process.env.PIBOT_REACTIONS !== "0" })]
       : [new CliTransport()];
 
   // /goal's judge + contract drafting: cheap ephemeral sessions on the first
@@ -248,6 +254,7 @@ async function main(): Promise<void> {
   diskGuard?.setNotify((text) => void bot.notifyOwnerEvent(text));
 
   await bot.start();
+  await coordinator?.start();
   scheduler.rearm();
 
   // pilot governance on boot: weekly scorecard jobs follow the manifest flags
@@ -261,6 +268,7 @@ async function main(): Promise<void> {
     const webApp = createWebApp({
       agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
       proactiveStore,
+      coordinator,
       commitments: { syncGovernance: (agentId) => commitments.syncPilotGovernance(agentId) },
       webToken, webRpId: config.webRpId, webPort,
       providers: providerManager,
@@ -290,8 +298,11 @@ async function main(): Promise<void> {
   const shutdown = () => {
     console.log("\n[pibot] stopping…");
     scheduler.stop();
-    void bot
-      .stop()
+    void (async () => {
+      await coordinator?.stopDispatch();
+      await bot.stop();
+      coordinator?.close();
+    })()
       .catch(() => {})
       .finally(() => process.exit(0));
   };
