@@ -20,6 +20,7 @@ import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
 import type { TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
 import { QuestionBus, type QuestionSpec } from "./questions.js";
+import { MessageCoalescer } from "./message-coalescer.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
 import type { Card, ChatRef, IncomingMedia, ReplyContext, Schedule, Transport } from "./types.js";
@@ -228,6 +229,8 @@ export class PiBot implements HeartbeatHost {
     return [...this.urgentSourceStores].map(store=>store.projection(scope)).find(p=>p.available);
   }
 
+  /** combines rapid-fire texts (forwards, split messages) into one agent turn; off when messageBufferMs is 0 */
+  private coalescer?: MessageCoalescer;
   private questions = new QuestionBus({
     getTransport: (name) => this.transports.get(name),
     notify: (chatKey, text) => {
@@ -268,6 +271,16 @@ export class PiBot implements HeartbeatHost {
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
+    const windowMs = deps.config.messageBufferMs ?? 0;
+    if (windowMs > 0) {
+      this.coalescer = new MessageCoalescer(windowMs, MessageCoalescer.DEFAULT_MAX_PARTS, (turn) => {
+        const { transport: name, chatId } = this.splitChatKey(turn.key);
+        const t = this.transports.get(name);
+        if (!t) return; // transport gone; inbox history already kept the parts
+        console.log(`[bot] combined ${turn.parts} rapid-fire message${turn.parts === 1 ? "" : "s"} into one turn (${name}:${chatId})`);
+        void this.promptAgent(t, chatId, turn.agentId, turn.text, { reply: turn.reply, incomingMessageId: turn.messageId }).catch((e) => console.error("[bot] combined turn error:", e));
+      });
+    }
     for (const t of deps.transports) this.addTransport(t);
   }
 
@@ -431,6 +444,7 @@ export class PiBot implements HeartbeatHost {
   }
 
   async stop(): Promise<void> {
+    this.coalescer?.dispose();
     for (const t of this.transports.values()) {
       try {
         await t.stop();
@@ -971,6 +985,14 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     this.lastUserMessage.set(agentId, Date.now());
     this.ownerSpokeAt.set(this.chatKey(t, chatId), Date.now());
     this.deps.heartbeat.noteUserMessage?.(agentId);
+    // rapid-fire texts (forwards, split messages, audio transcripts) wait for
+    // a short window per chat and enter the model as ONE turn (pibot-2dh,
+    // modeled on Verity's message_buffer). Slash commands, quick actions and
+    // pending-question answers are dispatched earlier and bypass the window.
+    if (this.coalescer) {
+      this.coalescer.admit({ key: ck, agentId, text, reply, messageId: incomingMessageId });
+      return;
+    }
     await this.promptAgent(t, chatId, agentId, text, { reply, incomingMessageId });
   }
 

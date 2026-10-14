@@ -158,7 +158,7 @@ function fakeAgentManager(promptSpy = vi.fn()) {
   return { agents, emitSessionEvent: (event: unknown) => sessionListeners.forEach((listener) => listener(event)) };
 }
 
-export function makeBot(evolution?: unknown) {
+export function makeBot(evolution?: unknown, configPatch?: Partial<Config>) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-bot-"));
   const config: Config = {
     transport: "cli",
@@ -168,6 +168,7 @@ export function makeBot(evolution?: unknown) {
     defaultAgentId: "assistant",
     allowedChats: [],
     telegramOpen: false,
+    ...configPatch,
   };
   const promptSpy = vi.fn();
   const { agents, emitSessionEvent } = fakeAgentManager(promptSpy);

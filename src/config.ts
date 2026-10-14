@@ -22,6 +22,10 @@ export interface Config {
   webToken?: string;
   webRpId?: string;
   webPort?: number;
+  /** combine texts arriving within this window per chat into one agent turn
+   *  (bead pibot-2dh, modeled on Verity's message_buffer.py); 0 disables.
+   *  Undefined = legacy behavior off (kept so hand-built test configs default off). */
+  messageBufferMs?: number;
 }
 
 // ─── runtime-editable settings (web-configurable, survives restarts) ───────
@@ -95,5 +99,6 @@ export function loadConfig(): Config {
     webToken: process.env.PIBOT_WEB_TOKEN?.trim() || undefined,
     webRpId: (process.env.PIBOT_WEB_RP_ID || process.env.PIBOT_WEB_AUTH || "").trim() || undefined,
     webPort: parseInt(process.env.PIBOT_WEB_PORT || "7860", 10),
+    messageBufferMs: (() => { const v = parseInt(process.env.PIBOT_BUFFER_MS || "2500", 10); return Number.isFinite(v) ? Math.max(0, v) : 2500; })(),
   };
 }
