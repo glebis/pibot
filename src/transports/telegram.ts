@@ -1,3 +1,4 @@
+import { captureBeforePollingCursor, type DurableTelegramIngress } from '../coordinator/telegram-ingress.js';
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
@@ -67,6 +68,8 @@ function messageIdOf(sent: unknown): number | undefined {
 }
 
 const BOT_COMMANDS = [
+  { command: "call", description: "Ring my phone as this agent (confirm first)" },
+  { command: "voicetest", description: "Pipecat voice test page for this agent" },
   { command: "help", description: "What pibot can do" },
   { command: "status", description: "Rhythm, snooze, next item" },
   { command: "minimal", description: "Minimal voice replies: /minimal on" },
@@ -447,8 +450,20 @@ export class TelegramTransport implements Transport {
     memberGroups?: string[];
     /** in group chats, react to @mentions of this bot and replies to its messages only — not to every message (main-bot group behavior unchanged) */
     groupMentionOnly?: boolean;
+    coordinatorIngress?: DurableTelegramIngress;
   } = {}) {
     this.bot = new Bot(token);
+    if (opts.coordinatorIngress) {
+      const ingress = opts.coordinatorIngress;
+      this.bot.api.config.use(captureBeforePollingCursor(ingress));
+      this.bot.use(async (ctx, next) => {
+        if (await ingress.handle(ctx.update)) {
+          if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: 'Response checked. View its status in the coordinator.' }).catch(() => {});
+          return;
+        }
+        await next();
+      });
+    }
     this.allowed = new Set(allowedChats);
     this.memberGroups = new Set(opts.memberGroups ?? []);
     this.groupMentionOnly = opts.groupMentionOnly ?? false;

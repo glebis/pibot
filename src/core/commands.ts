@@ -2,6 +2,7 @@
 // Satisfied by PiBot via a narrow context interface — keeps this file
 // independent of the routing/wiring in bot.ts.
 
+import type { VoiceOwnerCommands } from "../voice/owner-commands.js";
 import { listSkillDirs, type AgentManager, type LoadedAgent } from "./agent-manager.js";
 import type { ConsolidationEngine } from "./consolidation.js";
 import type { EvolutionEngine } from "./evolution.js";
@@ -32,6 +33,8 @@ const HELP = [
   `/consolidate [status] — distill the event log into durable memory`,
   `/status — what's running`,
   `/minimal on|off — minimal voice: terse, speakable replies (no URLs, code, paths)`,
+  `/call — ring your phone as this chat's agent (asks to confirm first)`,
+  `/voicetest — link to the private Pipecat voice test page for this agent`,
   `/goal <objective> — a bounded goal the agent works until a judge sees it done  ·  /goal draft, /goal status, /goal pause`,
 ].join("\n");
 
@@ -90,6 +93,8 @@ export interface CommandContext {
     detachSubBot(agentId: string): Promise<boolean>;
     requestSubBotCreation(agentId: string, fromChat?: { transport: string; chatId: string }): Promise<void>;
   };
+  /** owner-only voice commands (/call, /voicetest); undefined when voice is not wired */
+  voice?: () => VoiceOwnerCommands | undefined;
   currentAgent(ck: string): string | undefined;
   chatKey(t: Transport, chatId: string): string;
   resetSession(agentId: string, ck: string): Promise<void>;
@@ -152,6 +157,46 @@ export function createCommandHandler(ctx: CommandContext) {
       case "help":
         await reply(t.boundAgentId && !ownerChat ? PARTICIPANT_HELP : HELP);
         return;
+
+      case "call":
+      case "voicetest": {
+        // admin-only: the owner's own private chat, never groups or participant chats
+        if (!ownerChat || !/^[1-9]\d*$/.test(String(chatId))) {
+          await reply("This command is available only in your private owner chat.");
+          return;
+        }
+        if (!agentId) {
+          await reply("No agent in this chat yet — send a message first, or /agents to pick one.");
+          return;
+        }
+        const voice = ctx.voice?.();
+        if (!voice) {
+          await reply("Voice isn't set up on this bot.");
+          return;
+        }
+        if (cmd === "voicetest") {
+          const url = voice.testPageUrl(agentId);
+          await reply(url
+            ? `🎙 Voice test with **${agentId}** — an isolated copy (persona and model only; no tools, memory or chat history). Opens only on your Mac:\n${url}`
+            : "🎙 The voice test page isn't running. Start it on your Mac with `./scripts/start-voice.sh`, then send /voicetest again.");
+          return;
+        }
+        const availability = voice.callAvailability(agentId, ck);
+        if (availability === "not_configured") {
+          await reply("Phone calls aren't configured (no phone control token in the voice secrets).");
+          return;
+        }
+        if (availability === "not_bound") {
+          await reply(`**${agentId}** has no voice binding for this chat, so it can't take a call here.`);
+          return;
+        }
+        const id = voice.armCall(agentId, ck);
+        await t.push(chatId, {
+          text: `📞 Call your phone as **${agentId}**? Up to 3 minutes; you'll be asked for your PIN. This request expires in 2 minutes.`,
+          card: { text: "", buttons: [{ label: "✅ Call", action: `vcall:go:${id}` }, { label: "✖ Cancel", action: `vcall:x:${id}` }] },
+        });
+        return;
+      }
 
       case "id":
         // pairing helper: show this chat's id (owner chats need it for allowlists);

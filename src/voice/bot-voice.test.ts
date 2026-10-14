@@ -1,0 +1,87 @@
+import { describe, expect, it, vi } from 'vitest';
+import { CanonicalTurnGate } from './session-control.js';
+// The unrelated cascade source currently has merge conflicts; these boundary tests inject it.
+vi.mock('../core/cascade.js',()=>({classifyModelError:()=> 'transient',ModelCascade:class {},specProvider:()=> 'test'}));
+import { PiBot } from '../core/bot.js';
+
+function deferred() {let resolve!:()=>void;const promise=new Promise<void>(r=>resolve=r);return {promise,resolve};}
+function harness() {
+ const pushed: string[]=[];const subscribers: Array<(e:any)=>void>=[];
+ const t={name:'telegram',push:vi.fn(async (_chat:string,p:any)=>{pushed.push(p.text);}),notifyError:vi.fn(async()=>{}),setTyping:vi.fn(),onMessage:vi.fn(),onAction:vi.fn(),start:vi.fn(),stop:vi.fn()};
+ const session={isStreaming:false,subscribe:vi.fn((f:any)=>{subscribers.push(f);}),setModel:vi.fn(async()=>{}),prompt:vi.fn(async()=>{subscribers.forEach(f=>f({type:'agent_end',messages:[{role:'assistant',content:[{type:'text',text:'Here is the answer.'}],stopReason:'stop'}]}));})};
+ const agents={getAgent:vi.fn((id:string)=>id==='assistant'?{id,manifest:{name:id}}:undefined),getOrCreateSession:vi.fn(async()=>session)};
+ const bot=new PiBot({config:{dataDir:'/tmp/voice-test-unused',allowedChats:['42']},transports:[t],agents,heartbeat:{noteUserMessage:vi.fn()},events:{log:vi.fn()},scheduler:{},secrets:{}} as any);
+ const b=bot as any;b.chatAgent.set('telegram:42','assistant');b.agentChats.set('assistant',new Set(['telegram:42']));
+ // No test writes to runtime state or invokes unrelated plugin services.
+ b.persistState=vi.fn();b.flushCards=vi.fn(async()=>{});b.continueGoal=vi.fn(async()=>{});b.maybeEmitTaskAck=vi.fn();
+ return {bot,b,t,pushed,session,agents,subscribers,input:{agentId:'assistant',chatKey:'telegram:42',text:'Hi',onOutput:vi.fn(async()=>{})}};
+}
+describe('canonical voice bridge',()=>{
+ it('shares a cached canonical session, routes voice only, and does not create proactive recipients',async()=>{
+  const h=harness();await h.bot.promptAgent(h.t as any,'42','assistant','Text first',{taskAckFrom:null});h.pushed.length=0;
+  const before=JSON.stringify([...h.b.agentChats].map(([k,v]:any)=>[k,[...v]]));
+  const result=await h.bot.voiceTurn(h.input);
+  expect(result.status).toBe('completed');expect(h.input.onOutput).toHaveBeenCalledWith('Here is the answer.');expect(h.pushed).toEqual([]);
+  expect(h.session.subscribe).toHaveBeenCalledTimes(1);expect(h.agents.getOrCreateSession.mock.calls.at(-1)?.slice(0,3)).toEqual(['assistant','telegram:42',{transport:'telegram',chatId:'42'}]);
+  expect(JSON.stringify([...h.b.agentChats].map(([k,v]:any)=>[k,[...v]]))).toBe(before);
+ });
+ it('refuses voice during a canonical text turn and serializes incoming text behind voice',async()=>{
+  const h=harness();const hold=deferred();h.session.prompt.mockImplementationOnce(()=>hold.promise);
+  const text=h.bot.promptAgent(h.t as any,'42','assistant','text',{taskAckFrom:null});
+  expect(await h.bot.voiceTurn(h.input)).toEqual({status:'busy'});hold.resolve();await text;
+  const voiceHold=deferred();h.session.prompt.mockImplementationOnce(()=>voiceHold.promise);
+  const voice=h.bot.voiceTurn(h.input);const next=h.bot.promptAgent(h.t as any,'42','assistant','next',{taskAckFrom:null});
+  await new Promise(r=>setTimeout(r,1));expect(h.session.prompt).toHaveBeenCalledTimes(2);voiceHold.resolve();await voice;await next;expect(h.session.prompt).toHaveBeenCalledTimes(3);
+ });
+ it('denies unknown, group, foreign-owner, rebound, or pre-aborted attachments',async()=>{
+  const h=harness();for(const change of [{chatKey:'telegram:-42'},{chatKey:'telegram:99'},{agentId:'other'},{signal:AbortSignal.abort()}])expect((await h.bot.voiceTurn({...h.input,...change})).status).toBe('denied');expect(h.session.prompt).not.toHaveBeenCalled();
+ });
+ it('detaches audio but delivers completed work back to the canonical chat',async()=>{
+  const h=harness();const hold=deferred();const original=h.session.prompt.getMockImplementation()!;h.session.prompt.mockImplementationOnce(async()=>{await hold.promise;await original();});
+  const controller=new AbortController();const running=h.bot.voiceTurn({...h.input,signal:controller.signal});await new Promise(r=>setTimeout(r,1));controller.abort();hold.resolve();
+  expect((await running).status).toBe('detached');expect(h.input.onOutput).not.toHaveBeenCalled();expect(h.pushed).toEqual(['Here is the answer.']);
+ });
+ it('uses one prompt and returns no_reply or failed without goal continuation or recovery',async()=>{
+  const h=harness();h.b.goals.set('telegram:42',{status:'active'});h.session.prompt.mockResolvedValueOnce(undefined);
+  expect(await h.bot.voiceTurn(h.input)).toEqual({status:'no_reply'});expect(h.b.continueGoal).not.toHaveBeenCalled();expect(h.session.prompt).toHaveBeenCalledTimes(1);
+  h.session.prompt.mockRejectedValueOnce(new Error('private provider details'));expect(await h.bot.voiceTurn(h.input)).toEqual({status:'failed'});expect(h.session.prompt).toHaveBeenCalledTimes(2);
+ });
+ it('uses encrypted owner settings only when config is empty and respects transport revocation',async()=>{
+  const h=harness();h.b.deps.config.allowedChats=[];h.b.deps.secrets={get:()=>({telegram:{allowedChats:['42']}})};
+  (h.t as any).allowedChats=()=>['42'];expect(h.bot.voiceBindings()).toEqual([{agentId:'assistant',chatKey:'telegram:42'}]);
+  (h.t as any).allowedChats=()=>[];expect(h.bot.voiceBindings()).toEqual([]);
+  (h.t as any).allowedChats=()=>['42'];h.b.deps.config.allowedChats=['99'];expect(h.bot.voiceBindings()).toEqual([]);
+ });
+ it('suppresses voice and canonical output after owner revocation or chat rebind',async()=>{
+  for(const revoke of [(h:any)=>{h.b.deps.config.allowedChats=['99'];},(h:any)=>{h.b.chatAgent.set('telegram:42','other');}]) {
+    const h=harness();const hold=deferred();const original=h.session.prompt.getMockImplementation()!;h.session.prompt.mockImplementationOnce(async()=>{await hold.promise;await original();});
+    const running=h.bot.voiceTurn(h.input);await new Promise(r=>setTimeout(r,1));revoke(h);hold.resolve();
+    expect((await running).status).toBe('detached');expect(h.input.onOutput).not.toHaveBeenCalled();expect(h.pushed).toEqual([]);
+  }
+ });
+ it('never queues or retries a voice failure through the shared cascade',async()=>{
+  const h=harness();const cascade={chainFor:vi.fn(()=>['test/model']),firstHealthy:vi.fn(()=>undefined),resolveModel:vi.fn(()=>({provider:'test',id:'model'})),queueDead:vi.fn(),isOpen:vi.fn(()=>false),noteFailure:vi.fn()};h.b.deps.cascade=cascade;
+  expect(await h.bot.voiceTurn(h.input)).toEqual({status:'failed'});expect(cascade.queueDead).not.toHaveBeenCalled();expect(h.session.prompt).not.toHaveBeenCalled();
+  cascade.firstHealthy.mockReturnValue('test/model' as never);h.session.prompt.mockRejectedValueOnce(new Error('ambiguous failure'));
+  expect(await h.bot.voiceTurn(h.input)).toEqual({status:'failed'});expect(h.session.prompt).toHaveBeenCalledTimes(1);expect(cascade.queueDead).not.toHaveBeenCalled();expect(cascade.noteFailure).not.toHaveBeenCalled();
+ });
+ it('signals approval immediately but retains canonical turn ownership until the answer',async()=>{
+  const h=harness();const hold=deferred();h.b.questions.ask=vi.fn(async()=>{await hold.promise;return null;});
+  h.session.prompt.mockImplementationOnce(async()=>{const hook=(h.agents.getOrCreateSession.mock.calls[0] as any)[4];await hook({text:'Approve?',options:['Confirm','Cancel']});});
+  const required=vi.fn();const controller=new AbortController();const running=h.bot.voiceTurn({...h.input,onApprovalRequired:required,signal:controller.signal});
+  await new Promise(r=>setTimeout(r,1));expect(required).toHaveBeenCalledTimes(1);controller.abort();
+  expect(await h.bot.voiceTurn(h.input)).toEqual({status:'busy'});hold.resolve();expect((await running).status).toBe('detached');
+ });
+ it('keeps confirmation hooks in the canonical chat and notifies the voice channel',async()=>{
+  const h=harness();const ask=vi.fn(async()=>({choice:'Confirm',index:0,via:'button'}));h.b.questions.ask=ask;
+  h.session.prompt.mockImplementationOnce(async()=>{const hook=(h.agents.getOrCreateSession.mock.calls[0] as any)[4];await hook({text:'Change a thing?',options:['Confirm','Cancel']});});
+  await h.bot.voiceTurn(h.input);expect(ask).toHaveBeenCalledWith('assistant',{transport:'telegram',chatId:'42'},{text:'Change a thing?',options:['Confirm','Cancel']});expect(h.input.onOutput).toHaveBeenCalledWith(expect.stringContaining('existing chat'));
+ });
+});
+describe('canonical turn gate',()=>{
+ it('allows internal recursion without deadlock but rejects another voice turn',async()=>{const gate=new CanonicalTurnGate();await gate.run('a',async()=>{expect(gate.tryRun('a',async()=>1)).toBeUndefined();expect(await gate.run('a',async()=>2)).toBe(2);});expect(gate.busy('a')).toBe(false);});
+});
+
+it('sends contract reminders through the bound transport and acknowledges without replacing questions',async()=>{const h=harness();const acknowledge=vi.fn(()=>true);h.b.urgentSourceStores=new Set([{acknowledge}]);h.b.questions.ask=vi.fn();const input={agentId:'assistant',canonicalChatId:'telegram:42',text:'Renewal decision',decisionId:'d1',questionVersion:1,revision:'r1',deadline:Date.now()+600000};expect((await h.bot.sendUrgentSourceMessage(input)).status).toBe('accepted');const args=h.t.push.mock.calls.at(-1)!;expect(args[0]).toBe('42');const action=(args[1] as any).card.buttons[0].action;expect(await h.bot.handleAction(h.t as any,'99',action)).toContain('no longer');expect(acknowledge).not.toHaveBeenCalled();expect(await h.bot.handleAction(h.t as any,'42',action)).toContain('No call');expect(acknowledge).toHaveBeenCalledWith(action.slice(6),'telegram:42');expect(h.b.questions.ask).not.toHaveBeenCalled();h.b.chatAgent.set('telegram:42','other');expect((await h.bot.sendUrgentSourceMessage(input)).status).toBe('rejected');});
+
+it('exposes only live accepted explicit-deadline questions for the exact bound voice agent',()=>{const h=harness();const now=Date.now();const q={qid:'q1',agentId:'assistant',canonicalChatId:'telegram:42',question:'Approve?',options:['Yes','No'],status:'pending',pendingUntil:now+60000,usefulUntil:now+60000,deadlineReason:'Deadline',provenance:'agent_declared_deadline',acceptedMessageAt:now};h.b.questions.pendingSnapshots=()=>[q];expect(h.bot.voicePendingDecision(h.input)).toEqual({decisionId:'q1',question:'Approve?',options:['Yes','No']});expect(h.bot.voicePendingDecision({...h.input,agentId:'other'})).toBeUndefined();for(const patch of [{status:'answered'},{acceptedMessageAt:undefined},{usefulUntil:undefined},{pendingUntil:now-1}]){h.b.questions.pendingSnapshots=()=>[{...q,...patch}];expect(h.bot.voicePendingDecision(h.input)).toBeUndefined();}});
