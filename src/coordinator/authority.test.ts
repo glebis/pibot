@@ -1,6 +1,6 @@
 import { describe,it,expect } from 'vitest';
 import { createServer,type Socket } from 'node:net';
-import { chmodSync,mkdtempSync,writeFileSync } from 'node:fs';
+import { chmodSync,mkdtempSync,realpathSync,writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContractsAuthority } from './authority.js';
@@ -8,7 +8,7 @@ import type { AuthorityCheck } from './types.js';
 const input:AuthorityCheck={mandateId:'mandate',ownerId:'owner',coordinatorId:'coordinator',botId:'123',chatId:'456',userId:'456',purpose:'contract_decision',expectedVersion:7,expectedDigest:'sha256:expected'};
 async function fixture(handler:(socket:Socket,data:string)=>void) {
   // Short path keeps AF_UNIX names below macOS's socket path limit.
-  const dir=mkdtempSync('/private/tmp/pca-');chmodSync(dir,0o700);
+  const dir=mkdtempSync(join(realpathSync('/tmp'),'pca-'));chmodSync(dir,0o700);
   const socketPath=join(dir,'s');const tokenFile=join(dir,'token');const token='ab'.repeat(32);writeFileSync(tokenFile,token,{mode:0o600});
   const sockets=new Set<Socket>();let connections=0;
   const server=createServer(socket=>{connections++;sockets.add(socket);socket.on('close',()=>sockets.delete(socket));let buffer='';socket.on('data',chunk=>{buffer+=chunk.toString('utf8');if(buffer.includes('\n'))handler(socket,buffer.slice(0,buffer.indexOf('\n')));});});
