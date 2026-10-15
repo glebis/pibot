@@ -23,6 +23,8 @@ export interface LedgerTaskInput {
   chatKey: string;
   title: string;
   instructions: string;
+  /** owner-chosen tool names for the run (from a voice call); omitted = the agent's full set */
+  allowedTools?: string[];
 }
 
 export interface LedgerEntry extends LedgerTaskInput {
