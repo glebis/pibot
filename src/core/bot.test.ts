@@ -521,7 +521,8 @@ describe("PiBot commands", () => {
   it("references photo files with caption in the prompt", async () => {
     await t.transport.sayMedia({ kind: "photo", filePath: "/tmp/42-7-photo.jpg", caption: "the whiteboard" });
     const arg = t.promptSpy.mock.calls[0][0] as string;
-    expect(arg).toContain("📎 photo attached — file: /tmp/42-7-photo.jpg");
+    expect(arg).toContain("📎 photo: 42-7-photo.jpg attached");
+    expect(arg).toContain("[file stored at /tmp/42-7-photo.jpg — read tool]");
     expect(arg).toContain("caption: the whiteboard");
     expect(arg).toContain("read tool");
   });

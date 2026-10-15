@@ -228,6 +228,9 @@ export class AgentManager {
       cwd: sessionCwd,
       agentDir: getAgentDir(),
       systemPromptOverride: () => capabilitySet.systemPrompt,
+      // Never the owner's global ~/.pi extensions: they are for interactive pi, and a
+      // same-named tool (e.g. an ask_user popup) would shadow pibot's capability tools.
+      noExtensions: true,
       // per-agent private plugins
       additionalExtensionPaths: listTsFiles(path.join(agent.dir, "extensions")),
       // per-agent evolved skills (+ staging during evolution)
