@@ -175,8 +175,9 @@ async def run_voice(connection: Any, turn: Callable[[str], Awaitable[str]],
     transport = SmallWebRTCTransport(connection, TransportParams(audio_in_enabled=True, audio_out_enabled=True))
     user, assistant = LLMContextAggregatorPair(
         LLMContext(), user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.6)),
-            user_turn_strategies=UserTurnStrategies(stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)]),
+            # ~1 s of silence ends a turn: 0.6 s split one sentence into several turns that hit a busy chat.
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=1.0)),
+            user_turn_strategies=UserTurnStrategies(stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=1.0)]),
         ),
     )
     async def status(event):

@@ -3,51 +3,266 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Talk with your agent</title>
+<title>Voice</title>
 <style>
-:root{color-scheme:light;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#292e29;background:#f5f3ec}*{box-sizing:border-box}body{margin:0;padding:32px 20px}main{max-width:680px;margin:5vh auto}h1{font-size:clamp(2rem,5vw,3rem);letter-spacing:-.055em;margin:12px 0}p{line-height:1.6}.eyebrow{font-size:.8rem;letter-spacing:.12em;text-transform:uppercase;color:#59705b}.intro{color:#586057;max-width:560px}.card{background:#fffefa;border:1px solid #deded2;border-radius:20px;padding:24px;margin-top:24px;box-shadow:0 10px 30px #292e2906}label{display:block;font-weight:600;margin-bottom:10px}select{width:100%;font:inherit;border:1px solid #a8b0a4;background:white;border-radius:9px;padding:12px}button{font:inherit;font-weight:600;border-radius:9px;padding:12px 18px;cursor:pointer;border:1px solid #a8b0a4;background:transparent;color:inherit}button.primary{background:#34533b;color:white;border-color:#34533b}button:disabled{opacity:.45;cursor:not-allowed}button:focus-visible,select:focus-visible{outline:3px solid #b58336;outline-offset:3px}.buttons{display:flex;flex-wrap:wrap;gap:10px;margin:20px 0}#status{min-height:1.6em;font-weight:600}small,.note{font-size:.88rem;color:#62685e;line-height:1.6}.transcript{margin-top:24px;max-height:320px;overflow:auto}.turn{padding:12px 0;border-top:1px solid #e6e7dd;white-space:pre-wrap;overflow-wrap:anywhere}.turn strong{display:block;font-size:.78rem;text-transform:uppercase;letter-spacing:.07em;color:#62705f;margin-bottom:5px}[hidden]{display:none!important}
+:root{
+  --bg:#f3f0e8;--card:#fffdf8;--ink:#20241e;--muted:#5d6459;--line:#e2ded2;--field:#ffffff;
+  --accent:#2f5d3a;--accent-ink:#ffffff;--accent-soft:#e3ecdf;--end:#b3412e;--end-soft:#f6e1dc;
+  --chip:#f1eee6;--chip-on:#2f5d3a;--chip-on-ink:#ffffff;--focus:#b58336;
+  --shadow:0 18px 50px #20241e10;--ring:0 0 0 14px #2f5d3a1f;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#151815;--card:#1d211d;--ink:#eef0ea;--muted:#a9b0a3;--line:#323830;--field:#232823;
+  --accent:#7fbf8c;--accent-ink:#10160f;--accent-soft:#25322a;--end:#f08a73;--end-soft:#3a2622;
+  --chip:#272c26;--chip-on:#7fbf8c;--chip-on-ink:#10160f;--focus:#e0b061;
+  --shadow:0 18px 50px #00000059;--ring:0 0 0 14px #7fbf8c26;color-scheme:dark;}}
+:root[data-theme="dark"]{
+  --bg:#151815;--card:#1d211d;--ink:#eef0ea;--muted:#a9b0a3;--line:#323830;--field:#232823;
+  --accent:#7fbf8c;--accent-ink:#10160f;--accent-soft:#25322a;--end:#f08a73;--end-soft:#3a2622;
+  --chip:#272c26;--chip-on:#7fbf8c;--chip-on-ink:#10160f;--focus:#e0b061;
+  --shadow:0 18px 50px #00000059;--ring:0 0 0 14px #7fbf8c26;color-scheme:dark;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1180px;margin:0 auto;padding:clamp(16px,4vw,48px);display:grid;grid-template-columns:minmax(0,5fr) minmax(0,6fr);gap:clamp(16px,2.5vw,32px);align-items:start}
+.card{background:var(--card);border:1px solid var(--line);border-radius:28px;box-shadow:var(--shadow);padding:clamp(20px,3vw,36px)}
+.talk{position:sticky;top:24px;display:flex;flex-direction:column;gap:22px}
+.side{display:flex;flex-direction:column;gap:clamp(16px,2.5vw,32px)}
+h2{font-size:1.45rem;letter-spacing:-.02em;margin:0}
+.row{display:flex;gap:12px;align-items:center}
+select{font:inherit;color:var(--ink);background:var(--field);border:1px solid var(--line);border-radius:18px;padding:0 18px;min-height:64px;width:100%;appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 26px) 50%,calc(100% - 20px) 50%;background-size:6px 6px;background-repeat:no-repeat}
+#agent{font-size:1.6rem;font-weight:650;letter-spacing:-.02em;min-height:76px}
+#mic{min-height:52px;font-size:.95rem;color:var(--muted)}
+button{font:inherit;color:inherit;cursor:pointer;border:0;background:none}
+button:disabled{cursor:not-allowed;opacity:.45}
+button:focus-visible,select:focus-visible{outline:3px solid var(--focus);outline-offset:3px}
+.icon{width:64px;height:64px;flex:none;border-radius:18px;border:1px solid var(--line);background:var(--field);font-size:1.5rem}
+.stage{display:grid;place-items:center;padding:18px 0 6px}
+.big{width:min(240px,62vw);aspect-ratio:1;border-radius:50%;font-size:2rem;font-weight:700;letter-spacing:-.02em;transition:transform .15s ease,box-shadow .3s ease}
+.big:not(:disabled):hover{transform:scale(1.03)}
+#start{background:var(--accent);color:var(--accent-ink);box-shadow:var(--ring)}
+#stop{background:var(--end);color:#fff;box-shadow:0 0 0 14px var(--end-soft);animation:breathe 2.4s ease-in-out infinite}
+@keyframes breathe{50%{box-shadow:0 0 0 24px var(--end-soft)}}
+@media (prefers-reduced-motion:reduce){#stop{animation:none}.big{transition:none}}
+#status{font-size:1.15rem;font-weight:600;text-align:center;min-height:1.6em;margin:0}
+#levels{display:grid;gap:10px}
+.level{display:grid;grid-template-columns:4.5em 1fr;align-items:center;gap:12px;font-size:.9rem;color:var(--muted)}
+meter{width:100%;height:14px;border-radius:7px}
+meter::-webkit-meter-bar{background:var(--chip);border:0;border-radius:7px;height:14px}
+meter::-webkit-meter-optimum-value{background:var(--accent);border-radius:7px}
+meter::-moz-meter-bar{background:var(--accent);border-radius:7px}
+#device{font-size:.9rem;color:var(--muted);text-align:center}
+#play{min-height:56px;border-radius:18px;background:var(--accent-soft);font-weight:650}
+.tools-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+#tool-count{color:var(--muted);font-size:.95rem;margin-left:8px;font-weight:500}
+.seg{display:flex;background:var(--chip);border-radius:16px;padding:4px}
+.seg button{min-height:48px;padding:0 20px;border-radius:12px;font-weight:650}
+.seg button[aria-pressed="true"]{background:var(--card);box-shadow:0 2px 8px #0000001a}
+#tools{display:grid;gap:12px}
+.group{border:1px solid var(--line);border-radius:20px;padding:8px 12px}
+.group-head{display:flex;align-items:center;gap:6px;min-height:60px}
+.toggle{display:grid;place-items:center;width:72px;height:56px;flex:none;border-radius:16px}
+.expand{flex:1;display:flex;align-items:center;gap:12px;min-height:56px;text-align:left;font-size:1.1rem;font-weight:650;border-radius:14px;padding:0 8px}
+.expand::after{content:"›";font-size:1.6rem;color:var(--muted);transition:transform .2s;line-height:1}
+.expand[aria-expanded="true"]::after{transform:rotate(90deg)}
+.switch{flex:none;width:58px;height:34px;border-radius:17px;background:var(--chip);position:relative;transition:background .2s}
+.switch::after{content:"";position:absolute;top:4px;left:4px;width:26px;height:26px;border-radius:50%;background:var(--card);box-shadow:0 1px 4px #0003;transition:left .2s}
+[aria-checked="true"] > .switch{background:var(--accent)}
+[aria-checked="true"] > .switch::after{left:28px}
+[aria-checked="mixed"] > .switch{background:var(--accent);opacity:.55}
+[aria-checked="mixed"] > .switch::after{left:16px}
+.expand small{margin-left:auto;color:var(--muted);font-weight:500;font-size:.95rem;white-space:nowrap}
+.chips{display:flex;flex-wrap:wrap;gap:8px;padding:4px 8px 12px}
+.chip{min-height:44px;padding:0 16px;border-radius:22px;border:1.5px dashed var(--line);color:var(--muted);font-size:.95rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.chip[aria-pressed="true"]{border:1.5px solid transparent;background:var(--accent-soft);color:var(--ink)}
+.chip[aria-pressed="true"]::before{content:"✓ ";color:var(--accent);font-weight:700}
+.empty{color:var(--muted);margin:0}
+.transcript{max-height:46vh;overflow:auto;display:flex;flex-direction:column;gap:12px}
+.turn{padding:14px 18px;border-radius:20px;background:var(--chip);white-space:pre-wrap;overflow-wrap:anywhere;max-width:92%}
+.turn.you{align-self:flex-end;background:var(--accent-soft)}
+.turn strong{display:block;font-size:.85rem;color:var(--muted);margin-bottom:2px}
+#transcript:empty::before{content:"Your conversation appears here.";color:var(--muted)}
+#agent-detail{margin:-10px 0 0;color:var(--end);font-size:.95rem}
+#agent-detail:empty{display:none}
+#scope-note{grid-column:1/-1;text-align:center;color:var(--muted);font-size:.85rem;margin:0}
+.tools-title{display:flex;align-items:center;gap:10px;min-height:48px;font:inherit;font-size:1.45rem;font-weight:700;letter-spacing:-.02em}
+.tools-title::after{content:"›";font-size:1.7rem;color:var(--muted);transition:transform .2s;line-height:1}
+.tools-title[aria-expanded="true"]::after{transform:rotate(90deg)}
+.tools-head.closed{margin-bottom:0}
+.live-only{display:none}
+/* During a call the talk card shrinks to one slim bar pinned on top; the conversation gets the room. */
+main.live{grid-template-columns:1fr}
+.live .talk{position:sticky;top:10px;z-index:5;flex-direction:row;flex-wrap:wrap;align-items:center;gap:10px 16px;padding:10px 12px 10px 20px;border-radius:24px}
+.live .talk > .row,.live #mic,.live #agent-detail{display:none}
+.live .live-only{display:block;font-weight:700;font-size:1.05rem}
+.live #status{flex:1;min-width:8em;text-align:left;font-size:1rem;font-weight:500;color:var(--muted)}
+.live #levels{display:flex;gap:14px;align-items:center}
+.live .level{grid-template-columns:auto 72px;gap:8px;font-size:.8rem}
+.live #device{max-width:22ch;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.8rem}
+.live .stage{padding:0;order:9}
+.live .big{width:auto;aspect-ratio:auto;min-height:52px;padding:0 26px;border-radius:26px;font-size:1.05rem;animation:none;box-shadow:none}
+.live #play{min-height:44px;padding:0 16px}
+.live #stop{animation:none;box-shadow:0 0 0 4px var(--end-soft)}
+.live .stage{display:flex;gap:10px;align-items:center}
+#mute{min-height:52px;padding:0 24px;border-radius:26px;border:1.5px solid var(--line);background:var(--field);font-weight:700;font-size:1.05rem}
+#mute[aria-pressed="true"]{background:var(--end-soft);color:var(--end);border-color:transparent}
+.muted #mic-level{opacity:.35}
+.live .level meter{width:72px}
+.live .transcript{max-height:62vh}
+[hidden]{display:none!important}
+@media (max-width:860px){main{grid-template-columns:1fr}.talk{position:static}.live .talk{position:sticky}.live #levels .level span{display:none}.live .level{grid-template-columns:56px}.live .level meter{width:56px}}
 </style>
 </head>
 <body>
 <main>
-<div class="eyebrow">PiBot · Voice preview</div>
-<h1>Talk with your agent.</h1>
-<p class="intro">Choose an agent, then start a conversation. Your microphone stays off until you press Start.</p>
-<section class="card" aria-label="Voice controls">
-<label for="agent">Your agent</label>
-<select id="agent" disabled><option>Loading agents…</option></select>
-<p id="agent-detail" class="note"></p>
-<div class="buttons"><button id="start" class="primary" disabled>Start conversation</button><button id="stop" disabled>Stop</button><button id="refresh" disabled>Refresh agents</button><button id="play" hidden>Play agent audio</button></div>
-<p id="status" role="status" aria-live="polite">Checking this session…</p>
-<audio id="audio" autoplay></audio>
-<div id="transcript" class="transcript" role="log" aria-label="Conversation transcript" aria-live="polite"></div>
+<section class="card talk" aria-label="Talk">
+  <span id="live-agent" class="live-only"></span>
+  <div class="row">
+    <select id="agent" aria-label="Agent" disabled><option>Loading…</option></select>
+    <button id="refresh" class="icon" aria-label="Refresh agents" title="Refresh agents" disabled>↻</button>
+  </div>
+  <p id="agent-detail"></p>
+  <div class="stage">
+    <button id="start" class="big" disabled>Talk</button>
+    <button id="mute" aria-pressed="false" aria-keyshortcuts="M" title="Mute (M)" hidden>Mute</button>
+    <button id="stop" class="big" disabled hidden>End</button>
+  </div>
+  <p id="status" role="status" aria-live="polite">Checking…</p>
+  <button id="play" hidden>Play agent audio</button>
+  <div id="levels" hidden>
+    <div class="level"><span>You</span><meter id="mic-level" min="0" max="1" value="0"></meter></div>
+    <div class="level"><span>Agent</span><meter id="agent-level" min="0" max="1" value="0"></meter></div>
+    <div id="device"></div>
+  </div>
+  <select id="mic" aria-label="Microphone"><option value="">System microphone</option></select>
+  <audio id="audio" autoplay></audio>
 </section>
-<p class="note">Conversation only: no tools, actions or shared Telegram history. Deepgram processes audio for speech recognition and speech playback. Responses use your selected agent’s configured model provider. Sessions stop after 15 minutes.</p>
-<p class="note">Keep this page open while talking. Closing it stops your microphone. This preview will not reconnect automatically.</p>
+<div class="side">
+  <section class="card" aria-label="Conversation">
+    <div id="transcript" class="transcript" role="log" aria-label="Conversation" aria-live="polite"></div>
+  </section>
+  <section class="card" aria-labelledby="tools-toggle">
+    <div class="tools-head" id="tools-head">
+      <button id="tools-toggle" class="tools-title" aria-expanded="true" aria-controls="tools-body">Tools<span id="tool-count"></span></button>
+      <div class="seg" id="tools-presets" role="group" aria-label="Tool presets">
+        <button id="tools-none" aria-pressed="false">None</button>
+        <button id="tools-all" aria-pressed="false">All</button>
+      </div>
+    </div>
+    <div id="tools-body"><div id="tools"><p class="empty">Pick an agent to see its tools.</p></div></div>
+  </section>
+</div>
+<p id="scope-note"></p>
 </main>
 <script>
 'use strict';
 (() => {
   const $ = id => document.getElementById(id);
-  const secret = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+  const params = new URLSearchParams(location.hash.slice(1));
+  const requestedAgent = params.get('agent');
+  let secret = params.get('token') || '';
+  // Keep the key for this tab only, so a reload still works while the URL stays clean.
+  try { if (secret) sessionStorage.setItem('pibot-voice-token', secret); else secret = sessionStorage.getItem('pibot-voice-token') || ''; } catch {}
   history.replaceState(null, '', location.pathname + location.search);
+  // Opening a fresh launch link in an already-open tab only changes the fragment; reload to pick it up.
+  window.addEventListener('hashchange', () => { if (new URLSearchParams(location.hash.slice(1)).has('token')) location.reload(); });
   const validToken = /^[a-f0-9]{64}$/i.test(secret);
-  const agentSelect = $('agent'), startButton = $('start'), stopButton = $('stop'), refreshButton = $('refresh'), audio = $('audio');
-  let agents = [], audioReady = false, pc = null, stream = null, active = false, stopping = false, generation = 0, timer = null, controller = null;
+  const micSelect = $('mic'), agentSelect = $('agent'), startButton = $('start'), stopButton = $('stop'), refreshButton = $('refresh'), audio = $('audio');
+  let agents = [], audioReady = false, pc = null, stream = null, active = false, stopping = false, generation = 0, timer = null, controller = null, meterContext = null, silenceTimer = null;
+  // Tools for the selected agent: groups from the bot, the owner's choice remembered per agent.
+  let toolGroups = [], chosen = new Set(); const expanded = new Set();
+  let muted = false;
+  const micTracks = () => stream ? (stream.getAudioTracks?.() ?? stream.getTracks()) : [];
+  // Mute keeps the call open but sends silence: the track is disabled, not stopped.
+  function setMuted(next) {
+    muted = next && active;
+    for (const track of micTracks()) track.enabled = !muted;
+    $('mute').setAttribute?.('aria-pressed', String(muted)); $('mute').textContent = muted ? 'Unmute' : 'Mute';
+    document.querySelector?.('main')?.classList.toggle('muted', muted);
+    if (active) status(muted ? 'Muted.' : 'Listening.');
+  }
+  const GROUP_NAMES = { core: 'Files & shell', scheduler: 'Reminders', tasks: 'Background tasks', memory: 'Memory', 'agent-comms': 'Other agents', questions: 'Questions', skills: 'Skills', 'calendar-read': 'Calendar', 'telegram-send': 'Telegram', delegate: 'Coding CLIs', dictionary: 'Dictionary', commitments: 'Commitments', herdr: 'Herdr', exec: 'Run commands', 'vault-file': 'Vault files' };
+  const groupName = id => GROUP_NAMES[id] || id.replace(/[-_]/g, ' ').replace(/^./, c => c.toUpperCase());
+  const allTools = () => toolGroups.flatMap(g => g.tools.map(t => t.name));
   const status = text => { $('status').textContent = text; };
+  const lastAgent = () => { try { return localStorage.getItem('pibot-voice-agent') || ''; } catch { return ''; } };
   const selected = () => agents.find(agent => agent.id === agentSelect.value);
   function controls() {
     agentSelect.disabled = active || stopping || !agents.length;
+    micSelect.disabled = active || stopping;
     startButton.disabled = active || stopping || !validToken || !audioReady || !selected()?.available;
     stopButton.disabled = !active;
+    startButton.hidden = active; stopButton.hidden = !active; $('mute').hidden = !active;
+    document.querySelector?.('main')?.classList.toggle('live', active);
+    $('live-agent').textContent = active ? (selected()?.name || '') : '';
     refreshButton.disabled = active || stopping || !validToken;
     const agent = selected();
-    $('agent-detail').textContent = agent ? (agent.available ? 'Model: ' + agent.model : agent.reason || 'This agent is unavailable for voice.') : '';
+    $('agent-detail').textContent = agent && !agent.available ? (agent.reason || 'This agent is unavailable for voice.') : '';
+    renderTools();
   }
   async function api(path, options = {}) {
     const response = await fetch(path, { ...options, signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(10000), credentials: 'omit', cache: 'no-store', headers: { 'Authorization': 'Bearer ' + secret, ...(options.body ? {'Content-Type':'application/json'} : {}) } });
-    if (!response.ok) throw new Error('request-failed');
+    if (!response.ok) throw Object.assign(new Error('request-failed'), {status: response.status});
     return response;
+  }
+  // ── tools ──
+  function saveChoice() { try { localStorage.setItem('pibot-voice-tools:' + agentSelect.value, JSON.stringify([...chosen])); } catch {} }
+  async function loadTools() {
+    const agentId = agentSelect.value;
+    toolGroups = [];
+    if (agentId && selected()?.available) {
+      try {
+        const data = await (await api('/api/tools?agentId=' + encodeURIComponent(agentId))).json();
+        if (agentId !== agentSelect.value) return;
+        toolGroups = Array.isArray(data?.groups) ? data.groups.filter(g => g && typeof g.id === 'string' && Array.isArray(g.tools)) : [];
+      } catch { toolGroups = []; }
+    }
+    let saved = null; try { saved = JSON.parse(localStorage.getItem('pibot-voice-tools:' + agentId) || 'null'); } catch {}
+    const names = new Set(allTools());
+    chosen = new Set(Array.isArray(saved) ? saved.filter(n => names.has(n)) : names); // default: every tool the agent has
+    renderTools();
+  }
+  // Tools card open/closed, remembered across visits.
+  let toolsOpen = true; try { toolsOpen = localStorage.getItem('pibot-voice-tools-open') !== '0'; } catch {}
+  function showToolsOpen() {
+    $('tools-toggle').setAttribute?.('aria-expanded', String(toolsOpen));
+    $('tools-body').hidden = !toolsOpen; $('tools-presets').hidden = !toolsOpen;
+    $('tools-head').classList?.toggle('closed', !toolsOpen);
+  }
+  function renderTools() {
+    const box = $('tools'); if (!box?.replaceChildren || !document.createElement) return;
+    const total = allTools().length, on = allTools().filter(n => chosen.has(n)).length, locked = active || stopping;
+    $('tool-count').textContent = total ? ` · ${on} of ${total}` : '';
+    $('tools-none').setAttribute?.('aria-pressed', String(total > 0 && on === 0));
+    $('tools-all').setAttribute?.('aria-pressed', String(total > 0 && on === total));
+    $('tools-none').disabled = $('tools-all').disabled = locked || !total;
+    box.replaceChildren();
+    if (!total) { const p = document.createElement('p'); p.className = 'empty'; p.textContent = selected()?.available ? 'This agent has no tools here — talk only.' : 'Pick an agent to see its tools.'; box.append(p); return; }
+    for (const group of toolGroups) {
+      const names = group.tools.map(t => t.name), count = names.filter(n => chosen.has(n)).length;
+      const wrap = document.createElement('div'); wrap.className = 'group';
+      const head = document.createElement('div'); head.className = 'group-head';
+      const toggle = document.createElement('button'); toggle.className = 'toggle'; toggle.type = 'button'; toggle.disabled = locked;
+      toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-label', groupName(group.id));
+      toggle.setAttribute('aria-checked', count === names.length ? 'true' : count ? 'mixed' : 'false');
+      const sw = document.createElement('span'); sw.className = 'switch'; sw.setAttribute('aria-hidden', 'true'); toggle.append(sw);
+      toggle.addEventListener('click', () => { const all = count === names.length; for (const n of names) all ? chosen.delete(n) : chosen.add(n); saveChoice(); renderTools(); });
+      const open = expanded.has(group.id);
+      const expand = document.createElement('button'); expand.className = 'expand'; expand.type = 'button'; expand.setAttribute('aria-expanded', String(open));
+      const label = document.createElement('span'); label.textContent = groupName(group.id);
+      const meta = document.createElement('small'); meta.textContent = `${count} of ${names.length}`;
+      expand.append(label, meta);
+      expand.addEventListener('click', () => { open ? expanded.delete(group.id) : expanded.add(group.id); renderTools(); });
+      head.append(toggle, expand);
+      const chips = document.createElement('div'); chips.className = 'chips'; chips.hidden = !open;
+      for (const tool of group.tools) {
+        const chip = document.createElement('button'); chip.type = 'button'; chip.className = 'chip'; chip.disabled = locked;
+        chip.textContent = tool.name; chip.title = tool.description || tool.name; chip.setAttribute('aria-pressed', String(chosen.has(tool.name)));
+        chip.addEventListener('click', () => { chosen.has(tool.name) ? chosen.delete(tool.name) : chosen.add(tool.name); saveChoice(); renderTools(); });
+        chips.append(chip);
+      }
+      wrap.append(head, chips); box.append(wrap);
+    }
   }
   function closeLocal() {
     generation++;
@@ -56,14 +271,45 @@
     if (pc) { pc.onconnectionstatechange = null; pc.ontrack = null; pc.close(); pc = null; }
     if (stream) { stream.getTracks().forEach(track => track.stop()); stream = null; }
     audio.pause(); audio.srcObject = null;
-    $('play').hidden = true; active = false; controls();
+    clearTimeout(silenceTimer); silenceTimer = null;
+    meterContext?.close().catch(() => {}); meterContext = null; $('levels').hidden = true;
+    $('play').hidden = true; active = false; muted = false; setMuted(false); controls();
   }
-  async function stop(text = 'Conversation ended. Your microphone is off.') {
+  async function stop(text = 'Call ended.') {
     if (stopping) return;
     stopping = true; closeLocal(); status(text);
     try { await api('/api/session', {method:'DELETE', keepalive:true}); }
     catch { status(text + ' The server could not confirm the session closed.'); }
     finally { stopping = false; controls(); }
+  }
+  // Live input/output level; returns a reader for the loudest sample seen so far.
+  function meter(source, id) {
+    const Context = window.AudioContext || window.webkitAudioContext;
+    if (!Context) return null;
+    meterContext ??= new Context();
+    const context = meterContext, analyser = context.createAnalyser();
+    context.createMediaStreamSource(source).connect(analyser);
+    const data = new Float32Array(analyser.fftSize), element = $(id);
+    let peak = 0;
+    const tick = () => {
+      if (meterContext !== context) return;
+      analyser.getFloatTimeDomainData(data);
+      let level = 0; for (const v of data) level = Math.max(level, Math.abs(v));
+      peak = Math.max(peak, level); element.value = Math.min(1, level * 3);
+      requestAnimationFrame(tick);
+    };
+    tick();
+    return () => peak;
+  }
+  async function listMicrophones() {
+    try {
+      const inputs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId && d.deviceId !== 'default');
+      let wanted = micSelect.value; try { wanted ||= localStorage.getItem('pibot-voice-mic') || ''; } catch {}
+      const fallback = document.createElement('option'); fallback.value = ''; fallback.textContent = 'System microphone';
+      micSelect.replaceChildren(fallback);
+      for (const input of inputs) { const option = document.createElement('option'); option.value = input.deviceId; option.textContent = input.label || 'Microphone'; micSelect.append(option); }
+      micSelect.value = inputs.some(d => d.deviceId === wanted) ? wanted : '';
+    } catch {}
   }
   async function refresh() {
     refreshButton.disabled = true;
@@ -71,18 +317,27 @@
       const data = await (await api('/api/agents')).json();
       if (!Array.isArray(data.agents)) throw new Error('invalid-agents');
       audioReady = data.audioReady === true;
+      $('scope-note').textContent = data.mode === 'shared' ? 'Shared with your Telegram chat · approvals stay there · audio via Deepgram · 15 min' : 'Isolated copy · no tools or chat history · audio via Deepgram · 15 min';
       const previous = agentSelect.value;
       agents = data.agents.filter(a => typeof a.id === 'string' && typeof a.name === 'string' && typeof a.model === 'string' && typeof a.available === 'boolean');
       agentSelect.replaceChildren();
       for (const agent of agents) {
         const option = document.createElement('option'); option.value = agent.id; option.textContent = agent.name + (agent.available ? '' : ' — unavailable'); agentSelect.append(option);
       }
-      const requested = new URLSearchParams(location.hash.slice(1)).get('agent');
       if (agents.some(a => a.id === previous)) agentSelect.value = previous;
-      else if (requested && agents.some(a => a.id === requested && a.available)) agentSelect.value = requested;
+      else if (requestedAgent && agents.some(a => a.id === requestedAgent && a.available)) agentSelect.value = requestedAgent;
+      else if (lastAgent() && agents.some(a => a.id === lastAgent() && a.available)) agentSelect.value = lastAgent();
       else if (agents.some(a => a.available)) agentSelect.value = agents.find(a => a.available).id;
-      status(!audioReady ? 'Speech is not configured. Add the Deepgram credential to the local voice service, then refresh.' : agents.length ? 'Ready when you are.' : 'No agents are available.');
-    } catch { agents = []; agentSelect.replaceChildren(); status('Could not load agents. Check that the local voice service is running, then refresh.'); }
+      status(!audioReady ? 'Speech isn’t configured on the voice service.' : agents.length ? 'Ready.' : 'No agents available.');
+      void listMicrophones();
+      void loadTools();
+    } catch (error) {
+      agents = []; agentSelect.replaceChildren();
+      if (error?.status === 401) {
+        try { sessionStorage.removeItem('pibot-voice-token'); } catch {}
+        status('This link expired — send /voice again.');
+      } else status('Voice service unreachable.');
+    }
     controls();
   }
   function waitForIce(connection, signal) {
@@ -102,7 +357,7 @@
     if (!message || typeof message.text !== 'string') return;
     if (message.type === 'status') { status(message.text.slice(0, 500)); return; }
     if (!['user','assistant'].includes(message.type)) return;
-    const turn = document.createElement('div'); turn.className = 'turn';
+    const turn = document.createElement('div'); turn.className = message.type === 'user' ? 'turn you' : 'turn';
     const name = document.createElement('strong'); name.textContent = message.type === 'user' ? 'You' : (selected()?.name || 'Agent');
     const content = document.createElement('span'); content.textContent = message.text.slice(0, 16000); turn.append(name, content);
     const transcript = $('transcript'); transcript.append(turn);
@@ -112,29 +367,39 @@
   async function start() {
     if (active || stopping || !selected()?.available || !validToken || !audioReady) return;
     active = true; const current = ++generation; controller = new AbortController(); const signal = controller.signal;
-    timer = setTimeout(() => void stop('The 15-minute session has ended. Your microphone is off.'), 15 * 60 * 1000);
-    controls(); $('transcript').replaceChildren(); status('Allow microphone access to begin…');
+    timer = setTimeout(() => void stop('15-minute limit reached.'), 15 * 60 * 1000);
+    controls(); $('transcript').replaceChildren(); status('Allow the microphone…');
     try {
-      const media = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
+      const media = await navigator.mediaDevices.getUserMedia({audio: micSelect.value ? {deviceId:{exact:micSelect.value}} : true, video:false});
       if (current !== generation) { media.getTracks().forEach(track => track.stop()); return; }
+      const input = media.getAudioTracks?.()[0], inputName = input?.label || 'your microphone';
+      $('levels').hidden = false; $('device').textContent = inputName + (input?.muted ? ' — muted by the system' : '');
+      const micPeak = meter(media, 'mic-level');
+      if (micPeak) silenceTimer = setTimeout(() => {
+        if (current === generation && !muted && micPeak() < 0.01) $('device').textContent = `No sound from “${inputName}”. Pick another microphone or check macOS microphone access for this browser.`;
+      }, 6000);
+      void listMicrophones();
       stream = media; pc = new RTCPeerConnection({iceServers:[]}); const connection = pc;
       connection.createDataChannel('chat').onmessage = receive;
       connection.ondatachannel = event => { event.channel.onmessage = receive; };
       connection.ontrack = event => {
         audio.srcObject = event.streams[0] || new MediaStream([event.track]);
+        meter(audio.srcObject, 'agent-level');
         audio.play().catch(() => { if (current === generation) $('play').hidden = false; });
       };
       connection.onconnectionstatechange = () => {
         if (current !== generation) return;
-        if (connection.connectionState === 'connected') status('Connected. You can speak now.');
-        if (['failed','disconnected','closed'].includes(connection.connectionState)) void stop('Connection ended. Your microphone is off.');
+        if (connection.connectionState === 'connected') status(muted ? 'Muted.' : 'Listening.');
+        if (['failed','disconnected','closed'].includes(connection.connectionState)) void stop('Connection ended.');
       };
       stream.getTracks().forEach(track => connection.addTrack(track, stream));
-      status('Connecting to your agent…');
+      status('Connecting…');
       await connection.setLocalDescription(await connection.createOffer());
       await waitForIce(connection, signal);
       if (current !== generation) return;
-      const response = await api('/api/offer', {method:'POST', signal, body:JSON.stringify({agentId:agentSelect.value, sdp:connection.localDescription.sdp, type:'offer'})});
+      // tools: only send a choice when the agent's tools loaded; otherwise the agent keeps its own set
+      const offer = {agentId:agentSelect.value, sdp:connection.localDescription.sdp, type:'offer', ...(toolGroups.length ? {tools:allTools().filter(n => chosen.has(n))} : {})};
+      const response = await api('/api/offer', {method:'POST', signal, body:JSON.stringify(offer)});
       const answer = await response.json();
       if (current !== generation) return;
       if (answer.type !== 'answer' || typeof answer.sdp !== 'string') throw new Error('invalid-answer');
@@ -142,18 +407,31 @@
       if (current !== generation) return;
     } catch (error) {
       if (current !== generation) return;
-      const message = error?.name === 'NotAllowedError' ? 'Microphone access was not allowed. Your microphone is off.' : 'Could not start the conversation. Your microphone is off. Check the local voice service and agent configuration.';
+      const detail = error?.name ? error.name + (error?.message ? ' — ' + error.message : '') : String(error ?? 'unknown');
+      const message = error?.name === 'NotAllowedError' ? 'Microphone access was blocked.' : 'Couldn’t start (' + detail + ').';
+      console.error('[voice] start() failed:', detail, error);
       await stop(message);
     }
   }
-  agentSelect.addEventListener('change', controls);
+  agentSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-agent', agentSelect.value); } catch {} controls(); void loadTools(); });
+  micSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-mic', micSelect.value); } catch {} });
   startButton.addEventListener('click', () => void start());
   stopButton.addEventListener('click', () => void stop());
   refreshButton.addEventListener('click', () => void refresh());
-  $('play').addEventListener('click', () => { audio.play().then(() => { $('play').hidden = true; }).catch(() => status('Audio playback is blocked. Check your browser’s audio permission.')); });
+  $('mute').addEventListener('click', () => setMuted(!muted));
+  document.addEventListener?.('keydown', event => {
+    if (!active || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.key.toLowerCase() !== 'm') return;
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target?.tagName)) return;
+    event.preventDefault(); setMuted(!muted);
+  });
+  $('tools-toggle').addEventListener('click', () => { toolsOpen = !toolsOpen; try { localStorage.setItem('pibot-voice-tools-open', toolsOpen ? '1' : '0'); } catch {} showToolsOpen(); });
+  showToolsOpen();
+  $('tools-none').addEventListener('click', () => { chosen = new Set(); saveChoice(); renderTools(); });
+  $('tools-all').addEventListener('click', () => { chosen = new Set(allTools()); saveChoice(); renderTools(); });
+  $('play').addEventListener('click', () => { audio.play().then(() => { $('play').hidden = true; }).catch(() => status('Audio playback is blocked by the browser.')); });
   window.addEventListener('pagehide', () => { const wasActive = active; closeLocal(); if (wasActive) void api('/api/session', {method:'DELETE',keepalive:true}).catch(() => {}); });
-  if (!validToken) { status('Open the private launch link from your local voice service to begin.'); controls(); }
-  else if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) { status('This browser does not support local voice sessions. Open the launch link in a current browser.'); }
+  if (!validToken) { status('Open the link from /voice to begin.'); controls(); }
+  else if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) { status('This browser can’t do voice calls.'); }
   else void refresh();
 })();
 </script>

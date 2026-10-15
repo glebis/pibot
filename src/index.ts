@@ -257,6 +257,16 @@ async function main(): Promise<void> {
   await coordinator?.start();
   scheduler.rearm();
 
+  // Durable background tasks (pi-durable ledger, bead pibot-e9t). Opened after the bot is up:
+  // tasks left unfinished by the last process resume at once and post their results.
+  const taskDir = path.join(config.dataDir, "durable", "tasks");
+  fs.mkdirSync(taskDir, { recursive: true, mode: 0o700 });
+  const taskLedger = await (await import("./durable/task-ledger.js")).openTaskLedger({
+    storageDir: taskDir,
+    runner: { run: (t) => bot.runLedgerTask(t), notify: (ck, text) => bot.notifyChat(ck, text) },
+  }).catch((e) => { console.error("[pibot] task ledger unavailable:", e instanceof Error ? e.message : e); return undefined; });
+  agents.tasks = taskLedger;
+
   // pilot governance on boot: weekly scorecard jobs follow the manifest flags
   for (const a of agents.list()) commitments.syncPilotGovernance(a.id);
 
@@ -296,7 +306,7 @@ async function main(): Promise<void> {
     ? await (await import('./voice/runtime.js')).startCanonicalVoiceRuntime(bot, process.env.PIBOT_VOICE_CONFIG)
     : undefined;
 
-  // Owner-only /call + /voicetest. /voicetest works without the runtime (it only reads the test page URL).
+  // Owner-only /call + /voice. /voice works without the runtime (it only reads the test page URL).
   bot.setVoiceCommands(new (await import('./voice/owner-commands.js')).VoiceOwnerCommands({
     phone: voiceRuntime?.phone,
     testUrlFile: path.join(config.dataDir, 'voice', 'test-launch.url'),
@@ -320,6 +330,7 @@ async function main(): Promise<void> {
       await voiceRuntime?.close();
       await bot.stop();
       coordinator?.close();
+      await taskLedger?.close(); // a running task stays pending and resumes (once) after restart
     })()
       .catch(() => {})
       .finally(() => process.exit(0));

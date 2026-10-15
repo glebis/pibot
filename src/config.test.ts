@@ -48,6 +48,13 @@ describe("loadConfig", () => {
     expect(c.heartbeatModel).toBeUndefined(); // "same" is not an override
   });
 
+  it("defaults the burst-message window to 2.5s and honors PIBOT_BUFFER_MS", () => {
+    clearEnv();
+    expect(loadConfig().messageBufferMs).toBe(2500);
+    process.env.PIBOT_BUFFER_MS = "0"; // 0 = combine messages off
+    expect(loadConfig().messageBufferMs).toBe(0);
+  });
+
   it("reads values from .env without clobbering real env", () => {
     clearEnv();
     fs.writeFileSync(".env", "PIBOT_DEFAULT_AGENT=env-agent\nPIBOT_TRANSPORT=telegram\n");

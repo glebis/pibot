@@ -20,6 +20,7 @@ import { AvatarArtifactStore, createDefaultAvatarProviders } from "./avatar.js";
 import { createDefaultSpeechProviders, SpeechArtifactStore, type SpeechKind } from "./speech.js";
 import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext, type CapabilityDefinition, type CommitmentPluginEngine } from "./capabilities.js";
 import type { IntakeStore } from "./research-intake.js";
+import type { TaskLedger } from "../durable/task-ledger.js";
 import { childEnv } from "./child-env.js";
 import { EventLog } from "./events.js";
 import type { Scheduler } from "./scheduler.js";
@@ -39,6 +40,8 @@ export class AgentManager {
   commitments?: CommitmentPluginEngine;
   /** durable research-intake sessions (wizard persistence) */
   intake?: IntakeStore;
+  /** durable background-task ledger; set by the host after wiring */
+  tasks?: TaskLedger;
   private agentsDir: string;
   private vaultDir: string;
   /** shared docs site source root (read-only course content); set by the host from config */
@@ -202,6 +205,7 @@ export class AgentManager {
       dictionary: { dataDir: this.dataDir },
       commitments: this.commitments,
       intake: this.intake,
+      tasks: this.tasks,
       avatar: applyProfilePhoto && chat.transport.startsWith("telegram") && agent.manifest.capabilities?.includes("avatar") ? {
         providers: createDefaultAvatarProviders(),
         store: new AvatarArtifactStore(path.join(agent.dir, "runtime", "avatars")),
@@ -224,6 +228,9 @@ export class AgentManager {
       cwd: sessionCwd,
       agentDir: getAgentDir(),
       systemPromptOverride: () => capabilitySet.systemPrompt,
+      // Never the owner's global ~/.pi extensions: they are for interactive pi, and a
+      // same-named tool (e.g. an ask_user popup) would shadow pibot's capability tools.
+      noExtensions: true,
       // per-agent private plugins
       additionalExtensionPaths: listTsFiles(path.join(agent.dir, "extensions")),
       // per-agent evolved skills (+ staging during evolution)
