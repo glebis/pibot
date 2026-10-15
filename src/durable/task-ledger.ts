@@ -23,6 +23,8 @@ export interface LedgerTaskInput {
   chatKey: string;
   title: string;
   instructions: string;
+  /** owner-chosen tool names for the run (from a voice call); omitted = the agent's full set */
+  allowedTools?: string[];
 }
 
 export interface LedgerEntry extends LedgerTaskInput {
@@ -54,6 +56,8 @@ export interface TaskRunner {
 
 export interface TaskLedger {
   start(input: LedgerTaskInput, requestId?: string): Promise<LedgerEntry>;
+  /** Return the newest active task for an agent/chat, if any. */
+  latestActive(agentId: string, chatKey: string): Promise<LedgerEntry | undefined>;
   get(id: string): Promise<LedgerEntry | undefined>;
   list(filter: { agentId: string; chatKey?: string }): Promise<LedgerEntry[]>;
   /** true when an abort was requested for a live task */
@@ -182,6 +186,10 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
   harness.resume();
 
   const snapshot = async () => ((await harness.snapshot(Ledger, root.id, C)) ?? { tasks: {}, requests: {} }) as unknown as LedgerDoc;
+  const listTasks = async ({ agentId, chatKey }: { agentId: string; chatKey?: string }): Promise<LedgerEntry[]> =>
+    Object.values((await snapshot()).tasks)
+      .filter((t) => t.agentId === agentId && (!chatKey || t.chatKey === chatKey))
+      .sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt);
 
   return {
     async start(input, requestId) {
@@ -205,9 +213,15 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
       return (await snapshot()).tasks[id];
     },
     async list({ agentId, chatKey }) {
+      return listTasks({ agentId, chatKey });
+    },
+    async latestActive(agentId, chatKey) {
+      // Task keys are appended at creation; status updates do not change their
+      // insertion order. Pick the newest created active task, not the one whose
+      // status happened to update most recently.
       return Object.values((await snapshot()).tasks)
-        .filter((t) => t.agentId === agentId && (!chatKey || t.chatKey === chatKey))
-        .sort((a, b) => b.createdAt - a.createdAt);
+        .filter((t) => t.agentId === agentId && t.chatKey === chatKey && active(t.status))
+        .at(-1);
     },
     async cancel(id) {
       const entry = (await snapshot()).tasks[id];

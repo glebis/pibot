@@ -101,6 +101,19 @@ describe("durable task ledger", () => {
     } finally { await ledger.close(); }
   });
 
+  it("finds the newest active task for an agent and chat", async () => {
+    const { r } = runner(untilAborted);
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const first = await ledger.start({ ...input, title: "old" });
+      const second = await ledger.start({ ...input, title: "new" });
+      expect((await ledger.latestActive(input.agentId, input.chatKey))?.id).toBe(second.id);
+      await ledger.cancel(second.id);
+      await until(() => ledger.get(second.id), (e) => e?.status === "cancelled");
+      expect((await ledger.latestActive(input.agentId, input.chatKey))?.id).toBe(first.id);
+    } finally { await ledger.close(); }
+  });
+
   it("limits active tasks per agent", async () => {
     const { r } = runner(untilAborted);
     const ledger = await openTaskLedger({ runner: r });
