@@ -155,7 +155,7 @@ export function jevShadowPermitted(
     return { ok: false, reason: "provider_not_permitted" };
   }
   if (opts.requireKey === false) return { ok: true };
-  const key = opts.apiKey ?? process.env.AI_GATEWAY_API_KEY;
+  const key = opts.apiKey ?? (process.env.TYPESAFE_API_KEY?.trim() || process.env.AI_GATEWAY_API_KEY);
   if (!key?.trim()) return { ok: false, reason: "missing_api_key" };
   return { ok: true };
 }

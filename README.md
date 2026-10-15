@@ -92,7 +92,34 @@ Downloaded speech media uses private runtime storage, opaque filenames, local me
 
 Outgoing speech is local-only and opt-in per agent. Add `speech` to that agent's `capabilities`. `speech_generate` uses macOS `say` plus local `ffmpeg` to create either an OGG/Opus Telegram voice message or M4A music-player audio; it never sends. `speech_send` sends the selected artifact only to the same invoking Telegram chat through the normal per-chat queue, rate-limit retry, and duplicate guard. A successful send deletes the artifact; unsent artifacts expire after 24 hours.
 
-Speech is never generated or sent automatically, and it has no heartbeat, scheduler, replay, or automatic reply-conversion hook. No external TTS provider or credential is included in this foundation.
+Telegram speech artifacts are never generated or sent automatically, and this local speech foundation has no heartbeat, scheduler, replay, or automatic reply-conversion hook. Telephone conversations use the separate service below, including external speech providers.
+
+### Telephone calls and urgent escalation
+
+The permanent Twilio/Pipecat phone service connects to the real PiBot agent session, with its tools and canonical Telegram history after PIN authentication. The deployed route is Cloudflare gateway → Tailscale Funnel → local phone service → PiBot voice bridge. Telephone speech recognition uses Deepgram Nova-3; speech synthesis uses Deepgram Aura-2. The agent reply uses the existing PiBot model routing. Credentials and the PIN are stored with SOPS; never put them in this README or logs.
+
+- **Manual call:** send `/call` in a configured private owner chat, then confirm the inline call button. The service dials the fixed owner number; enter the PIN to connect. Maximum duration is three minutes. Inspect an uncertain attempt before trying again.
+- **Automatic call:** enabled in the local deployment through `PIBOT_VOICE_ESCALATION_CONFIG` and a separately approved Personal Contracts owner-call permission. Ordinary messages, heartbeats and timeouts do not authorize calls. This is deadline-triggered escalation, not a scheduled morning call.
+- **Sources:** blocked decisions with explicit useful deadlines across the nine reviewed private agents, plus active locally owned Personal Contracts deadlines. The expired legacy contract was not adopted. New agents are not enrolled automatically.
+
+All covered agents share these limits:
+
+| Gate | Approved limit |
+| --- | --- |
+| Urgency window | Within 60 minutes before an explicit deadline |
+| Message first | Accepted initial message, then at least 120 seconds unanswered and unacknowledged |
+| Frequency | At most 3 calls per rolling 24 hours; at least 30 minutes apart |
+| Duration | At most 180 seconds per call |
+| Quiet hours | 22:00–08:00 Europe/Berlin, including daylight-saving changes; no exceptions |
+| Cumulative budget | US$5 for telephone/speech infrastructure, with US$2.50 reserved per attempt |
+
+Two unreconciled reservations exhaust the current budget even though the daily frequency ceiling is three. Usage reconciliation checks the existing provider call through authenticated read-only control. A terminal call with a confirmed numeric Twilio charge releases the unused connectivity allowance; a missing price, mismatched call/currency, provider error or unverified speech exposure keeps the original reservation. Confirmed charges are rounded up to whole cents. Connected calls retain a conservative media/speech allowance until those costs are accounted for; it is not reported as actual speech usage. Older calls without durable usage evidence remain reserved. Reconciliation preserves the original attempt and audit record, rolling daily count, cooldown and duplicate guard. Unknown dispatch outcomes are never automatically retried. Consent renewal does not reset spending. Agent model/tool charges, taxes and fixed number rental are outside this infrastructure ceiling. Calls also require fresh consent, source/version and bounded-cost evidence; stale or unavailable checks block dispatch. Voice can read a pending protected question, but approval remains in the authenticated chat.
+
+**State verified 15 October 2026:** the local configuration links approved permission for nine private agent bindings. A real test created a blocked decision, accepted its Telegram message at 16:50:15 and automatically called at 16:52:16 after the required grace period. The owner missed it; Twilio reported busy with zero connected seconds and no numeric price yet. The test question was resolved and exactly one automatic attempt was recorded. This demonstrates trigger/message/grace/automatic dispatch; PIN and audio remain unverified for that test. Earlier manual telephone testing was owner-confirmed as two-way audio with tools/history. Usage reconciliation was activated on 15 October after an approved reload. The existing missed call remains reserved because its provider charge is still unconfirmed.
+
+The linked permission expires **13 November 2026**. Current public speech/media pricing evidence expires **21 October 2026** unless reviewed again; telephone rates refresh daily. Expired evidence pauses calls. These dates describe this local deployment, not defaults for other installations.
+
+See [the voice operations guide](docs/voice-test.md) for commands, service ports, private configuration and diagnostics. Revoke calling permission through the authenticated local Personal Contracts review screen; do not edit authority tables or reset ledgers.
 
 ### Minimal voice communication (`/minimal`)
 
@@ -109,6 +136,8 @@ Two mechanisms, because they do different jobs. A prompt-side directive asks the
 The dashboard provides:
 agent CRUD, manifest editor (model/heartbeat/evolution/quiet hours), persona + memory editors,
 schedule table with cancel, snooze/wake, staged-skill review (promote/reject), run-evolution, event tail.
+
+The **lab admin inbox** is at `http://localhost:7860/inbox`, behind the same admin login. It uses vendored Pico CSS (no CDN) and reads local lab conversation history and participant context. Select a participant, review messages, and use **Send as Lab Companion** to reply through the bound lab bot. Replies have durable pending/sent/ambiguous receipts; an uncertain send must be reviewed before retrying. The **Logs** panel shows the last 200 lines (up to 64 KiB) of the redacted daemon log. New text conversations and bot replies are captured locally; older history is shown where it was already saved. Nothing is exported to a telemetry service.
 
 Chat commands: `/help` `/agents` `/agent <name>` `/newagent <name> <persona>` `/handoff <agent> [note]` `/schedules` `/snooze 2h` `/wake` `/status` `/skills` `/minimal on|off|default` `/goal …` `/evolve [goal]` `/evolve status|promote|reject`
 
@@ -163,7 +192,7 @@ collect (events + persona + skills) → propose (cheap model)
 - **Improvement backlog** (per agent, `memory/improvement-backlog.md`): durable, deduplicated candidates ranked priority → recurrence → recency (ported from Ouroboros's improvement backlog — a repeated irritation is *counted*, never dropped). Heartbeats append candidates via `maintain: "backlog: <summary>"`; the digest shows the top 5 to every heartbeat and evolution cycle; a goal-less `/evolve` (scheduled tick, dashboard) targets the top-ranked open item as its goal, and landing the skill closes what it addressed (`closesBacklog` proposal field + staging sidecar, close-on-promote). Advisory only — implementation always goes through the gated cycle.
 - **Manual**: `/evolve [goal]` runs a cycle now; `npm run evolve -- assistant "get better at morning briefings"`.
 - **Staging workflow**: `/evolve status` → `/evolve promote <name>` / `/evolve reject <name>`. Probes below 4 avg never auto-apply.
-- **Agents evolve themselves mid-chat** too: `skill_save` / `skill_patch` / `skill_list` (Hermes `skill_manage` style) after non-trivial workflows.
+- **Agents propose skills mid-chat** too: `skill_save` / `skill_patch` / `skill_list` (Hermes `skill_manage` style) after non-trivial workflows. Saves and patches are **staged** (`skills/.staging/`) and become active only after you promote them in the dashboard's **Review changes**, so one prompt-injected page can't plant a permanent instruction.
 
 ## Goals (`/goal`)
 
@@ -299,3 +328,13 @@ Shipped changes are recorded in [CHANGELOG.md](CHANGELOG.md); the items below ar
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Lab course payments
+
+The lab bot has a fixed public sales flow for people outside its course group. They remain outside agent sessions and admin command dispatch. `/start KRAFT` (or `https://t.me/agency_lab_companion_bot?start=KRAFT`) opens the personal offer; checkout buttons prefill the promotion code and carry a private random purchase reference. Normal menus do not advertise the special code. Admins can copy the offer with `/courseoffer KRAFT`.
+
+Configure `payments.json` (0600) in the lab agent's private `lab-recommendations` directory: `enabled`, `groupInviteUrl`, two `links` with `tier`, `label`, `url`, `paymentLinkId`, `productId`, and optional `offers.KRAFT.code`. Keep the invite and runtime purchase state outside Git. `/lab-payments` in the authenticated dashboard verifies and encrypts a live restricted Stripe read key. Grant Account, Checkout Sessions, Products, and Prices read access; no write access is needed. Saving a key takes effect on the next payment action/tick without restarting.
+
+The existing signed agency-docs webhook remains responsible for portal/email fulfillment. The local bot additionally reconciles Stripe Checkout Sessions every minute and on “Проверить оплату”, matching its own issued reference, exact Payment Link, paid/complete live session, and the course product metadata. It then sends the configured group invite to the originating Telegram chat. Returning from checkout, an email address, a screenshot, and Telegram's unrelated payment service messages never authorize an invitation.
+
+Durable `payments-state.json` tracks each session's invitation receipt. Ambiguous sends remain blocked for admin review rather than replaying. Never delete or reset that state to retry a message. Verification outages are logged without purchaser data or credentials. Offline tests cover unpaid sessions, incorrect references/products/modes, duplicate delivery, restart recovery, and restricted key validation. No real payment is needed to run these tests.

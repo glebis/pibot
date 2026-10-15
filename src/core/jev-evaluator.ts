@@ -1,4 +1,4 @@
-/** A bounded, side-effect-free client for AI Gateway's typed evaluation endpoint. */
+/** A bounded, side-effect-free client for TypeSafe Jev or Vercel AI Gateway. */
 export type JevQuestion =
   | { type: "boolean"; instructions: string; criteria?: { true: string; false: string } }
   | { type: "choice"; instructions: string; criteria: Record<string, string> }
@@ -33,7 +33,9 @@ export type JevResult =
   | { ok: true; answers: Record<string, JevAnswer>; elapsedMs: number }
   | { ok: false; reason: JevFailureReason; elapsedMs: number };
 
-const ENDPOINT = "https://ai-gateway.vercel.sh/v1/evaluate";
+export type JevProvider = "typesafe" | "gateway";
+const GATEWAY_ENDPOINT = "https://ai-gateway.vercel.sh/v1/evaluate";
+const TYPESAFE_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const MAX_STATE_BYTES = 16_384;
 const MAX_RESPONSE_BYTES = 65_536;
 const MAX_QUESTIONS = 8;
@@ -81,18 +83,21 @@ function probabilities(value: unknown, keys: string[]): value is Record<string, 
     && Math.abs(keys.reduce((sum, key) => sum + (value[key] as number), 0) - 1) <= 0.03;
 }
 
-function parseAnswers(body: unknown, questions: Record<string, JevQuestion>): Record<string, JevAnswer> | null {
-  if (!isRecord(body) || (body.model !== undefined && body.model !== "typesafe-ai/jev")
+function parseAnswers(body: unknown, questions: Record<string, JevQuestion>, provider: JevProvider): Record<string, JevAnswer> | null {
+  if (!isRecord(body) || (body.model !== undefined && (provider === "gateway"
+    ? body.model !== "typesafe-ai/jev" : typeof body.model !== "string" || !body.model.startsWith("jev-")))
     || !isRecord(body.answers)) return null;
   const entries = Object.entries(questions);
   if (Object.keys(body.answers).length !== entries.length) return null;
   const answers: Record<string, JevAnswer> = {};
   for (const [name, question] of entries) {
     const answer = body.answers[name];
-    if (!isRecord(answer) || answer.type !== question.type) return null;
+    const wireType = provider === "typesafe" && question.type === "boolean" ? "noul" : question.type;
+    if (!isRecord(answer) || answer.type !== wireType) return null;
     if (question.type === "boolean") {
-      if (!probability(answer.probability)) return null;
-      answers[name] = { type: "boolean", probability: answer.probability };
+      const value = provider === "typesafe" ? answer.noul : answer.probability;
+      if (!probability(value)) return null;
+      answers[name] = { type: "boolean", probability: value };
     } else if (question.type === "choice") {
       const options = Object.keys(question.criteria);
       if (typeof answer.choice !== "string" || !options.includes(answer.choice)
@@ -115,6 +120,7 @@ export async function evaluateJev(input: {
   state: unknown;
   questions: Record<string, JevQuestion>;
   apiKey?: string;
+  provider?: JevProvider;
   fetchFn?: typeof fetch;
   timeoutMs?: number;
   trace?: (event: JevTrace) => void;
@@ -133,7 +139,12 @@ export async function evaluateJev(input: {
     return { ...result, elapsedMs };
   };
 
-  const key = input.apiKey ?? process.env.AI_GATEWAY_API_KEY;
+  // An explicit injected key keeps the existing gateway call contract. With
+  // encrypted runtime credentials, prefer the direct TypeSafe route and never
+  // silently fall back to another provider after an HTTP or network failure.
+  const provider = input.provider ?? (input.apiKey !== undefined ? "gateway"
+    : process.env.TYPESAFE_API_KEY?.trim() ? "typesafe" : "gateway");
+  const key = input.apiKey ?? (provider === "typesafe" ? process.env.TYPESAFE_API_KEY : process.env.AI_GATEWAY_API_KEY);
   if (!key?.trim()) return finish({ ok: false, reason: "missing_api_key" });
   if (typeof input.state !== "string" && !isRecord(input.state) && !Array.isArray(input.state))
     return finish({ ok: false, reason: "invalid_state" });
@@ -147,8 +158,16 @@ export async function evaluateJev(input: {
   if (!validQuestions(input.questions)) return finish({ ok: false, reason: "invalid_questions" });
 
   const timeoutMs = Math.min(10_000, Math.max(250, input.timeoutMs ?? 4_000));
-  const body = JSON.stringify({ model: "typesafe-ai/jev", state: JSON.parse(serializedState), questions: input.questions,
-    providerOptions: { gateway: { zeroDataRetention: true, only: ["typesafe-ai"] } } });
+  const wireQuestions = provider === "typesafe"
+    ? Object.fromEntries(Object.entries(input.questions).map(([name, question]) => [name, question.type === "boolean"
+      ? { type: "noul", instructions: question.criteria
+        ? `${question.instructions}\nTrue: ${question.criteria.true}\nFalse: ${question.criteria.false}` : question.instructions }
+      : question]))
+    : input.questions;
+  const body = provider === "typesafe"
+    ? JSON.stringify({ model: "jev-latest", state: JSON.parse(serializedState), questions: wireQuestions })
+    : JSON.stringify({ model: "typesafe-ai/jev", state: JSON.parse(serializedState), questions: wireQuestions,
+      providerOptions: { gateway: { zeroDataRetention: true, only: ["typesafe-ai"] } } });
   const fetchFn = input.fetchFn ?? globalThis.fetch;
 
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -158,7 +177,7 @@ export async function evaluateJev(input: {
     try {
       const result = await Promise.race([
         (async () => {
-          const response = await fetchFn(ENDPOINT, {
+          const response = await fetchFn(provider === "typesafe" ? TYPESAFE_ENDPOINT : GATEWAY_ENDPOINT, {
             method: "POST",
             headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
             body,
@@ -172,7 +191,7 @@ export async function evaluateJev(input: {
           if (Buffer.byteLength(responseText, "utf8") > MAX_RESPONSE_BYTES) return { kind: "invalid" as const };
           let parsed: unknown;
           try { parsed = JSON.parse(responseText); } catch { return { kind: "invalid" as const }; }
-          const answers = parseAnswers(parsed, input.questions);
+          const answers = parseAnswers(parsed, input.questions, provider);
           return answers ? { kind: "success" as const, answers } : { kind: "invalid" as const };
         })(),
         new Promise<{ kind: "timeout" }>((resolve) => {

@@ -354,6 +354,8 @@ describe("encryptJsonWithSops", () => {
 describe("isSecretSettings / stripSecrets", () => {
   it("detects token and subBot tokens", () => {
     expect(isSecretSettings({})).toBe(false);
+    expect(isSecretSettings({ labPayments: { stripeKey: "rk_live_private" } })).toBe(true);
+    expect(stripSecrets({ labPayments: { stripeKey: "rk_live_private" } }).labPayments?.stripeKey).toBeUndefined();
     expect(isSecretSettings({ telegram: { token: "x" } })).toBe(true);
     expect(isSecretSettings({ telegram: { subBots: { a: { token: "y" } } } })).toBe(true);
     expect(isSecretSettings({ telegram: { subBots: { a: { token: "" } } } })).toBe(false);

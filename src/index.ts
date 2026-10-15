@@ -278,7 +278,9 @@ async function main(): Promise<void> {
     const webApp = createWebApp({
       agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
       proactiveStore,
+      inbox: bot.labInboxControl(),
       coordinator,
+      enrollment: bot.labEnrollmentControl(),
       commitments: { syncGovernance: (agentId) => commitments.syncPilotGovernance(agentId) },
       webToken, webRpId: config.webRpId, webPort,
       providers: providerManager,
@@ -328,15 +330,26 @@ async function main(): Promise<void> {
       await voiceEscalation?.close();
       await coordinator?.stopDispatch();
       await voiceRuntime?.close();
+      await taskLedger?.close(); // a running task stays pending and resumes (once) after restart
       await bot.stop();
       coordinator?.close();
-      await taskLedger?.close(); // a running task stays pending and resumes (once) after restart
     })()
       .catch(() => {})
       .finally(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  // One process hosts every bot: a stray rejected promise in one feature must not take the
+  // others down (Node's default is to exit). Log it loudly and keep serving.
+  process.on("unhandledRejection", (reason) => {
+    console.error("[pibot] unhandled rejection (kept running):", reason instanceof Error ? reason.stack ?? reason.message : reason);
+  });
+  // A synchronous throw that escaped every handler may have left state half-updated: exit and let
+  // launchd (KeepAlive) restart from durable state rather than limp on.
+  process.on("uncaughtException", (err) => {
+    console.error("[pibot] uncaught exception — exiting for a clean restart:", err.stack ?? err.message);
+    process.exit(1);
+  });
 }
 
 main().catch((e) => {

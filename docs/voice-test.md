@@ -6,7 +6,7 @@ PiBot agents can be reached by voice in three ways. They differ in which agent y
 |---|---|---|---|
 | **Browser test page** (Pipecat) | You, on this Mac | An isolated copy of the agent | None: persona and allowed model only |
 | **Phone call** (Twilio) | You: `/call` in Telegram, or the operator script | The real agent session for that chat | Yes: the same session as the Telegram chat |
-| **Automatic escalation call** | PiBot, under a separate call consent | The real agent session | Yes. **Currently off** |
+| **Automatic escalation call** | PiBot, under a separate call consent | The real agent session | Yes. Enabled locally under reviewed owner-call permission |
 
 ## Telegram commands
 
@@ -64,7 +64,11 @@ An agent can take a call only if it has exactly one current private owner chat (
 
 ## Automatic escalation calls
 
-PiBot can also call you on its own when something urgent needs a decision. This is **off**. It turns on only when the daemon is given `PIBOT_VOICE_ESCALATION_CONFIG`, and even then each call needs a separately approved call consent. A message mandate never counts as call consent. The consent sets daily limits, a cooldown, quiet hours (Europe/Berlin) and a maximum duration, and a trusted authority must confirm the price ceiling and the provider-side duration limit before any call.
+The local deployment enables automatic escalation through `PIBOT_VOICE_ESCALATION_CONFIG` and a separate authenticated owner-call permission. A message mandate never counts as call consent. The exact current policy, budget scope, evidence expiry and verification status are documented in the README's [Telephone calls and urgent escalation](../README.md#telephone-calls-and-urgent-escalation) section.
+
+The source must be a live unanswered blocked decision with an explicit useful deadline, or an eligible active owned Personal Contract. Accepted message delivery and the two-minute grace period precede any call. All nine reviewed private bindings share the frequency, cooldown and spending ledger. Source changes, answers, acknowledgement, revocation or stale evidence suppress dispatch; uncertain attempts are not replayed.
+
+The real 15 October 2026 test produced one automatic attempt after the full message grace period; the owner missed it, so that test did not establish PIN authentication or audio. A successful manual call does not verify automatic escalation. Test the production flow with one harmless explicitly labelled blocked decision during permitted hours, leaving its Telegram question unanswered through the real grace period. Observe the automatic dispatcher rather than invoking a manual call endpoint. Keep all limits and audit reservations intact, obtain owner confirmation of two-way audio, then resolve the question normally and verify duplicate suppression.
 
 ## Services, ports and files
 
@@ -94,3 +98,12 @@ The gateway's upstream address is a Worker secret, never committed. Set it with 
 - **Not yet verified here:** a real `/call` through to a ringing phone and a spoken round trip, and a live microphone → Deepgram → agent → spoken reply round trip on the browser page. A listening port or a passing offline test doesn't prove audio delivery.
 
 The browser transport follows [Pipecat's SmallWebRTC design](https://docs.pipecat.ai/client/concepts/choosing-a-transport), tested with Pipecat 1.0.0. It is independent of the Pipecat MCP conversation tools.
+
+
+## Usage reconciliation
+
+The private read-only `GET /control/calls/<attempt-id>/usage` endpoint looks up only an existing ledger call and checks its exact provider identity. It never initiates a call. Twilio must report a terminal state and a numeric charge in the expected currency before the gate can release connectivity funds. Null or malformed price is unknown, including on busy or zero-duration calls. Provider failures retain the full allowance.
+
+The shared escalation ledger records confirmed connectivity cost separately from remaining media/speech exposure. It preserves original reservations and immutable reconciliation events. A proven never-authenticated zero-duration new call can have no speech exposure; connected calls retain the enforced speech/media upper bound, while legacy records without the new proof retain their reservation. This is conservative partial reconciliation, not provider-confirmed Deepgram billing. Overruns remain counted even above the original allowance and block further spending. Billing updates do not erase cooldowns, daily call counts, consent lineage or no-retry protections.
+
+See Twilio's [Call resource price field](https://www.twilio.com/docs/voice/api/call-resource): it can arrive after completion and covers connectivity rather than all related features.

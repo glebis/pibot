@@ -18,3 +18,7 @@ agents/*
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Python bytecode (scripts/, voice/)
+__pycache__/
+*.pyc

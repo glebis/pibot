@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import os
 from collections.abc import Awaitable, Callable
@@ -148,7 +149,8 @@ class PiBotTurnProcessor(FrameProcessor):
 
 
 async def run_voice(connection: Any, turn: Callable[[str], Awaitable[str]],
-                    on_status: StatusCallback | None = None) -> None:
+                    on_status: StatusCallback | None = None,
+                    announcements: "asyncio.Queue[str] | None" = None) -> None:
     """Run one connected voice session; caller owns bridge DELETE and total lifetime.
 
     Requires DEEPGRAM_API_KEY. Speech is sent to Deepgram for transcription and
@@ -205,4 +207,128 @@ async def run_voice(connection: Any, turn: Callable[[str], Awaitable[str]],
     @transport.event_handler("on_client_disconnected")
     async def disconnected(_transport, _client):
         await task.cancel()
-    await PipelineRunner(handle_sigint=False, handle_sigterm=False).run(task)
+    async def announce():
+        # background-task results are spoken between turns as they arrive
+        from pipecat.frames.frames import TTSSpeakFrame
+        while announcements is not None:
+            text = await announcements.get()
+            await task.queue_frames([TTSSpeakFrame(text)])  # the page already shows it as a task event
+    announcer = asyncio.create_task(announce()) if announcements is not None else None
+    try:
+        await PipelineRunner(handle_sigint=False, handle_sigterm=False).run(task)
+    finally:
+        if announcer:
+            announcer.cancel()
+
+
+class CallNotes(FrameProcessor):
+    """Mirror a speech-to-speech call into the page transcript and the call summary.
+
+    Placed on both sides of the realtime model: user transcripts travel upstream from it,
+    the model's spoken sentences downstream. Nothing here is logged.
+    """
+
+    def __init__(self, note: Callable[[str, str], Awaitable[None]], send: Callable[[dict], None]):
+        super().__init__()
+        self._note, self._send, self._said = note, send, []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        from pipecat.frames.frames import BotStoppedSpeakingFrame, TranscriptionFrame, TTSTextFrame
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            self._send({"type": "user", "text": frame.text.strip()})
+            await self._note("owner", frame.text.strip())
+        elif isinstance(frame, TTSTextFrame) and frame.text:
+            self._said.append(frame.text)
+        elif isinstance(frame, (LLMFullResponseEndFrame, BotStoppedSpeakingFrame)) and self._said:
+            text = "".join(self._said).strip(); self._said = []
+            if text:
+                self._send({"type": "assistant", "text": text})
+                await self._note("agent", text)
+        await self.push_frame(frame, direction)
+
+
+async def run_realtime(connection: Any, call: Any,
+                       announcements: "asyncio.Queue[str] | None" = None) -> None:
+    """Speech-to-speech call over OpenAI Realtime (experimental).
+
+    The model is configured with the voice front's instructions and tools from the bridge
+    (`call.setup()`); its tool calls run there (`call.tool()`), so background tasks,
+    announcements, hang-up and the call summary behave as in the Fast mode. Requires
+    OPENAI_API_KEY; audio goes to OpenAI instead of Deepgram.
+    """
+    from pipecat.adapters.schemas.function_schema import FunctionSchema
+    from pipecat.adapters.schemas.tools_schema import ToolsSchema
+    from pipecat.frames.frames import LLMRunFrame
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.runner import PipelineRunner
+    from pipecat.pipeline.task import PipelineParams, PipelineTask
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+    from pipecat.services.openai.realtime import events
+    from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+    from pipecat.transports.base_transport import TransportParams
+    from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is required for realtime voice")
+    setup = await call.setup()
+    tools = ToolsSchema(standard_tools=[
+        FunctionSchema(name=t["name"], description=t["description"],
+                       properties=(t.get("parameters") or {}).get("properties", {}),
+                       required=(t.get("parameters") or {}).get("required", []))
+        for t in setup["tools"]
+    ])
+    session = events.SessionProperties(
+        instructions=setup["instructions"], tools=tools,
+        audio=events.AudioConfiguration(
+            input=events.AudioInput(transcription=events.InputAudioTranscription(),
+                                    turn_detection=events.SemanticTurnDetection(eagerness="medium")),
+            output=events.AudioOutput(voice=os.environ.get("PIBOT_REALTIME_VOICE", "marin")),
+        ),
+    )
+    llm = OpenAIRealtimeLLMService(api_key=key, settings=OpenAIRealtimeLLMService.Settings(
+        model=os.environ.get("PIBOT_REALTIME_MODEL", "gpt-realtime-1.5"), session_properties=session))
+
+    async def run_tool(params):
+        result = await call.tool(params.function_name, dict(params.arguments or {}), params.tool_call_id)
+        await params.result_callback(result)
+    for t in setup["tools"]:
+        llm.register_function(t["name"], run_tool)
+
+    def send(message: dict) -> None:
+        with contextlib.suppress(Exception):
+            connection.send_app_message(message)
+
+    transport = SmallWebRTCTransport(connection, TransportParams(audio_in_enabled=True, audio_out_enabled=True))
+    context = LLMContext([{"role": "user", "content": "(The call just connected. Greet the owner in a few words.)"}])
+    user, assistant = LLMContextAggregatorPair(context)
+    notes_in, notes_out = CallNotes(call.note, send), CallNotes(call.note, send)
+    task = PipelineTask(Pipeline([transport.input(), user, notes_in, llm, notes_out, transport.output(), assistant]),
+                        params=PipelineParams(), enable_rtvi=False, idle_timeout_secs=300)
+
+    @transport.event_handler("on_client_connected")
+    async def connected(_transport, _client):
+        send({"type": "status", "text": "listening"})
+        await task.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_client_disconnected")
+    async def disconnected(_transport, _client):
+        await task.cancel()
+
+    async def announce():
+        # a finished background task becomes a conversation item the model speaks about
+        while announcements is not None:
+            text = await announcements.get()
+            with contextlib.suppress(Exception):
+                await llm.send_client_event(events.ConversationItemCreateEvent(item=events.ConversationItem(
+                    type="message", role="user",
+                    content=[events.ItemContent(type="input_text", text=f"[Background task update — not said by the owner] {text} Tell the owner in one short sentence.")])))
+                await llm.send_client_event(events.ResponseCreateEvent())
+    announcer = asyncio.create_task(announce()) if announcements is not None else None
+    try:
+        await PipelineRunner(handle_sigint=False, handle_sigterm=False).run(task)
+    finally:
+        if announcer:
+            announcer.cancel()

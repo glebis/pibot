@@ -93,6 +93,30 @@ describe("SttService", () => {
     expect(res.error).toContain("local_whisper: whisper CLI not installed");
   });
 
+  it("defaults to Russian transcription when no STT_LANGUAGE is set", async () => {
+    const file = tmpOgg();
+    let lang: string | undefined;
+    const fetchFn = fakeFetchJson((_url, init) => {
+      lang = String((init?.body as FormData).get("language") ?? "");
+      return new Response(JSON.stringify({ text: "ok" }), { status: 200 });
+    });
+    process.env.GROQ_API_KEY = "test-key";
+    const stt = new SttService(["groq"], { fetchFn });
+    const res = await stt.transcribe(file, { providers: ["groq"], allowExternal: true });
+    expect(res.ok).toBe(true);
+    expect(lang).toBe("ru");
+    process.env.STT_LANGUAGE = "de";
+    let deLang: string | undefined;
+    const fetchFn2 = fakeFetchJson((_url, init) => {
+      deLang = String((init?.body as FormData).get("language") ?? "");
+      return new Response(JSON.stringify({ text: "ok" }), { status: 200 });
+    });
+    const stt2 = new SttService(["groq"], { fetchFn: fetchFn2 });
+    const res2 = await stt2.transcribe(file, { providers: ["groq"], allowExternal: true });
+    expect(res2.ok).toBe(true);
+    expect(deLang).toBe("de");
+  });
+
   it("transcribes via whisperkit when installed, cleaning non-transcript lines", async () => {
     const file = tmpOgg();
     const fakeExec = ((

@@ -118,6 +118,41 @@ describe('canonical voice bridge',()=>{
   await h.bot.voiceTurn(h.input);expect(ask).toHaveBeenCalledWith('assistant',{transport:'telegram',chatId:'42'},{text:'Change a thing?',options:['Confirm','Cancel']});expect(h.input.onOutput).toHaveBeenCalledWith(expect.stringContaining('existing chat'));
  });
 });
+describe('voice front in the bot',()=>{
+ it('answers fast without the canonical session, then posts a summary and notes the call for the agent',async()=>{
+  const h=harness();const complete=vi.fn(async()=>({role:'assistant',content:[{type:'text',text:'Sure, here.'}],stopReason:'stop',timestamp:1}));
+  h.b.deps.modelRuntime={complete};(h.agents as any).resolveModel=vi.fn(()=>({provider:'openrouter',id:'fast'}));
+  const custom=vi.fn(async()=>{});Object.assign(h.session,{sendCustomMessage:custom,agent:{state:{messages:[{role:'user',content:[{type:'text',text:'earlier question'}]}]}}});
+  expect(h.bot.voiceFrontOpen('call-1','assistant','telegram:99')).toBe(false);
+  expect(h.bot.voiceFrontOpen('call-1','assistant','telegram:42')).toBe(true);
+  expect(await h.bot.voiceFrontTurn('call-1','Are you there?',new AbortController().signal)).toBe('Sure, here.');
+  expect(h.session.prompt).not.toHaveBeenCalled();
+  expect(String((complete.mock.calls[0] as any[])[1].systemPrompt)).toContain('earlier question');
+  await h.bot.voiceFrontClose('call-1');
+  expect(h.pushed.at(-1)).toContain('📞 Voice call');expect(h.pushed.at(-1)).toContain('You: Are you there?');
+  expect(custom).toHaveBeenCalledWith(expect.objectContaining({customType:'voice-call'}),{deliverAs:'nextTurn'});
+ });
+});
+describe('task steps for the page and the front',()=>{
+ it('summarises a task session as readable steps: short paths, the command itself, notes as text',()=>{
+  const h=harness();const home=process.env.HOME!;
+  const messages=[{role:'assistant',content:[{type:'toolCall',name:'read',arguments:{path:`${home}/.local/share/pibot/agents/mentalhealthtech/drafts/character-ai.md`}},{type:'toolCall',name:'bash',arguments:{command:`cat ${home}/.local/share/pibot/agents/mentalhealthtech/drafts/character-ai.md | wc -l`}},{type:'text',text:'Reviewing the draft now.'}]}];
+  (h.agents as any).sessions=new Map([['assistant::agent::assistant::task-t1',{agent:{state:{messages}}}]]);
+  expect(h.bot.taskSteps('assistant','t1')).toEqual([{tool:'read',detail:'~/…/drafts/character-ai.md'},{tool:'bash',detail:'cat ~/…/drafts/character-ai.md | wc -l'},{detail:'Reviewing the draft now.'}]);
+  expect(h.bot.taskActivity('assistant','t1')[0]).toBe('read ~/…/drafts/character-ai.md');
+  expect(h.bot.taskSteps('assistant','missing')).toEqual([]);
+ });
+});
+describe('cancelling a task from the page',()=>{
+ it('cancels only this chat\'s own tasks',async()=>{
+  const h=harness();const cancel=vi.fn(async()=>true);
+  (h.agents as any).tasks={get:vi.fn(async(id:string)=>id==='mine'?{id,agentId:'assistant',chatKey:'telegram:42',status:'running'}:id==='other'?{id,agentId:'assistant',chatKey:'telegram:99',status:'running'}:undefined),cancel};
+  expect(await h.bot.voiceCancelTask('assistant','telegram:99','mine')).toBeUndefined();
+  expect(await h.bot.voiceCancelTask('assistant','telegram:42','other')).toBe(false);
+  expect(await h.bot.voiceCancelTask('assistant','telegram:42','mine')).toBe(true);
+  expect(cancel).toHaveBeenCalledOnce();
+ });
+});
 describe('canonical turn gate',()=>{
  it('allows internal recursion without deadlock but rejects another voice turn',async()=>{const gate=new CanonicalTurnGate();await gate.run('a',async()=>{expect(gate.tryRun('a',async()=>1)).toBeUndefined();expect(await gate.run('a',async()=>2)).toBe(2);});expect(gate.busy('a')).toBe(false);});
 });

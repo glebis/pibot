@@ -60,7 +60,13 @@ bd `pibot-n13`, spec `docs/superpowers/specs/2026-09-25-jev-evolution-shadow-eva
 It is **not** part of the decision path: the engine hands it a bounded snapshot after each probe
 reply exists, never awaits it, and never reads what it returns. Enabling it for an agent requires
 the manifest flag **and** an approved data scope **and** the provider in `providers` — a configured
-gateway key alone is not permission — so in practice it stays off until the owner decides.
+API key alone is not permission. The daemon constructs the observer in `dry_run` mode unless
+`PIBOT_JEV_SHADOW=live`; the current assistant grant is synthetic only, so live probe text is refused.
+
+`src/core/jev-evaluator.ts` prefers the direct TypeSafe API at `api.typesafe.ai/v1/systemone`
+when `TYPESAFE_API_KEY` is present in SOPS encrypted settings. Otherwise it uses Vercel AI Gateway
+with `AI_GATEWAY_API_KEY`. It does not fall back between providers after a failed request. Both
+routes keep the same bounded state, typed questions, timeout, and response validation.
 
 | Rule | Where |
 |---|---|
@@ -70,9 +76,7 @@ gateway key alone is not permission — so in practice it stays off until the ow
 | Records are metadata only (hashes, categories, latency, the old score and its parse provenance) | `JevShadowRecord` |
 | Offline half: independence/provenance checks, blinding, verdicts, report | `src/core/jev-replay.ts` |
 
-The observer is not constructed by the daemon yet: wiring it is a one-line change plus a per-agent
-flag, and the epic's scope excludes live deployment. The current 1–5 judge, the `avg >= 4` rule and
-every gate above remain the only authorities.
+The current 1–5 judge, the `avg >= 4` rule and every gate above remain the only authorities.
 
 ## Code map
 

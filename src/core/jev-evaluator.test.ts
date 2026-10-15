@@ -31,6 +31,37 @@ describe("evaluateJev", () => {
     expect(JSON.stringify(traces)).not.toContain("test-key");
   });
 
+  it("calls TypeSafe directly with its own key and maps Noul into the internal boolean answer", async () => {
+    const directAnswers = {
+      relevant: { type: "noul", noul: 0.9 },
+      destination: { ...answers.destination, confidence: 0.8 },
+      depth: { ...answers.depth, confidence: 0.5 },
+    };
+    const fetchFn = vi.fn(async () => response({ model: "jev-1.13.0", answers: directAnswers }));
+    const result = await evaluateJev({ state: "Example", questions, provider: "typesafe", apiKey: "direct-test-key", fetchFn });
+    expect(result).toMatchObject({ ok: true, answers });
+    const [url, options] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.typesafe.ai/v1/systemone");
+    expect(options.headers).toMatchObject({ Authorization: "Bearer direct-test-key" });
+    const body = JSON.parse(options.body as string);
+    expect(body.model).toBe("jev-latest");
+    expect(body.questions.relevant).toEqual({ type: "noul", instructions: "Is this relevant?" });
+    expect(body).not.toHaveProperty("providerOptions");
+  });
+
+  it("prefers a configured direct key and never falls back to the gateway on failure", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "direct-test-key");
+    try {
+      const fetchFn = vi.fn(async () => response({}, 401));
+      const result = await evaluateJev({ state: "Example", questions, fetchFn });
+      expect(result).toMatchObject({ ok: false, reason: "http_error" });
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+      expect((fetchFn.mock.calls[0] as unknown as [string])[0]).toBe("https://api.typesafe.ai/v1/systemone");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("rejects an out-of-criteria choice instead of making a decision", async () => {
     const fetchFn = vi.fn(async () => response({ answers: { ...answers, destination: { ...answers.destination, choice: "other" } } }));
     expect(await evaluateJev({ state: "example", questions, apiKey: "test-key", fetchFn })).toMatchObject({ ok: false, reason: "invalid_response" });

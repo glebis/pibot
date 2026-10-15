@@ -57,3 +57,28 @@ describe('durable urgent-call gate',()=>{
   });
   it('rejects policies which weaken fixed duration/grace/cooldown bounds',()=>{for(const change of [{maxDurationSeconds:181},{messageGraceMs:1},{cooldownMs:1}]){const f=fixture();Object.assign(f.policy,change);expect(()=>new UrgentCallEscalation(f.deps)).toThrow();}});
 });
+
+describe('call usage reconciliation',()=>{
+  function usage(f:ReturnType<typeof fixture>, charge:number, residual:number|null=0) {
+    return vi.fn(async(a:import('./escalation.js').CallAttempt)=>({schemaVersion:1 as const,terminal:true as const,attemptId:a.attemptId,providerCallId:a.providerCallId!,currency:a.currency,checkedAt:f.now(),confirmedTwilioMinor:charge,remainingExposureMinor:residual}));
+  }
+  it.each([[0,0,0],[12,23,35],[12,null,100],[400,0,400]])('accounts confirmed charge %s and residual %s without changing reservation',async(charge,residual,total)=>{
+    const f=fixture();f.policy.maxSpendMinor=100;f.deps.usageReconciler={check:usage(f,charge!,residual!)};
+    let gate=new UrgentCallEscalation(f.deps);await gate.tick();await gate.tick();
+    expect(gate.history()[0]).toMatchObject({maxExposureMinor:100,status:'accepted',usageSettlement:{confirmedTwilioMinor:charge,remainingExposureMinor:residual,state:residual===0?'settled':'partial'}});
+    gate.close();gate=new UrgentCallEscalation(f.deps);
+    try {f.advance(1800001);f.decisions=[{...f.decisions[0]!,id:'next'}];await gate.tick();expect(f.dispatcher.dispatch).toHaveBeenCalledTimes(total===0?2:1);expect(f.deps.usageReconciler.check).toHaveBeenCalledTimes(1);}finally{gate.close();}
+  });
+  it.each(['null','wrong-id','wrong-call','currency','stale','future','negative','fraction','nonterminal'])('keeps full reservation for %s evidence with durable polling backoff',async(kind)=>{
+    const f=fixture();const check=usage(f,0);f.deps.usageReconciler={check:vi.fn(async(a)=>{const e=await check(a);if(kind==='null')return null;if(kind==='wrong-id')e.attemptId='other';if(kind==='wrong-call')e.providerCallId='other';if(kind==='currency')e.currency='USD';if(kind==='stale')e.checkedAt-=30001;if(kind==='future')e.checkedAt++;if(kind==='negative')e.confirmedTwilioMinor=-1;if(kind==='fraction')e.confirmedTwilioMinor=0.1;if(kind==='nonterminal')(e as any).terminal=false;return e;})};
+    let gate=new UrgentCallEscalation(f.deps);await gate.tick();await gate.tick();expect(gate.history()[0]?.usageSettlement).toBeUndefined();gate.close();gate=new UrgentCallEscalation(f.deps);
+    try{await gate.tick();expect(f.deps.usageReconciler.check).toHaveBeenCalledTimes(1);f.advance(60000);await gate.tick();expect(f.deps.usageReconciler.check).toHaveBeenCalledTimes(2);}finally{gate.close();}
+  });
+  it('shared instances reconcile once and preserve cooldown and daily frequency after zero settlement',async()=>{
+    const f=fixture();f.deps.usageReconciler={check:usage(f,0)};const a=new UrgentCallEscalation(f.deps),b=new UrgentCallEscalation(f.deps);
+    try{await a.tick();await Promise.all([a.tick(),b.tick()]);expect(f.deps.usageReconciler.check).toHaveBeenCalledTimes(1);f.decisions=[{...f.decisions[0]!,id:'two'}];await a.tick();expect(f.dispatcher.dispatch).toHaveBeenCalledTimes(1);f.advance(1800001);await a.tick();expect(f.dispatcher.dispatch).toHaveBeenCalledTimes(2);f.decisions=[{...f.decisions[0]!,id:'three'}];f.advance(1800001);await a.tick();expect(f.dispatcher.dispatch).toHaveBeenCalledTimes(2);}finally{a.close();b.close();}
+  });
+  it('never queries unknown dispatches without a provider identifier',async()=>{
+    const f=fixture({status:'unknown'});f.deps.usageReconciler={check:usage(f,0)};const gate=new UrgentCallEscalation(f.deps);try{await gate.tick();await gate.tick();expect(f.deps.usageReconciler.check).not.toHaveBeenCalled();}finally{gate.close();}
+  });
+});

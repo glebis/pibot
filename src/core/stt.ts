@@ -177,7 +177,9 @@ export class SttService {
   constructor(providers?: string[], deps: SttDeps = {}) {
     this.providers = (providers ?? sttProvidersFromEnv()).filter((p): p is SttProviderId => KNOWN_STT_PROVIDERS.has(p));
     const lang = (process.env.STT_LANGUAGE ?? "").trim();
-    this.language = lang || undefined;
+    // Russian is the default transcription language everywhere (owner instruction 2026-10-14);
+    // STT_LANGUAGE overrides — e.g. empty/other codes restore provider auto-detection.
+    this.language = lang || "ru";
     this.deps = deps;
   }
 

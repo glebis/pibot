@@ -31,6 +31,10 @@ export interface Config {
 // ─── runtime-editable settings (web-configurable, survives restarts) ───────
 
 export interface Settings {
+  /** Shared website claim signer; encrypted at rest, never public settings. */
+  labEnrollment?: { signingSecret?: string };
+  /** Local course payment reconciliation; stored only in SOPS encrypted settings. */
+  labPayments?: { stripeKey?: string };
   telegram?: {
     token?: string;
     allowedChats?: string[];

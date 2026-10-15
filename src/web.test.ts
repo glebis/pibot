@@ -472,21 +472,19 @@ describe("web /telegram", () => {
     expect(after).toContain('value="agent-comms,scheduler,exec"');
   });
 
-  it("staged candidates are viewable and actionable from home and the agent page", async () => {
+  it("staged candidates link to the guided review queue", async () => {
     boot({ subBotFor: vi.fn(() => undefined), managerMode: vi.fn(() => true) });
     const stagingFile = path.join(dir, "assistant", "skills", ".staging", "morning-brief", "SKILL.md");
     fs.mkdirSync(path.dirname(stagingFile), { recursive: true });
     fs.writeFileSync(stagingFile, "# Morning brief\n\n- greet\n- list today's schedule");
-
     const page = await (await app.request("/")).text();
-    expect(page).toContain("morning-brief");
-    expect(page).toContain("view");
-    expect(page).toContain("promote");
-
-    const view = await (await app.request("/agents/assistant/staged/morning-brief")).text();
-    expect(view).toContain("# Morning brief");
-    expect(view).toContain("✅ Promote");
-    expect(view).toContain("✖ Reject");
+    expect(page).toContain("Review 1 proposed changes");
+    expect(page).not.toContain("staged/morning-brief/promote");
+    const oldBookmark = await app.request("/agents/assistant/staged/morning-brief");
+    expect(oldBookmark.headers.get("location")).toContain("/review?");
+    const view = await (await app.request("/review?id=assistant%2Fmorning-brief")).text();
+    expect(view).toContain("Morning brief");
+    expect(view).toContain("Archive");
   });
 
   it("cascade card stays hidden when cascade is not wired", async () => {

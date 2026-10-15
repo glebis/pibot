@@ -18,6 +18,10 @@ import { CAPABILITY_REGISTRY } from "./core/capabilities.js";
 import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
 import { providerRowHtml } from "./core/providers.js";
 import { getMediaLinkKey, mediaDirFor, verifyMediaToken } from "./core/media-links.js";
+import { registerInboxRoutes, type InboxControl } from "./web-inbox-routes.js";
+import { registerEnrollmentRoutes, type EnrollmentControl } from "./web-enrollment.js";
+import { mountLabPaymentRoutes } from "./web-payments.js";
+import { registerReviewRoutes } from "./web-review-routes.js";
 import { WebAuthStore } from "./web-auth.js";
 import {
   generateRegistrationOptions,
@@ -47,6 +51,8 @@ export interface TelegramControl {
 
 export interface WebDeps {
   coordinator?: CoordinatorControl;
+  inbox?: InboxControl;
+  enrollment?: EnrollmentControl;
   agents: AgentManager;
   scheduler: Scheduler;
   events: EventLog;
@@ -96,6 +102,7 @@ function page(title: string, body: string, flash?: string): string {
 <title>${esc(title)} · pibot</title>
 <style>
   :root { color-scheme: dark; }
+  [hidden]{display:none!important} :focus-visible{outline:3px solid #9fe0b5;outline-offset:3px} nav{margin-bottom:20px} .admin-search{margin:12px 0} .admin-search input{max-width:420px}
   * { box-sizing: border-box; }
   body { margin: 0; background: #0d0f12; color: #d7dce2; font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
   a { color: #8ab4ff; text-decoration: none; } a:hover { text-decoration: underline; }
@@ -133,11 +140,27 @@ function page(title: string, body: string, flash?: string): string {
   form.inline { display: inline; }
   pre.events { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #9aa4b1; max-height: 260px; overflow: auto; margin: 0; white-space: pre-wrap; }
 </style></head><body><main>
+<nav aria-label="Admin navigation"><a href="/">Overview</a> · <a href="/review">Review changes</a> · <a href="/inbox">Lab inbox</a> · <a href="/lab-payments">Course payments</a> · <a href="/enrollments">Course access</a></nav>
 <h1>🤖 pibot config</h1>
 <p class="sub">agents · rhythm · schedules · evolution${flash ? "" : ""}</p>
 ${flash ? `<div class="flash" id="page-flash">${esc(flash)}</div>` : ""}
 ${body}
 </main>
+<script>
+(function(){
+function setup(){document.querySelectorAll('table,[data-admin-list]').forEach((list,i)=>{
+if(list.dataset.searchReady)return;list.dataset.searchReady='1';
+const params=new URLSearchParams(location.search),key='list'+i, label=list.dataset.adminList||list.closest('.card')?.previousElementSibling?.textContent?.trim()||'table';
+const previous=list.previousElementSibling;
+const controls=previous?.classList.contains('admin-search')?previous:document.createElement('div');controls.className='admin-search';
+let input=controls.querySelector('input'),count=controls.querySelector('span');
+if(!input){input=document.createElement('input');input.type='search';input.placeholder='Search '+label;input.setAttribute('aria-label','Search '+label);input.value=params.get(key)||'';count=document.createElement('span');count.className='muted';count.setAttribute('aria-live','polite');controls.append(input,count);list.before(controls);}
+const items=list.matches('table')?[...list.querySelectorAll('tr')].filter(r=>r.querySelector('td')&&!r.querySelector('td[colspan]')):[...list.children].filter(item=>!item.matches('.muted'));
+function filter(){let n=0;items.forEach(item=>{item.hidden=!item.textContent.toLowerCase().includes(input.value.trim().toLowerCase());if(!item.hidden)n++;});count.textContent=' '+n+' of '+items.length+' results';}
+input.oninput=()=>{filter();const url=new URL(location.href);if(input.value)url.searchParams.set(key,input.value);else url.searchParams.delete(key);history.replaceState(null,'',url);};filter();
+});}window.pibotInitListSearch=setup;setup();
+})();
+</script>
 <script>
 (function () {
   "use strict";
@@ -253,6 +276,7 @@ ${body}
       if (target && freshSwap) {
         var imp2 = document.importNode(freshSwap, true);
         target.replaceWith(imp2);
+        window.pibotInitListSearch?.();
         if (flash) showFlash(imp2, flash.cls, flash.text); else showFlash(imp2, "flash", "\u2713 applied");
         refreshStagedBanner(doc);
         return;
@@ -377,6 +401,13 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
 </form>`;
 }
 
+/** Constant-time string comparison for secrets (length leak is acceptable). */
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
 // ─── app factory ────────────────────────────────────────────────────────────
 
 export function createWebApp(deps: WebDeps): Hono {
@@ -426,7 +457,7 @@ export function createWebApp(deps: WebDeps): Hono {
 
   function isAuthenticated(c: any): boolean {
     const auth = c.req.header("authorization") ?? "";
-    if (webToken && auth === `Bearer ${webToken}`) return true;
+    if (webToken && safeEqual(auth, `Bearer ${webToken}`)) return true;
     const cookie = authStore.parseCookie(c.req.header("cookie"));
     if (cookie) {
       const tok = authStore.verifySignedToken(cookie);
@@ -605,7 +636,7 @@ ${hasToken ? `<div class="card">
     const body = await c.req.parseBody() as Record<string,string>;
     if (!checkCsrf(body as any)) return c.text("CSRF failed", 403);
     if (!webToken) return c.redirect("/auth?msg=" + encodeURIComponent("No PIBOT_WEB_TOKEN configured"));
-    if (String(body.token ?? "").trim() === webToken) {
+    if (safeEqual(String(body.token ?? "").trim(), webToken)) {
       invalidTokenAttempts = [];
       const tok = authStore.createSession();
       c.header("Set-Cookie", authStore.makeCookie(tok));
@@ -783,6 +814,20 @@ ${hasToken ? `<div class="card">
   });
 
   registerCoordinatorRoutes(app, deps, csrfToken, expectedOrigins());
+  registerInboxRoutes(app, deps, csrfToken, expectedOrigins());
+  registerEnrollmentRoutes(app, deps, csrfToken, expectedOrigins());
+  registerReviewRoutes(app, deps, csrfToken, expectedOrigins());
+  mountLabPaymentRoutes(app, {
+    getKey: () => deps.secrets?.get().labPayments?.stripeKey,
+    saveKey: async (stripeKey) => {
+      if (!deps.secrets) throw new Error("Encrypted settings unavailable");
+      await deps.secrets.save({ labPayments: { stripeKey } });
+    },
+    root: () => {
+      const agent = deps.agents.getAgent("lab");
+      return agent ? path.join(agent.dir, "private", "lab-recommendations") : undefined;
+    },
+  }, csrfToken, expectedOrigins());
 
   const agentOr404 = (id: string): LoadedAgent | null => {
     const a = deps.agents.getAgent(id);
@@ -798,7 +843,6 @@ ${hasToken ? `<div class="card">
         const sn = deps.scheduler.snoozeState(a.id);
         const staged = deps.evolution.staged(a.id);
         const skills = listSkillDirs(path.join(a.dir, "skills"));
-        const stagedDetail = deps.evolution.stagedDetail(a.id);
         return `<div class="card">
   <a href="/agents/${esc(a.id)}"><strong>${esc(a.id)}</strong></a>
   <span class="muted">${esc(a.manifest.description ?? "")}</span><br>
@@ -809,10 +853,7 @@ ${hasToken ? `<div class="card">
   ${skills.length ? `<span class="pill">${skills.length} skills</span>` : ""}
   ${staged.length ? `<span class="pill on">🧬 ${staged.length} staged</span>` : ""}
   ${sn ? `<span class="pill">😴 until ${esc(fmtWhen(sn.until))}</span>` : ""}
-  ${stagedDetail.length ? `<div style="margin-top:10px">${stagedDetail.map((s2) => {
-    const stagePath = `/agents/${esc(a.id)}/staged/${esc(s2.name)}`;
-    return `<a href="${stagePath}"><span class="pill on">${esc(s2.name)}</span></a> <a href="${stagePath}" class="mini">view</a> <form class="inline" method="post" action="${stagePath}/promote">${csrfField()}<button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="${stagePath}/reject">${csrfField()}<button class="mini danger" type="submit">reject</button></form>`;
-  }).join(" · ")}</div>` : ""}
+  ${staged.length ? `<p><a class="btn ghost" href="/review?agent=${encodeURIComponent(a.id)}">Review ${staged.length} proposed changes</a></p>` : ""}
 </div>`;
       })
       .join("\n");
@@ -829,7 +870,7 @@ ${hasToken ? `<div class="card">
     <form class="inline" method="post" action="/cascade/clear" data-swap="#cascade-card">${csrfField()}<button class="mini danger" type="submit">clear breakers</button></form>
   </div>
 </div>` : "";
-    return c.html(page("overview", `${deps.proactiveStore ? `<div class="card"><a href="/analytics">📊 Proactive analytics →</a> <span class="muted">commitment follow-through pilot</span></div>` : ""}${authBanner}${cascadeCard}${cards || '<p class="muted">No agents yet.</p>'}
+    return c.html(page("overview", `${deps.proactiveStore ? `<div class="card"><a href="/analytics">📊 Proactive analytics →</a> <span class="muted">commitment follow-through pilot</span></div>` : ""}<div class="card"><a href="/inbox">Lab inbox →</a> <span class="muted">Conversations, replies and runtime logs</span></div>${authBanner}${cascadeCard}<div data-admin-list="Agents">${cards || '<p class="muted">No agents yet.</p>'}</div>
 <h2>Telegram</h2>
 <div class="card">
   ${deps.telegram?.hasTransport("telegram")
@@ -1113,7 +1154,7 @@ ${hasToken ? `<div class="card">
       .join("\n") || `<tr><td colspan="4" class="muted">Nothing pending.</td></tr>`;
 
     const body = `
-${staged.length ? `<div class="flash warn" id="staged-banner">🧬 Staged for review: ${staged.map((s) => `<strong>${esc(s)}</strong>`).join(", ")}</div>` : ""}
+${staged.length ? `<div class="flash warn" id="staged-banner"><a href="/review?agent=${encodeURIComponent(agent.id)}">Review ${staged.length} proposed changes for ${esc(agent.id)}</a></div>` : ""}
 <div class="row">
   <div class="card"><span class="pill ${m.heartbeat?.enabled ? "on" : ""}">heartbeat ${esc(m.heartbeat?.interval ?? "off")}</span>
   <span class="pill ${m.evolution?.enabled ? "on" : ""}">evolution ${esc(m.evolution?.interval ?? "off")}</span>
@@ -1156,9 +1197,9 @@ ${manifestForm(agent, csrfToken)}
 </div>
 
 <h2>Skills</h2>
-<div class="card" id="skills-card">
+<div class="card" id="skills-card"><div data-admin-list="Installed skills">
   ${skills.length ? skills.map((s) => `<div><strong>${esc(s.name)}</strong> <span class="muted">${esc(s.description)}</span></div>`).join("") : '<span class="muted">No skills yet.</span>'}
-  ${staged.length ? `<div style="margin-top:12px"><strong>Staged:</strong> ${staged.map((s) => `<a href="/agents/${esc(agent.id)}/staged/${esc(s)}"><span class="pill on">${esc(s)}</span></a> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/promote" data-swap="#skills-card">${csrfField()}<button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/reject" data-swap="#skills-card">${csrfField()}<button class="mini danger" type="submit">reject</button></form>`).join(" · ")}</div>` : ""}
+  </div>${staged.length ? `<p><a href="/review?agent=${encodeURIComponent(agent.id)}">Review ${staged.length} proposed changes</a></p>` : ""}
 </div>
 
 <h2>Telegram sub-bot <span class="muted">(its own @identity)</span></h2>
@@ -1187,7 +1228,7 @@ ${manifestForm(agent, csrfToken)}
 </form>
 
 <h2>Capabilities <span class="muted">(what tools this agent may use)</span></h2>
-<div class="card" id="capabilities-card">
+<div class="card" id="capabilities-card" data-admin-list="Capabilities">
   ${CAPABILITY_REGISTRY.map((cap) => {
     const on = (agent.manifest.capabilities ?? []).includes(cap.id) || (cap.defaultEnabled && !agent.manifest.capabilities);
     const note = cap.prompt ?? "";
@@ -1361,29 +1402,11 @@ ${manifestForm(agent, csrfToken)}
     const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
     if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     deps.evolution.reject(c.req.param("id"), c.req.param("name"));
-    return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Rejected 🗑")}`);
+    return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Archived — recover it in Review changes")}`);
   });
 
-  app.get("/agents/:id/staged/:name", async (c) => {
-    const agent = agentOr404(c.req.param("id"));
-    if (!agent) return c.notFound();
-    const name = c.req.param("name");
-    const content = deps.evolution.stagedContent(agent.id, name);
-    if (content === undefined) return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Nothing staged under that name")}`);
-    const cand = deps.evolution.stagedDetail(agent.id).find((s2) => s2.name === name);
-    const meta = [
-      cand?.scores?.length ? `probes ${cand.scores.join(", ")}` : "",
-      cand?.closesBacklog?.length ? `closes ${cand.closesBacklog.join(", ")}` : "",
-    ].filter(Boolean).join(" · ");
-    const body = `<h2>Staged: <strong>${esc(name)}</strong> <span class="muted">${esc(cand?.mode ?? "create")}${meta ? ` · ${esc(meta)}` : ""}</span></h2>
-<div class="card"><pre class="events" style="max-height:520px">${esc(content)}</pre></div>
-<div class="card">
-  <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(name)}/promote">${csrfField()}<button class="mini" type="submit">✅ Promote</button></form>
-  <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(name)}/reject">${csrfField()}<button class="mini danger" type="submit">✖ Reject</button></form>
-  <a href="/agents/${esc(agent.id)}" style="margin-left:8px">← Back</a>
-</div>`;
-    return c.html(page(`${agent.id} · staged ${name}`, body, c.req.query("msg")));
-  });
+  // Old bookmarks land on the same review screen as the queue.
+  app.get("/agents/:id/staged/:name", c => c.redirect(`/review?${new URLSearchParams({agent:c.req.param("id"),id:`${c.req.param("id")}/${c.req.param("name")}`})}`));
 
   app.post("/agents/:id/rebind", async (c) => {
     const b = await c.req.parseBody() as Record<string,string>;

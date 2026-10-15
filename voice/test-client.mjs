@@ -17,14 +17,17 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true, 
     play() { return Promise.resolve(); }
     pause() { this.paused = true; }
   }
-  const elements = Object.fromEntries(['agent','start','stop','refresh','audio','status','agent-detail','play','transcript','mic','levels','mic-level','agent-level','device','scope-note','tools','tool-count','tools-none','tools-all','tools-toggle','tools-body','tools-presets','tools-head','live-agent'].map(id => [id,new Element(id)]));
+  const elements = Object.fromEntries(['agent','start','stop','refresh','audio','status','agent-detail','play','transcript','mic','levels','mic-level','agent-level','device','scope-note','tools','tool-count','tools-none','tools-all','tools-toggle','tools-body','tools-presets','tools-head','live-agent','mute','modes','mode-front','mode-agent','mode-realtime','mode-note','mode-box','live-caption','mic-wrap','tasks-card','tasks','info'].map(id => [id,new Element(id)]));
   const requests = [], replaced = [], timers = new Map();
-  let microphoneCalls = 0, tracksStopped = 0, rtcClosed = 0;
+  let microphoneCalls = 0, tracksStopped = 0, rtcClosed = 0; const channels = []; const intervals = new Set();
   const track = {stop() { tracksStopped++; }};
+  const sender = {track:{kind:'audio'},replaced:[],async replaceTrack(t) { this.replaced.push(t); }};
+  const track2 = {label:'USB mic',enabled:true,stop() {}};
   class RTC {
     iceGatheringState = 'complete';
-    createDataChannel() { return {}; }
+    createDataChannel() { const channel = {}; channels.push(channel); return channel; }
     addTrack() {}
+    getSenders() { return [sender]; }
     createOffer() { return Promise.resolve({type:'offer',sdp:'local-sdp'}); }
     setLocalDescription(description) { this.localDescription = description; return Promise.resolve(); }
     setRemoteDescription() { return Promise.resolve(); }
@@ -36,26 +39,27 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true, 
   const context = {
     document:{getElementById:id => elements[id],createElement:() => new Element()},
     location:{hash,pathname:'/',search:''},history:{replaceState(...args) { replaced.push(args); }},
-    ...(storage ? {sessionStorage:storage} : {}),URLSearchParams,AbortController,AbortSignal,RTCPeerConnection:RTC,window,
-    navigator:{mediaDevices:{async getUserMedia() { microphoneCalls++; return {getTracks:() => [track]}; }}},
+    ...(storage ? {sessionStorage:storage,localStorage:storage} : {}),URLSearchParams,AbortController,AbortSignal,RTCPeerConnection:RTC,window,
+    navigator:{mediaDevices:{async getUserMedia() { microphoneCalls++; const t = microphoneCalls > 1 ? track2 : track; return {getTracks:() => [t],getAudioTracks:() => [t]}; }}},
     setTimeout(fn,ms) { const id = timers.size + 1; timers.set(id,{fn,ms}); return id; },clearTimeout(id) { timers.delete(id); },
+    setInterval(fn,ms) { intervals.add(ms); return 'i' + ms; },clearInterval() { intervals.clear(); },
     async fetch(path,opts) {
       requests.push({path,opts});
-      return {ok:true,async json() { return path.startsWith('/api/tools') ? {groups:[{id:'core',tools:[{name:'read',description:'Read'},{name:'bash',description:'Shell'}]}]} : path === '/api/agents' ? {agents:[{id:'one',name:'One',model:'test-model',available,reason:available ? undefined : 'Model unavailable'}],audioReady,speechProvider:'Deepgram'} : {sdp:'remote-sdp',type:'answer',pc_id:'test'}; }};
+      return {ok:true,async json() { return path.startsWith('/api/tasks') ? {tasks:[{id:'t1',title:'Sources',status:'done',result:'Five found.',createdAt:Date.now()}]} : path.startsWith('/api/tools') ? {groups:[{id:'core',tools:[{name:'read',description:'Read'},{name:'bash',description:'Shell'}]}]} : path === '/api/agents' ? {agents:[{id:'one',name:'One',model:'test-model',available,reason:available ? undefined : 'Model unavailable'}],audioReady,speechProvider:'Deepgram'} : {sdp:'remote-sdp',type:'answer',pc_id:'test'}; }};
     },
   };
   vm.runInNewContext(script,context);
-  return {elements,requests,replaced,window,timers,counts:() => ({microphoneCalls,tracksStopped,rtcClosed})};
+  return {elements,requests,replaced,window,timers,intervals,track,sender,track2,channels,counts:() => ({microphoneCalls,tracksStopped,rtcClosed})};
 }
 
 test('missing token fails closed, strips fragment and makes no request',async () => {
   const ui = setup({hash:''}); await settle();
   assert.equal(ui.elements.start.disabled,true);
-  assert.match(ui.elements.status.textContent,/link from \/voice/);
+  assert.match(ui.elements.status.textContent,/open the link once/);
   assert.equal(ui.requests.length,0);
   assert.equal(ui.replaced[0][2],'/');
 });
-test('reload without fragment reuses the tab-scoped key',async () => {
+test('the bare address reuses the key remembered from the first link',async () => {
   const map = new Map(), storage = {getItem:k => map.get(k) ?? null,setItem:(k,v) => map.set(k,v),removeItem:k => map.delete(k)};
   setup({storage}); await settle();
   const reloaded = setup({hash:'',storage}); await settle();
@@ -65,7 +69,7 @@ test('reload without fragment reuses the tab-scoped key',async () => {
 test('missing Deepgram credential disables Start with actionable status',async () => {
   const ui = setup({audioReady:false}); await settle();
   assert.equal(ui.elements.start.disabled,true);
-  assert.match(ui.elements.status.textContent,/Speech isn’t configured/);
+  assert.match(ui.elements.status.textContent,/Speech isn’t set up/);
   ui.elements.start.handlers.click(); await settle();
   assert.equal(ui.counts().microphoneCalls,0);
 });
@@ -83,7 +87,7 @@ test('Start uses selected agent and bearer auth; Stop closes microphone and RTC'
   ui.elements.start.handlers.click(); await settle();
   assert.equal(ui.counts().microphoneCalls,1);
   const offer = ui.requests.find(request => request.path === '/api/offer');
-  assert.deepEqual(JSON.parse(offer.opts.body),{agentId:'one',sdp:'local-sdp',type:'offer',tools:['read','bash']});
+  assert.deepEqual(JSON.parse(offer.opts.body),{agentId:'one',sdp:'local-sdp',type:'offer',mode:'front',tools:['read','bash']});
   for (const request of ui.requests) {
     assert.equal(request.opts.headers.Authorization,'Bearer ' + token);
     assert.equal(request.opts.credentials,'omit');
@@ -99,7 +103,9 @@ test('Start uses selected agent and bearer auth; Stop closes microphone and RTC'
   assert.equal(ui.requests.at(-1).opts.method,'DELETE');
   assert.equal(ui.elements.start.disabled,false);
   assert.equal(ui.elements.stop.disabled,true);
-  assert.equal(ui.timers.size,0);
+  // the call's timers are gone; only the task panel's refresh keeps running
+  assert.ok(![...ui.timers.values()].some(timer => timer.ms === 15 * 60 * 1000));
+  assert.ok([...ui.timers.values()].every(timer => timer.ms === 5000));
 });
 
 test('the call carries the owner\'s tool choice: every tool by default, none after the preset',async () => {
@@ -112,4 +118,66 @@ test('the call carries the owner\'s tool choice: every tool by default, none aft
   ui.elements.start.handlers.click(); await settle();
   offer = ui.requests.filter(request => request.path === '/api/offer').at(-1);
   assert.deepEqual(JSON.parse(offer.opts.body).tools,[]);
+});
+
+test('mute disables the microphone track for the call and resets when it ends',async () => {
+  const ui = setup(); await settle();
+  assert.equal(ui.elements.mute.hidden,true);
+  ui.elements.start.handlers.click(); await settle();
+  assert.equal(ui.elements.mute.hidden,false);
+  ui.elements.mute.handlers.click();
+  assert.equal(ui.track.enabled,false);
+  assert.equal(ui.elements.mute.textContent,'Unmute');
+  ui.elements.mute.handlers.click();
+  assert.equal(ui.track.enabled,true);
+  ui.elements.mute.handlers.click();
+  ui.elements.stop.handlers.click(); await settle();
+  assert.equal(ui.elements.mute.hidden,true);
+  assert.equal(ui.elements.mute.textContent,'Mute');
+});
+
+test('the call uses the chosen voice mode, and the task panel lists background tasks',async () => {
+  const ui = setup(); await settle();
+  assert.equal(ui.elements['tasks-card'].hidden,false);
+  assert.equal(ui.elements.tasks.children.length,1);
+  ui.elements['mode-agent'].handlers.click();
+  ui.elements.start.handlers.click(); await settle();
+  const offer = ui.requests.find(request => request.path === '/api/offer');
+  assert.equal(JSON.parse(offer.opts.body).mode,'agent');
+  assert.equal(ui.elements['mode-front'].disabled,true);
+});
+
+test('an end message from the agent ends the call like pressing End',async () => {
+  const ui = setup(); await settle();
+  ui.elements.start.handlers.click(); await settle();
+  assert.equal(ui.elements.stop.disabled,false);
+  ui.channels.at(-1).onmessage({data:JSON.stringify({type:'end',text:'Call ended.'})}); await settle();
+  assert.equal(ui.elements.stop.disabled,true);
+  assert.equal(ui.counts().tracksStopped,1);
+  assert.equal(ui.requests.at(-1).opts.method,'DELETE');
+  assert.equal(ui.elements.status.textContent,'Call ended');
+});
+
+test('switching the microphone during a call swaps the sent track and keeps mute',async () => {
+  const ui = setup(); await settle();
+  ui.elements.start.handlers.click(); await settle();
+  assert.equal(ui.elements.mic.disabled,false);
+  ui.elements.mute.handlers.click();
+  ui.elements.mic.value = 'usb'; ui.elements.mic.handlers.change(); await settle();
+  assert.deepEqual(ui.sender.replaced,[ui.track2]);
+  assert.equal(ui.counts().tracksStopped,1);
+  assert.equal(ui.track2.enabled,false);
+  assert.equal(ui.counts().microphoneCalls,2);
+});
+
+test('the call bar shows the mode and a running clock that stops with the call',async () => {
+  const ui = setup(); await settle();
+  assert.match(ui.elements['mode-note'].textContent,/background tasks/);
+  assert.match(ui.elements['mode-front'].attrs['data-tip'],/background tasks/);
+  assert.equal(ui.elements['mode-realtime'].hidden,true); // no realtime key reported
+  ui.elements.start.handlers.click(); await settle();
+  assert.match(ui.elements['live-caption'].textContent,/^Fast · 0:00( · connecting…)?$/);
+  assert.ok(ui.intervals.has(1000));
+  ui.elements.stop.handlers.click(); await settle();
+  assert.equal(ui.intervals.size,0);
 });

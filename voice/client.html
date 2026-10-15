@@ -5,83 +5,88 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Voice</title>
 <style>
+@font-face{font-family:"Manrope";font-style:normal;font-weight:400;font-display:swap;src:url("/assets/lab/manrope-regular.ttf") format("truetype")}
+@font-face{font-family:"Manrope";font-style:normal;font-weight:600;font-display:swap;src:url("/assets/lab/manrope-semibold.ttf") format("truetype")}
+@font-face{font-family:"EB Garamond";font-style:normal;font-weight:400;font-display:swap;src:url("/assets/lab/eb-garamond-regular.ttf") format("truetype")}
+@font-face{font-family:"IBM Plex Mono";font-style:normal;font-weight:400;font-display:swap;src:url("/assets/lab/ibm-plex-mono-regular.ttf") format("truetype")}
 :root{
-  --bg:#f3f0e8;--card:#fffdf8;--ink:#20241e;--muted:#5d6459;--line:#e2ded2;--field:#ffffff;
-  --accent:#2f5d3a;--accent-ink:#ffffff;--accent-soft:#e3ecdf;--end:#b3412e;--end-soft:#f6e1dc;
-  --chip:#f1eee6;--chip-on:#2f5d3a;--chip-on-ink:#ffffff;--focus:#b58336;
-  --shadow:0 18px 50px #20241e10;--ring:0 0 0 14px #2f5d3a1f;
-  color-scheme:light;
+  --bg:#f3f0e8;--card:#faf8f2;--ink:#090909;--muted:#57534c;--line:rgba(9,9,9,.20);--field:#fffdf8;
+  --accent:#d01920;--accent-ink:#ffffff;--accent-soft:#f2ded8;--end:#a81119;--end-soft:#f2ded8;--end-fill:#090909;
+  --chip:#eae5da;--chip-on:#d01920;--chip-on-ink:#ffffff;--focus:#d01920;
+  --shadow:none;--ring:none;color-scheme:light;
 }
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
-  --bg:#151815;--card:#1d211d;--ink:#eef0ea;--muted:#a9b0a3;--line:#323830;--field:#232823;
-  --accent:#7fbf8c;--accent-ink:#10160f;--accent-soft:#25322a;--end:#f08a73;--end-soft:#3a2622;
-  --chip:#272c26;--chip-on:#7fbf8c;--chip-on-ink:#10160f;--focus:#e0b061;
-  --shadow:0 18px 50px #00000059;--ring:0 0 0 14px #7fbf8c26;color-scheme:dark;}}
+  --bg:#191715;--card:#221f1c;--ink:#f3f0e8;--muted:#c5beb2;--line:#575149;--field:#292521;
+  --accent:#ff777b;--accent-ink:#191715;--accent-soft:#40282a;--end:#ff999c;--end-soft:#40282a;--end-fill:#a81119;
+  --chip:#312c27;--chip-on:#ff777b;--chip-on-ink:#191715;--focus:#ff999c;color-scheme:dark;}}
 :root[data-theme="dark"]{
-  --bg:#151815;--card:#1d211d;--ink:#eef0ea;--muted:#a9b0a3;--line:#323830;--field:#232823;
-  --accent:#7fbf8c;--accent-ink:#10160f;--accent-soft:#25322a;--end:#f08a73;--end-soft:#3a2622;
-  --chip:#272c26;--chip-on:#7fbf8c;--chip-on-ink:#10160f;--focus:#e0b061;
-  --shadow:0 18px 50px #00000059;--ring:0 0 0 14px #7fbf8c26;color-scheme:dark;}
+  --bg:#191715;--card:#221f1c;--ink:#f3f0e8;--muted:#c5beb2;--line:#575149;--field:#292521;
+  --accent:#ff777b;--accent-ink:#191715;--accent-soft:#40282a;--end:#ff999c;--end-soft:#40282a;--end-fill:#a81119;
+  --chip:#312c27;--chip-on:#ff777b;--chip-on-ink:#191715;--focus:#ff999c;color-scheme:dark;}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.55 Manrope,Arial,sans-serif}
 main{max-width:1180px;margin:0 auto;padding:clamp(16px,4vw,48px);display:grid;grid-template-columns:minmax(0,5fr) minmax(0,6fr);gap:clamp(16px,2.5vw,32px);align-items:start}
-.card{background:var(--card);border:1px solid var(--line);border-radius:28px;box-shadow:var(--shadow);padding:clamp(20px,3vw,36px)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:2px;box-shadow:var(--shadow);padding:clamp(20px,3vw,36px)}
 .talk{position:sticky;top:24px;display:flex;flex-direction:column;gap:22px}
 .side{display:flex;flex-direction:column;gap:clamp(16px,2.5vw,32px)}
 h2{font-size:1.45rem;letter-spacing:-.02em;margin:0}
 .row{display:flex;gap:12px;align-items:center}
-select{font:inherit;color:var(--ink);background:var(--field);border:1px solid var(--line);border-radius:18px;padding:0 18px;min-height:64px;width:100%;appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 26px) 50%,calc(100% - 20px) 50%;background-size:6px 6px;background-repeat:no-repeat}
+select{font:inherit;color:var(--ink);background:var(--field);border:1px solid var(--line);border-radius:2px;padding:0 18px;min-height:64px;width:100%;appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 26px) 50%,calc(100% - 20px) 50%;background-size:6px 6px;background-repeat:no-repeat}
 #agent{font-size:1.6rem;font-weight:650;letter-spacing:-.02em;min-height:76px}
 #mic{min-height:52px;font-size:.95rem;color:var(--muted)}
 button{font:inherit;color:inherit;cursor:pointer;border:0;background:none}
 button:disabled{cursor:not-allowed;opacity:.45}
 button:focus-visible,select:focus-visible{outline:3px solid var(--focus);outline-offset:3px}
-.icon{width:64px;height:64px;flex:none;border-radius:18px;border:1px solid var(--line);background:var(--field);font-size:1.5rem}
+.icon{width:64px;height:64px;flex:none;border-radius:2px;border:1px solid var(--line);background:var(--field);font-size:1.5rem}
 .stage{display:grid;place-items:center;padding:18px 0 6px}
-.big{width:min(240px,62vw);aspect-ratio:1;border-radius:50%;font-size:2rem;font-weight:700;letter-spacing:-.02em;transition:transform .15s ease,box-shadow .3s ease}
+.big{width:min(240px,62vw);aspect-ratio:1;border-radius:2px;font-size:2rem;font-weight:700;letter-spacing:-.02em;transition:transform .15s ease,box-shadow .3s ease}
 .big:not(:disabled):hover{transform:scale(1.03)}
 #start{background:var(--accent);color:var(--accent-ink);box-shadow:var(--ring)}
-#stop{background:var(--end);color:#fff;box-shadow:0 0 0 14px var(--end-soft);animation:breathe 2.4s ease-in-out infinite}
+#stop{background:var(--end-fill);color:#fff;box-shadow:none}
 @keyframes breathe{50%{box-shadow:0 0 0 24px var(--end-soft)}}
 @media (prefers-reduced-motion:reduce){#stop{animation:none}.big{transition:none}}
 #status{font-size:1.15rem;font-weight:600;text-align:center;min-height:1.6em;margin:0}
 #levels{display:grid;gap:10px}
 .level{display:grid;grid-template-columns:4.5em 1fr;align-items:center;gap:12px;font-size:.9rem;color:var(--muted)}
-meter{width:100%;height:14px;border-radius:7px}
-meter::-webkit-meter-bar{background:var(--chip);border:0;border-radius:7px;height:14px}
-meter::-webkit-meter-optimum-value{background:var(--accent);border-radius:7px}
-meter::-moz-meter-bar{background:var(--accent);border-radius:7px}
+meter{width:100%;height:14px;border-radius:2px}
+meter::-webkit-meter-bar{background:var(--chip);border:0;border-radius:2px;height:14px}
+meter::-webkit-meter-optimum-value{background:var(--accent);border-radius:2px}
+meter::-moz-meter-bar{background:var(--accent);border-radius:2px}
 #device{font-size:.9rem;color:var(--muted);text-align:center}
-#play{min-height:56px;border-radius:18px;background:var(--accent-soft);font-weight:650}
+#play{min-height:56px;border-radius:2px;background:var(--accent-soft);font-weight:650}
 .tools-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px}
 #tool-count{color:var(--muted);font-size:.95rem;margin-left:8px;font-weight:500}
-.seg{display:flex;background:var(--chip);border-radius:16px;padding:4px}
-.seg button{min-height:48px;padding:0 20px;border-radius:12px;font-weight:650}
-.seg button[aria-pressed="true"]{background:var(--card);box-shadow:0 2px 8px #0000001a}
+.seg{display:flex;background:var(--chip);border-radius:2px;padding:4px}
+.seg button{min-height:48px;padding:0 20px;border-radius:2px;font-weight:650}
+.seg button[aria-pressed="true"]{background:var(--card);box-shadow:none}
 #tools{display:grid;gap:12px}
-.group{border:1px solid var(--line);border-radius:20px;padding:8px 12px}
+.group{border:1px solid var(--line);border-radius:2px;padding:8px 12px}
 .group-head{display:flex;align-items:center;gap:6px;min-height:60px}
-.toggle{display:grid;place-items:center;width:72px;height:56px;flex:none;border-radius:16px}
-.expand{flex:1;display:flex;align-items:center;gap:12px;min-height:56px;text-align:left;font-size:1.1rem;font-weight:650;border-radius:14px;padding:0 8px}
+.toggle{display:grid;place-items:center;width:72px;height:56px;flex:none;border-radius:2px}
+.expand{flex:1;display:flex;align-items:center;gap:12px;min-height:56px;text-align:left;font-size:1.1rem;font-weight:650;border-radius:2px;padding:0 8px}
 .expand::after{content:"›";font-size:1.6rem;color:var(--muted);transition:transform .2s;line-height:1}
 .expand[aria-expanded="true"]::after{transform:rotate(90deg)}
-.switch{flex:none;width:58px;height:34px;border-radius:17px;background:var(--chip);position:relative;transition:background .2s}
-.switch::after{content:"";position:absolute;top:4px;left:4px;width:26px;height:26px;border-radius:50%;background:var(--card);box-shadow:0 1px 4px #0003;transition:left .2s}
+.switch{flex:none;width:58px;height:34px;border-radius:2px;background:var(--chip);position:relative;transition:background .2s}
+.switch::after{content:"";position:absolute;top:4px;left:4px;width:26px;height:26px;border-radius:2px;background:var(--card);box-shadow:none;transition:left .2s}
 [aria-checked="true"] > .switch{background:var(--accent)}
 [aria-checked="true"] > .switch::after{left:28px}
 [aria-checked="mixed"] > .switch{background:var(--accent);opacity:.55}
 [aria-checked="mixed"] > .switch::after{left:16px}
 .expand small{margin-left:auto;color:var(--muted);font-weight:500;font-size:.95rem;white-space:nowrap}
 .chips{display:flex;flex-wrap:wrap;gap:8px;padding:4px 8px 12px}
-.chip{min-height:44px;padding:0 16px;border-radius:22px;border:1.5px dashed var(--line);color:var(--muted);font-size:.95rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.tool-list{flex-direction:column;flex-wrap:nowrap}
+.tool-row{display:flex;align-items:center;gap:12px;min-width:0}
+.tool-row .chip{flex:none;white-space:nowrap}
+.tool-desc{color:var(--muted);font-size:.9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.chip{min-height:44px;padding:0 16px;border-radius:2px;border:1.5px dashed var(--line);color:var(--muted);font-size:.95rem;font-family:"IBM Plex Mono",monospace}
 .chip[aria-pressed="true"]{border:1.5px solid transparent;background:var(--accent-soft);color:var(--ink)}
 .chip[aria-pressed="true"]::before{content:"✓ ";color:var(--accent);font-weight:700}
 .empty{color:var(--muted);margin:0}
 .transcript{max-height:46vh;overflow:auto;display:flex;flex-direction:column;gap:12px}
-.turn{padding:14px 18px;border-radius:20px;background:var(--chip);white-space:pre-wrap;overflow-wrap:anywhere;max-width:92%}
+.turn{padding:14px 18px;border-radius:2px;background:var(--chip);white-space:pre-wrap;overflow-wrap:anywhere;max-width:92%}
 .turn.you{align-self:flex-end;background:var(--accent-soft)}
 .turn strong{display:block;font-size:.85rem;color:var(--muted);margin-bottom:2px}
-#transcript:empty::before{content:"Your conversation appears here.";color:var(--muted)}
+#transcript:empty::before{content:"Press Talk and start speaking — what you both say shows up here.";color:var(--muted)}
 #agent-detail{margin:-10px 0 0;color:var(--end);font-size:.95rem}
 #agent-detail:empty{display:none}
 #scope-note{grid-column:1/-1;text-align:center;color:var(--muted);font-size:.85rem;margin:0}
@@ -90,36 +95,121 @@ meter::-moz-meter-bar{background:var(--accent);border-radius:7px}
 .tools-title[aria-expanded="true"]::after{transform:rotate(90deg)}
 .tools-head.closed{margin-bottom:0}
 .live-only{display:none}
+#modes{display:flex}
+#mode-note{display:none;margin:10px 4px 0;color:var(--muted);font-size:.95rem}
+#scope-note{display:none}
+@media (hover:none){#mode-note,#scope-note{display:block}#info{display:none}}
+#modes button{flex:1}
+.task{border-top:1px solid var(--line)}
+.task:first-child{border-top:0}
+.task-head{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:4px 12px;width:100%;padding:14px 6px;text-align:left;border-radius:2px}
+.task-head:hover{background:var(--chip)}
+.task-head b{font-weight:650;overflow-wrap:anywhere}
+.task-head small{grid-column:2/-1;color:var(--muted);font-size:.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--muted)}
+.dot.running,.dot.queued{background:var(--accent);animation:pulse 1.6s ease-in-out infinite}
+.dot.done{background:var(--accent)}
+.dot.failed{background:var(--end)}
+.dot.cancelled{background:var(--line)}
+@keyframes pulse{50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){.dot{animation:none!important}}
+.pill{padding:3px 12px;border-radius:2px;font-size:.82rem;font-weight:650;background:var(--chip)}
+.pill.running,.pill.queued{background:var(--accent-soft)}
+.pill.done{background:var(--accent);color:var(--accent-ink)}
+.pill.failed{background:var(--end-soft);color:var(--end)}
+.task-detail{display:grid;gap:16px;padding:4px 6px 18px 28px}
+.task-detail h3{margin:0 0 6px;font-size:.78rem;letter-spacing:.02em;color:var(--muted);font-weight:650}
+.task-detail p{margin:0;line-height:1.55}
+.steps{list-style:none;margin:0;padding:0;display:grid;gap:6px;border-left:2px solid var(--line);padding-left:14px}
+.steps li{display:flex;gap:10px;align-items:baseline;min-width:0}
+.steps .tool{flex:none;padding:1px 8px;border-radius:2px;background:var(--chip);font:600 .8rem "IBM Plex Mono",monospace}
+.steps .arg{font:.85rem "IBM Plex Mono",monospace;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.steps .note{font-size:.92rem}
+.task-detail .result{max-height:40vh;overflow:auto;background:var(--field);border:1px solid var(--line);border-radius:2px;padding:12px 14px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55}
+.task-detail .meta{color:var(--muted);font-size:.88rem}
+.task-cancel{justify-self:start;min-height:44px;padding:0 18px;border-radius:2px;border:1.5px solid var(--end);color:var(--end);font-weight:650}
+.task-cancel:hover{background:var(--end-soft)}
+.turn.event{align-self:center;background:transparent;border:1px dashed var(--line);font-size:.95rem;color:var(--muted)}
 /* During a call the talk card shrinks to one slim bar pinned on top; the conversation gets the room. */
-main.live{grid-template-columns:1fr}
-.live .talk{position:sticky;top:10px;z-index:5;flex-direction:row;flex-wrap:wrap;align-items:center;gap:10px 16px;padding:10px 12px 10px 20px;border-radius:24px}
-.live .talk > .row,.live #mic,.live #agent-detail{display:none}
-.live .live-only{display:block;font-weight:700;font-size:1.05rem}
-.live #status{flex:1;min-width:8em;text-align:left;font-size:1rem;font-weight:500;color:var(--muted)}
-.live #levels{display:flex;gap:14px;align-items:center}
-.live .level{grid-template-columns:auto 72px;gap:8px;font-size:.8rem}
-.live #device{max-width:22ch;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.8rem}
-.live .stage{padding:0;order:9}
-.live .big{width:auto;aspect-ratio:auto;min-height:52px;padding:0 26px;border-radius:26px;font-size:1.05rem;animation:none;box-shadow:none}
-.live #play{min-height:44px;padding:0 16px}
-.live #stop{animation:none;box-shadow:0 0 0 4px var(--end-soft)}
-.live .level meter{width:72px}
 .live .transcript{max-height:62vh}
+/* tooltips: hover and keyboard focus */
+[data-tip]{position:relative}
+[data-tip]:not([data-tip=""]):hover::after,[data-tip]:not([data-tip=""]):focus-visible::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 10px);transform:translateX(-50%);width:max-content;max-width:280px;padding:8px 12px;border-radius:2px;background:var(--ink);color:var(--bg);font-size:.85rem;font-weight:500;line-height:1.4;text-align:left;white-space:normal;z-index:20;pointer-events:none}
+.tip-below[data-tip]:hover::after,.tip-below[data-tip]:focus-visible::after{bottom:auto;top:calc(100% + 10px);left:0;transform:none}
+#info{font-size:1.3rem;color:var(--muted)}
+/* ── live call bar: one row; each signal shown once, inside the thing it belongs to ──
+   orb = the agent's voice · ring around the mic button = your voice · caption = mode, clock, exceptional state */
+.mic-wrap{display:block;position:relative}
+main.live{grid-template-columns:1fr}
+.live .talk{position:sticky;top:10px;z-index:5;flex-direction:row;align-items:center;gap:14px;padding:10px 10px 10px 16px;border-radius:2px}
+.live .talk > .row,.live #agent-detail,.live #mode-box,.live #status,.live #levels,.live #device{display:none}
+.live .live-only{display:block}
+.orb{position:relative;width:40px;height:40px;flex:none}
+.orb span{position:absolute;inset:0;border-radius:50%;background:var(--accent);transform:scale(calc(.82 + var(--voice,0)*.38));box-shadow:0 0 calc(var(--voice,0)*28px) calc(var(--voice,0)*8px) color-mix(in srgb,var(--accent) 55%,transparent);transition:transform .09s linear,box-shadow .09s linear}
+.ident{flex:1;min-width:0;line-height:1.25}
+.ident b{display:block;font-size:1.05rem;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#live-caption{display:block;font-size:.85rem;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#live-caption.warn{color:var(--end)}
+.live .stage{display:flex;gap:8px;align-items:center;padding:0;order:9}
+.live .mic-wrap,#mute{width:48px;height:48px;flex:none;border-radius:2px;border:1.5px solid var(--line);background:var(--field)}
+.live .mic-wrap{order:8;box-shadow:0 0 0 calc(var(--mic,0)*7px) color-mix(in srgb,var(--accent) 35%,transparent);transition:box-shadow .09s linear}
+.live #mic{position:absolute;inset:0;opacity:0;cursor:pointer;min-height:0;width:100%}
+.live .mic-wrap:focus-within{outline:3px solid var(--focus);outline-offset:3px}
+.live .mic-wrap::after{content:"";position:absolute;right:3px;bottom:3px;width:14px;height:14px;border-radius:2px;background:var(--card);border:1.5px solid var(--line);-webkit-mask:none;pointer-events:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-size:4px 4px;background-position:4px 5px,7px 5px;background-repeat:no-repeat}
+.live .mic-wrap::before,#mute::before,#stop::before{content:"";display:block;width:22px;height:22px;margin:auto;background:currentColor;-webkit-mask:var(--icon) center/contain no-repeat;mask:var(--icon) center/contain no-repeat}
+.live .mic-wrap::before{position:absolute;inset:0;--icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Crect x='9' y='3' width='6' height='12' rx='3'/%3E%3Cpath d='M5 11a7 7 0 0 0 14 0M12 18v3'/%3E%3C/svg%3E")}
+#mute{font-size:0;display:grid;place-items:center;--icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Crect x='9' y='3' width='6' height='12' rx='3'/%3E%3Cpath d='M5 11a7 7 0 0 0 14 0M12 18v3'/%3E%3Cpath d='M3 3l18 18'/%3E%3C/svg%3E")}
+#mute[aria-pressed="true"]{background:var(--end-soft);color:var(--end);border-color:transparent}
+.live #stop{width:auto;aspect-ratio:auto;height:48px;padding:0 20px 0 16px;border-radius:2px;display:flex;align-items:center;gap:8px;font-size:1rem;animation:none;box-shadow:none;--icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='black'%3E%3Cpath d='M12 9c-3.2 0-6.2.9-8.6 2.6-.6.4-.9 1.2-.6 1.9l1 2.3c.3.7 1.1 1 1.8.8l2.9-.9c.6-.2 1-.8 1-1.4V12.6c1.6-.4 3.4-.4 5 0v1.7c0 .6.4 1.2 1 1.4l2.9.9c.7.2 1.5-.1 1.8-.8l1-2.3c.3-.7 0-1.5-.6-1.9C18.2 9.9 15.2 9 12 9z'/%3E%3C/svg%3E")}
+.live #stop::before{margin:0}
+.live #play{order:7;min-height:44px;padding:0 16px;border-radius:2px}
+.live .transcript{max-height:62vh}
+.muted .mic-wrap{box-shadow:none}
+@media (prefers-reduced-motion:reduce){.orb span,.live .mic-wrap{transition:none}}
+@media (max-width:520px){#refresh{display:none}#agent{font-size:1.3rem;min-height:64px}.live .talk{gap:10px;padding-left:12px}.orb{width:32px;height:32px}.live #stop{padding:0 14px}}
 [hidden]{display:none!important}
-@media (max-width:860px){main{grid-template-columns:1fr}.talk{position:static}.live .talk{position:sticky}.live #levels .level span{display:none}.live .level{grid-template-columns:56px}.live .level meter{width:56px}}
+@media (max-width:860px){main{grid-template-columns:1fr}.talk{position:static}}
+
+/* Lab identity: paper, red ink, fine rules, square controls. */
+.big{font-weight:600;letter-spacing:-.04em;border:1px solid transparent}
+#start:not(:disabled):hover{background:var(--ink);color:var(--bg)}
+.seg button[aria-pressed="true"]{border-bottom:2px solid var(--accent)}
+.turn{border-left:2px solid var(--line)}
+.turn.you{border-left-color:var(--accent)}
+.task-detail h3,.pill,.turn strong{font-family:"IBM Plex Mono",monospace}
+
+
+/* A dedicated task column on wide desktops; ordered sections on narrow screens. */
+main{max-width:1800px;grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(300px,1fr);grid-template-areas:"talk conversation tasks" "tools conversation tasks";gap:24px}
+.talk{grid-area:talk;position:static}.live .talk{position:sticky}.conversation-card{grid-area:conversation}.tools-card{grid-area:tools}#tasks-card{grid-area:tasks}
+.conversation-card,#tasks-card{min-height:240px;min-width:0}#tasks-title{margin-bottom:20px}
+main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(300px,1fr);grid-template-areas:"talk talk talk" "tools conversation tasks"}
+@media(max-width:1279px){main{grid-template-columns:minmax(280px,1fr) minmax(300px,1.2fr);grid-template-areas:"talk conversation" "tools tasks"}main.live{grid-template-columns:1fr 1fr;grid-template-areas:"talk talk" "conversation tasks" "tools tools"}}
+@media(max-width:860px){main,main.live{grid-template-columns:minmax(0,1fr);grid-template-areas:"talk" "conversation" "tasks" "tools";gap:16px}.conversation-card,#tasks-card{min-height:160px}.talk{position:static}}
 </style>
 </head>
 <body>
 <main>
 <section class="card talk" aria-label="Talk">
-  <span id="live-agent" class="live-only"></span>
+  <span class="live-only orb" aria-hidden="true"><span></span></span>
+  <div class="live-only ident"><b id="live-agent"></b><span id="live-caption" aria-live="polite"></span></div>
   <div class="row">
+    <button id="info" class="icon tip-below" aria-label="About this call" data-tip="">ⓘ</button>
     <select id="agent" aria-label="Agent" disabled><option>Loading…</option></select>
     <button id="refresh" class="icon" aria-label="Refresh agents" title="Refresh agents" disabled>↻</button>
   </div>
   <p id="agent-detail"></p>
+  <div id="mode-box">
+    <div class="seg" id="modes" role="group" aria-label="Voice mode">
+      <button id="mode-front" aria-pressed="true">Fast</button>
+      <button id="mode-realtime" aria-pressed="false" hidden>Realtime</button>
+      <button id="mode-agent" aria-pressed="false">Agent</button>
+    </div>
+    <p id="mode-note"></p>
+  </div>
   <div class="stage">
     <button id="start" class="big" disabled>Talk</button>
+    <button id="mute" aria-pressed="false" aria-keyshortcuts="M" title="Mute (M)" hidden>Mute</button>
     <button id="stop" class="big" disabled hidden>End</button>
   </div>
   <p id="status" role="status" aria-live="polite">Checking…</p>
@@ -127,16 +217,19 @@ main.live{grid-template-columns:1fr}
   <div id="levels" hidden>
     <div class="level"><span>You</span><meter id="mic-level" min="0" max="1" value="0"></meter></div>
     <div class="level"><span>Agent</span><meter id="agent-level" min="0" max="1" value="0"></meter></div>
-    <div id="device"></div>
+    <div id="device" hidden></div>
   </div>
-  <select id="mic" aria-label="Microphone"><option value="">System microphone</option></select>
+  <span class="mic-wrap" id="mic-wrap" data-tip=""><select id="mic" aria-label="Microphone"><option value="">System microphone</option></select></span>
   <audio id="audio" autoplay></audio>
 </section>
-<div class="side">
-  <section class="card" aria-label="Conversation">
+  <section class="card conversation-card" aria-label="Conversation">
     <div id="transcript" class="transcript" role="log" aria-label="Conversation" aria-live="polite"></div>
   </section>
-  <section class="card" aria-labelledby="tools-toggle">
+  <section class="card" id="tasks-card" aria-labelledby="tasks-title">
+    <h2 id="tasks-title">Tasks</h2>
+    <div id="tasks"><p class="empty">Loading tasks…</p></div>
+  </section>
+  <section class="card tools-card" aria-labelledby="tools-toggle">
     <div class="tools-head" id="tools-head">
       <button id="tools-toggle" class="tools-title" aria-expanded="true" aria-controls="tools-body">Tools<span id="tool-count"></span></button>
       <div class="seg" id="tools-presets" role="group" aria-label="Tool presets">
@@ -146,7 +239,6 @@ main.live{grid-template-columns:1fr}
     </div>
     <div id="tools-body"><div id="tools"><p class="empty">Pick an agent to see its tools.</p></div></div>
   </section>
-</div>
 <p id="scope-note"></p>
 </main>
 <script>
@@ -156,8 +248,12 @@ main.live{grid-template-columns:1fr}
   const params = new URLSearchParams(location.hash.slice(1));
   const requestedAgent = params.get('agent');
   let secret = params.get('token') || '';
-  // Keep the key for this tab only, so a reload still works while the URL stays clean.
-  try { if (secret) sessionStorage.setItem('pibot-voice-token', secret); else secret = sessionStorage.getItem('pibot-voice-token') || ''; } catch {}
+  // Remember the key in this browser, so the bare address works after opening a /voice link once.
+  const KEY = 'pibot-voice-token';
+  const remembered = () => { try { return localStorage.getItem(KEY) || sessionStorage.getItem(KEY) || ''; } catch { return ''; } };
+  const forget = () => { try { localStorage.removeItem(KEY); sessionStorage.removeItem(KEY); } catch {} };
+  if (secret) { try { localStorage.setItem(KEY, secret); } catch { try { sessionStorage.setItem(KEY, secret); } catch {} } }
+  else secret = remembered();
   history.replaceState(null, '', location.pathname + location.search);
   // Opening a fresh launch link in an already-open tab only changes the fragment; reload to pick it up.
   window.addEventListener('hashchange', () => { if (new URLSearchParams(location.hash.slice(1)).has('token')) location.reload(); });
@@ -166,24 +262,123 @@ main.live{grid-template-columns:1fr}
   let agents = [], audioReady = false, pc = null, stream = null, active = false, stopping = false, generation = 0, timer = null, controller = null, meterContext = null, silenceTimer = null;
   // Tools for the selected agent: groups from the bot, the owner's choice remembered per agent.
   let toolGroups = [], chosen = new Set(); const expanded = new Set();
+  let muted = false;
+  const MODES = {
+    front: ['Fast', 'Answers in a few seconds. Longer work runs as background tasks you can follow below.'],
+    realtime: ['Realtime', 'OpenAI speech-to-speech: natural voice, interrupt any time. Same background tasks. Experimental.'],
+    agent: ['Agent', 'The full agent with all its tools on every turn. Slow, and the chat waits while it works.'],
+  };
+  let mode = 'front', realtimeReady = false; try { mode = localStorage.getItem('pibot-voice-mode') || 'front'; } catch {}
+  function showMode() {
+    if (!MODES[mode] || (mode === 'realtime' && !realtimeReady)) mode = 'front';
+    for (const id of Object.keys(MODES)) { const b = $('mode-' + id); b.setAttribute?.('aria-pressed', String(mode === id)); b.disabled = active || stopping; }
+    $('mode-realtime').hidden = !realtimeReady;
+    $('mode-note').textContent = MODES[mode][1];
+    for (const id of Object.keys(MODES)) $('mode-' + id).setAttribute?.('data-tip', MODES[id][1]);
+  }
+  // call clock in the call bar
+  let callStarted = 0, clock = null;
+  function tickClock() { const s = Math.floor((Date.now() - callStarted) / 1000); clockText = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); caption(); }
+  // ── background tasks (durable ledger) ──
+  let tasksTimer = null, confirmCancel = null; const openTasks = new Set();
+  const ago = ms => { const m = Math.round(ms / 60000); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.round(m / 60) + ' h ago'; };
+  async function loadTasks() {
+    clearTimeout(tasksTimer); tasksTimer = setTimeout(() => void loadTasks(), 5000);
+    const agentId = agentSelect.value; if (!agentId || !selected()?.available || !document.createElement) return;
+    let tasks = [];
+    try { const data = await (await api('/api/tasks?agentId=' + encodeURIComponent(agentId))).json(); tasks = Array.isArray(data?.tasks) ? data.tasks : []; } catch { if(agentId === agentSelect.value && (!$('tasks').children.length || $('tasks').textContent.trim() === 'Loading tasks…')) $('tasks').textContent = 'Tasks unavailable. Retrying…'; return; }
+    if (agentId !== agentSelect.value) return;
+    const box = $('tasks'); if (!box?.replaceChildren) return;
+    box.replaceChildren(); $('tasks-card').hidden = false;
+    if(!tasks.length){const empty=document.createElement('p');empty.className='empty';empty.textContent='No tasks yet. Ask your agent to work on something; its progress will appear here.';box.append(empty);return;}
+    const LABEL = { running: 'Running', queued: 'Queued', done: 'Done', failed: 'Failed', cancelled: 'Cancelled' };
+    const clock = ms => new Date(ms).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    const span = ms => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? s + ' s' : s < 3600 ? Math.round(s / 60) + ' min' : Math.floor(s / 3600) + ' h ' + Math.round((s % 3600) / 60) + ' min'; };
+    const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = String(text); return e; };
+    const stepText = st => (st.tool ? st.tool + ' ' : '') + (st.detail || '');
+    for (const t of tasks.slice(0, 8)) {
+      const live = t.status === 'running' || t.status === 'queued';
+      // structured steps from the bot; older services sent plain one-liners
+      const steps = Array.isArray(t.steps) ? t.steps.filter(x => x && typeof x.detail === 'string')
+        : Array.isArray(t.activity) ? t.activity.filter(x => typeof x === 'string').map(x => { const m = /^(\w+) (\{.*)$/.exec(x); return m ? { tool: m[1], detail: m[2].replace(/^\{"\w+":"?|"?\}?$/g, '').replace(/\\"/g, '"').replace(/\/Users\/[^/]+/g, '~') } : { detail: x }; }) : [];
+      const timing = live ? 'running for ' + span(Date.now() - t.createdAt) : (t.status === 'done' ? 'took ' : 'after ') + span(t.updatedAt - t.createdAt);
+      const outcome = t.status === 'done' ? t.result : t.status === 'failed' ? t.error : '';
+      const row = el('div', 'task');
+      const head = el('button', 'task-head'); head.type = 'button'; head.setAttribute?.('aria-expanded', String(openTasks.has(t.id)));
+      head.addEventListener('click', () => { openTasks.has(t.id) ? openTasks.delete(t.id) : openTasks.add(t.id); void loadTasks(); });
+      const summary = outcome ? String(outcome).replace(/\s+/g, ' ').slice(0, 160) : steps.length ? stepText(steps.at(-1)) : '';
+      head.append(el('span', 'dot ' + t.status), el('b', '', t.title ?? ''), el('span', 'pill ' + t.status, LABEL[t.status] || t.status), el('small', '', (summary ? summary + ' · ' : '') + timing));
+      row.append(head);
+      if (openTasks.has(t.id)) {
+        const more = el('div', 'task-detail');
+        const section = (label, body) => { const sec = el('section'); sec.append(el('h3', '', label), body); more.append(sec); };
+        if (t.instructions) section('Instructions', el('p', '', t.instructions));
+        if (steps.length) {
+          const list = el('ol', 'steps');
+          for (const st of steps) { const li = el('li'); st.tool ? li.append(el('span', 'tool', st.tool), el('span', 'arg', st.detail)) : li.append(el('span', 'note', st.detail)); list.append(li); }
+          section(live ? 'Working on' : 'Last steps', list);
+        }
+        if (outcome) section(t.status === 'failed' ? 'Error' : 'Result', el('div', 'result', outcome));
+        more.append(el('p', 'meta', `Started ${clock(t.createdAt)} · ${timing}${t.attempts > 1 ? ' · attempt ' + t.attempts : ''}`));
+        if (live) {
+          // two taps: a running task may be halfway through editing something
+          const stopBtn = el('button', 'task-cancel', confirmCancel === t.id ? 'Tap again to cancel' : 'Cancel task'); stopBtn.type = 'button';
+          stopBtn.addEventListener('click', async () => {
+            if (confirmCancel !== t.id) { confirmCancel = t.id; void loadTasks(); setTimeout(() => { if (confirmCancel === t.id) { confirmCancel = null; void loadTasks(); } }, 4000); return; }
+            confirmCancel = null; stopBtn.disabled = true; stopBtn.textContent = 'Cancelling…';
+            try { await api('/api/tasks/' + encodeURIComponent(t.id) + '/cancel?agentId=' + encodeURIComponent(agentId), {method:'POST'}); }
+            catch { stopBtn.disabled = false; stopBtn.textContent = 'Couldn’t cancel — try again'; return; }
+            void loadTasks();
+          });
+          more.append(stopBtn);
+        }
+        row.append(more);
+      }
+      box.append(row);
+    }
+  }
+  const micTracks = () => stream ? (stream.getAudioTracks?.() ?? stream.getTracks()) : [];
+  // Mute keeps the call open but sends silence: the track is disabled, not stopped.
+  function setMuted(next) {
+    muted = next && active;
+    for (const track of micTracks()) track.enabled = !muted;
+    $('mute').setAttribute?.('aria-pressed', String(muted)); $('mute').textContent = muted ? 'Unmute' : 'Mute';
+    document.querySelector?.('main')?.classList.toggle('muted', muted);
+    if (active) status(muted ? 'Muted.' : 'Listening.');
+  }
   const GROUP_NAMES = { core: 'Files & shell', scheduler: 'Reminders', tasks: 'Background tasks', memory: 'Memory', 'agent-comms': 'Other agents', questions: 'Questions', skills: 'Skills', 'calendar-read': 'Calendar', 'telegram-send': 'Telegram', delegate: 'Coding CLIs', dictionary: 'Dictionary', commitments: 'Commitments', herdr: 'Herdr', exec: 'Run commands', 'vault-file': 'Vault files' };
   const groupName = id => GROUP_NAMES[id] || id.replace(/[-_]/g, ' ').replace(/^./, c => c.toUpperCase());
   const allTools = () => toolGroups.flatMap(g => g.tools.map(t => t.name));
-  const status = text => { $('status').textContent = text; };
+  // Call-bar caption: mode · clock, plus a state only when it isn't the normal one
+  let liveState = '', liveWarn = false, clockText = '0:00';
+  function caption() {
+    const el = $('live-caption'); if (!el) return;
+    el.textContent = active ? [MODES[mode]?.[0], clockText, liveState].filter(Boolean).join(' · ') : '';
+    el.className = liveWarn ? 'warn' : '';
+  }
+  function warn(text) { liveState = text; liveWarn = !!text; caption(); }
+  // Status reads like a label: no trailing full stop, capitalised (the server sends "listening", "thinking")
+  const status = text => {
+    let t = String(text ?? '').trim().replace(/([^.])\.$/, '$1');
+    if (t === 'thinking') t = 'Thinking…';
+    $('status').textContent = t.charAt(0).toUpperCase() + t.slice(1);
+    if (!liveWarn) { liveState = /^(listening|ready|connected|)$/i.test(t) ? '' : t.charAt(0).toLowerCase() + t.slice(1); caption(); }
+  };
   const lastAgent = () => { try { return localStorage.getItem('pibot-voice-agent') || ''; } catch { return ''; } };
   const selected = () => agents.find(agent => agent.id === agentSelect.value);
   function controls() {
     agentSelect.disabled = active || stopping || !agents.length;
-    micSelect.disabled = active || stopping;
+    micSelect.disabled = stopping;
     startButton.disabled = active || stopping || !validToken || !audioReady || !selected()?.available;
     stopButton.disabled = !active;
-    startButton.hidden = active; stopButton.hidden = !active;
+    startButton.hidden = active; stopButton.hidden = !active; $('mute').hidden = !active;
     document.querySelector?.('main')?.classList.toggle('live', active);
+    caption();
     $('live-agent').textContent = active ? (selected()?.name || '') : '';
     refreshButton.disabled = active || stopping || !validToken;
     const agent = selected();
     $('agent-detail').textContent = agent && !agent.available ? (agent.reason || 'This agent is unavailable for voice.') : '';
-    renderTools();
+    renderTools(); showMode();
   }
   async function api(path, options = {}) {
     const response = await fetch(path, { ...options, signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(10000), credentials: 'omit', cache: 'no-store', headers: { 'Authorization': 'Bearer ' + secret, ...(options.body ? {'Content-Type':'application/json'} : {}) } });
@@ -208,7 +403,7 @@ main.live{grid-template-columns:1fr}
     renderTools();
   }
   // Tools card open/closed, remembered across visits.
-  let toolsOpen = true; try { toolsOpen = localStorage.getItem('pibot-voice-tools-open') !== '0'; } catch {}
+  let toolsOpen = false; try { toolsOpen = localStorage.getItem('pibot-voice-tools-open') === '1'; } catch {}
   function showToolsOpen() {
     $('tools-toggle').setAttribute?.('aria-expanded', String(toolsOpen));
     $('tools-body').hidden = !toolsOpen; $('tools-presets').hidden = !toolsOpen;
@@ -239,12 +434,14 @@ main.live{grid-template-columns:1fr}
       expand.append(label, meta);
       expand.addEventListener('click', () => { open ? expanded.delete(group.id) : expanded.add(group.id); renderTools(); });
       head.append(toggle, expand);
-      const chips = document.createElement('div'); chips.className = 'chips'; chips.hidden = !open;
+      const chips = document.createElement('div'); chips.className = 'chips tool-list'; chips.hidden = !open;
       for (const tool of group.tools) {
         const chip = document.createElement('button'); chip.type = 'button'; chip.className = 'chip'; chip.disabled = locked;
-        chip.textContent = tool.name; chip.title = tool.description || tool.name; chip.setAttribute('aria-pressed', String(chosen.has(tool.name)));
+        chip.textContent = tool.name; chip.setAttribute('aria-pressed', String(chosen.has(tool.name)));
         chip.addEventListener('click', () => { chosen.has(tool.name) ? chosen.delete(tool.name) : chosen.add(tool.name); saveChoice(); renderTools(); });
-        chips.append(chip);
+        const line = document.createElement('div'); line.className = 'tool-row';
+        const what = document.createElement('span'); what.className = 'tool-desc'; what.textContent = (tool.description || '').split(/(?<=[.!?])\s/)[0];
+        line.append(chip, what); chips.append(line);
       }
       wrap.append(head, chips); box.append(wrap);
     }
@@ -252,13 +449,13 @@ main.live{grid-template-columns:1fr}
   function closeLocal() {
     generation++;
     controller?.abort(); controller = null;
-    clearTimeout(timer); timer = null;
+    clearTimeout(timer); timer = null; clearInterval(clock); clock = null;
     if (pc) { pc.onconnectionstatechange = null; pc.ontrack = null; pc.close(); pc = null; }
     if (stream) { stream.getTracks().forEach(track => track.stop()); stream = null; }
     audio.pause(); audio.srcObject = null;
-    clearTimeout(silenceTimer); silenceTimer = null;
+    clearTimeout(silenceTimer); silenceTimer = null; voiceLevel = 0; document.querySelector?.('main')?.classList.remove('speaking');
     meterContext?.close().catch(() => {}); meterContext = null; $('levels').hidden = true;
-    $('play').hidden = true; active = false; controls();
+    $('play').hidden = true; active = false; muted = false; setMuted(false); controls();
   }
   async function stop(text = 'Call ended.') {
     if (stopping) return;
@@ -268,23 +465,35 @@ main.live{grid-template-columns:1fr}
     finally { stopping = false; controls(); }
   }
   // Live input/output level; returns a reader for the loudest sample seen so far.
+  const meterOwner = {};
   function meter(source, id) {
     const Context = window.AudioContext || window.webkitAudioContext;
     if (!Context) return null;
+    const owner = {}; meterOwner[id] = owner; // a newer source (e.g. switched mic) takes over this meter
     meterContext ??= new Context();
     const context = meterContext, analyser = context.createAnalyser();
     context.createMediaStreamSource(source).connect(analyser);
     const data = new Float32Array(analyser.fftSize), element = $(id);
     let peak = 0;
     const tick = () => {
-      if (meterContext !== context) return;
+      if (meterContext !== context || meterOwner[id] !== owner) return;
       analyser.getFloatTimeDomainData(data);
       let level = 0; for (const v of data) level = Math.max(level, Math.abs(v));
       peak = Math.max(peak, level); element.value = Math.min(1, level * 3);
+      if (id === 'agent-level') speaking(level);
+      else if (id === 'mic-level') document.querySelector?.('main')?.style?.setProperty('--mic', Math.min(1, level * 4).toFixed(3));
       requestAnimationFrame(tick);
     };
     tick();
     return () => peak;
+  }
+  // The agent's voice drives the orb and the equaliser (CSS variables; smoothed so it breathes, not flickers).
+  let voiceLevel = 0, eqPhase = 0;
+  function speaking(level) {
+    voiceLevel = voiceLevel * 0.7 + Math.min(1, level * 4) * 0.3; eqPhase += 0.35;
+    const root = document.querySelector?.('main'); if (!root?.style) return;
+    root.style.setProperty('--voice', voiceLevel.toFixed(3));
+    root.classList.toggle('speaking', voiceLevel > 0.06);
   }
   async function listMicrophones() {
     try {
@@ -301,8 +510,9 @@ main.live{grid-template-columns:1fr}
     try {
       const data = await (await api('/api/agents')).json();
       if (!Array.isArray(data.agents)) throw new Error('invalid-agents');
-      audioReady = data.audioReady === true;
+      audioReady = data.audioReady === true; realtimeReady = data.realtimeReady === true;
       $('scope-note').textContent = data.mode === 'shared' ? 'Shared with your Telegram chat · approvals stay there · audio via Deepgram · 15 min' : 'Isolated copy · no tools or chat history · audio via Deepgram · 15 min';
+      $('info').setAttribute?.('data-tip', $('scope-note').textContent);
       const previous = agentSelect.value;
       agents = data.agents.filter(a => typeof a.id === 'string' && typeof a.name === 'string' && typeof a.model === 'string' && typeof a.available === 'boolean');
       agentSelect.replaceChildren();
@@ -313,15 +523,14 @@ main.live{grid-template-columns:1fr}
       else if (requestedAgent && agents.some(a => a.id === requestedAgent && a.available)) agentSelect.value = requestedAgent;
       else if (lastAgent() && agents.some(a => a.id === lastAgent() && a.available)) agentSelect.value = lastAgent();
       else if (agents.some(a => a.available)) agentSelect.value = agents.find(a => a.available).id;
-      status(!audioReady ? 'Speech isn’t configured on the voice service.' : agents.length ? 'Ready.' : 'No agents available.');
+      status(!audioReady ? 'Speech isn’t set up — add the Deepgram key to the voice service, then reload' : agents.length ? 'Ready.' : 'No agents available.');
       void listMicrophones();
-      void loadTools();
+      void loadTools(); void loadTasks();
     } catch (error) {
       agents = []; agentSelect.replaceChildren();
       if (error?.status === 401) {
-        try { sessionStorage.removeItem('pibot-voice-token'); } catch {}
-        status('This link expired — send /voice again.');
-      } else status('Voice service unreachable.');
+        forget(); noKey('This page key is no longer valid. Send /voice and open the link once.');
+      } else status('Voice service isn’t running — start it with ./scripts/start-voice.sh, then reload');
     }
     controls();
   }
@@ -341,6 +550,11 @@ main.live{grid-template-columns:1fr}
     let message; try { message = JSON.parse(event.data); } catch { return; }
     if (!message || typeof message.text !== 'string') return;
     if (message.type === 'status') { status(message.text.slice(0, 500)); return; }
+    if (message.type === 'end') { void stop('Call ended.'); return; }
+    if (message.type === 'task') {
+      const line = document.createElement('div'); line.className = 'turn event'; line.textContent = message.text.slice(0, 500);
+      $('transcript').append(line); $('transcript').scrollTop = $('transcript').scrollHeight; void loadTasks(); return;
+    }
     if (!['user','assistant'].includes(message.type)) return;
     const turn = document.createElement('div'); turn.className = message.type === 'user' ? 'turn you' : 'turn';
     const name = document.createElement('strong'); name.textContent = message.type === 'user' ? 'You' : (selected()?.name || 'Agent');
@@ -352,16 +566,19 @@ main.live{grid-template-columns:1fr}
   async function start() {
     if (active || stopping || !selected()?.available || !validToken || !audioReady) return;
     active = true; const current = ++generation; controller = new AbortController(); const signal = controller.signal;
+    callStarted = Date.now(); liveState = ''; liveWarn = false; clearInterval(clock); clock = setInterval(tickClock, 1000); tickClock();
     timer = setTimeout(() => void stop('15-minute limit reached.'), 15 * 60 * 1000);
     controls(); $('transcript').replaceChildren(); status('Allow the microphone…');
     try {
       const media = await navigator.mediaDevices.getUserMedia({audio: micSelect.value ? {deviceId:{exact:micSelect.value}} : true, video:false});
       if (current !== generation) { media.getTracks().forEach(track => track.stop()); return; }
       const input = media.getAudioTracks?.()[0], inputName = input?.label || 'your microphone';
-      $('levels').hidden = false; $('device').textContent = inputName + (input?.muted ? ' — muted by the system' : '');
+      $('levels').hidden = false; $('device').textContent = ''; $('device').hidden = true; micSelect.setAttribute?.('title', inputName);
+      $('mic-wrap').setAttribute?.('data-tip', inputName);
+      if (input?.muted) warn('mic muted by the system');
       const micPeak = meter(media, 'mic-level');
       if (micPeak) silenceTimer = setTimeout(() => {
-        if (current === generation && micPeak() < 0.01) $('device').textContent = `No sound from “${inputName}”. Pick another microphone or check macOS microphone access for this browser.`;
+        if (current === generation && !muted && micPeak() < 0.01) warn(`no sound from ${inputName} — pick another mic`), $('device').textContent = `No sound from “${inputName}”. Pick another microphone or check macOS microphone access for this browser.`;
       }, 6000);
       void listMicrophones();
       stream = media; pc = new RTCPeerConnection({iceServers:[]}); const connection = pc;
@@ -374,7 +591,7 @@ main.live{grid-template-columns:1fr}
       };
       connection.onconnectionstatechange = () => {
         if (current !== generation) return;
-        if (connection.connectionState === 'connected') status('Listening.');
+        if (connection.connectionState === 'connected') status(muted ? 'Muted.' : 'Listening.');
         if (['failed','disconnected','closed'].includes(connection.connectionState)) void stop('Connection ended.');
       };
       stream.getTracks().forEach(track => connection.addTrack(track, stream));
@@ -383,7 +600,7 @@ main.live{grid-template-columns:1fr}
       await waitForIce(connection, signal);
       if (current !== generation) return;
       // tools: only send a choice when the agent's tools loaded; otherwise the agent keeps its own set
-      const offer = {agentId:agentSelect.value, sdp:connection.localDescription.sdp, type:'offer', ...(toolGroups.length ? {tools:allTools().filter(n => chosen.has(n))} : {})};
+      const offer = {agentId:agentSelect.value, sdp:connection.localDescription.sdp, type:'offer', mode, ...(toolGroups.length ? {tools:allTools().filter(n => chosen.has(n))} : {})};
       const response = await api('/api/offer', {method:'POST', signal, body:JSON.stringify(offer)});
       const answer = await response.json();
       if (current !== generation) return;
@@ -393,23 +610,52 @@ main.live{grid-template-columns:1fr}
     } catch (error) {
       if (current !== generation) return;
       const detail = error?.name ? error.name + (error?.message ? ' — ' + error.message : '') : String(error ?? 'unknown');
-      const message = error?.name === 'NotAllowedError' ? 'Microphone access was blocked.' : 'Couldn’t start (' + detail + ').';
+      const message = error?.name === 'NotAllowedError' ? 'Microphone access is blocked — allow it in the browser’s site settings, then press Talk'
+        : ['NotFoundError', 'OverconstrainedError', 'NotReadableError'].includes(error?.name) ? 'That microphone isn’t available — pick another one, then press Talk'
+        : error?.status === 409 ? 'Another call is still open — end it, then press Talk'
+        : error?.status === 503 || /ice-timeout|request-failed/.test(String(error?.message)) ? 'Couldn’t reach the voice service — check it’s running, then press Talk'
+        : 'Couldn’t start the call — press Talk to try again';
       console.error('[voice] start() failed:', detail, error);
       await stop(message);
     }
   }
-  agentSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-agent', agentSelect.value); } catch {} controls(); void loadTools(); });
-  micSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-mic', micSelect.value); } catch {} });
+  agentSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-agent', agentSelect.value); } catch {} controls(); void loadTools(); void loadTasks(); });
+  // Switching the microphone mid-call swaps the sent track in place; the call keeps running.
+  async function switchMicrophone() {
+    if (!active || !pc || !stream) return;
+    const current = generation;
+    try {
+      const media = await navigator.mediaDevices.getUserMedia({audio: micSelect.value ? {deviceId:{exact:micSelect.value}} : true, video:false});
+      if (current !== generation || !pc) { media.getTracks().forEach(t => t.stop()); return; }
+      const track = media.getAudioTracks()[0];
+      const sender = pc.getSenders().find(s => s.track?.kind === 'audio');
+      await sender?.replaceTrack(track);
+      stream.getTracks().forEach(t => t.stop()); stream = media; track.enabled = !muted;
+      $('mic-wrap').setAttribute?.('data-tip', track.label || 'Microphone'); warn(''); meter(media, 'mic-level');
+    } catch (error) { status('That microphone isn’t available — pick another one'); console.error('[voice] mic switch failed:', error); }
+  }
+  micSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-mic', micSelect.value); } catch {} void switchMicrophone(); });
   startButton.addEventListener('click', () => void start());
   stopButton.addEventListener('click', () => void stop());
   refreshButton.addEventListener('click', () => void refresh());
+  $('mute').addEventListener('click', () => setMuted(!muted));
+  for (const value of Object.keys(MODES)) $('mode-' + value).addEventListener('click', () => { mode = value; try { localStorage.setItem('pibot-voice-mode', mode); } catch {} showMode(); });
+  document.addEventListener?.('keydown', event => {
+    if (!active || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.key.toLowerCase() !== 'm') return;
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target?.tagName)) return;
+    event.preventDefault(); setMuted(!muted);
+  });
   $('tools-toggle').addEventListener('click', () => { toolsOpen = !toolsOpen; try { localStorage.setItem('pibot-voice-tools-open', toolsOpen ? '1' : '0'); } catch {} showToolsOpen(); });
   showToolsOpen();
   $('tools-none').addEventListener('click', () => { chosen = new Set(); saveChoice(); renderTools(); });
   $('tools-all').addEventListener('click', () => { chosen = new Set(allTools()); saveChoice(); renderTools(); });
   $('play').addEventListener('click', () => { audio.play().then(() => { $('play').hidden = true; }).catch(() => status('Audio playback is blocked by the browser.')); });
   window.addEventListener('pagehide', () => { const wasActive = active; closeLocal(); if (wasActive) void api('/api/session', {method:'DELETE',keepalive:true}).catch(() => {}); });
-  if (!validToken) { status('Open the link from /voice to begin.'); controls(); }
+  function noKey(text) {
+    const option = document.createElement('option'); option.textContent = 'Open the /voice link once'; agentSelect.replaceChildren(option);
+    status(text); controls();
+  }
+  if (!validToken) noKey('Send /voice in Telegram and open the link once — after that this address works on its own.');
   else if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) { status('This browser can’t do voice calls.'); }
   else void refresh();
 })();

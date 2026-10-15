@@ -40,11 +40,17 @@ export interface CallDispatchInput {
 export type CallDispatchResult = { status: 'accepted'; providerCallId: string } | { status: 'unknown' } |
   { status: 'rejected_preflight' }; // Only when the adapter guarantees no provider call was attempted.
 export interface CallDispatcher { dispatch(input: CallDispatchInput): Promise<CallDispatchResult> }
-export interface CallAttempt extends CallDispatchInput { status: 'accepted' | 'unknown' | 'rejected_preflight'; reservedAt: number; day: string; lineageId: string; providerCallId?: string }
+export interface CallUsageEvidence {
+  schemaVersion: 1; attemptId: string; providerCallId: string; currency: string;
+  checkedAt: number; terminal: true; confirmedTwilioMinor: number; remainingExposureMinor: number | null;
+}
+export interface CallUsageSettlement extends CallUsageEvidence { state: 'partial' | 'settled' }
+export interface CallAttempt extends CallDispatchInput { status: 'accepted' | 'unknown' | 'rejected_preflight'; reservedAt: number; day: string; lineageId: string; providerCallId?: string; usageSettlement?: CallUsageSettlement }
 export interface EscalationDependencies {
   databasePath: string; policy: CallPolicy; decisions(): CallDecision[];
   authority: { check(decision: CallDecision, expected?: { version: number; digest: string }): Promise<CallAuthorityResult> };
   sourceAuthority: { check(decision: CallDecision): Promise<SourceAuthorityResult> };
+  usageReconciler?: { check(attempt: CallAttempt): Promise<CallUsageEvidence | null> };
   dispatcher: CallDispatcher; clock?: () => number;
 }
 const DAY = 86_400_000;
@@ -77,6 +83,7 @@ export class UrgentCallEscalation {
     try { const st=fs.fstatSync(fd); if (!st.isFile() || st.uid!==process.getuid?.() || (st.mode&0o077)!==0) throw new Error('Unsafe call ledger'); } finally {fs.closeSync(fd);}
     this.db = new DatabaseSync(deps.databasePath);
     this.db.exec('PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS call_attempts(decision_id TEXT NOT NULL, question_version INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(decision_id,question_version)); CREATE TABLE IF NOT EXISTS accepted_message_observations(decision_id TEXT NOT NULL,question_version INTEGER NOT NULL,message_key TEXT NOT NULL,observed_at INTEGER NOT NULL,PRIMARY KEY(decision_id,question_version,message_key));');
+    this.db.exec('CREATE TABLE IF NOT EXISTS call_usage_settlements(attempt_id TEXT PRIMARY KEY,body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS call_usage_events(id INTEGER PRIMARY KEY,attempt_id TEXT NOT NULL,body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS call_usage_polls(attempt_id TEXT PRIMARY KEY,checked_at INTEGER NOT NULL);');
   }
   /** Conservative grace origin for older message receipts without an acceptance timestamp. */
   observeAcceptedMessage(decisionId:string,questionVersion:number,messageKey:string):number {
@@ -85,7 +92,40 @@ export class UrgentCallEscalation {
     this.db.prepare('INSERT OR IGNORE INTO accepted_message_observations VALUES(?,?,?,?)').run(decisionId,questionVersion,messageKey,now);
     return Number(this.db.prepare('SELECT observed_at FROM accepted_message_observations WHERE decision_id=? AND question_version=? AND message_key=?').get(decisionId,questionVersion,messageKey)!.observed_at);
   }
-  history(): CallAttempt[] { return this.db.prepare('SELECT body FROM call_attempts').all().map(r=>JSON.parse(String(r.body))); }
+  history(): CallAttempt[] { return this.db.prepare("SELECT a.body, u.body AS usage_body FROM call_attempts a LEFT JOIN call_usage_settlements u ON u.attempt_id=json_extract(a.body,'$.attemptId')").all().map(r=>({...JSON.parse(String(r.body)), ...(r.usage_body ? {usageSettlement:JSON.parse(String(r.usage_body))} : {})})); }
+  private validUsage(e: CallUsageEvidence | null, a: CallAttempt, now: number): e is CallUsageEvidence {
+    return !!e && e.schemaVersion===1 && e.terminal===true && e.attemptId===a.attemptId && e.providerCallId===a.providerCallId && e.currency===a.currency && Number.isSafeInteger(e.checkedAt) && e.checkedAt<=now && e.checkedAt>=now-30000 && Number.isSafeInteger(e.confirmedTwilioMinor) && e.confirmedTwilioMinor>=0 && (e.remainingExposureMinor===null || (Number.isSafeInteger(e.remainingExposureMinor) && e.remainingExposureMinor>=0 && Number.isSafeInteger(e.confirmedTwilioMinor+e.remainingExposureMinor)));
+  }
+  private async reconcile(): Promise<void> {
+    if(!this.deps.usageReconciler)return;
+    for(const a of this.history().filter(a=>a.ownerId===this.policy.ownerId && a.status==='accepted' && !!a.providerCallId && !a.usageSettlement)) {
+      if(this.stopped)return;
+      const now=this.clock(); let claimed=false;
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const last=this.db.prepare('SELECT checked_at FROM call_usage_polls WHERE attempt_id=?').get(a.attemptId);
+        const settled=this.db.prepare('SELECT 1 FROM call_usage_settlements WHERE attempt_id=?').get(a.attemptId);
+        if(!settled && (!last || Number(last.checked_at)<=now-60000)) {
+          this.db.prepare('INSERT INTO call_usage_polls VALUES(?,?) ON CONFLICT(attempt_id) DO UPDATE SET checked_at=excluded.checked_at').run(a.attemptId,now); claimed=true;
+        }
+        this.db.exec('COMMIT');
+      } catch(e) {this.db.exec('ROLLBACK');throw e;}
+      if(!claimed)continue;
+      let evidence:CallUsageEvidence|null;
+      try {evidence=await this.deps.usageReconciler.check(a);} catch {continue;}
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const latest=this.history().find(v=>v.attemptId===a.attemptId);
+        if(latest && latest.status==='accepted' && !latest.usageSettlement && this.validUsage(evidence,latest,this.clock())) {
+          const settlement:CallUsageSettlement={...evidence,state:evidence.remainingExposureMinor===0?'settled':'partial'};
+          const body=JSON.stringify(settlement);
+          this.db.prepare('INSERT OR IGNORE INTO call_usage_settlements VALUES(?,?)').run(a.attemptId,body);
+          this.db.prepare('INSERT INTO call_usage_events(attempt_id,body) VALUES(?,?)').run(a.attemptId,body);
+        }
+        this.db.exec('COMMIT');
+      } catch(e) {this.db.exec('ROLLBACK');throw e;}
+    }
+  }
   stop(): void { this.stopped=true; }
   close(): void { if(this.running)throw new Error('Stop and await tick before closing call ledger');this.stopped=true;this.db.close(); }
   private eligible(d: CallDecision, now: number, grace: number): boolean {
@@ -99,7 +139,7 @@ export class UrgentCallEscalation {
   async tick(): Promise<void> {
     if(this.stopped||this.running||!this.policy.enabled)return;
     this.running=true;
-    try { for(const initial of this.deps.decisions().map(d=>({...d}))) { if(this.stopped)break; try { await this.consider(initial); } catch { /* Authority/source/ledger failures never dispatch. Retry evaluation, not calls. */ } } }
+    try { await this.reconcile(); for(const initial of this.deps.decisions().map(d=>({...d}))) { if(this.stopped)break; try { await this.consider(initial); } catch { /* Authority/source/ledger failures never dispatch. Retry evaluation, not calls. */ } } }
     finally{this.running=false;}
   }
   private async consider(initial:CallDecision):Promise<void>{
@@ -122,7 +162,7 @@ export class UrgentCallEscalation {
       const current=this.deps.decisions().find(d=>d.id===initial.id);
       const history=this.history(),used=history.filter(a=>a.status!=='rejected_preflight'&&a.ownerId===p.ownerId);
       const cooldown=Math.max(p.cooldownMs,c.cooldownMs),limit=Math.min(p.maxCallsPerDay,c.maxCallsPerDay),ceiling=Math.min(p.maxSpendMinor,c.maxSpendMinor);
-      if(!this.stopped&&p.enabled&&current&&current.questionVersion===initial.questionVersion&&current.sourceContractId===initial.sourceContractId&&this.eligible(current,now,Math.max(p.messageGraceMs,c.messageGraceMs))&&source.usefulUntil>=current.deadline&&!history.some(a=>a.decisionId===current.id&&a.questionVersion===current.questionVersion)&&!used.some(a=>a.currency!==p.currency)&&used.filter(a=>a.reservedAt>now-DAY).length<limit&&!used.some(a=>a.reservedAt>now-cooldown)&&used.reduce((sum,a)=>sum+a.maxExposureMinor,0)+exposure<=ceiling) {
+      if(!this.stopped&&p.enabled&&current&&current.questionVersion===initial.questionVersion&&current.sourceContractId===initial.sourceContractId&&this.eligible(current,now,Math.max(p.messageGraceMs,c.messageGraceMs))&&source.usefulUntil>=current.deadline&&!history.some(a=>a.decisionId===current.id&&a.questionVersion===current.questionVersion)&&!used.some(a=>a.currency!==p.currency)&&used.filter(a=>a.reservedAt>now-DAY).length<limit&&!used.some(a=>a.reservedAt>now-cooldown)&&used.reduce((sum,a)=>sum+(a.usageSettlement ? (a.usageSettlement.remainingExposureMinor===null ? Math.max(a.maxExposureMinor,a.usageSettlement.confirmedTwilioMinor) : a.usageSettlement.confirmedTwilioMinor+a.usageSettlement.remainingExposureMinor) : a.maxExposureMinor),0)+exposure<=ceiling) {
         attempt={attemptId:randomUUID(),decisionId:current.id,questionVersion:current.questionVersion,sourceContractId:current.sourceContractId,sourceRevision:source.revision,ownerId:p.ownerId,recipientRef:p.recipientRef,maxDurationSeconds:duration,maxExposureMinor:exposure,currency:p.currency,consentId:c.id,consentVersion:c.version,consentDigest:c.digest,costScope:'telephone_speech_infrastructure',modelBudgetBound:false,lineageId:c.lineageId,status:'unknown',reservedAt:now,day:dayKey(now)};
         // Unknown from the instant of reservation: a crash cannot make this eligible again.
         this.db.prepare('INSERT INTO call_attempts VALUES(?,?,?)').run(current.id,current.questionVersion,JSON.stringify(attempt));
