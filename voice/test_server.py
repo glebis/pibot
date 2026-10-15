@@ -99,7 +99,12 @@ def test_canonical_mode_uses_bound_shared_session():
         assert c.post('/api/offer',headers=HEADERS,json={'agentId':'coach','sdp':'v=0','type':'offer'}).status_code==200
         assert ('post','/voice/browser-sessions',{'agentId':'coach','chatKey':'telegram:42'}) in b.calls
         c.delete('/api/session',headers=HEADERS)
+        assert c.post('/api/offer',headers=HEADERS,json={'agentId':'coach','sdp':'v=0','type':'offer','tools':['read']}).status_code==200
+        assert ('post','/voice/browser-sessions',{'agentId':'coach','chatKey':'telegram:42','tools':['read']}) in b.calls
+        assert c.post('/api/offer',headers=HEADERS,json={'agentId':'coach','sdp':'v=0','type':'offer','tools':'read'}).status_code==400
+        c.delete('/api/session',headers=HEADERS)
         assert ('delete','/voice/sessions/s-1') in b.calls
+        assert c.get('/api/tools?agentId=other',headers=HEADERS).status_code==404
 
 def test_public_origin_is_exact_and_https_only():
     with pytest.raises(ValueError):

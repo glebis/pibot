@@ -10,13 +10,14 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true, 
   class Element {
     constructor(id = '') { this.id = id; this.children = []; this.value = ''; this.disabled = ['start','stop','refresh','agent'].includes(id); this.hidden = id === 'play'; this.handlers = {}; this.textContent = ''; }
     addEventListener(name, fn) { this.handlers[name] = fn; }
+    setAttribute(name, value) { (this.attrs ??= {})[name] = value; }
     append(...children) { this.children.push(...children); if (this.id === 'agent' && !this.value) this.value = children[0].value; }
     replaceChildren() { this.children = []; this.value = ''; }
     get childElementCount() { return this.children.length; }
     play() { return Promise.resolve(); }
     pause() { this.paused = true; }
   }
-  const elements = Object.fromEntries(['agent','start','stop','refresh','audio','status','agent-detail','play','transcript','mic','levels','mic-level','agent-level','device','scope-note'].map(id => [id,new Element(id)]));
+  const elements = Object.fromEntries(['agent','start','stop','refresh','audio','status','agent-detail','play','transcript','mic','levels','mic-level','agent-level','device','scope-note','tools','tool-count','tools-none','tools-all'].map(id => [id,new Element(id)]));
   const requests = [], replaced = [], timers = new Map();
   let microphoneCalls = 0, tracksStopped = 0, rtcClosed = 0;
   const track = {stop() { tracksStopped++; }};
@@ -40,7 +41,7 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true, 
     setTimeout(fn,ms) { const id = timers.size + 1; timers.set(id,{fn,ms}); return id; },clearTimeout(id) { timers.delete(id); },
     async fetch(path,opts) {
       requests.push({path,opts});
-      return {ok:true,async json() { return path === '/api/agents' ? {agents:[{id:'one',name:'One',model:'test-model',available,reason:available ? undefined : 'Model unavailable'}],audioReady,speechProvider:'Deepgram'} : {sdp:'remote-sdp',type:'answer',pc_id:'test'}; }};
+      return {ok:true,async json() { return path.startsWith('/api/tools') ? {groups:[{id:'core',tools:[{name:'read',description:'Read'},{name:'bash',description:'Shell'}]}]} : path === '/api/agents' ? {agents:[{id:'one',name:'One',model:'test-model',available,reason:available ? undefined : 'Model unavailable'}],audioReady,speechProvider:'Deepgram'} : {sdp:'remote-sdp',type:'answer',pc_id:'test'}; }};
     },
   };
   vm.runInNewContext(script,context);
@@ -50,7 +51,7 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true, 
 test('missing token fails closed, strips fragment and makes no request',async () => {
   const ui = setup({hash:''}); await settle();
   assert.equal(ui.elements.start.disabled,true);
-  assert.match(ui.elements.status.textContent,/private launch link/);
+  assert.match(ui.elements.status.textContent,/link from \/voice/);
   assert.equal(ui.requests.length,0);
   assert.equal(ui.replaced[0][2],'/');
 });
@@ -64,7 +65,7 @@ test('reload without fragment reuses the tab-scoped key',async () => {
 test('missing Deepgram credential disables Start with actionable status',async () => {
   const ui = setup({audioReady:false}); await settle();
   assert.equal(ui.elements.start.disabled,true);
-  assert.match(ui.elements.status.textContent,/Deepgram credential/);
+  assert.match(ui.elements.status.textContent,/Speech isn’t configured/);
   ui.elements.start.handlers.click(); await settle();
   assert.equal(ui.counts().microphoneCalls,0);
 });
@@ -82,7 +83,7 @@ test('Start uses selected agent and bearer auth; Stop closes microphone and RTC'
   ui.elements.start.handlers.click(); await settle();
   assert.equal(ui.counts().microphoneCalls,1);
   const offer = ui.requests.find(request => request.path === '/api/offer');
-  assert.deepEqual(JSON.parse(offer.opts.body),{agentId:'one',sdp:'local-sdp',type:'offer'});
+  assert.deepEqual(JSON.parse(offer.opts.body),{agentId:'one',sdp:'local-sdp',type:'offer',tools:['read','bash']});
   for (const request of ui.requests) {
     assert.equal(request.opts.headers.Authorization,'Bearer ' + token);
     assert.equal(request.opts.credentials,'omit');
@@ -99,4 +100,16 @@ test('Start uses selected agent and bearer auth; Stop closes microphone and RTC'
   assert.equal(ui.elements.start.disabled,false);
   assert.equal(ui.elements.stop.disabled,true);
   assert.equal(ui.timers.size,0);
+});
+
+test('the call carries the owner\'s tool choice: every tool by default, none after the preset',async () => {
+  const ui = setup(); await settle();
+  ui.elements.start.handlers.click(); await settle();
+  let offer = ui.requests.find(request => request.path === '/api/offer');
+  assert.deepEqual(JSON.parse(offer.opts.body).tools,['read','bash']);
+  ui.elements.stop.handlers.click(); await settle();
+  ui.elements['tools-none'].handlers.click();
+  ui.elements.start.handlers.click(); await settle();
+  offer = ui.requests.filter(request => request.path === '/api/offer').at(-1);
+  assert.deepEqual(JSON.parse(offer.opts.body).tools,[]);
 });

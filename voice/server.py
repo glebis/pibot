@@ -7,6 +7,7 @@ import os
 import stat
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 from uuid import uuid4
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -132,6 +133,23 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
         except Exception:
             raise HTTPException(503, "Agent bridge unavailable") from None
 
+    @app.get("/api/tools")
+    async def tools(agentId: str = ""):
+        """The agent's tools for this chat, grouped by capability, so a call can enable a subset."""
+        if not canonical:
+            return {"groups": []}  # isolated copies have no tools
+        try:
+            chat_key = (await bindings()).get(agentId)
+            if not chat_key:
+                raise HTTPException(404, "Agent is not bound to a voice chat")
+            r = await bridge.get(f"/voice/tools?agentId={quote(agentId, safe='')}&chatKey={quote(chat_key, safe='')}")
+            r.raise_for_status()
+            return {"groups": r.json().get("groups", [])}
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(503, "Agent tools unavailable") from None
+
     @app.post("/api/offer")
     async def offer(request: Request):
         nonlocal handler
@@ -147,6 +165,9 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
         try:
             import json
             body = json.loads(raw)
+            tools = body.pop("tools", None)
+            if tools is not None and (not isinstance(tools, list) or len(tools) > 200 or not all(isinstance(t, str) and 0 < len(t) <= 80 for t in tools)):
+                raise ValueError()
             if set(body) != {"agentId", "sdp", "type"} or body["type"] != "offer" or not isinstance(body["sdp"], str) or not body["sdp"].startswith("v=0") or not isinstance(body["agentId"], str) or not 1 <= len(body["agentId"]) <= 64:
                 raise ValueError()
         except Exception:
@@ -159,7 +180,7 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
                     chat_key = (await bindings()).get(body["agentId"])
                     if not chat_key:
                         raise ValueError("Agent is not bound to a voice chat")
-                    response = await bridge.post("/voice/browser-sessions", json={"agentId": body["agentId"], "chatKey": chat_key})
+                    response = await bridge.post("/voice/browser-sessions", json={"agentId": body["agentId"], "chatKey": chat_key, **({"tools": tools} if tools is not None else {})})
                 else:
                     response = await bridge.post("/v1/sessions", json={"agentId": body["agentId"]})
                 response.raise_for_status()

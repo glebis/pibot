@@ -25,13 +25,17 @@ describe('canonical voice bridge',()=>{
   expect(h.session.subscribe).toHaveBeenCalledTimes(1);expect(h.agents.getOrCreateSession.mock.calls.at(-1)?.slice(0,3)).toEqual(['assistant','telegram:42',{transport:'telegram',chatId:'42'}]);
   expect(JSON.stringify([...h.b.agentChats].map(([k,v]:any)=>[k,[...v]]))).toBe(before);
  });
- it('refuses voice during a canonical text turn and serializes incoming text behind voice',async()=>{
+ it('queues voice behind a canonical text turn and serializes incoming text behind voice',async()=>{
   const h=harness();const hold=deferred();h.session.prompt.mockImplementationOnce(()=>hold.promise);
   const text=h.bot.promptAgent(h.t as any,'42','assistant','text',{taskAckFrom:null});
-  expect(await h.bot.voiceTurn(h.input)).toEqual({status:'busy'});hold.resolve();await text;
+  const queued=await h.bot.voiceTurn(h.input);
+  expect(queued.status).toBe('completed');expect(queued.text).toContain('queued');
+  hold.resolve();await text;await new Promise(r=>setTimeout(r,5));
+  expect(String((h.session.prompt.mock.calls[1] as any[])[0])).toContain('said on the voice call while you were still busy');
+  h.session.prompt.mockClear();
   const voiceHold=deferred();h.session.prompt.mockImplementationOnce(()=>voiceHold.promise);
   const voice=h.bot.voiceTurn(h.input);const next=h.bot.promptAgent(h.t as any,'42','assistant','next',{taskAckFrom:null});
-  await new Promise(r=>setTimeout(r,1));expect(h.session.prompt).toHaveBeenCalledTimes(2);voiceHold.resolve();await voice;await next;expect(h.session.prompt).toHaveBeenCalledTimes(3);
+  await new Promise(r=>setTimeout(r,1));expect(h.session.prompt).toHaveBeenCalledTimes(1);voiceHold.resolve();await voice;await next;expect(h.session.prompt).toHaveBeenCalledTimes(2);
  });
  it('denies unknown, group, foreign-owner, rebound, or pre-aborted attachments',async()=>{
   const h=harness();for(const change of [{chatKey:'telegram:-42'},{chatKey:'telegram:99'},{agentId:'other'},{signal:AbortSignal.abort()}])expect((await h.bot.voiceTurn({...h.input,...change})).status).toBe('denied');expect(h.session.prompt).not.toHaveBeenCalled();
@@ -70,7 +74,43 @@ describe('canonical voice bridge',()=>{
   h.session.prompt.mockImplementationOnce(async()=>{const hook=(h.agents.getOrCreateSession.mock.calls[0] as any)[4];await hook({text:'Approve?',options:['Confirm','Cancel']});});
   const required=vi.fn();const controller=new AbortController();const running=h.bot.voiceTurn({...h.input,onApprovalRequired:required,signal:controller.signal});
   await new Promise(r=>setTimeout(r,1));expect(required).toHaveBeenCalledTimes(1);controller.abort();
-  expect(await h.bot.voiceTurn(h.input)).toEqual({status:'busy'});hold.resolve();expect((await running).status).toBe('detached');
+  expect((await h.bot.voiceTurn(h.input)).text).toContain('queued');hold.resolve();expect((await running).status).toBe('detached');
+ });
+ it('narrows tools to the call\'s choice for the turn and restores the full set after',async()=>{
+  const h=harness();let active=['read','bash','start_task'];const seen:string[][]=[];
+  Object.assign(h.session,{getActiveToolNames:()=>[...active],setActiveToolsByName:vi.fn((n:string[])=>{active=[...n];}),getAllTools:()=>active.map(name=>({name,description:name+' tool'}))});
+  h.session.prompt.mockImplementationOnce(async()=>{seen.push([...active]);});
+  await h.bot.voiceTurn({...h.input,allowedTools:['read','start_task','not_an_agent_tool']});
+  expect(seen[0]).toEqual(['read','start_task']);expect(active).toEqual(['read','bash','start_task']);
+  const groups=await h.bot.voiceTools('assistant','telegram:42');
+  expect(groups!.flatMap(g=>g.tools.map(t=>t.name)).sort()).toEqual(['bash','read','start_task']);
+  expect(groups!.find(g=>g.id==='tasks')?.tools.map(t=>t.name)).toEqual(['start_task']);
+  expect(await h.bot.voiceTools('assistant','telegram:99')).toBeUndefined();
+ });
+ it('lets a live voice turn ask clarifying questions out loud instead of blocking on buttons',async()=>{
+  const h=harness();const ask=vi.fn();h.b.questions.ask=ask;let answer:any;
+  h.session.prompt.mockImplementationOnce(async()=>{const hook=(h.agents.getOrCreateSession.mock.calls[0] as any)[4];answer=await hook({text:'For what?',options:['A','B'],kind:'question'});});
+  await h.bot.voiceTurn(h.input);expect(answer).toMatchObject({spoken:true});expect(ask).not.toHaveBeenCalled();
+ });
+ it('tells the agent it is on a live call and caps utterances queued behind a busy chat',async()=>{
+  const h=harness();await h.bot.voiceTurn(h.input);expect(String((h.session.prompt.mock.calls[0] as any[])[0])).toContain('Live voice call');
+  const hold=deferred();h.session.prompt.mockImplementationOnce(()=>hold.promise);
+  const text=h.bot.promptAgent(h.t as any,'42','assistant','long',{taskAckFrom:null});
+  expect((await h.bot.voiceTurn(h.input)).status).toBe('completed');expect((await h.bot.voiceTurn(h.input)).status).toBe('completed');
+  expect(await h.bot.voiceTurn(h.input)).toEqual({status:'busy'});hold.resolve();await text;
+ });
+ it('delivers what a live voice turn cannot speak to the Telegram chat the call started from',async()=>{
+  const h=harness();const full='Speaking summary first. Then a link https://example.com/note. Plus a fallback sentence. One more sentence to speak. And a spare sentence. Last spare sentence.';
+  h.session.prompt.mockImplementationOnce(async()=>{h.subscribers.forEach(f=>f({type:'agent_end',messages:[{role:'assistant',content:[{type:'text',text:full}],stopReason:'stop'}]}));});
+  expect((await h.bot.voiceTurn(h.input)).status).toBe('completed');
+  const spoken=String((h.input.onOutput as ReturnType<typeof vi.fn>).mock.calls[0]![0]);
+  expect(spoken).toContain('Speaking summary first.');expect(spoken).not.toContain('https://');
+  expect(h.pushed).toEqual([full]);
+ });
+ it('never mirrors a fully speakable voice reply into the chat',async()=>{
+  const h=harness();h.session.prompt.mockImplementationOnce(async()=>{h.subscribers.forEach(f=>f({type:'agent_end',messages:[{role:'assistant',content:[{type:'text',text:'Short and speakable.'}],stopReason:'stop'}]}));});
+  expect((await h.bot.voiceTurn(h.input)).status).toBe('completed');
+  expect(h.pushed).toEqual([]);expect(h.input.onOutput).toHaveBeenCalledWith('Short and speakable.');
  });
  it('keeps confirmation hooks in the canonical chat and notifies the voice channel',async()=>{
   const h=harness();const ask=vi.fn(async()=>({choice:'Confirm',index:0,via:'button'}));h.b.questions.ask=ask;

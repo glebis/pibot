@@ -103,7 +103,7 @@ const installedDelegateClis = () => Object.keys(DELEGATE_CLIS).filter(executable
 
 const confirmMutation = (ctx: CapabilityContext) => async (description: string): Promise<boolean> => {
   if (!ctx.ask) return false;
-  const answer = await ctx.ask({ text: description, options: ["Confirm", "Cancel"], timeoutMs: 5 * 60_000 });
+  const answer = await ctx.ask({ text: description, options: ["Confirm", "Cancel"], timeoutMs: 5 * 60_000, kind: "approval" });
   return answer?.index === 0 && !answer.timedOut && !answer.replaced;
 };
 

@@ -12,6 +12,8 @@ export interface QuestionSpec {
   /** Agent-declared useful deadline, distinct from the question wait timeout. */
   usefulUntil?: number;
   deadlineReason?: string;
+  /** "question" = clarifying ask_user (spoken on a live voice call); anything else blocks for an explicit tap */
+  kind?: "question" | "approval";
 }
 
 export interface QuestionAnswer {
@@ -23,6 +25,8 @@ export interface QuestionAnswer {
   timedOut?: boolean;
   /** a newer question replaced this one */
   replaced?: boolean;
+  /** the owner is on a live voice call: ask out loud instead; the next utterance answers */
+  spoken?: boolean;
 }
 
 export interface QuestionSnapshot {

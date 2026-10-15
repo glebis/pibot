@@ -57,6 +57,7 @@ export function questionPlugin(deps: QuestionPluginDeps): InlineExtension {
             options,
             timeoutMs,
             poll: options.length > 6,
+            kind: "question",
             ...(usefulUntil!==undefined?{usefulUntil,deadlineReason:params.deadlineReason!.trim()}:{})
           };
           let res: QuestionAnswer | null = null;
@@ -65,6 +66,9 @@ export function questionPlugin(deps: QuestionPluginDeps): InlineExtension {
             res = await deps.ask(spec);
           } catch (e) {
             err = String(e);
+          }
+          if (res?.spoken) {
+            return { content: [{ type: "text", text: "The owner is on a live voice call and can't tap buttons. Ask this question out loud in your reply — briefly, naming the options — and end your turn. Their next spoken message is the answer." }], details: { choice: "", index: -1, via: "voice", timedOut: false } };
           }
           const superseded = res?.replaced === true;
           const answered: QuestionAnswer | null = res !== null && !res.timedOut ? res : null;

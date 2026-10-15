@@ -1,6 +1,7 @@
 import { urgentSourceReceipt } from '../voice/urgent-sources.js';
 import type { UrgentSourceStore, SourceScope, BlockedDecisionProjection } from '../voice/urgent-sources.js';
-import { CanonicalTurnGate, type ActiveVoiceTurn, type BotVoiceInput, type BotVoiceResult } from '../voice/session-control.js';
+import { CanonicalTurnGate, VOICE_CALL_DIRECTIVE, type ActiveVoiceTurn, type BotVoiceInput, type BotVoiceResult, type VoiceToolGroup } from '../voice/session-control.js';
+import { CAPABILITY_REGISTRY } from './capabilities.js';
 import type { VoiceOwnerCommands } from '../voice/owner-commands.js';
 import type { TaskRun } from '../durable/task-ledger.js';
 import * as fs from "node:fs";
@@ -153,6 +154,10 @@ export class PiBot implements HeartbeatHost {
   }
   private canonicalTurns = new CanonicalTurnGate();
   private activeVoiceTurns = new Map<string, ActiveVoiceTurn>();
+  /** utterances queued behind a busy chat during a voice call, per agent::chat */
+  private voiceQueued = new Map<string, number>();
+  /** a session's full tool set while a voice turn has narrowed it, per agent::chat */
+  private voiceBaseTools = new Map<string, string[]>();
 
   /** Only existing, live, owner-private bindings can attach to full agent history/tools. */
   voiceBindings(): Array<{ agentId: string; chatKey: string }> {
@@ -187,13 +192,53 @@ export class PiBot implements HeartbeatHost {
       try {
         this.lastUserMessage.set(input.agentId,Date.now()); this.ownerSpokeAt.set(input.chatKey,Date.now());
         this.deps.heartbeat.noteUserMessage?.(input.agentId);
-        await this.promptAgentUnlocked(t,chatId,input.agentId,input.text,{taskAckFrom:null,voiceTurn:true});
+        // owner-chosen tools for this call: narrow for the turn only, restore the agent's full set after
+        let restore: (() => void) | undefined;
+        if (input.allowedTools) {
+          const session = await this.sessionFor(t, chatId, input.agentId, input.chatKey);
+          const full = session.getActiveToolNames(); const allow = new Set(input.allowedTools);
+          this.voiceBaseTools.set(key, full);
+          session.setActiveToolsByName(full.filter(n => allow.has(n)));
+          restore = () => { session.setActiveToolsByName(full); this.voiceBaseTools.delete(key); };
+        }
+        try { await this.promptAgentUnlocked(t,chatId,input.agentId,input.text,{taskAckFrom:null,voiceTurn:true}); }
+        finally { restore?.(); }
         if(context.detached) return {status:'detached'};
         return context.replies.length ? {status:'completed',text:context.replies.join('\n')} : {status:'no_reply'};
       } catch(error) { return {status:context.detached?'detached':error instanceof Error && error.message==='voice_session_busy'?'busy':'failed'}; }
       finally { input.signal?.removeEventListener('abort',detach); this.activeVoiceTurns.delete(key); }
     });
-    return run ?? {status:'busy'};
+    const result = run ? await run : {status:'busy' as const};
+    if (result.status !== 'busy') return result;
+    // The chat is still on an earlier turn (often a voice turn that outlived the 40 s audio wait).
+    // Don't drop what was said: queue it behind that turn (at most two); the answers land in the chat.
+    const holder=this.activeVoiceTurns.get(key);
+    const idx=input.chatKey.lastIndexOf(':'); const t=this.transports.get(input.chatKey.slice(0,idx));
+    const queued=this.voiceQueued.get(key) ?? 0;
+    if(!t || queued>=2) return {status:'busy'};
+    this.voiceQueued.set(key,queued+1);
+    void this.promptAgent(t,input.chatKey.slice(idx+1),input.agentId,`(said on the voice call while you were still busy) ${input.text}`,{taskAckFrom:null})
+      .catch(()=>{}).finally(()=>{const n=(this.voiceQueued.get(key) ?? 1)-1; if(n>0) this.voiceQueued.set(key,n); else this.voiceQueued.delete(key);});
+    const earlier=holder?` on "${holder.input.text.slice(0,60).trim()}${holder.input.text.length>60?'…':''}"`:'';
+    return {status:'completed',text:`I'm still working${earlier}. I've queued what you just said, and the answers will arrive in your chat.`};
+  }
+
+  /** The agent's tools in a bound voice chat, grouped by capability — what a call may allow. */
+  async voiceTools(agentId: string, chatKey: string): Promise<VoiceToolGroup[] | undefined> {
+    if (!this.voiceBindings().some(b => b.agentId === agentId && b.chatKey === chatKey)) return undefined;
+    const { transport, chatId } = this.splitChatKey(chatKey); const t = this.transports.get(transport);
+    if (!t) return undefined;
+    const session = await this.sessionFor(t, chatId, agentId, chatKey);
+    const active = new Set(this.voiceBaseTools.get(`${agentId}::${chatKey}`) ?? session.getActiveToolNames());
+    const owner = new Map<string, string>(); for (const c of CAPABILITY_REGISTRY) for (const n of c.tools) owner.set(n, c.id);
+    const groups = new Map<string, VoiceToolGroup>();
+    for (const tool of session.getAllTools()) {
+      if (!active.has(tool.name)) continue;
+      const id = owner.get(tool.name) ?? 'core';
+      if (!groups.has(id)) groups.set(id, { id, tools: [] });
+      groups.get(id)!.tools.push({ name: tool.name, description: String(tool.description ?? '').split('\n')[0].slice(0, 160) });
+    }
+    return [...groups.values()].sort((a, b) => a.id === 'core' ? -1 : b.id === 'core' ? 1 : a.id.localeCompare(b.id));
   }
 
   private async deliverTurnText(t: Transport,chatId:string,agentId:string,text:string): Promise<void> {
@@ -202,7 +247,18 @@ export class PiBot implements HeartbeatHost {
     if(voice && !voice.detached && !voice.input.signal?.aborted) {
       const spoken=applyVoiceStyle(text,{maxSentences:4,maxChars:900,allowFullPaths:false}).slice(0,900);
       voice.replies.push(spoken);
-      try { await voice.input.onOutput?.(spoken); return; } catch { voice.detached=true; }
+      let spokenDelivered=false;
+      try { await voice.input.onOutput?.(spoken); spokenDelivered=true; } catch { voice.detached=true; }
+      // A call can only carry the short spoken version. Whatever the agent's
+      // message holds beyond it — full length, links, code, paths — still
+      // reaches the Telegram chat the voice turn started from (owner ask,
+      // 2026-10-15). The shared turn dedupe key keeps the fallback delivery
+      // below from landing the same text twice.
+      if(spokenDelivered && !voice.detached && spoken.trim()!==text.trim()) {
+        try { await t.push(chatId,{text:this.shapeOutbound(agentId,this.chatKey(t,chatId),text),dedupeKey:this.turnKeys.get(key)}); }
+        catch(e) { console.error("[bot] voice chat delivery failed:", e); }
+      }
+      if(spokenDelivered) return;
     }
     await t.push(chatId,{text:this.shapeOutbound(agentId,this.chatKey(t,chatId),text),dedupeKey:this.turnKeys.get(key)});
   }
@@ -749,6 +805,8 @@ export class PiBot implements HeartbeatHost {
       (spec: QuestionSpec) => {
         const voice=this.activeVoiceTurns.get(`${agentId}::${ck}`);
         if(voice && !this.voiceBindings().some(b=>b.agentId===agentId&&b.chatKey===ck)) {voice.detached=true;return Promise.resolve(null);}
+        // a clarifying question can't wait for a tap mid-call: the agent asks it out loud instead
+        if(voice && !voice.detached && spec.kind==='question') return Promise.resolve({choice:'',index:-1,via:'text',spoken:true});
         if(voice && !voice.detached) { try { voice.input.onApprovalRequired?.(); } catch { voice.detached=true; } }
         if(voice && !voice.detached) void Promise.resolve().then(()=>voice.input.onOutput?.("Please confirm this request in your existing chat. I will wait for your answer there.")).catch(()=>{voice.detached=true;});
         return this.questions.ask(agentId, { transport: t.name, chatId }, spec);
@@ -1154,6 +1212,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       if (requestsFullPath(text)) this.wantsFullPath.set(ck, true);
       else this.wantsFullPath.delete(ck);
       let styled = this.minimalVoice(agentId, ck) ? `${text}\n\n${VOICE_STYLE_DIRECTIVE}` : text;
+      if (opts.voiceTurn) styled += `\n\n${VOICE_CALL_DIRECTIVE}`;
       // an active goal rides every turn (suffix: internal-prefix detection looks at the start)
       const activeGoal = this.goals.get(ck);
       if (!opts.voiceTurn && activeGoal && activeGoal.status === "active") styled = `${styled}\n\n${renderGoalBlock(activeGoal)}`;
