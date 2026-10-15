@@ -103,6 +103,10 @@ main.live{grid-template-columns:1fr}
 .live .big{width:auto;aspect-ratio:auto;min-height:52px;padding:0 26px;border-radius:26px;font-size:1.05rem;animation:none;box-shadow:none}
 .live #play{min-height:44px;padding:0 16px}
 .live #stop{animation:none;box-shadow:0 0 0 4px var(--end-soft)}
+.live .stage{display:flex;gap:10px;align-items:center}
+#mute{min-height:52px;padding:0 24px;border-radius:26px;border:1.5px solid var(--line);background:var(--field);font-weight:700;font-size:1.05rem}
+#mute[aria-pressed="true"]{background:var(--end-soft);color:var(--end);border-color:transparent}
+.muted #mic-level{opacity:.35}
 .live .level meter{width:72px}
 .live .transcript{max-height:62vh}
 [hidden]{display:none!important}
@@ -120,6 +124,7 @@ main.live{grid-template-columns:1fr}
   <p id="agent-detail"></p>
   <div class="stage">
     <button id="start" class="big" disabled>Talk</button>
+    <button id="mute" aria-pressed="false" aria-keyshortcuts="M" title="Mute (M)" hidden>Mute</button>
     <button id="stop" class="big" disabled hidden>End</button>
   </div>
   <p id="status" role="status" aria-live="polite">Checking…</p>
@@ -166,6 +171,16 @@ main.live{grid-template-columns:1fr}
   let agents = [], audioReady = false, pc = null, stream = null, active = false, stopping = false, generation = 0, timer = null, controller = null, meterContext = null, silenceTimer = null;
   // Tools for the selected agent: groups from the bot, the owner's choice remembered per agent.
   let toolGroups = [], chosen = new Set(); const expanded = new Set();
+  let muted = false;
+  const micTracks = () => stream ? (stream.getAudioTracks?.() ?? stream.getTracks()) : [];
+  // Mute keeps the call open but sends silence: the track is disabled, not stopped.
+  function setMuted(next) {
+    muted = next && active;
+    for (const track of micTracks()) track.enabled = !muted;
+    $('mute').setAttribute?.('aria-pressed', String(muted)); $('mute').textContent = muted ? 'Unmute' : 'Mute';
+    document.querySelector?.('main')?.classList.toggle('muted', muted);
+    if (active) status(muted ? 'Muted.' : 'Listening.');
+  }
   const GROUP_NAMES = { core: 'Files & shell', scheduler: 'Reminders', tasks: 'Background tasks', memory: 'Memory', 'agent-comms': 'Other agents', questions: 'Questions', skills: 'Skills', 'calendar-read': 'Calendar', 'telegram-send': 'Telegram', delegate: 'Coding CLIs', dictionary: 'Dictionary', commitments: 'Commitments', herdr: 'Herdr', exec: 'Run commands', 'vault-file': 'Vault files' };
   const groupName = id => GROUP_NAMES[id] || id.replace(/[-_]/g, ' ').replace(/^./, c => c.toUpperCase());
   const allTools = () => toolGroups.flatMap(g => g.tools.map(t => t.name));
@@ -177,7 +192,7 @@ main.live{grid-template-columns:1fr}
     micSelect.disabled = active || stopping;
     startButton.disabled = active || stopping || !validToken || !audioReady || !selected()?.available;
     stopButton.disabled = !active;
-    startButton.hidden = active; stopButton.hidden = !active;
+    startButton.hidden = active; stopButton.hidden = !active; $('mute').hidden = !active;
     document.querySelector?.('main')?.classList.toggle('live', active);
     $('live-agent').textContent = active ? (selected()?.name || '') : '';
     refreshButton.disabled = active || stopping || !validToken;
@@ -258,7 +273,7 @@ main.live{grid-template-columns:1fr}
     audio.pause(); audio.srcObject = null;
     clearTimeout(silenceTimer); silenceTimer = null;
     meterContext?.close().catch(() => {}); meterContext = null; $('levels').hidden = true;
-    $('play').hidden = true; active = false; controls();
+    $('play').hidden = true; active = false; muted = false; setMuted(false); controls();
   }
   async function stop(text = 'Call ended.') {
     if (stopping) return;
@@ -361,7 +376,7 @@ main.live{grid-template-columns:1fr}
       $('levels').hidden = false; $('device').textContent = inputName + (input?.muted ? ' — muted by the system' : '');
       const micPeak = meter(media, 'mic-level');
       if (micPeak) silenceTimer = setTimeout(() => {
-        if (current === generation && micPeak() < 0.01) $('device').textContent = `No sound from “${inputName}”. Pick another microphone or check macOS microphone access for this browser.`;
+        if (current === generation && !muted && micPeak() < 0.01) $('device').textContent = `No sound from “${inputName}”. Pick another microphone or check macOS microphone access for this browser.`;
       }, 6000);
       void listMicrophones();
       stream = media; pc = new RTCPeerConnection({iceServers:[]}); const connection = pc;
@@ -374,7 +389,7 @@ main.live{grid-template-columns:1fr}
       };
       connection.onconnectionstatechange = () => {
         if (current !== generation) return;
-        if (connection.connectionState === 'connected') status('Listening.');
+        if (connection.connectionState === 'connected') status(muted ? 'Muted.' : 'Listening.');
         if (['failed','disconnected','closed'].includes(connection.connectionState)) void stop('Connection ended.');
       };
       stream.getTracks().forEach(track => connection.addTrack(track, stream));
@@ -403,6 +418,12 @@ main.live{grid-template-columns:1fr}
   startButton.addEventListener('click', () => void start());
   stopButton.addEventListener('click', () => void stop());
   refreshButton.addEventListener('click', () => void refresh());
+  $('mute').addEventListener('click', () => setMuted(!muted));
+  document.addEventListener?.('keydown', event => {
+    if (!active || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.key.toLowerCase() !== 'm') return;
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target?.tagName)) return;
+    event.preventDefault(); setMuted(!muted);
+  });
   $('tools-toggle').addEventListener('click', () => { toolsOpen = !toolsOpen; try { localStorage.setItem('pibot-voice-tools-open', toolsOpen ? '1' : '0'); } catch {} showToolsOpen(); });
   showToolsOpen();
   $('tools-none').addEventListener('click', () => { chosen = new Set(); saveChoice(); renderTools(); });

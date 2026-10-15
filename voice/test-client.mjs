@@ -17,7 +17,7 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true, 
     play() { return Promise.resolve(); }
     pause() { this.paused = true; }
   }
-  const elements = Object.fromEntries(['agent','start','stop','refresh','audio','status','agent-detail','play','transcript','mic','levels','mic-level','agent-level','device','scope-note','tools','tool-count','tools-none','tools-all','tools-toggle','tools-body','tools-presets','tools-head','live-agent'].map(id => [id,new Element(id)]));
+  const elements = Object.fromEntries(['agent','start','stop','refresh','audio','status','agent-detail','play','transcript','mic','levels','mic-level','agent-level','device','scope-note','tools','tool-count','tools-none','tools-all','tools-toggle','tools-body','tools-presets','tools-head','live-agent','mute'].map(id => [id,new Element(id)]));
   const requests = [], replaced = [], timers = new Map();
   let microphoneCalls = 0, tracksStopped = 0, rtcClosed = 0;
   const track = {stop() { tracksStopped++; }};
@@ -45,7 +45,7 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true, 
     },
   };
   vm.runInNewContext(script,context);
-  return {elements,requests,replaced,window,timers,counts:() => ({microphoneCalls,tracksStopped,rtcClosed})};
+  return {elements,requests,replaced,window,timers,track,counts:() => ({microphoneCalls,tracksStopped,rtcClosed})};
 }
 
 test('missing token fails closed, strips fragment and makes no request',async () => {
@@ -112,4 +112,20 @@ test('the call carries the owner\'s tool choice: every tool by default, none aft
   ui.elements.start.handlers.click(); await settle();
   offer = ui.requests.filter(request => request.path === '/api/offer').at(-1);
   assert.deepEqual(JSON.parse(offer.opts.body).tools,[]);
+});
+
+test('mute disables the microphone track for the call and resets when it ends',async () => {
+  const ui = setup(); await settle();
+  assert.equal(ui.elements.mute.hidden,true);
+  ui.elements.start.handlers.click(); await settle();
+  assert.equal(ui.elements.mute.hidden,false);
+  ui.elements.mute.handlers.click();
+  assert.equal(ui.track.enabled,false);
+  assert.equal(ui.elements.mute.textContent,'Unmute');
+  ui.elements.mute.handlers.click();
+  assert.equal(ui.track.enabled,true);
+  ui.elements.mute.handlers.click();
+  ui.elements.stop.handlers.click(); await settle();
+  assert.equal(ui.elements.mute.hidden,true);
+  assert.equal(ui.elements.mute.textContent,'Mute');
 });
