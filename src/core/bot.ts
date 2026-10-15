@@ -3,7 +3,9 @@ import type { UrgentSourceStore, SourceScope, BlockedDecisionProjection } from '
 import { CanonicalTurnGate, VOICE_CALL_DIRECTIVE, type ActiveVoiceTurn, type BotVoiceInput, type BotVoiceResult, type VoiceToolGroup } from '../voice/session-control.js';
 import { CAPABILITY_REGISTRY } from './capabilities.js';
 import type { VoiceOwnerCommands } from '../voice/owner-commands.js';
-import type { TaskRun } from '../durable/task-ledger.js';
+import type { TaskRun, LedgerEntry } from '../durable/task-ledger.js';
+import { VoiceFront, type CallRecord, type TaskEvent } from '../voice/front.js';
+import type { AssistantMessage, Message, Tool } from '@earendil-works/pi-ai';
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildManifest, buildPersona, validateAgentName, type AgentDraft, type Proactivity } from "./agent-factory.js";
@@ -221,6 +223,93 @@ export class PiBot implements HeartbeatHost {
       .catch(()=>{}).finally(()=>{const n=(this.voiceQueued.get(key) ?? 1)-1; if(n>0) this.voiceQueued.set(key,n); else this.voiceQueued.delete(key);});
     const earlier=holder?` on "${holder.input.text.slice(0,60).trim()}${holder.input.text.length>60?'…':''}"`:'';
     return {status:'completed',text:`I'm still working${earlier}. I've queued what you just said, and the answers will arrive in your chat.`};
+  }
+
+  // ── voice front: a fast talker over durable background tasks; the chat itself is never locked ──
+  private voiceFrontInstance?: VoiceFront;
+  private get voiceFront(): VoiceFront {
+    return this.voiceFrontInstance ??= new VoiceFront({
+      complete: (agentId, context, signal) => this.frontComplete(agentId, context, signal),
+      context: (agentId, chatKey) => this.frontContext(agentId, chatKey),
+      ledger: () => this.deps.agents.tasks,
+      activity: (agentId, taskId) => this.taskActivity(agentId, taskId),
+    });
+  }
+  /** Last steps of a background task's own session: tool calls and short notes, newest last. */
+  taskActivity(agentId: string, taskId: string): string[] {
+    const session = this.cachedSessions?.get(`${agentId}::agent::${agentId}::task-${taskId}`);
+    const msgs = ((session as { agent?: { state?: { messages?: unknown[] } } } | undefined)?.agent?.state?.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string; name?: string; arguments?: unknown }> }>;
+    const steps: string[] = [];
+    for (const m of msgs.slice(-16)) {
+      if (m.role !== "assistant") continue;
+      for (const b of m.content ?? []) {
+        if (b.type === "toolCall" && b.name) steps.push(`${b.name}${b.arguments ? " " + truncate(JSON.stringify(b.arguments), 70) : ""}`);
+        else if (b.type === "text" && b.text?.trim()) steps.push(truncate(b.text.trim().replace(/\s+/g, " "), 110));
+      }
+    }
+    return steps.slice(-4);
+  }
+  private bound(agentId: string, chatKey: string): boolean { return this.voiceBindings().some(b => b.agentId === agentId && b.chatKey === chatKey); }
+  /** Fast model for the front: PIBOT_VOICE_MODEL (default DeepSeek V4.1 Flash), then the agent's own chain, within its providers. */
+  private async frontComplete(agentId: string, context: { systemPrompt: string; messages: Message[]; tools: Tool[] }, signal: AbortSignal): Promise<AssistantMessage> {
+    const runtime = this.deps.modelRuntime;
+    if (!runtime) throw new Error("no model runtime");
+    const manifest = this.deps.agents.getAgent(agentId)?.manifest;
+    const providers = (manifest as { providers?: unknown } | undefined)?.providers;
+    const allowed = Array.isArray(providers) ? new Set(providers as string[]) : undefined;
+    const chain = this.deps.cascade?.chainFor(manifest ?? {}) ?? (manifest?.model ? [manifest.model] : []);
+    let lastError: unknown = new Error("no voice model available");
+    for (const spec of [...new Set([process.env.PIBOT_VOICE_MODEL || "openrouter/deepseek/deepseek-v4.1-flash", ...chain])]) {
+      if (this.deps.cascade?.isOpen(spec)) continue;
+      const model = this.deps.cascade ? this.deps.cascade.resolveModel(spec) : this.deps.agents.resolveModel(spec);
+      if (!model || (allowed && !allowed.has(model.provider))) continue;
+      try {
+        const answer = await runtime.complete(model, context, { maxTokens: 600, signal: AbortSignal.any([signal, AbortSignal.timeout(20000)]) });
+        if (answer.stopReason === "error") throw new Error(answer.errorMessage ?? "model error");
+        return answer;
+      } catch (error) { lastError = error; if (signal.aborted) throw error; }
+    }
+    throw lastError;
+  }
+  private async frontContext(agentId: string, chatKey: string): Promise<{ name: string; persona: string; recent: string }> {
+    const agent = this.deps.agents.getAgent(agentId);
+    let persona = "";
+    if (agent) try { persona = fs.readFileSync(path.join(agent.dir, "AGENTS.md"), "utf8").slice(0, 3000); } catch {}
+    const { transport, chatId } = this.splitChatKey(chatKey); const t = this.transports.get(transport);
+    const session = this.cachedSessions?.get(`${agentId}::${chatKey}`) ?? (t ? await this.sessionFor(t, chatId, agentId, chatKey).catch(() => undefined) : undefined);
+    return { name: agent?.manifest.name ?? agentId, persona, recent: session ? this.transcriptTail(session, 20, 400) : "" };
+  }
+  voiceFrontOpen(callId: string, agentId: string, chatKey: string, allowedTools?: string[]): boolean {
+    if (!this.bound(agentId, chatKey)) return false;
+    this.voiceFront.open(callId, agentId, chatKey, allowedTools); return true;
+  }
+  voiceFrontTurn(callId: string, text: string, signal: AbortSignal): Promise<string> { return this.voiceFront.turn(callId, text, signal); }
+  voiceFrontEvents(callId: string): Promise<TaskEvent[]> { return this.voiceFront.events(callId); }
+  voiceFrontEnding(callId: string): boolean { return this.voiceFront.ending(callId); }
+  voiceFrontInstructions(callId: string): Promise<string> { return this.voiceFront.instructions(callId); }
+  voiceFrontTool(callId: string, name: string, args: Record<string, unknown>, toolCallId: string): Promise<string> { return this.voiceFront.tool(callId, name, args, toolCallId); }
+  voiceFrontNote(callId: string, role: "owner" | "agent", text: string): void { this.voiceFront.note(callId, role, text); }
+  /** Ends a front call: a summary goes to the chat, and the agent's session learns about it on its next turn. */
+  async voiceFrontClose(callId: string): Promise<CallRecord | undefined> {
+    const record = await this.voiceFront.close(callId);
+    if (!record) return undefined;
+    const lines = record.transcript.slice(-16).map(t => `${t.role === "owner" ? "You" : "Agent"}: ${truncate(t.text.replace(/\s+/g, " "), 240)}`);
+    const tasks = record.tasks.map(t => `• ${t.title} — ${t.status}`);
+    const text = truncate(`📞 Voice call\n\n${lines.join("\n")}${tasks.length ? `\n\nBackground tasks:\n${tasks.join("\n")}` : ""}`, 3800);
+    await this.notifyChat(record.chatKey, text).catch(e => console.error("[bot] voice summary delivery failed:", e));
+    const session = this.cachedSessions?.get(`${record.agentId}::${record.chatKey}`) ?? await this.sessionForKey(record.agentId, record.chatKey);
+    await session?.sendCustomMessage({ customType: "voice-call", content: `[The owner just had a voice call with you; transcript and tasks below. No reply needed.]\n\n${text}`, display: false }, { deliverAs: "nextTurn" }).catch(() => {});
+    return record;
+  }
+  private async sessionForKey(agentId: string, chatKey: string): Promise<AgentSession | undefined> {
+    const { transport, chatId } = this.splitChatKey(chatKey); const t = this.transports.get(transport);
+    return t ? this.sessionFor(t, chatId, agentId, chatKey).catch(() => undefined) : undefined;
+  }
+  /** This chat's background tasks, newest first — the page's task panel. */
+  async voiceTasks(agentId: string, chatKey: string): Promise<LedgerEntry[] | undefined> {
+    if (!this.bound(agentId, chatKey)) return undefined;
+    const tasks = (await this.deps.agents.tasks?.list({ agentId, chatKey }))?.slice(0, 20) ?? [];
+    return tasks.map(t => (t.status === "running" || t.status === "queued") ? { ...t, activity: this.taskActivity(agentId, t.id) } : t);
   }
 
   /** The agent's tools in a bound voice chat, grouped by capability — what a call may allow. */
@@ -2828,6 +2917,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       (spec: QuestionSpec) => this.questions.ask(run.agentId, originChat, spec), this.commsHooks(),
     );
     if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("task session is busy");
+    // a task started from a voice call keeps that call's tool choice
     const resume = run.resumed
       ? "\n\nNote: an earlier attempt of this task was interrupted by a restart. This session shows what it already did — check before repeating any action (messages, writes, bookings)."
       : "";

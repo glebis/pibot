@@ -90,10 +90,32 @@ meter::-moz-meter-bar{background:var(--accent);border-radius:7px}
 .tools-title[aria-expanded="true"]::after{transform:rotate(90deg)}
 .tools-head.closed{margin-bottom:0}
 .live-only{display:none}
+#modes{display:flex}
+#mode-note{margin:10px 4px 0;color:var(--muted);font-size:.95rem;min-height:2.9em}
+.badge{padding:3px 12px;border-radius:12px;font-size:.85rem !important;font-weight:650 !important;background:var(--accent-soft)}
+.badge.agent{background:var(--end-soft);color:var(--end)}
+#call-time{font-variant-numeric:tabular-nums;color:var(--muted);font-weight:600 !important}
+#modes button{flex:1}
+.task{display:grid;grid-template-columns:1fr auto;gap:2px 12px;padding:12px 4px;border-top:1px solid var(--line);width:100%;text-align:left;border-radius:12px}
+.task:hover{background:var(--chip)}
+.task-detail{grid-column:1/-1;margin-top:8px;display:grid;gap:8px;font-size:.92rem}
+.task-detail div{white-space:pre-wrap;overflow-wrap:anywhere}
+.task-detail span{display:block;font-size:.8rem;color:var(--muted);font-weight:600}
+.task-detail .result{max-height:40vh;overflow:auto;background:var(--field);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
+.task:first-child{border-top:0}
+.task b{font-weight:650;overflow-wrap:anywhere}
+.task .pill{align-self:start;padding:2px 12px;border-radius:12px;font-size:.85rem;font-weight:650;background:var(--chip)}
+.task .pill.running,.task .pill.queued{background:var(--accent-soft);color:var(--ink)}
+.task .pill.done{background:var(--accent);color:var(--accent-ink)}
+.task .pill.failed{background:var(--end-soft);color:var(--end)}
+.task small{grid-column:1/-1;color:var(--muted);font-size:.9rem;overflow-wrap:anywhere}
+.turn.event{align-self:center;background:transparent;border:1px dashed var(--line);font-size:.95rem;color:var(--muted)}
+.live #mode-box{display:none}
 /* During a call the talk card shrinks to one slim bar pinned on top; the conversation gets the room. */
 main.live{grid-template-columns:1fr}
 .live .talk{position:sticky;top:10px;z-index:5;flex-direction:row;flex-wrap:wrap;align-items:center;gap:10px 16px;padding:10px 12px 10px 20px;border-radius:24px}
-.live .talk > .row,.live #mic,.live #agent-detail{display:none}
+.live .talk > .row,.live #agent-detail{display:none}
+.live #mic{width:auto;max-width:240px;min-height:44px;font-size:.85rem;padding-right:40px}
 .live .live-only{display:block;font-weight:700;font-size:1.05rem}
 .live #status{flex:1;min-width:8em;text-align:left;font-size:1rem;font-weight:500;color:var(--muted)}
 .live #levels{display:flex;gap:14px;align-items:center}
@@ -117,11 +139,21 @@ main.live{grid-template-columns:1fr}
 <main>
 <section class="card talk" aria-label="Talk">
   <span id="live-agent" class="live-only"></span>
+  <span id="live-mode" class="live-only badge"></span>
+  <span id="call-time" class="live-only" aria-label="Call time">0:00</span>
   <div class="row">
     <select id="agent" aria-label="Agent" disabled><option>Loading…</option></select>
     <button id="refresh" class="icon" aria-label="Refresh agents" title="Refresh agents" disabled>↻</button>
   </div>
   <p id="agent-detail"></p>
+  <div id="mode-box">
+    <div class="seg" id="modes" role="group" aria-label="Voice mode">
+      <button id="mode-front" aria-pressed="true">Fast</button>
+      <button id="mode-realtime" aria-pressed="false" hidden>Realtime</button>
+      <button id="mode-agent" aria-pressed="false">Agent</button>
+    </div>
+    <p id="mode-note"></p>
+  </div>
   <div class="stage">
     <button id="start" class="big" disabled>Talk</button>
     <button id="mute" aria-pressed="false" aria-keyshortcuts="M" title="Mute (M)" hidden>Mute</button>
@@ -140,6 +172,10 @@ main.live{grid-template-columns:1fr}
 <div class="side">
   <section class="card" aria-label="Conversation">
     <div id="transcript" class="transcript" role="log" aria-label="Conversation" aria-live="polite"></div>
+  </section>
+  <section class="card" id="tasks-card" aria-labelledby="tasks-title" hidden>
+    <h2 id="tasks-title">Tasks</h2>
+    <div id="tasks"></div>
   </section>
   <section class="card" aria-labelledby="tools-toggle">
     <div class="tools-head" id="tools-head">
@@ -161,8 +197,12 @@ main.live{grid-template-columns:1fr}
   const params = new URLSearchParams(location.hash.slice(1));
   const requestedAgent = params.get('agent');
   let secret = params.get('token') || '';
-  // Keep the key for this tab only, so a reload still works while the URL stays clean.
-  try { if (secret) sessionStorage.setItem('pibot-voice-token', secret); else secret = sessionStorage.getItem('pibot-voice-token') || ''; } catch {}
+  // Remember the key in this browser, so the bare address works after opening a /voice link once.
+  const KEY = 'pibot-voice-token';
+  const remembered = () => { try { return localStorage.getItem(KEY) || sessionStorage.getItem(KEY) || ''; } catch { return ''; } };
+  const forget = () => { try { localStorage.removeItem(KEY); sessionStorage.removeItem(KEY); } catch {} };
+  if (secret) { try { localStorage.setItem(KEY, secret); } catch { try { sessionStorage.setItem(KEY, secret); } catch {} } }
+  else secret = remembered();
   history.replaceState(null, '', location.pathname + location.search);
   // Opening a fresh launch link in an already-open tab only changes the fragment; reload to pick it up.
   window.addEventListener('hashchange', () => { if (new URLSearchParams(location.hash.slice(1)).has('token')) location.reload(); });
@@ -172,6 +212,55 @@ main.live{grid-template-columns:1fr}
   // Tools for the selected agent: groups from the bot, the owner's choice remembered per agent.
   let toolGroups = [], chosen = new Set(); const expanded = new Set();
   let muted = false;
+  const MODES = {
+    front: ['Fast', 'Answers in a few seconds. Longer work runs as background tasks you can follow below.'],
+    realtime: ['Realtime', 'OpenAI speech-to-speech: natural voice, interrupt any time. Same background tasks. Experimental.'],
+    agent: ['Agent', 'The full agent with all its tools on every turn. Slow, and the chat waits while it works.'],
+  };
+  let mode = 'front', realtimeReady = false; try { mode = localStorage.getItem('pibot-voice-mode') || 'front'; } catch {}
+  function showMode() {
+    if (!MODES[mode] || (mode === 'realtime' && !realtimeReady)) mode = 'front';
+    for (const id of Object.keys(MODES)) { const b = $('mode-' + id); b.setAttribute?.('aria-pressed', String(mode === id)); b.disabled = active || stopping; }
+    $('mode-realtime').hidden = !realtimeReady;
+    $('mode-note').textContent = MODES[mode][1];
+  }
+  // call clock in the call bar
+  let callStarted = 0, clock = null;
+  function tickClock() { const s = Math.floor((Date.now() - callStarted) / 1000); $('call-time').textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+  // ── background tasks (durable ledger) ──
+  let tasksTimer = null; const openTasks = new Set();
+  const ago = ms => { const m = Math.round(ms / 60000); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.round(m / 60) + ' h ago'; };
+  async function loadTasks() {
+    clearTimeout(tasksTimer); tasksTimer = setTimeout(() => void loadTasks(), 5000);
+    const agentId = agentSelect.value; if (!agentId || !selected()?.available || !document.createElement) return;
+    let tasks = [];
+    try { const data = await (await api('/api/tasks?agentId=' + encodeURIComponent(agentId))).json(); tasks = Array.isArray(data?.tasks) ? data.tasks : []; } catch { return; }
+    if (agentId !== agentSelect.value) return;
+    const box = $('tasks'); if (!box?.replaceChildren) return;
+    box.replaceChildren(); $('tasks-card').hidden = !tasks.length;
+    for (const t of tasks.slice(0, 8)) {
+      const row = document.createElement('button'); row.type = 'button'; row.className = 'task'; row.setAttribute?.('aria-expanded', String(openTasks.has(t.id)));
+      row.addEventListener('click', () => { openTasks.has(t.id) ? openTasks.delete(t.id) : openTasks.add(t.id); void loadTasks(); });
+      const title = document.createElement('b'); title.textContent = String(t.title ?? '');
+      const pill = document.createElement('span'); pill.className = 'pill ' + t.status; pill.textContent = String(t.status ?? '');
+      const note = document.createElement('small');
+      const detail = t.status === 'done' ? t.result : t.status === 'failed' ? t.error : '';
+      note.textContent = (detail ? String(detail).replace(/\s+/g, ' ').slice(0, 160) + ' · ' : '') + (Number.isFinite(t.createdAt) ? ago(Date.now() - t.createdAt) : '');
+      const steps = Array.isArray(t.activity) ? t.activity.filter(x => typeof x === 'string') : [];
+      if (steps.length && !detail) note.textContent = steps.at(-1).slice(0, 140) + ' · ' + note.textContent;
+      row.append(title, pill, note);
+      if (openTasks.has(t.id)) {
+        const more = document.createElement('div'); more.className = 'task-detail';
+        const block = (label, text, cls) => { if (!text) return; const d = document.createElement('div'); if (cls) d.className = cls; const l = document.createElement('span'); l.textContent = label; d.append(l, document.createTextNode(String(text))); more.append(d); };
+        block('Instructions', t.instructions);
+        block('Latest steps', steps.join('\n'));
+        block(t.status === 'failed' ? 'Error' : 'Result', t.status === 'failed' ? t.error : t.result, 'result');
+        block('Timing', `started ${new Date(t.createdAt).toLocaleTimeString()} · updated ${new Date(t.updatedAt).toLocaleTimeString()}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ''}`);
+        row.append(more);
+      }
+      box.append(row);
+    }
+  }
   const micTracks = () => stream ? (stream.getAudioTracks?.() ?? stream.getTracks()) : [];
   // Mute keeps the call open but sends silence: the track is disabled, not stopped.
   function setMuted(next) {
@@ -189,16 +278,17 @@ main.live{grid-template-columns:1fr}
   const selected = () => agents.find(agent => agent.id === agentSelect.value);
   function controls() {
     agentSelect.disabled = active || stopping || !agents.length;
-    micSelect.disabled = active || stopping;
+    micSelect.disabled = stopping;
     startButton.disabled = active || stopping || !validToken || !audioReady || !selected()?.available;
     stopButton.disabled = !active;
     startButton.hidden = active; stopButton.hidden = !active; $('mute').hidden = !active;
     document.querySelector?.('main')?.classList.toggle('live', active);
+    $('live-mode').textContent = active ? MODES[mode][0] : ''; $('live-mode').className = 'live-only badge' + (mode === 'agent' ? ' agent' : '');
     $('live-agent').textContent = active ? (selected()?.name || '') : '';
     refreshButton.disabled = active || stopping || !validToken;
     const agent = selected();
     $('agent-detail').textContent = agent && !agent.available ? (agent.reason || 'This agent is unavailable for voice.') : '';
-    renderTools();
+    renderTools(); showMode();
   }
   async function api(path, options = {}) {
     const response = await fetch(path, { ...options, signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(10000), credentials: 'omit', cache: 'no-store', headers: { 'Authorization': 'Bearer ' + secret, ...(options.body ? {'Content-Type':'application/json'} : {}) } });
@@ -267,7 +357,7 @@ main.live{grid-template-columns:1fr}
   function closeLocal() {
     generation++;
     controller?.abort(); controller = null;
-    clearTimeout(timer); timer = null;
+    clearTimeout(timer); timer = null; clearInterval(clock); clock = null;
     if (pc) { pc.onconnectionstatechange = null; pc.ontrack = null; pc.close(); pc = null; }
     if (stream) { stream.getTracks().forEach(track => track.stop()); stream = null; }
     audio.pause(); audio.srcObject = null;
@@ -283,16 +373,18 @@ main.live{grid-template-columns:1fr}
     finally { stopping = false; controls(); }
   }
   // Live input/output level; returns a reader for the loudest sample seen so far.
+  const meterOwner = {};
   function meter(source, id) {
     const Context = window.AudioContext || window.webkitAudioContext;
     if (!Context) return null;
+    const owner = {}; meterOwner[id] = owner; // a newer source (e.g. switched mic) takes over this meter
     meterContext ??= new Context();
     const context = meterContext, analyser = context.createAnalyser();
     context.createMediaStreamSource(source).connect(analyser);
     const data = new Float32Array(analyser.fftSize), element = $(id);
     let peak = 0;
     const tick = () => {
-      if (meterContext !== context) return;
+      if (meterContext !== context || meterOwner[id] !== owner) return;
       analyser.getFloatTimeDomainData(data);
       let level = 0; for (const v of data) level = Math.max(level, Math.abs(v));
       peak = Math.max(peak, level); element.value = Math.min(1, level * 3);
@@ -316,7 +408,7 @@ main.live{grid-template-columns:1fr}
     try {
       const data = await (await api('/api/agents')).json();
       if (!Array.isArray(data.agents)) throw new Error('invalid-agents');
-      audioReady = data.audioReady === true;
+      audioReady = data.audioReady === true; realtimeReady = data.realtimeReady === true;
       $('scope-note').textContent = data.mode === 'shared' ? 'Shared with your Telegram chat · approvals stay there · audio via Deepgram · 15 min' : 'Isolated copy · no tools or chat history · audio via Deepgram · 15 min';
       const previous = agentSelect.value;
       agents = data.agents.filter(a => typeof a.id === 'string' && typeof a.name === 'string' && typeof a.model === 'string' && typeof a.available === 'boolean');
@@ -330,12 +422,11 @@ main.live{grid-template-columns:1fr}
       else if (agents.some(a => a.available)) agentSelect.value = agents.find(a => a.available).id;
       status(!audioReady ? 'Speech isn’t configured on the voice service.' : agents.length ? 'Ready.' : 'No agents available.');
       void listMicrophones();
-      void loadTools();
+      void loadTools(); void loadTasks();
     } catch (error) {
       agents = []; agentSelect.replaceChildren();
       if (error?.status === 401) {
-        try { sessionStorage.removeItem('pibot-voice-token'); } catch {}
-        status('This link expired — send /voice again.');
+        forget(); noKey('This page key is no longer valid. Send /voice and open the link once.');
       } else status('Voice service unreachable.');
     }
     controls();
@@ -356,6 +447,11 @@ main.live{grid-template-columns:1fr}
     let message; try { message = JSON.parse(event.data); } catch { return; }
     if (!message || typeof message.text !== 'string') return;
     if (message.type === 'status') { status(message.text.slice(0, 500)); return; }
+    if (message.type === 'end') { void stop('Call ended.'); return; }
+    if (message.type === 'task') {
+      const line = document.createElement('div'); line.className = 'turn event'; line.textContent = message.text.slice(0, 500);
+      $('transcript').append(line); $('transcript').scrollTop = $('transcript').scrollHeight; void loadTasks(); return;
+    }
     if (!['user','assistant'].includes(message.type)) return;
     const turn = document.createElement('div'); turn.className = message.type === 'user' ? 'turn you' : 'turn';
     const name = document.createElement('strong'); name.textContent = message.type === 'user' ? 'You' : (selected()?.name || 'Agent');
@@ -367,6 +463,7 @@ main.live{grid-template-columns:1fr}
   async function start() {
     if (active || stopping || !selected()?.available || !validToken || !audioReady) return;
     active = true; const current = ++generation; controller = new AbortController(); const signal = controller.signal;
+    callStarted = Date.now(); clearInterval(clock); clock = setInterval(tickClock, 1000); tickClock();
     timer = setTimeout(() => void stop('15-minute limit reached.'), 15 * 60 * 1000);
     controls(); $('transcript').replaceChildren(); status('Allow the microphone…');
     try {
@@ -398,7 +495,7 @@ main.live{grid-template-columns:1fr}
       await waitForIce(connection, signal);
       if (current !== generation) return;
       // tools: only send a choice when the agent's tools loaded; otherwise the agent keeps its own set
-      const offer = {agentId:agentSelect.value, sdp:connection.localDescription.sdp, type:'offer', ...(toolGroups.length ? {tools:allTools().filter(n => chosen.has(n))} : {})};
+      const offer = {agentId:agentSelect.value, sdp:connection.localDescription.sdp, type:'offer', mode, ...(toolGroups.length ? {tools:allTools().filter(n => chosen.has(n))} : {})};
       const response = await api('/api/offer', {method:'POST', signal, body:JSON.stringify(offer)});
       const answer = await response.json();
       if (current !== generation) return;
@@ -413,12 +510,27 @@ main.live{grid-template-columns:1fr}
       await stop(message);
     }
   }
-  agentSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-agent', agentSelect.value); } catch {} controls(); void loadTools(); });
-  micSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-mic', micSelect.value); } catch {} });
+  agentSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-agent', agentSelect.value); } catch {} controls(); void loadTools(); void loadTasks(); });
+  // Switching the microphone mid-call swaps the sent track in place; the call keeps running.
+  async function switchMicrophone() {
+    if (!active || !pc || !stream) return;
+    const current = generation;
+    try {
+      const media = await navigator.mediaDevices.getUserMedia({audio: micSelect.value ? {deviceId:{exact:micSelect.value}} : true, video:false});
+      if (current !== generation || !pc) { media.getTracks().forEach(t => t.stop()); return; }
+      const track = media.getAudioTracks()[0];
+      const sender = pc.getSenders().find(s => s.track?.kind === 'audio');
+      await sender?.replaceTrack(track);
+      stream.getTracks().forEach(t => t.stop()); stream = media; track.enabled = !muted;
+      $('device').textContent = track.label || 'Microphone'; meter(media, 'mic-level');
+    } catch (error) { status('Couldn’t switch microphone (' + (error?.name || 'error') + ').'); }
+  }
+  micSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-mic', micSelect.value); } catch {} void switchMicrophone(); });
   startButton.addEventListener('click', () => void start());
   stopButton.addEventListener('click', () => void stop());
   refreshButton.addEventListener('click', () => void refresh());
   $('mute').addEventListener('click', () => setMuted(!muted));
+  for (const value of Object.keys(MODES)) $('mode-' + value).addEventListener('click', () => { mode = value; try { localStorage.setItem('pibot-voice-mode', mode); } catch {} showMode(); });
   document.addEventListener?.('keydown', event => {
     if (!active || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.key.toLowerCase() !== 'm') return;
     if (['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target?.tagName)) return;
@@ -430,7 +542,11 @@ main.live{grid-template-columns:1fr}
   $('tools-all').addEventListener('click', () => { chosen = new Set(allTools()); saveChoice(); renderTools(); });
   $('play').addEventListener('click', () => { audio.play().then(() => { $('play').hidden = true; }).catch(() => status('Audio playback is blocked by the browser.')); });
   window.addEventListener('pagehide', () => { const wasActive = active; closeLocal(); if (wasActive) void api('/api/session', {method:'DELETE',keepalive:true}).catch(() => {}); });
-  if (!validToken) { status('Open the link from /voice to begin.'); controls(); }
+  function noKey(text) {
+    const option = document.createElement('option'); option.textContent = 'Open the /voice link once'; agentSelect.replaceChildren(option);
+    status(text); controls();
+  }
+  if (!validToken) noKey('Send /voice in Telegram and open the link once — after that this address works on its own.');
   else if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) { status('This browser can’t do voice calls.'); }
   else void refresh();
 })();

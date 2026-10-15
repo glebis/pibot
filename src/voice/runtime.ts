@@ -7,6 +7,8 @@ import { serve } from '@hono/node-server';
 import { decryptJsonWithSops } from '../core/secrets.js';
 import { applyVoiceStyle } from '../core/voice-style.js';
 import type { BotVoiceInput, BotVoiceResult, VoiceToolGroup } from './session-control.js';
+import { FRONT_TOOLS, type TaskEvent } from './front.js';
+import type { LedgerEntry } from '../durable/task-ledger.js';
 import { httpPhoneControl, type PhoneControl } from './owner-commands.js';
 
 export interface VoiceHost {
@@ -14,15 +16,26 @@ export interface VoiceHost {
   voicePendingDecision?(input:{agentId:string;chatKey:string}):{decisionId:string;question:string;options:string[]}|undefined;
   voiceTurn(input:BotVoiceInput):Promise<BotVoiceResult>;
   voiceTools?(agentId:string,chatKey:string):Promise<VoiceToolGroup[]|undefined>;
+  /** voice front: a fast talker over durable background tasks (browser calls) */
+  voiceFrontOpen?(callId:string,agentId:string,chatKey:string,allowedTools?:string[]):boolean;
+  voiceFrontTurn?(callId:string,text:string,signal:AbortSignal):Promise<string>;
+  voiceFrontEvents?(callId:string):Promise<TaskEvent[]>;
+  voiceFrontEnding?(callId:string):boolean;
+  voiceFrontInstructions?(callId:string):Promise<string>;
+  voiceFrontTool?(callId:string,name:string,args:Record<string,unknown>,toolCallId:string):Promise<string>;
+  voiceFrontNote?(callId:string,role:'owner'|'agent',text:string):void;
+  voiceFrontClose?(callId:string):Promise<unknown>;
+  voiceTasks?(agentId:string,chatKey:string):Promise<LedgerEntry[]|undefined>;
   blockedDecisionProjection?(scope:SourceScope):BlockedDecisionProjection|undefined;
 }
-interface Session { agentId:string;chatKey:string;callSid:string;tools?:string[];expires:number;controller:AbortController;requests:Map<string,{text:string;reply?:string}>;busy:boolean }
+interface Session { agentId:string;chatKey:string;callSid:string;tools?:string[];front?:boolean;expires:number;controller:AbortController;requests:Map<string,{text:string;reply?:string}>;busy:boolean }
 export function createCanonicalVoiceBridge(host:VoiceHost,token:string,clock=Date.now) {
   if(!/^[a-f0-9]{64}$/.test(token))throw new Error('Invalid voice bridge credential');
   const sessions=new Map<string,Session>();
   const consumedCalls=new Set<string>();
   const app=new Hono();
-  function sweep(){for(const [id,s] of sessions)if(s.expires<=clock()){s.controller.abort();sessions.delete(id);}}
+  const end=(id:string)=>{const s=sessions.get(id);if(!s)return;s.controller.abort();sessions.delete(id);if(s.front)void host.voiceFrontClose?.(id)?.catch(()=>{});};
+  function sweep(){for(const [id,s] of sessions)if(s.expires<=clock())end(id);}
   app.use('*',async(c,next)=>{
     const got=c.req.header('authorization')??'',expected=`Bearer ${token}`;
     if(Buffer.byteLength(got)!==Buffer.byteLength(expected)||!timingSafeEqual(Buffer.from(got),Buffer.from(expected)))return c.json({error:'unauthorized'},401);
@@ -72,12 +85,38 @@ export function createCanonicalVoiceBridge(host:VoiceHost,token:string,clock=Dat
     let b:any;try{b=await body(c);}catch{return c.json({error:'invalid_body'},400);}
     if(!b||typeof b.agentId!=='string'||typeof b.chatKey!=='string'||!allowed(b))return c.json({error:'binding_denied'},403);
     if(b.tools!==undefined&&(!Array.isArray(b.tools)||b.tools.length>200||!b.tools.every((n:unknown)=>typeof n==='string'&&TOOL_NAME.test(n))))return c.json({error:'invalid_tools'},400);
+    if(b.mode!==undefined&&b.mode!=='front'&&b.mode!=='agent')return c.json({error:'invalid_mode'},400);
     if(sessions.size)return c.json({error:'session_unavailable'},409);
     const sessionId=randomUUID();
-    sessions.set(sessionId,{agentId:b.agentId,chatKey:b.chatKey,callSid:'browser',...(b.tools?{tools:[...b.tools]}:{}),expires:clock()+15*60000,controller:new AbortController(),requests:new Map(),busy:false});
-    const greeting=pendingSummary(b);return c.json({sessionId,...(greeting?{greeting}: {})});
+    const front=(b.mode??'front')==='front'&&!!host.voiceFrontOpen&&!!host.voiceFrontTurn;
+    if(front&&!host.voiceFrontOpen!(sessionId,b.agentId,b.chatKey,b.tools))return c.json({error:'binding_denied'},403);
+    sessions.set(sessionId,{agentId:b.agentId,chatKey:b.chatKey,callSid:'browser',...(front?{front:true}:{}),...(b.tools?{tools:[...b.tools]}:{}),expires:clock()+15*60000,controller:new AbortController(),requests:new Map(),busy:false});
+    const greeting=pendingSummary(b);return c.json({sessionId,mode:front?'front':'agent',...(greeting?{greeting}: {})});
   });
-  app.delete('/voice/sessions/:id',c=>{const id=c.req.param('id'),s=sessions.get(id);s?.controller.abort();sessions.delete(id);return c.json({closed:true});});
+  app.delete('/voice/sessions/:id',c=>{end(c.req.param('id'));return c.json({closed:true});});
+  // front calls: task events to announce, plus the instructions/tools seam for speech-to-speech fronts
+  const frontCall=(c:any)=>{const s=sessions.get(c.req.param('id'));return s?.front&&allowed(s)?s:undefined;};
+  app.get('/voice/sessions/:id/events',async c=>{if(!frontCall(c))return c.json({error:'session_expired'},404);return c.json({events:await host.voiceFrontEvents!(c.req.param('id'))});});
+  app.get('/voice/sessions/:id/instructions',async c=>{if(!frontCall(c))return c.json({error:'session_expired'},404);return c.json({instructions:await host.voiceFrontInstructions!(c.req.param('id')),tools:FRONT_TOOLS.map(t=>({name:t.name,description:t.description,parameters:t.parameters}))});});
+  app.post('/voice/sessions/:id/tool',async c=>{
+    if(!frontCall(c))return c.json({error:'session_expired'},404);
+    let b:any;try{b=await body(c);}catch{return c.json({error:'invalid_body'},400);}
+    if(!b||typeof b.name!=='string'||!TOOL_NAME.test(b.name)||typeof b.id!=='string'||!/^[A-Za-z0-9_.:-]{1,128}$/.test(b.id)||(b.arguments!==undefined&&(typeof b.arguments!=='object'||Array.isArray(b.arguments)||b.arguments===null)))return c.json({error:'invalid_tool_call'},400);
+    const result=await host.voiceFrontTool!(c.req.param('id'),b.name,b.arguments??{},b.id);
+    return c.json({result,...(host.voiceFrontEnding?.(c.req.param('id'))?{end:true}:{})});
+  });
+  app.post('/voice/sessions/:id/note',async c=>{
+    if(!frontCall(c))return c.json({error:'session_expired'},404);
+    let b:any;try{b=await body(c);}catch{return c.json({error:'invalid_body'},400);}
+    if(!b||!['owner','agent'].includes(b.role)||typeof b.text!=='string'||b.text.length>4000)return c.json({error:'invalid_note'},400);
+    host.voiceFrontNote?.(c.req.param('id'),b.role,b.text);return c.json({ok:true});
+  });
+  app.get('/voice/tasks',async c=>{
+    const agentId=c.req.query('agentId')??'',chatKey=c.req.query('chatKey')??'';
+    if(!allowed({agentId,chatKey}))return c.json({error:'binding_denied'},403);
+    const tasks=await host.voiceTasks?.(agentId,chatKey);
+    return tasks?c.json({tasks}):c.json({error:'tasks_unavailable'},503);
+  });
   app.post('/voice/sessions/:id/turn',async c=>{
     const sessionId=c.req.param('id'),s=sessions.get(sessionId);if(!s)return c.json({error:'session_expired'},404);
     const attached=()=>sessions.get(sessionId)===s&&!s.controller.signal.aborted&&!c.req.raw.signal.aborted&&s.expires>clock();
@@ -104,6 +143,15 @@ export function createCanonicalVoiceBridge(host:VoiceHost,token:string,clock=Dat
       if(!attached()||controller.signal.aborted)return c.json({error:'turn_detached'},409);
       const pending=pendingSummary(s);
       if(pending){s.requests.set(b.requestId,{text:b.text,reply:pending});return c.json({text:pending,pendingApproval:true,readOnly:true});}
+      if(s.front){
+        const reply=await Promise.race([host.voiceFrontTurn!(sessionId,b.text,controller.signal).catch(()=>undefined),detached.then(()=>undefined)]);
+        if(controller.signal.aborted)return c.json({error:'turn_detached'},409);
+        const spoken=reply?applyVoiceStyle(reply,{maxSentences:4,maxChars:900,allowFullPaths:false}).trim().slice(0,900):'';
+        if(!spoken)return c.json({error:'agent_reply_unavailable'},502);
+        s.requests.set(b.requestId,{text:b.text,reply:spoken});
+        // the front hung up: the voice service ends the call once this goodbye has been spoken
+        return c.json({text:spoken,...(host.voiceFrontEnding?.(sessionId)?{end:true}:{})});
+      }
       const turn=host.voiceTurn({agentId:s.agentId,chatKey:s.chatKey,text:b.text,...(s.tools?{allowedTools:s.tools}:{}),signal:controller.signal,onApprovalRequired:()=>{approvalPending=true;approval();}});
       const result=await Promise.race([turn,approvalNotice,detached]);
       if(approvalPending){controller.abort();const reply=result.text!;s.requests.set(b.requestId,{text:b.text,reply});return c.json({text:reply,pendingApproval:true});}

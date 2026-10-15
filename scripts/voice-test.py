@@ -32,6 +32,37 @@ def canonical_bridge():
     return int(config['bridgePort']), token
 
 
+def openai_key():
+    """OPENAI_API_KEY for the experimental realtime mode: environment first, then the owner's SOPS secrets."""
+    key = os.environ.get('OPENAI_API_KEY', '').strip()
+    if key:
+        return key
+    secrets_file = Path.home()/'.claude/skills/secrets.enc.yaml'
+    if not secrets_file.is_file():
+        return ''
+    env = dict(os.environ, SOPS_AGE_KEY_FILE=os.environ.get('SOPS_AGE_KEY_FILE', str(Path.home()/'.config/sops/age/keys.txt')))
+    try:
+        out = subprocess.run(['sops', '-d', '--extract', '["OPENAI_API_KEY"]', str(secrets_file)], env=env, capture_output=True, timeout=20)
+        return out.stdout.decode().strip() if out.returncode == 0 else ''
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+
+def page_token(rotate=False):
+    """The page's private key, kept across restarts (owner-only file) so remembered links keep working."""
+    path = ROOT/'data'/'voice'/'page-token'
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not rotate and path.is_file() and not path.is_symlink():
+        st = path.stat()
+        token = path.read_text().strip()
+        if st.st_uid == os.getuid() and not st.st_mode & 0o077 and len(token) == 64 and all(c in '0123456789abcdef' for c in token):
+            return token
+    token = secrets.token_hex(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f: f.write(token + '\n')
+    return token
+
+
 def tailscale_origin(voice_port):
     """https origin of a tailnet-only `tailscale serve` for the page; never a Funnel (public) one."""
     try:
@@ -52,6 +83,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--speech-env-file', type=Path, help='Read only DEEPGRAM_API_KEY from this private environment file')
     parser.add_argument('--no-open', action='store_true', help='Do not open the private browser link')
+    parser.add_argument('--new-token', action='store_true', help='Issue a fresh page key (old links and remembered keys stop working)')
     parser.add_argument('--isolated', action='store_true', help='Use an isolated persona copy instead of the bot\'s shared Telegram session')
     parser.add_argument('--check', action='store_true', help='Check dependencies, credential presence and free ports without starting services')
     args = parser.parse_args()
@@ -81,9 +113,16 @@ def main():
     if voice_port == bridge_port or not all(1024 <= p <= 65535 for p in (voice_port, bridge_port)):
         raise RuntimeError('Choose distinct local ports between 1024 and 65535')
     for port in ((voice_port, bridge_port) if args.isolated else (voice_port,)):
-        with socket.socket() as probe:
-            try: probe.bind(('127.0.0.1', port))
-            except OSError: raise RuntimeError(f'Port {port} is occupied; existing processes were left untouched') from None
+        # a just-stopped service can hold the port for a few seconds; wait briefly before giving up
+        for attempt in range(20):
+            with socket.socket() as probe:
+                # like the real server: lingering closed connections (TIME_WAIT) must not count as "occupied"
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    probe.bind(('127.0.0.1', port)); probe.listen(1); break
+                except OSError:
+                    if attempt == 19: raise RuntimeError(f'Port {port} is occupied; existing processes were left untouched') from None
+            time.sleep(0.5)
     tsx = ROOT / 'node_modules/.bin/tsx'
     if not tsx.exists():
         raise RuntimeError('Install PiBot dependencies first')
@@ -96,7 +135,7 @@ def main():
     os.umask(0o077)
     state = Path(tempfile.mkdtemp(prefix='pibot-voice-'))
     state.chmod(0o700)
-    voice_token, bridge_token = secrets.token_hex(32), canonical_token or secrets.token_hex(32)
+    voice_token, bridge_token = page_token(args.new_token), canonical_token or secrets.token_hex(32)
     for name, token in [('voice-token', voice_token), ('bridge-token', bridge_token)]:
         p = state/name
         p.write_text(token)
@@ -108,7 +147,13 @@ def main():
                PIBOT_VOICE_BRIDGE_MODE='isolated' if args.isolated else 'canonical', PIBOT_VOICE_PUBLIC_ORIGINS=ts_origin or '')
     bridge_env = env.copy()
     bridge_env.pop('DEEPGRAM_API_KEY', None)
+    bridge_env.pop('OPENAI_API_KEY', None)
     audio_env = dict(env, DEEPGRAM_API_KEY=key)
+    realtime_key = '' if args.isolated else openai_key()
+    if realtime_key:
+        audio_env['OPENAI_API_KEY'] = realtime_key  # only the audio process; never the bridge
+    else:
+        audio_env.pop('OPENAI_API_KEY', None)
     children = []
     logs = []
     try:
