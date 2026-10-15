@@ -17,7 +17,7 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true, 
     play() { return Promise.resolve(); }
     pause() { this.paused = true; }
   }
-  const elements = Object.fromEntries(['agent','start','stop','refresh','audio','status','agent-detail','play','transcript','mic','levels','mic-level','agent-level','device','scope-note','tools','tool-count','tools-none','tools-all'].map(id => [id,new Element(id)]));
+  const elements = Object.fromEntries(['agent','start','stop','refresh','audio','status','agent-detail','play','transcript','mic','levels','mic-level','agent-level','device','scope-note','tools','tool-count','tools-none','tools-all','tools-toggle','tools-body','tools-presets','tools-head','live-agent'].map(id => [id,new Element(id)]));
   const requests = [], replaced = [], timers = new Map();
   let microphoneCalls = 0, tracksStopped = 0, rtcClosed = 0;
   const track = {stop() { tracksStopped++; }};

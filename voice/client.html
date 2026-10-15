@@ -85,13 +85,34 @@ meter::-moz-meter-bar{background:var(--accent);border-radius:7px}
 #agent-detail{margin:-10px 0 0;color:var(--end);font-size:.95rem}
 #agent-detail:empty{display:none}
 #scope-note{grid-column:1/-1;text-align:center;color:var(--muted);font-size:.85rem;margin:0}
+.tools-title{display:flex;align-items:center;gap:10px;min-height:48px;font:inherit;font-size:1.45rem;font-weight:700;letter-spacing:-.02em}
+.tools-title::after{content:"›";font-size:1.7rem;color:var(--muted);transition:transform .2s;line-height:1}
+.tools-title[aria-expanded="true"]::after{transform:rotate(90deg)}
+.tools-head.closed{margin-bottom:0}
+.live-only{display:none}
+/* During a call the talk card shrinks to one slim bar pinned on top; the conversation gets the room. */
+main.live{grid-template-columns:1fr}
+.live .talk{position:sticky;top:10px;z-index:5;flex-direction:row;flex-wrap:wrap;align-items:center;gap:10px 16px;padding:10px 12px 10px 20px;border-radius:24px}
+.live .talk > .row,.live #mic,.live #agent-detail{display:none}
+.live .live-only{display:block;font-weight:700;font-size:1.05rem}
+.live #status{flex:1;min-width:8em;text-align:left;font-size:1rem;font-weight:500;color:var(--muted)}
+.live #levels{display:flex;gap:14px;align-items:center}
+.live .level{grid-template-columns:auto 72px;gap:8px;font-size:.8rem}
+.live #device{max-width:22ch;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.8rem}
+.live .stage{padding:0;order:9}
+.live .big{width:auto;aspect-ratio:auto;min-height:52px;padding:0 26px;border-radius:26px;font-size:1.05rem;animation:none;box-shadow:none}
+.live #play{min-height:44px;padding:0 16px}
+.live #stop{animation:none;box-shadow:0 0 0 4px var(--end-soft)}
+.live .level meter{width:72px}
+.live .transcript{max-height:62vh}
 [hidden]{display:none!important}
-@media (max-width:860px){main{grid-template-columns:1fr}.talk{position:static}}
+@media (max-width:860px){main{grid-template-columns:1fr}.talk{position:static}.live .talk{position:sticky}.live #levels .level span{display:none}.live .level{grid-template-columns:56px}.live .level meter{width:56px}}
 </style>
 </head>
 <body>
 <main>
 <section class="card talk" aria-label="Talk">
+  <span id="live-agent" class="live-only"></span>
   <div class="row">
     <select id="agent" aria-label="Agent" disabled><option>Loading…</option></select>
     <button id="refresh" class="icon" aria-label="Refresh agents" title="Refresh agents" disabled>↻</button>
@@ -112,19 +133,18 @@ meter::-moz-meter-bar{background:var(--accent);border-radius:7px}
   <audio id="audio" autoplay></audio>
 </section>
 <div class="side">
-  <section class="card" aria-labelledby="tools-title">
-    <div class="tools-head">
-      <h2 id="tools-title">Tools<span id="tool-count"></span></h2>
-      <div class="seg" role="group" aria-label="Tool presets">
+  <section class="card" aria-label="Conversation">
+    <div id="transcript" class="transcript" role="log" aria-label="Conversation" aria-live="polite"></div>
+  </section>
+  <section class="card" aria-labelledby="tools-toggle">
+    <div class="tools-head" id="tools-head">
+      <button id="tools-toggle" class="tools-title" aria-expanded="true" aria-controls="tools-body">Tools<span id="tool-count"></span></button>
+      <div class="seg" id="tools-presets" role="group" aria-label="Tool presets">
         <button id="tools-none" aria-pressed="false">None</button>
         <button id="tools-all" aria-pressed="false">All</button>
       </div>
     </div>
-    <div id="tools"><p class="empty">Pick an agent to see its tools.</p></div>
-  </section>
-  <section class="card" aria-labelledby="talk-title">
-    <h2 id="talk-title" hidden>Conversation</h2>
-    <div id="transcript" class="transcript" role="log" aria-label="Conversation" aria-live="polite"></div>
+    <div id="tools-body"><div id="tools"><p class="empty">Pick an agent to see its tools.</p></div></div>
   </section>
 </div>
 <p id="scope-note"></p>
@@ -158,6 +178,8 @@ meter::-moz-meter-bar{background:var(--accent);border-radius:7px}
     startButton.disabled = active || stopping || !validToken || !audioReady || !selected()?.available;
     stopButton.disabled = !active;
     startButton.hidden = active; stopButton.hidden = !active;
+    document.querySelector?.('main')?.classList.toggle('live', active);
+    $('live-agent').textContent = active ? (selected()?.name || '') : '';
     refreshButton.disabled = active || stopping || !validToken;
     const agent = selected();
     $('agent-detail').textContent = agent && !agent.available ? (agent.reason || 'This agent is unavailable for voice.') : '';
@@ -184,6 +206,13 @@ meter::-moz-meter-bar{background:var(--accent);border-radius:7px}
     const names = new Set(allTools());
     chosen = new Set(Array.isArray(saved) ? saved.filter(n => names.has(n)) : names); // default: every tool the agent has
     renderTools();
+  }
+  // Tools card open/closed, remembered across visits.
+  let toolsOpen = true; try { toolsOpen = localStorage.getItem('pibot-voice-tools-open') !== '0'; } catch {}
+  function showToolsOpen() {
+    $('tools-toggle').setAttribute?.('aria-expanded', String(toolsOpen));
+    $('tools-body').hidden = !toolsOpen; $('tools-presets').hidden = !toolsOpen;
+    $('tools-head').classList?.toggle('closed', !toolsOpen);
   }
   function renderTools() {
     const box = $('tools'); if (!box?.replaceChildren || !document.createElement) return;
@@ -374,6 +403,8 @@ meter::-moz-meter-bar{background:var(--accent);border-radius:7px}
   startButton.addEventListener('click', () => void start());
   stopButton.addEventListener('click', () => void stop());
   refreshButton.addEventListener('click', () => void refresh());
+  $('tools-toggle').addEventListener('click', () => { toolsOpen = !toolsOpen; try { localStorage.setItem('pibot-voice-tools-open', toolsOpen ? '1' : '0'); } catch {} showToolsOpen(); });
+  showToolsOpen();
   $('tools-none').addEventListener('click', () => { chosen = new Set(); saveChoice(); renderTools(); });
   $('tools-all').addEventListener('click', () => { chosen = new Set(allTools()); saveChoice(); renderTools(); });
   $('play').addEventListener('click', () => { audio.play().then(() => { $('play').hidden = true; }).catch(() => status('Audio playback is blocked by the browser.')); });
