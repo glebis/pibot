@@ -565,6 +565,18 @@ describe("PiBot commands", () => {
     expect(t.transport.lastText()).toContain("No agent");
   });
 
+  it("/agent switch wins over a dedicated sub-bot's binding (pibot-z09)", async () => {
+    const t = makeBot(undefined, { allowedChats: ["42"] }); // owner chat passes the dedicated-bot gate
+    const subBot = new MockTransport("telegram:fitness", "fitness");
+    t.bot.addTransport(subBot);
+    await subBot.say("hi"); // registers the chat with the bound agent
+    await subBot.say("/agent assistant");
+    expect(subBot.lastText()).toContain("Switched to");
+    await subBot.say("who am I talking to");
+    expect((t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0]).toBe("assistant");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
   it("hands the conversation to another agent with /handoff", async () => {
     await t.transport.say("we are planning the tax report");
     await t.transport.say("/handoff fitness deadline is friday");

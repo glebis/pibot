@@ -1015,7 +1015,13 @@ export class PiBot implements HeartbeatHost {
     const idx = ck.lastIndexOf(":");
     const transportName = ck.slice(0, idx);
     const bound = this.transports.get(transportName)?.boundAgentId;
-    return bound ?? this.chatAgent.get(ck) ?? this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId();
+    // The chat mapping normally tracks whoever answered (promptAgent re-remembers
+    // every turn), so on a dedicated sub-bot it equals the binding. It only
+    // diverges when the owner explicitly switched (/agent, /handoff, born-card,
+    // dashboard rebind) — and that switch must beat the dedicated binding here,
+    // otherwise the switch acknowledges but the next message still routes to the
+    // sub-bot's own agent (pibot-z09).
+    return this.chatAgent.get(ck) ?? bound ?? this.deps.config.defaultAgentId ?? this.deps.agents.defaultAgentId();
   }
 
   private rememberChat(agentId: string, ck: string): void {
