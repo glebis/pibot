@@ -75,6 +75,18 @@ describe("exec plugin allowlist resolution", () => {
     expect(r.error).toMatch(/shell metacharacters/);
   });
 
+  it("allows space-bounded '|' as plain data but refuses pipe-shaped args", async () => {
+    const plain = path.join(agentDir, "bin/fake-plain");
+    for (const arg of ["%(title)s | %(channel)s", "a | b", "a |", "A | B | C"]) {
+      const r = await resolveExec([plain, arg], { workspace: agentDir, agentDir }, allow);
+      expect(r.error, arg).toBeUndefined();
+    }
+    for (const arg of ["a |b", "a| b", "a|b", "| b", "  | b", "a > b", "a ; b", "$(id)", "a && b", "a || b", "`id`"]) {
+      const r = await resolveExec([plain, arg], { workspace: agentDir, agentDir }, allow);
+      expect(r.error, arg).toMatch(/shell metacharacters/);
+    }
+  });
+
   it("enforces pin: python3-style pinned script must match exactly", async () => {
     const py = path.join(agentDir, "bin/fake-py");
     const ok = await resolveExec([py, "/tmp/fake/pinned.py", "--flag", "x"], { workspace: agentDir, agentDir }, allow);
@@ -216,16 +228,29 @@ describe("default allowlist hardening (bypass regressions)", () => {
       }
     });
 
-    it("-o/--output must stay workspace-relative", async () => {
-      for (const o of ["/etc/x", "../../x", "a/../../x", "~/x", "~"]) {
+    it("resolves the argvs from knower's blocked sessions (2026-10-19 regressions)", async () => {
+      // 17:54 session: the runner refused this for the pipe in --print; -o is now allowed under the agent dir
+      expect((await yt("--skip-download", "--write-auto-subs", "--write-subs", "--sub-langs", "en.*", "--sub-format", "vtt",
+        "-o", path.join(agentDir, "7T-gldvgfpo.%(ext)s"), "--print", "%(title)s | %(channel)s | %(upload_date)s", URL)).error).toBeUndefined();
+      // 16:22 session: multi-line --print + absolute -o under the agent dir
+      expect((await yt("--skip-download", "--print", "%(title)s\n%(channel)s\n%(description)s\n%(subtitles)j",
+        "--write-auto-subs", "--write-subs", "--sub-langs", "en.*", "--sub-format", "vtt",
+        "-o", path.join(agentDir, "70fH1KGSlOo.%(ext)s"), URL)).error).toBeUndefined();
+    });
+
+    it("-o/--output must stay under the agent's workspace or agent dir", async () => {
+      fs.symlinkSync("/tmp", path.join(agentDir, "outdir-link"));
+      for (const o of ["/etc/x", "../../x", "a/../../x", "~/x", "~", "outdir-link/x.mp3", path.join(agentDir, "scripts/x.scpt")]) {
         expect((await yt("-o", o, URL)).error, o).toMatch(/not allowed/);
         expect((await yt(`--output=${o}`, URL)).error, o).toMatch(/not allowed/);
       }
       expect((await yt("-o", "out/%(id)s.%(ext)s", URL)).error).toBeUndefined();
+      expect((await yt("-o", path.join(agentDir, "out.%(ext)s"), URL)).error).toBeUndefined();
+      expect((await yt("-o", path.join(agentDir, "media/x.%(ext)s"), URL)).error).toBeUndefined();
     });
 
     it("-o refuses type prefixes (their template may be absolute)", async () => {
-      for (const o of ["subtitle:/Users/x/.zshrc", "infojson:/tmp/x", "pl_thumbnail:x", "SUBTITLE:x"]) {
+      for (const o of ["subtitle:/Users/x/.zshrc", "infojson:/tmp/x", "pl_thumbnail:x", "SUBTITLE:x", "subtitle:~/x"]) {
         expect((await yt("-o", o, URL)).error, o).toMatch(/not allowed/);
         expect((await yt(`--output=${o}`, URL)).error, o).toMatch(/not allowed/);
       }
@@ -236,6 +261,11 @@ describe("default allowlist hardening (bypass regressions)", () => {
         expect((await yt("-o", o, URL)).error, o).toMatch(/not allowed/);
       }
       expect((await yt("-o", "materials/scripts-notes.%(ext)s", URL)).error).toBeUndefined();
+    });
+
+    it("--print template values stay plain data space-bounded pipe ok, shell shapes refused", async () => {
+      expect((await yt("--print", "%(title)s | %(channel)s", URL)).error).toBeUndefined();
+      expect((await yt("--print", "%(title)s > %(channel)s", URL)).error).toMatch(/shell metacharacters/);
     });
 
     it("positionals must be https URLs; value flags need a safe value", async () => {
