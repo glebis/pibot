@@ -59,6 +59,8 @@ export interface CapabilityContext {
     providers: SpeechProviderRegistry;
     store: SpeechArtifactStore;
     send: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>;
+    /** native round video note (Bot API sendVideoNote) — externally produced MP4 */
+    sendVideoNote?: (transport: string, chatId: string, filePath: string) => Promise<void>;
   };
   /** global STT custom-vocabulary store (bot-wide data dir) */
   dictionary?: {
@@ -128,6 +130,7 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
       providers: ctx.speech!.providers,
       store: ctx.speech!.store,
       send: ctx.speech!.send,
+      sendVideoNote: ctx.speech!.sendVideoNote,
     }),
   },
   {

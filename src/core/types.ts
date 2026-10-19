@@ -138,6 +138,8 @@ export interface Transport {
   sendVoice?(chatId: string, filePath: string, caption?: string): Promise<void>;
   /** Send a local MP3/M4A music-player artifact through this transport. */
   sendAudio?(chatId: string, filePath: string, caption?: string): Promise<void>;
+  /** native round video note (Bot API sendVideoNote) — externally produced square MP4 */
+  sendVideoNote?(chatId: string, filePath: string): Promise<void>;
   /** Manager-mode bots receive managed-bot creation/token updates (optional) */
   onManagedBot?(cb: (info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>): void;
 }

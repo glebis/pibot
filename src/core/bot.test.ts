@@ -67,6 +67,7 @@ class MockTransport implements Transport {
   mediaCb: ((media: import("./types.js").IncomingMedia) => Promise<void>) | null = null;
   mediaSeen: import("./types.js").IncomingMedia[] = [];
   speechSeen: Array<{ kind: "voice" | "audio"; chatId: string; filePath: string; caption?: string }> = [];
+  videoNoteSeen: Array<{ chatId: string; filePath: string }> = [];
 
   constructor(name = "mock", boundAgentId?: string) {
     this.name = name;
@@ -86,6 +87,9 @@ class MockTransport implements Transport {
   }
   async sendAudio(chatId: string, filePath: string, caption?: string): Promise<void> {
     this.speechSeen.push({ kind: "audio", chatId, filePath, caption });
+  }
+  async sendVideoNote(chatId: string, filePath: string): Promise<void> {
+    this.videoNoteSeen.push({ chatId, filePath });
   }
   onMessage(cb: (text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>): void {
     this.messageCb = cb;
@@ -482,6 +486,22 @@ describe("PiBot commands", () => {
     expect(arg).toContain("spoken words");
     expect(arg).not.toContain("🎙"); // bare transcript IS the prompt — no transcript-object framing
     expect(arg).not.toContain("transcribed via");
+  });
+
+  it.each([true, false])("retains the original video only after successful transcription (%s)", async (success) => {
+    const retainVideo = vi.fn(() => "/private/media/original.mp4");
+    const cleanup = vi.fn(async () => {});
+    t.audioMedia.prepare.mockResolvedValueOnce({ ok: true, filePath: "/private/media/audio.wav", durationSec: 9, retainVideo, cleanup } as never);
+    if (!success) t.stt.transcribe.mockRejectedValueOnce(new Error("failed"));
+    await t.transport.sayMedia({ kind: "video_note", durationSec: 9, filePath: "/private/media/original.mp4" });
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(retainVideo).toHaveBeenCalledTimes(success ? 1 : 0);
+    if (success) {
+      expect(t.promptSpy.mock.calls[0][0]).toContain("spoken words");
+      expect(t.promptSpy.mock.calls[0][0]).toContain("/private/media/original.mp4");
+      expect(t.promptSpy.mock.calls[0][0]).toContain("only when requested");
+      expect(t.transport.pushed.some((p) => p.opts.text.includes("/private/media/"))).toBe(false);
+    }
   });
 
   it("uses the resolved agent speech policy for video-note transcription", async () => {
@@ -2476,5 +2496,54 @@ describe("PiBot host routing", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("background task model failover", () => {
+  let t: ReturnType<typeof makeBot>;
+  const run = () => ({ agentId: "assistant", chatKey: "mock:42", taskId: "tk1", title: "research", instructions: "find it", attempt: 1, resumed: false, signal: new AbortController().signal }) as never;
+  const failed = { role: "assistant", content: [], stopReason: "error", errorMessage: "429: weekly usage limit", timestamp: 1 };
+  const answered = { role: "assistant", content: [{ type: "text", text: "Found it: the answer." }], stopReason: "stop", timestamp: 2 };
+
+  beforeEach(() => { t = makeBot(); });
+  afterEach(() => { fs.rmSync(t.dir, { recursive: true, force: true }); });
+
+  it("switches to the next model when the primary errors instead of finishing with no summary", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["primary/m", "fallback/m"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("primary/m");
+    (t.cascade.nextCandidate as ReturnType<typeof vi.fn>).mockReturnValue("fallback/m");
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "m" } as never);
+    t.promptSpy.mockImplementationOnce(async () => { messages.push(failed); }).mockImplementationOnce(async () => { messages.push(answered); });
+
+    await expect(t.bot.runLedgerTask(run())).resolves.toBe("Found it: the answer.");
+    expect(t.cascade.noteFailure).toHaveBeenCalledWith("primary/m", "429: weekly usage limit");
+    expect(t.cascade.noteSuccess).toHaveBeenCalledWith("fallback/m");
+    expect(t.promptSpy.mock.calls[1][0]).toContain("[cascade] Internal");
+  });
+
+  it("fails the task with the provider error when every model is down", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementation(async () => { messages.push(failed); });
+
+    await expect(t.bot.runLedgerTask(run())).rejects.toThrow(/every model failed \(ollama\/test\): 429: weekly usage limit/);
+  });
+});
+
+describe("video_note_send routing", () => {
+  it("routes to the invoking transport and chat, rejects other targets", async () => {
+    const t = makeBot();
+    await t.transport.say("hello"); // binds mock:42 → assistant session
+    const hooks = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls[0][8] as (
+      transport: string,
+      chatId: string,
+      filePath: string,
+    ) => Promise<void>;
+    expect(hooks).toBeTypeOf("function");
+    await hooks("mock", "42", "/tmp/circle.mp4");
+    expect(t.transport.videoNoteSeen).toEqual([{ chatId: "42", filePath: "/tmp/circle.mp4" }]);
+    await expect(hooks("mock", "43", "/tmp/circle.mp4")).rejects.toThrow(/invoking chat/i);
   });
 });

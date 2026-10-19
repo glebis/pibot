@@ -629,6 +629,31 @@ export class TelegramTransport implements Transport {
     });
   }
 
+    async sendVideoNote(chatId: string, filePath: string): Promise<void> {
+    const resolved = path.resolve(filePath);
+    // Sync lstat here keeps the guard simple: no symlinks, regular files only.
+    const st = fs.lstatSync(resolved);
+    if (!st.isFile() || st.isSymbolicLink()) throw new Error("Invalid video note artifact file");
+    if (st.size <= 0 || st.size > 50 * 1024 * 1024) throw new Error("Video note artifact must be between 1 byte and 50MB");
+    if (path.extname(resolved).toLowerCase() !== ".mp4") throw new Error("Telegram video notes must be MP4 (H.264 up to 60s)");
+    const digest = createHash("sha256").update(fs.readFileSync(resolved)).digest("hex");
+    const payload = `videonote:${digest}`;
+    await this.enqueue(chatId, async () => {
+      if (!this.duplicateGuard.shouldSend(chatId, payload)) {
+        console.warn(`[telegram] suppressed duplicate video-note send to chat ${chatId}`);
+        return;
+      }
+      await this.sendTelegram(chatId, () => {
+        const input = new InputFile(resolved, path.basename(resolved));
+        // Native round note: sendVideoNote — never ordinary video (sendVideo would
+        // deliver a rectangular clip, not a circle). No caption field exists for
+        // video notes in the Bot API, so none is passed.
+        return this.bot.api.sendVideoNote(chatId, input);
+      });
+      this.duplicateGuard.markSent(chatId, payload);
+    });
+  }
+
   private onManagedBotCb: ((info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>) | null = null;
 
   /** Manager-mode flag from the last getMe */

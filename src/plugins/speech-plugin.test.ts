@@ -48,7 +48,7 @@ describe("speech plugin", () => {
 
   it("generates a private artifact without sending it", async () => {
     const { tools, provider, send } = setup();
-    expect([...tools.keys()].sort()).toEqual(["speech_generate", "speech_send"]);
+    expect([...tools.keys()].sort()).toEqual(["speech_generate", "speech_send", "video_note_send"]);
 
     const result = await tools.get("speech_generate")!.execute("call-1", { text: "hello", kind: "voice", provider: "local" });
 

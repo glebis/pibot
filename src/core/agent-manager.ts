@@ -168,6 +168,7 @@ export class AgentManager {
     comms?: CommsHooks,
     applyProfilePhoto?: (transport: string, filePath: string) => Promise<void>,
     sendSpeech?: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>,
+    sendVideoNote?: (transport: string, chatId: string, filePath: string) => Promise<void>,
     telegramSend?: TelegramSendHooks,
     /** minimal-voice shaping applied to spoken text before synthesis (bd: minimal voice).
      *  Last on purpose: the call site appends it without disturbing existing arg positions. */
@@ -215,6 +216,7 @@ export class AgentManager {
         providers: createDefaultSpeechProviders(),
         store: new SpeechArtifactStore(path.join(agent.dir, "runtime", "speech")),
         send: sendSpeech,
+        sendVideoNote: sendVideoNote,
         ...(styleSpeech ? { styleText: styleSpeech } : {}),
       } : undefined,
     });

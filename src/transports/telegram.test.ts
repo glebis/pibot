@@ -1016,3 +1016,32 @@ describe("TelegramTransport outbound push path", () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("Telegram video-note delivery", () => {
+  it("sends native round notes via sendVideoNote (no caption) and suppresses an immediate duplicate", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-videofnote-"));
+    const file = path.join(dir, "circle.mp4");
+    fs.writeFileSync(file, "ftyp-circle-note", { mode: 0o600 });
+    const transport = new (await import("./telegram.js")).TelegramTransport("123:test", ["42"]);
+    const sendVideoNote = vi.fn(async (_chatId: string, _note: unknown, _options?: unknown) => ({ message_id: 2 }));
+    (transport as unknown as { bot: { api: { sendVideoNote: typeof sendVideoNote } } }).bot.api.sendVideoNote = sendVideoNote;
+
+    await transport.sendVideoNote("42", file);
+    await transport.sendVideoNote("42", file);
+
+    expect(sendVideoNote).toHaveBeenCalledTimes(1); // duplicate suppressed
+    expect(sendVideoNote.mock.calls[0][0]).toBe("42");
+    // no caption/other params: video notes have no caption field in the Bot API
+    expect(sendVideoNote.mock.calls[0][2]).toBeUndefined();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("rejects non-MP4 artifacts", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-videofnote-"));
+    const file = path.join(dir, "circle.webm");
+    fs.writeFileSync(file, "webm", { mode: 0o600 });
+    const transport = new (await import("./telegram.js")).TelegramTransport("123:test", ["42"]);
+    await expect(transport.sendVideoNote("42", file)).rejects.toThrow(/MP4/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});

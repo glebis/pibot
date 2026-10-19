@@ -1105,6 +1105,12 @@ export class PiBot implements HeartbeatHost {
           await target.sendAudio(targetChatId, filePath, caption);
         }
       },
+      async (transportName: string, targetChatId: string, filePath: string) => {
+        if (transportName !== t.name || targetChatId !== chatId) throw new Error("Video-note target does not match the invoking chat");
+        const target = this.transports.get(transportName);
+        if (!target?.sendVideoNote) throw new Error("The invoking transport cannot send video notes");
+        return target.sendVideoNote(targetChatId, filePath);
+      },
       this.telegramSendHooks(),
       (text: string) => this.shapeSpoken(agentId, ck, text),
     );

@@ -9,6 +9,8 @@ export interface SpeechPluginOptions {
   providers: SpeechProviderRegistry;
   store: SpeechArtifactStore;
   send: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>;
+  /** native round video note (Bot API sendVideoNote) from an existing local MP4 */
+  sendVideoNote?: (transport: string, chatId: string, filePath: string) => Promise<void>;
   /**
    * Applied to `text` BEFORE synthesis. Filtering after the fact would leave the
    * audio saying "slash Users slash gleb slash…" while the transcript looked clean
@@ -74,6 +76,30 @@ export function speechPlugin(options: SpeechPluginOptions): InlineExtension {
             content: [{ type: "text", text: `Telegram ${artifact.kind} message sent.` }],
             details: { artifactId: artifact.id, kind: artifact.kind, sent: true },
           };
+        },
+      });
+
+      pi.registerTool({
+        name: "video_note_send",
+        label: "Send Video Note",
+        description: [
+          "Send an EXISTING local MP4 as a native round Telegram video note (Bot API sendVideoNote).",
+          "For example, forwarding a video the owner received as a circle, or any prepared square MP4. This is NOT ordinary video: Telegram renders a true circular note.",
+          "Never use from heartbeat, schedules, replay, or without an explicit owner request. The source file is left on disk.",
+        ].join(" "),
+        parameters: Type.Object({
+          path: Type.String({ description: "Absolute local path of the MP4 to send as a video note" }),
+        }),
+        async execute(_toolCallId, params) {
+          if (!options.sendVideoNote) {
+            return { content: [{ type: "text", text: "Video-note delivery is not wired on this agent." }], details: { sent: false } };
+          }
+          try {
+            await options.sendVideoNote(options.transport, options.chatId, params.path);
+            return { content: [{ type: "text", text: "Native video note sent." }, { type: "text", text: "The source file was not modified or deleted." }], details: { sent: true } };
+          } catch (e) {
+            return { content: [{ type: "text", text: `ERROR: ${e instanceof Error ? e.message : String(e)}` }], details: { sent: false } };
+          }
         },
       });
     },
