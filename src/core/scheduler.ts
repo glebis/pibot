@@ -25,6 +25,8 @@ export interface ScheduleFailureNotice {
   error: string;
 }
 
+export class ScheduleRouteError extends Error {}
+
 export class Scheduler {
   private jobs = new Map<string, Schedule>();
   private snoozeByAgent = new Map<string, SnoozeState>();
@@ -35,6 +37,18 @@ export class Scheduler {
   private fireCb: (job: Schedule, snoozed: boolean) => void | Promise<void>;
   private noticeCb?: (job: Schedule, event: ScheduleFailureNotice) => void | Promise<void>;
   private stopped = false;
+  private routeValidator?: (job: Pick<Schedule, "agentId" | "chat" | "delivery" | "internal">) => string | undefined;
+
+  /** Host checks transport availability and ownership without rerouting a job. */
+  setRouteValidator(validate: NonNullable<Scheduler["routeValidator"]>): void {
+    this.routeValidator = validate;
+  }
+
+  private assertRoute(job: Pick<Schedule, "agentId" | "chat" | "delivery" | "internal">): void {
+    if (job.internal) return;
+    const error = this.routeValidator?.(job);
+    if (error) throw new ScheduleRouteError(error);
+  }
 
   constructor(
     dataDir: string,
@@ -91,6 +105,7 @@ export class Scheduler {
 
   create(job: Omit<Schedule, "id" | "createdAt" | "firedCount" | "status"> & { id?: string }): Schedule {
     if (!job.internal) {
+      this.assertRoute(job);
       if (job.repeat?.everyMs != null && job.repeat.everyMs < MIN_AGENT_REPEAT_MS) {
         throw new Error("Recurring schedules must be at least 15 minutes apart.");
       }
@@ -151,6 +166,7 @@ export class Scheduler {
   resume(id: string): Schedule | null {
     const job = this.get(id);
     if (!job || job.status !== "paused") return null;
+    this.assertRoute(job);
     job.status = "pending";
     job.deliveryAttempts = 0;
     job.consecutiveFailures = 0;
@@ -311,6 +327,7 @@ export class Scheduler {
     // instead of being clobbered by the post-delivery bookkeeping below.
     const dueAtAtFire = job.dueAt;
     try {
+      this.assertRoute(job);
       await this.fireCb(job, Boolean(sn && now < sn.until && job.wake === "important"));
     } catch (e) {
       console.error("[scheduler] fire handler error:", e);
@@ -321,7 +338,11 @@ export class Scheduler {
       job.deliveryAttempts = (job.deliveryAttempts ?? 0) + 1;
       job.lastDeliveryError = errorMessage(e).slice(0, 300);
       let noticeKind: ScheduleFailureNotice["kind"] | null = null;
-      if (job.repeat && job.deliveryAttempts >= MAX_ATTEMPTS_PER_OCCURRENCE) {
+      if (e instanceof ScheduleRouteError) {
+        job.status = "paused";
+        job.pauseReason = `Delivery route needs repair: ${job.lastDeliveryError}`;
+        noticeKind = "paused";
+      } else if (job.repeat && job.deliveryAttempts >= MAX_ATTEMPTS_PER_OCCURRENCE) {
         job.deliveryAttempts = 0;
         job.consecutiveFailures = (job.consecutiveFailures ?? 0) + 1;
         if (job.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {

@@ -32,7 +32,7 @@ import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
 import type { TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
 import { QuestionBus, type QuestionSpec } from "./questions.js";
 import { MessageCoalescer } from "./message-coalescer.js";
-import type { Scheduler } from "./scheduler.js";
+import { ScheduleRouteError, type Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
 import type { Card, ChatRef, IncomingMedia, ReplyContext, Schedule, Transport } from "./types.js";
 import * as os from "node:os";
@@ -597,6 +597,19 @@ export class PiBot implements HeartbeatHost {
       });
     }
     for (const t of deps.transports) this.addTransport(t);
+    deps.scheduler.setRouteValidator?.((job) => this.scheduleRouteError(job));
+  }
+
+  private scheduleRouteError(job: Pick<Schedule, "agentId" | "chat" | "delivery" | "internal">): string | undefined {
+    if (job.internal) return;
+    if (job.delivery === "agent") {
+      const ck = this.primaryChat(job);
+      if (ck && this.transports.has(this.splitChatKey(ck).transport)) return;
+      return `No usable owned chat for ${job.agentId}. Repair the destination before resuming; no message was sent.`;
+    }
+    if (!job.chat.chatId || !this.transports.has(job.chat.transport)) {
+      return `Delivery transport unavailable: ${job.chat.transport}. Repair the destination before resuming; no message was sent.`;
+    }
   }
 
   addTransport(t: Transport): void {
@@ -3068,6 +3081,8 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       await this.deps.commitments.onFire(job);
       return;
     }
+    const routeError = this.scheduleRouteError(job);
+    if (routeError) throw new ScheduleRouteError(routeError);
     this.deps.events.log(job.agentId, "fire", `${job.title} (${job.kind})`);
 
     if (job.delivery === "agent") {

@@ -871,6 +871,17 @@ describe("PiBot fire delivery", () => {
     expect(t.transport.lastText()).not.toContain("produced no model output");
   });
 
+  it("rejects an unresolved synthetic schedule without delivering anywhere", async () => {
+    const t = makeBot();
+    await expect(t.bot.deliverFire({
+      id: "lost", agentId: "pibot-dev", chat: { transport: "agent", chatId: "sender" },
+      title: "lost route", kind: "task", dueAt: Date.now(), wake: "normal",
+      delivery: "agent", status: "pending", createdAt: 0, firedCount: 0,
+    }, false)).rejects.toThrow(/No usable owned chat.*Repair the destination/);
+    expect(t.promptSpy).not.toHaveBeenCalled();
+    expect(t.transport.pushed).toHaveLength(0);
+  });
+
   it("agent delivery with the synthetic 'agent' transport resolves the agent's remembered chat", async () => {
     const t = makeBot();
     // agent→chat bindings persist in state.json; simulate a restored binding (both maps)
