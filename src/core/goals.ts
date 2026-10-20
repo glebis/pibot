@@ -253,7 +253,8 @@ export async function createLlmGoalIO(deps: {
       })
     ).session;
     try {
-      await session.prompt(userPrompt);
+      const { trackActivity } = await import("./activity.js");
+      await trackActivity({ kind: "goal-judge", label: "judge /goal progress", session }, () => session.prompt(userPrompt));
       const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
       const last = [...msgs].reverse().find((m) => m.role === "assistant");
       return (last?.content ?? []).filter((b) => b?.type === "text").map((b) => b.text).join(" ");

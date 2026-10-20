@@ -13,6 +13,7 @@ import {
   SettingsManager,
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
+import { trackActivity } from "./activity.js";
 
 const BRIEF_SYSTEM = `You package a conversation for handoff to another AI agent. Given the recent transcript, write a brief that lets the target agent continue — and execute the task — without asking the user to repeat anything.
 
@@ -83,7 +84,7 @@ export async function composeHandoffBrief(
       })
     ).session;
     try {
-      await session.prompt(`Transcript to package:\n\n${excerpt}`);
+      await trackActivity({ kind: "handoff-brief", label: "package handoff brief", session }, () => session.prompt(`Transcript to package:\n\n${excerpt}`));
       const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
       const last = [...msgs].reverse().find((m) => m.role === "assistant");
       const raw = (last?.content ?? []).filter((b) => b?.type === "text").map((b) => b.text).join(" ");

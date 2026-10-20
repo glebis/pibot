@@ -19,6 +19,7 @@ import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate,
 import { providerRowHtml } from "./core/providers.js";
 import { getMediaLinkKey, mediaDirFor, verifyMediaToken } from "./core/media-links.js";
 import { registerInboxRoutes, type InboxControl } from "./web-inbox-routes.js";
+import { renderProcesses } from "./web-processes.js";
 import { registerEnrollmentRoutes, type EnrollmentControl } from "./web-enrollment.js";
 import { mountLabPaymentRoutes } from "./web-payments.js";
 import { registerReviewRoutes } from "./web-review-routes.js";
@@ -52,6 +53,8 @@ export interface TelegramControl {
 export interface WebDeps {
   coordinator?: CoordinatorControl;
   inbox?: InboxControl;
+  /** live turns, durable tasks, goal loops, voice calls and child OS processes */
+  processes?: import("./core/processes.js").ProcessControl;
   enrollment?: EnrollmentControl;
   agents: AgentManager;
   scheduler: Scheduler;
@@ -137,10 +140,11 @@ function page(title: string, body: string, flash?: string): string {
   code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
   .pill { display: inline-block; border: 1px solid #2b313b; border-radius: 999px; padding: 1px 10px; font-size: 12px; color: #aab3bf; margin-right: 6px; }
   .pill.on { border-color: #1d5c33; color: #9fe0b5; }
+  .pill.bad { border-color: #7f1d1d; color: #f2a7a7; }
   form.inline { display: inline; }
   pre.events { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #9aa4b1; max-height: 260px; overflow: auto; margin: 0; white-space: pre-wrap; }
 </style></head><body><main>
-<nav aria-label="Admin navigation"><a href="/">Overview</a> · <a href="/review">Review changes</a> · <a href="/inbox">Lab inbox</a> · <a href="/lab-payments">Course payments</a> · <a href="/enrollments">Course access</a></nav>
+<nav aria-label="Admin navigation"><a href="/">Overview</a> · <a href="/processes">Processes</a> · <a href="/review">Review changes</a> · <a href="/inbox">Lab inbox</a> · <a href="/lab-payments">Course payments</a> · <a href="/enrollments">Course access</a></nav>
 <h1>🤖 pibot config</h1>
 <p class="sub">agents · rhythm · schedules · evolution${flash ? "" : ""}</p>
 ${flash ? `<div class="flash" id="page-flash">${esc(flash)}</div>` : ""}
@@ -815,6 +819,26 @@ ${hasToken ? `<div class="card">
 
   registerCoordinatorRoutes(app, deps, csrfToken, expectedOrigins());
   registerInboxRoutes(app, deps, csrfToken, expectedOrigins());
+
+  // ─── /processes: everything the daemon is running right now ──────────────
+  app.get("/processes", async (c) => {
+    if (!deps.processes) return c.text("Process view is not wired in this build", 404);
+    c.header("Cache-Control", "no-store");
+    const snap = await deps.processes.snapshot();
+    return c.html(page("processes", renderProcesses(snap, esc, csrfField), c.req.query("msg")));
+  });
+  app.get("/api/processes", async (c) => {
+    if (!deps.processes) return c.json({ error: "Process view is not wired." }, 503);
+    c.header("Cache-Control", "no-store");
+    return c.json(await deps.processes.snapshot());
+  });
+  app.post("/processes/tasks/:id/cancel", async (c) => {
+    const b = await c.req.parseBody().catch(() => ({})) as Record<string, string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
+    if (!deps.processes) return c.redirect("/processes");
+    const ok = await deps.processes.cancelTask(c.req.param("id"));
+    return c.redirect(`/processes?msg=${encodeURIComponent(ok ? "Cancel requested — the task stops at its next step." : "That task is no longer running.")}`);
+  });
   registerEnrollmentRoutes(app, deps, csrfToken, expectedOrigins());
   registerReviewRoutes(app, deps, csrfToken, expectedOrigins());
   mountLabPaymentRoutes(app, {

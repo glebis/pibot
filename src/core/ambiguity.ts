@@ -5,6 +5,7 @@
  * Ambiguity = 1 - (goal*0.4 + constraints*0.3 + success*0.3)
  * The gate: score > threshold → ask the generated follow-ups first.
  */
+import { trackActivity } from "./activity.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -80,7 +81,7 @@ export async function scorePersonaAmbiguity(
     dimensions: { goal: 0.8, constraints: 0.6, success: 0.6 },
   };
   try {
-    await session.prompt(`Score this draft persona:\n\n${personaText.slice(0, 3000)}`);
+    await trackActivity({ kind: "persona-score", label: "score draft persona", session }, () => session.prompt(`Score this draft persona:\n\n${personaText.slice(0, 3000)}`));
     const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
     const last = [...msgs].reverse().find((m) => m.role === "assistant");
     const raw = (last?.content ?? []).filter((b) => b?.type === "text").map((b) => b.text).join(" ");

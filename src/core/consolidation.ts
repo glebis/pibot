@@ -25,6 +25,7 @@ import { Type } from "typebox";
 import type { AgentManager, LoadedAgent } from "./agent-manager.js";
 import { redactEventSummary, type EventEntry } from "./events.js";
 import { ensureDir, errorMessage, readJson, slug, truncate, uid, writeJsonAtomic } from "./util.js";
+import { trackActivity } from "./activity.js";
 
 // ─── tunables ───────────────────────────────────────────────────────────────
 
@@ -701,7 +702,7 @@ export function createLlmConsolidationIO(deps: {
           "",
           "Call consolidation_submit exactly once.",
         ].join("\n");
-        await session.prompt(ask);
+        await trackActivity({ kind: "memory", label: `distil ${events.length} event(s)`, agentId, session }, () => session.prompt(ask));
         const merr = sessionError(session);
         if (merr) throw new Error(merr);
       } finally {
@@ -725,7 +726,7 @@ export function createLlmConsolidationIO(deps: {
         const body = blocks
           .map((b) => `#### ${b.kind} (${day(b.fromT)} – ${day(b.toT)})\n${b.text}`)
           .join("\n\n");
-        await session.prompt([`COMPRESS ${blocks.length} old memory block(s) into one era block.`, "", "# Blocks", body].join("\n"));
+        await trackActivity({ kind: "memory", label: `compress ${blocks.length} memory block(s)`, agentId, session }, () => session.prompt([`COMPRESS ${blocks.length} old memory block(s) into one era block.`, "", "# Blocks", body].join("\n")));
         const merr = sessionError(session);
         if (merr) throw new Error(merr);
         const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;

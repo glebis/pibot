@@ -279,6 +279,7 @@ async function main(): Promise<void> {
       agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
       proactiveStore,
       inbox: bot.labInboxControl(),
+      processes: bot.processControl(),
       coordinator,
       enrollment: bot.labEnrollmentControl(),
       commitments: { syncGovernance: (agentId) => commitments.syncPilotGovernance(agentId) },

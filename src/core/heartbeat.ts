@@ -23,6 +23,7 @@ import type { Scheduler } from "./scheduler.js";
 import { ensureDir, errorMessage, fmtWhen, inQuietHours, parseDuration, readJson, truncate, writeJsonAtomic } from "./util.js";
 import { appendBacklogItems, formatBacklogDigest } from "./backlog.js";
 import { buildResearchSignals } from "./research-signals.js";
+import { trackActivity } from "./activity.js";
 
 /** Adaptive-wakeup bounds (Ouroboros set_next_wakeup pattern): the agent may
  *  compress the next gap when something is brewing, stretch it when idle.
@@ -447,12 +448,12 @@ export class HeartbeatEngine {
     }
 
     try {
-      await session.prompt(
+      await trackActivity({ kind: opts.brief ? "morning-brief" : "heartbeat", label: opts.brief ? "morning brief" : "heartbeat tick", agentId: agent.id, session }, () => session.prompt(
         opts.brief
           ? `MORNING BRIEF — ${new Date().toLocaleString([], { weekday: "long", hour: "2-digit", minute: "2-digit" })}\n\n${digest}\n\nCompose the user's morning brief: check calendar_today first, then cover pending items and open promises, and suggest the single most important thing today. Keep it short.`
           : `HEARTBEAT TICK — ${new Date().toLocaleString([], { weekday: "long", hour: "2-digit", minute: "2-digit" })}\n\n${digest}\n\nDecide. Call heartbeat_act exactly once.`,
         {}
-      );
+      ));
       if (choice.spec) this.deps.cascade?.noteSuccess(choice.spec);
     } catch (e) {
       if (choice.spec) this.deps.cascade?.noteFailure(choice.spec, errorMessage(e));

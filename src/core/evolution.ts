@@ -21,6 +21,7 @@ import type { EventLog } from "./events.js";
 import { buildHeartbeatDigest } from "./heartbeat.js";
 import { errorMessage, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { JEV_RUBRIC_VERSION, type JevShadowObserver } from "./jev-shadow.js";
+import { trackActivity } from "./activity.js";
 
 /** Stable content identity for shadow metadata — the content itself never leaves. */
 function contentHash(text: string): string {
@@ -874,12 +875,12 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
             `Propose exactly one skill (create new, or patch existing).`,
             nudge ?? `Call the evolution_propose tool exactly once — text-only replies are discarded.`,
           ].filter(Boolean).join("\n");
-        await session.prompt(ask());
+        await trackActivity({ kind: "evolution", label: "propose a skill", agentId: ctx.agent.id, session }, () => session.prompt(ask()));
         const merr = sessionError(session);
         if (merr) throw new Error(merr);
         if (!proposal) {
           // some models reply in text first — one explicit retry
-          await session.prompt(`You did not call the tool. Call evolution_propose exactly once now.`);
+          await trackActivity({ kind: "evolution", label: "propose a skill (retry)", agentId: ctx.agent.id, session }, () => session.prompt(`You did not call the tool. Call evolution_propose exactly once now.`));
         }
       } finally {
         try {
@@ -901,7 +902,7 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
         skillsDirs,
       });
       try {
-        await session.prompt(probe.task);
+        await trackActivity({ kind: "evolution", label: `probe: ${probe.task}`, agentId: agent.id, session }, () => session.prompt(probe.task));
         const merr = sessionError(session);
         if (merr) throw new Error(merr);
         const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
@@ -925,7 +926,7 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
         systemPrompt: `You are a strict eval judge. Score 1-5 whether the REPLY handles the TASK according to the CRITERIA. Reply with ONLY the digit.`,
       });
       try {
-        await session.prompt(`TASK: ${args.task}\nCRITERIA: ${args.criteria}\nREPLY: ${truncate(args.reply, 4000)}`);
+        await trackActivity({ kind: "evolution", label: `judge: ${args.task}`, session }, () => session.prompt(`TASK: ${args.task}\nCRITERIA: ${args.criteria}\nREPLY: ${truncate(args.reply, 4000)}`));
         const merr = sessionError(session);
         if (merr) return { score: 3, parse: "fallback" as const };
         const msgs = (session.agent.state.messages ?? []) as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
