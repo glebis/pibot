@@ -246,3 +246,125 @@ def test_lab_assets_do_not_expose_runtime_files():
         for name in ('README.md','voice-service.enc.json','missing.png','..%2F..%2Fservice.py'):
             assert c.get('/assets/lab/'+name).status_code==404
         assert c.get('/api/agents').status_code==401
+
+
+def test_hermes_authenticated_offer_routes_pipeline_turn_to_exact_native_session():
+    from hermes_bridge import HermesBridge
+    from test_hermes_bridge import Transport, Fallback
+    transport = Transport()
+    bridge = HermesBridge(Fallback(), transport)
+    observed = {}
+    async def voice_pipeline(connection, turn):
+        observed['answer'] = await turn('fixture browser utterance')
+        await asyncio.Event().wait()
+    app = create_app(TOKEN, 'cd'*32, client=bridge, canonical=True,
+                     rtc_factory=RTC, pipeline=voice_pipeline)
+    with patch.dict(os.environ, {'DEEPGRAM_API_KEY': 'fixture'}, clear=True), TestClient(app, base_url='http://127.0.0.1:8788') as c:
+        assert c.get('/api/agents').status_code == 401
+        rows = c.get('/api/agents', headers=HEADERS).json()['agents']
+        hermes = next(a for a in rows if a.get('backend') == 'hermes')
+        assert hermes['sessionId'] == 'fixture-session'
+        assert hermes['toolSelection'] is False and hermes['modes'] == ['agent', 'realtime']
+        body = {'agentId': hermes['id'], 'sdp': 'v=0 fixture', 'type': 'offer'}
+        for extra in ({'mode': 'front'}, {'tools': []}, {'allowedTools': []}):
+            assert c.post('/api/offer', headers=HEADERS, json={**body, **extra}).status_code == 400
+        assert not transport.rpc.calls
+        # Mode omitted: server forces agent, not the PiBot front default.
+        assert c.post('/api/offer', headers=HEADERS, json=body).status_code == 200
+        for _ in range(100):
+            if observed:
+                break
+            c.get('/api/agents', headers=HEADERS)
+        assert observed['answer'] == 'fixture answer'
+        submits = [p for method, p in transport.rpc.calls if method == 'prompt.submit']
+        assert len(submits) == 1 and submits[0]['session_id'] == 'fixture-session'
+        assert submits[0]['text'] == 'fixture browser utterance' and submits[0]['submission_id']
+        assert c.delete('/api/session', headers=HEADERS).status_code == 200
+        assert not bridge.calls
+
+
+def test_hermes_realtime_offer_delegates_to_exact_native_session_not_pi_front():
+    from hermes_bridge import HermesBridge
+    from test_hermes_bridge import Transport, Fallback
+    transport, fallback = Transport(), Fallback()
+    bridge = HermesBridge(fallback, transport)
+    observed = {}
+
+    async def realtime_pipeline(connection, call, announcements):
+        observed['setup'] = await call.setup()
+        await call.note('owner', 'fixture browser utterance')
+        observed['answer'] = await call.tool('hermes_turn', {'text': 'fixture browser utterance'}, 'call-1')
+        await call.note('agent', observed['answer'])
+        await asyncio.Event().wait()
+
+    app = create_app(TOKEN, 'cd'*32, client=bridge, canonical=True,
+                     rtc_factory=RTC, pipeline=pipeline, realtime_pipeline=realtime_pipeline)
+    with patch.dict(os.environ, {'DEEPGRAM_API_KEY': 'fixture', 'OPENAI_API_KEY': 'fixture'}, clear=True), TestClient(app, base_url='http://127.0.0.1:8788') as c:
+        body = {'agentId': transport.target.id, 'sdp': 'v=0 fixture', 'type': 'offer', 'mode': 'realtime'}
+        assert c.post('/api/offer', headers=HEADERS, json=body).status_code == 200
+        for _ in range(100):
+            if 'answer' in observed:
+                break
+            c.get('/api/agents', headers=HEADERS)
+        assert observed['answer'] == 'fixture answer'
+        assert [tool['name'] for tool in observed['setup']['tools']] == ['hermes_turn']
+        assert transport.connected == [transport.target.home]
+        submits = [p for method, p in transport.rpc.calls if method == 'prompt.submit']
+        assert len(submits) == 1
+        assert submits[0]['session_id'] == transport.target.session_id
+        assert submits[0]['text'] == 'fixture browser utterance'
+        assert submits[0]['submission_id']
+        assert {method for method, _ in transport.rpc.calls} == {'session.resume', 'prompt.submit', 'prompt.receipt'}
+        # Hermes speech is not a Pi front: no instructions/tools/notes/task polling there.
+        assert all(call == ('get', '/voice/bindings') for call in fallback.calls)
+        assert c.delete('/api/session', headers=HEADERS).status_code == 200
+        assert not bridge.calls
+
+
+def test_hermes_realtime_requires_openai_not_deepgram():
+    from hermes_bridge import HermesBridge
+    from test_hermes_bridge import Transport, Fallback
+    transport = Transport()
+    bridge = HermesBridge(Fallback(), transport)
+    observed = []
+    async def realtime_pipeline(connection, call, announcements):
+        observed.append(await call.setup())
+        assert announcements is None
+        await asyncio.Event().wait()
+    app = create_app(TOKEN, 'cd'*32, client=bridge, canonical=True,
+                     rtc_factory=RTC, pipeline=pipeline, realtime_pipeline=realtime_pipeline)
+    body = {'agentId': transport.target.id, 'sdp': 'v=0 fixture', 'type': 'offer', 'mode': 'realtime'}
+    with patch.dict(os.environ, {'OPENAI_API_KEY': 'fixture'}, clear=True), TestClient(app, base_url='http://127.0.0.1:8788') as c:
+        assert c.post('/api/offer', headers=HEADERS, json=body).status_code == 200
+        for _ in range(100):
+            if observed:
+                break
+            c.get('/api/agents', headers=HEADERS)
+        assert observed
+        c.delete('/api/session', headers=HEADERS)
+        assert c.post('/api/offer', headers=HEADERS, json={**body, 'mode': 'agent'}).status_code == 503
+    with patch.dict(os.environ, {'DEEPGRAM_API_KEY': 'fixture'}, clear=True), TestClient(app, base_url='http://127.0.0.1:8788') as c:
+        assert c.post('/api/offer', headers=HEADERS, json=body).status_code == 503
+    assert not bridge.calls and not transport.rpc.calls
+
+
+def test_hermes_native_approval_voice_message_not_telegram():
+    from hermes_bridge import HermesBridge
+    from test_hermes_bridge import Transport, Fallback, RPC
+    transport = Transport(RPC(prompts=[{'kind': 'approval'}]))
+    bridge = HermesBridge(Fallback(), transport)
+    observed = {}
+    async def voice_pipeline(connection, turn):
+        observed['answer'] = await turn('fixture utterance')
+        await asyncio.Event().wait()
+    app = create_app(TOKEN, 'cd'*32, client=bridge, canonical=True,
+                     rtc_factory=RTC, pipeline=voice_pipeline)
+    with patch.dict(os.environ, {'DEEPGRAM_API_KEY': 'fixture'}, clear=True), TestClient(app, base_url='http://127.0.0.1:8788') as c:
+        assert c.post('/api/offer', headers=HEADERS, json={
+            'agentId': transport.target.id, 'sdp': 'v=0 fixture', 'type': 'offer'}).status_code == 200
+        for _ in range(100):
+            if observed:
+                break
+            c.get('/api/agents', headers=HEADERS)
+        assert 'native Hermes session' in observed['answer'] and 'Telegram' not in observed['answer']
+        assert not any(method == 'prompt.submit' for method, _ in transport.rpc.calls)

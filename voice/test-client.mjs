@@ -6,7 +6,7 @@ import test from 'node:test';
 const script = fs.readFileSync(new URL('./client.html', import.meta.url), 'utf8').match(/<script>([\s\S]*?)<\/script>/)[1];
 const token = 'a'.repeat(64);
 const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
-function setup({ hash = '#token=' + token, audioReady = true, available = true, storage } = {}) {
+function setup({ hash = '#token=' + token, audioReady = true, realtimeReady = false, available = true, storage, hermes = false } = {}) {
   class Element {
     constructor(id = '') { this.id = id; this.children = []; this.value = ''; this.disabled = ['start','stop','refresh','agent'].includes(id); this.hidden = id === 'play'; this.handlers = {}; this.textContent = ''; }
     addEventListener(name, fn) { this.handlers[name] = fn; }
@@ -45,12 +45,80 @@ function setup({ hash = '#token=' + token, audioReady = true, available = true, 
     setInterval(fn,ms) { intervals.add(ms); return 'i' + ms; },clearInterval() { intervals.clear(); },
     async fetch(path,opts) {
       requests.push({path,opts});
-      return {ok:true,async json() { return path.startsWith('/api/tasks') ? {tasks:[{id:'t1',title:'Sources',status:'done',result:'Five found.',createdAt:Date.now()}]} : path.startsWith('/api/tools') ? {groups:[{id:'core',tools:[{name:'read',description:'Read'},{name:'bash',description:'Shell'}]}]} : path === '/api/agents' ? {agents:[{id:'one',name:'One',model:'test-model',available,reason:available ? undefined : 'Model unavailable'}],audioReady,speechProvider:'Deepgram'} : {sdp:'remote-sdp',type:'answer',pc_id:'test'}; }};
+      return {ok:true,async json() { return path.startsWith('/api/tasks') ? {tasks:[{id:'t1',title:'Sources',status:'done',result:'Five found.',createdAt:Date.now()}]} : path.startsWith('/api/tools') ? {groups:[{id:'core',tools:[{name:'read',description:'Read'},{name:'bash',description:'Shell'}]}]} : path === '/api/agents' ? {agents:[{id:'one',name:'One',model:'test-model',...(hermes ? {backend:'hermes',modes:['agent','realtime'],toolSelection:false,nativeApprovals:true} : {}),available,reason:available ? undefined : 'Model unavailable'}],audioReady,realtimeReady,speechProvider:'Deepgram'} : {sdp:'remote-sdp',type:'answer',pc_id:'test'}; }};
     },
   };
   vm.runInNewContext(script,context);
   return {elements,requests,replaced,window,timers,intervals,track,sender,track2,channels,counts:() => ({microphoneCalls,tracksStopped,rtcClosed})};
 }
+
+test('Hermes falls back to Agent without Realtime, hides false tool restrictions, and submits no tool override',async () => {
+  const map = new Map([['pibot-voice-mode','realtime'],['pibot-voice-tools-open','1']]);
+  const storage = {getItem:k => map.get(k) ?? null,setItem:(k,v) => map.set(k,v),removeItem:k => map.delete(k)};
+  const ui = setup({hermes:true,storage}); await settle();
+  assert.equal(ui.elements['mode-front'].hidden,true);
+  assert.equal(ui.elements['mode-realtime'].hidden,true);
+  assert.equal(ui.elements['mode-agent'].attrs['aria-pressed'],'true');
+  assert.equal(ui.elements['tools-presets'].hidden,true);
+  assert.equal(ui.elements['tools-none'].disabled,true);
+  assert.match(ui.elements.tools.children[0].textContent,/native policy/);
+  assert.match(ui.elements['scope-note'].textContent,/selected Hermes session/);
+  assert.ok(!ui.requests.some(r => r.path.startsWith('/api/tools')));
+  ui.elements.start.handlers.click(); await settle();
+  const offer = ui.requests.find(request => request.path === '/api/offer');
+  assert.deepEqual(JSON.parse(offer.opts.body),{agentId:'one',sdp:'local-sdp',type:'offer',mode:'agent'});
+});
+
+test('Hermes Realtime uses selected mode without tool overrides and names the real audio provider',async () => {
+  const map = new Map([['pibot-voice-mode','realtime']]);
+  const storage = {getItem:k => map.get(k) ?? null,setItem:(k,v) => map.set(k,v)};
+  const ui = setup({hermes:true,realtimeReady:true,storage}); await settle();
+  assert.equal(ui.elements['mode-front'].hidden,true);
+  assert.equal(ui.elements['mode-realtime'].hidden,false);
+  assert.equal(ui.elements['mode-realtime'].attrs['aria-pressed'],'true');
+  assert.match(ui.elements['scope-note'].textContent,/selected Hermes session.*OpenAI/);
+  assert.match(ui.elements['mode-note'].textContent,/native.*Hermes/i);
+  assert.doesNotMatch(ui.elements['mode-note'].textContent,/background tasks/i);
+  assert.ok(!ui.requests.some(r => r.path.startsWith('/api/tools')));
+  ui.elements.start.handlers.click(); await settle();
+  const offer = ui.requests.find(r => r.path === '/api/offer');
+  assert.deepEqual(JSON.parse(offer.opts.body),{agentId:'one',sdp:'local-sdp',type:'offer',mode:'realtime'});
+  assert.match(ui.elements['live-caption'].textContent,/^Realtime ·/);
+  ui.elements.stop.handlers.click(); await settle();
+  ui.elements['mode-agent'].handlers.click();
+  assert.match(ui.elements['scope-note'].textContent,/Deepgram/);
+  ui.elements.start.handlers.click(); await settle();
+  assert.equal(JSON.parse(ui.requests.filter(r => r.path === '/api/offer').at(-1).opts.body).mode,'agent');
+});
+
+test('Realtime can start without Deepgram, while switching to Agent fails closed',async () => {
+  const map = new Map([['pibot-voice-mode','realtime']]);
+  const storage = {getItem:k => map.get(k) ?? null,setItem:(k,v) => map.set(k,v)};
+  const ui = setup({hermes:true,realtimeReady:true,audioReady:false,storage}); await settle();
+  assert.equal(ui.elements.start.disabled,false);
+  assert.doesNotMatch(ui.elements.status.textContent,/Speech isn’t set up/);
+  ui.elements.start.handlers.click(); await settle();
+  assert.equal(JSON.parse(ui.requests.find(r => r.path === '/api/offer').opts.body).mode,'realtime');
+  ui.elements.stop.handlers.click(); await settle();
+  ui.elements['mode-agent'].handlers.click();
+  assert.equal(ui.elements.start.disabled,true);
+  const before = ui.counts().microphoneCalls;
+  ui.elements.start.handlers.click(); await settle();
+  assert.equal(ui.counts().microphoneCalls,before);
+  ui.elements['mode-realtime'].handlers.click();
+  assert.equal(ui.elements.start.disabled,false);
+});
+
+test('Pi Realtime keeps the selected tool set and does not force Agent mode',async () => {
+  const ui = setup({realtimeReady:true}); await settle();
+  assert.equal(ui.elements['mode-front'].hidden,false);
+  assert.equal(ui.elements['mode-realtime'].hidden,false);
+  ui.elements['mode-realtime'].handlers.click();
+  ui.elements['tools-none'].handlers.click();
+  ui.elements.start.handlers.click(); await settle();
+  assert.deepEqual(JSON.parse(ui.requests.find(r => r.path === '/api/offer').opts.body),
+    {agentId:'one',sdp:'local-sdp',type:'offer',mode:'realtime',tools:[]});
+});
 
 test('missing token fails closed, strips fragment and makes no request',async () => {
   const ui = setup({hash:''}); await settle();

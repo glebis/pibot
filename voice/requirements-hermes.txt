@@ -1,0 +1,4 @@
+# Optional dependencies for the canonical Hermes adapter, in addition to requirements.txt.
+# Install into a dedicated voice environment, never the existing MCP environment.
+websockets>=15,<16
+ruamel.yaml>=0.18,<0.19

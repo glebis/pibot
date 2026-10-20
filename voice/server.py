@@ -54,6 +54,11 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
     state = VoiceSession()
     bridge = client or httpx.AsyncClient(base_url=f"http://127.0.0.1:{bridge_port}",
         headers={"authorization": f"Bearer {bridge_token}"}, timeout=httpx.Timeout(50), follow_redirects=False)
+    if os.environ.get("PIBOT_HERMES_REPO"):
+        if not canonical:
+            raise ValueError("Hermes voice requires canonical bridge mode")
+        from hermes_bridge import HermesBridge
+        bridge = HermesBridge.from_env(bridge)
     handler = None
 
     async def close_session():
@@ -123,22 +128,29 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
             raise HTTPException(404)
         return FileResponse(asset)
 
-    async def bindings() -> dict[str, str]:
-        """agentId -> owner chatKey, from the bot's live voice bindings."""
+    async def binding_rows():
         r = await bridge.get("/voice/bindings")
         r.raise_for_status()
+        return [b for b in r.json().get("bindings", []) if isinstance(b, dict)
+                and isinstance(b.get("agentId"), str) and isinstance(b.get("chatKey"), str)]
+
+    async def bindings() -> dict[str, str]:
+        """agentId -> owner chatKey, from live canonical bindings."""
         out: dict[str, str] = {}
-        for b in r.json().get("bindings", []):
-            if isinstance(b, dict) and isinstance(b.get("agentId"), str) and isinstance(b.get("chatKey"), str):
-                out.setdefault(b["agentId"], b["chatKey"])
+        for b in await binding_rows():
+            out.setdefault(b["agentId"], b["chatKey"])
         return out
 
     @app.get("/api/agents")
     async def agents():
         try:
             if canonical:
-                data = {"mode": "shared", "agents": [{"id": a, "name": a, "model": "shared with your Telegram chat", "available": True}
-                                                       for a in sorted(await bindings())]}
+                rows = await binding_rows()
+                data = {"mode": "shared", "agents": [
+                    {"id": b["agentId"], "name": b.get("name", b["agentId"]),
+                     "model": b.get("model", "shared with your Telegram chat"), "available": True,
+                     **{k: b[k] for k in ("backend", "profile", "sessionId", "running", "modes", "toolSelection", "nativeApprovals") if k in b}}
+                    for b in rows]}
             else:
                 r = await bridge.get("/v1/agents")
                 r.raise_for_status()
@@ -204,8 +216,6 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
     @app.post("/api/offer")
     async def offer(request: Request):
         nonlocal handler
-        if not os.environ.get("DEEPGRAM_API_KEY"):
-            raise HTTPException(503, "Deepgram speech credential is not configured")
         if request.headers.get("content-type", "").split(";")[0] != "application/json":
             raise HTTPException(415, "JSON required")
         raw = bytearray()
@@ -227,8 +237,17 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
                 raise ValueError()
         except Exception:
             raise HTTPException(400, "Invalid voice offer") from None
+        hermes = body["agentId"].startswith("hermes-")
+        if hermes:
+            if not canonical or not hasattr(bridge, 'is_hermes'):
+                raise HTTPException(400, "Hermes voice is not enabled")
+            if tools is not None or mode == "front":
+                raise HTTPException(400, "Hermes uses native tools and approvals; choose agent or realtime mode")
+            mode = "realtime" if realtime else "agent"
         if realtime and not (canonical and os.environ.get("OPENAI_API_KEY")):
             raise HTTPException(503, "Realtime voice is not configured")
+        if not realtime and not os.environ.get("DEEPGRAM_API_KEY"):
+            raise HTTPException(503, "Deepgram speech credential is not configured")
         async with state.lock:
             if state.session_id or state.closing:
                 raise HTTPException(409, "A voice session is already active")
@@ -237,7 +256,8 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
                     chat_key = (await bindings()).get(body["agentId"])
                     if not chat_key:
                         raise ValueError("Agent is not bound to a voice chat")
-                    response = await bridge.post("/voice/browser-sessions", json={"agentId": body["agentId"], "chatKey": chat_key, **({"tools": tools} if tools is not None else {}), **({"mode": "front" if realtime else mode} if mode else {})})
+                    bridge_mode = "agent" if hermes else "front" if realtime else mode
+                    response = await bridge.post("/voice/browser-sessions", json={"agentId": body["agentId"], "chatKey": chat_key, **({"tools": tools} if tools is not None else {}), **({"mode": bridge_mode} if bridge_mode else {})})
                 else:
                     response = await bridge.post("/v1/sessions", json={"agentId": body["agentId"]})
                 response.raise_for_status()
@@ -263,6 +283,12 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
                         r = await bridge.post(path, json={"requestId": str(uuid4()), "text": text})
                         if canonical and r.status_code == 409:
                             error = r.json().get("error")
+                            if hermes:
+                                if error == "agent_busy":
+                                    return "This Hermes session is busy. No new message was submitted. Wait for it to finish."
+                                if error == "hermes_input_required":
+                                    return "Hermes needs your input or approval. Open the selected native Hermes session. I have not approved or retried anything."
+                                return "The Hermes turn did not return a confirmed answer. Check the selected native Hermes session before sending more work. I have detached without cancelling or retrying it."
                             if error == "turn_detached":
                                 # The shared turn keeps running; the bot delivers its answer in Telegram.
                                 return "That is taking longer. I'll keep working, and the answer will arrive in your Telegram chat."
@@ -339,9 +365,14 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
                         try:
                             print("voice: session connected", flush=True)
                             async with asyncio.timeout(duration):
-                                if realtime and front:
+                                if realtime and (hermes or front):
                                     from pipeline import run_realtime
-                                    await (realtime_pipeline or run_realtime)(connection, RealtimeCall(), announcements=announcements)
+                                    if hermes:
+                                        from hermes_realtime import HermesRealtimeCall
+                                        call = HermesRealtimeCall(bridge, sid)
+                                    else:
+                                        call = RealtimeCall()
+                                    await (realtime_pipeline or run_realtime)(connection, call, announcements=announcements if front else None)
                                 elif "announcements" in inspect.signature(runner).parameters:
                                     await runner(connection, turn, announcements=announcements)
                                 else:

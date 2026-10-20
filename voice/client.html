@@ -270,10 +270,21 @@ main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(30
   };
   let mode = 'front', realtimeReady = false; try { mode = localStorage.getItem('pibot-voice-mode') || 'front'; } catch {}
   function showMode() {
-    if (!MODES[mode] || (mode === 'realtime' && !realtimeReady)) mode = 'front';
+    const hermes = selected()?.backend === 'hermes';
+    const hermesRealtime = hermes && selected()?.modes?.includes('realtime');
+    if (hermes && (mode !== 'realtime' || !hermesRealtime || !realtimeReady)) mode = 'agent';
+    if (!MODES[mode] || (mode === 'realtime' && !realtimeReady)) mode = hermes ? 'agent' : 'front';
     for (const id of Object.keys(MODES)) { const b = $('mode-' + id); b.setAttribute?.('aria-pressed', String(mode === id)); b.disabled = active || stopping; }
-    $('mode-realtime').hidden = !realtimeReady;
-    $('mode-note').textContent = MODES[mode][1];
+    $('mode-front').hidden = hermes;
+    $('mode-realtime').hidden = !realtimeReady || (hermes && !hermesRealtime);
+    $('mode-note').textContent = hermes ? (mode === 'realtime' ? 'OpenAI speech interface → selected native Hermes session · native tools and approvals only in Hermes. Interrupting speech never cancels native work.' : 'Existing Hermes session · native tool policy · approve only in Hermes.') : MODES[mode][1];
+    if (hermes) {
+      $('scope-note').textContent = 'Shared with the selected Hermes session · approvals only in Hermes · audio via ' + (mode === 'realtime' ? 'OpenAI' : 'Deepgram') + ' · 15 min';
+      $('info').setAttribute?.('data-tip', $('scope-note').textContent);
+    } else if (agents.some(a => a.backend === 'hermes')) {
+      $('scope-note').textContent = 'Shared with your Telegram chat · approvals stay there · audio via Deepgram · 15 min';
+      $('info').setAttribute?.('data-tip', $('scope-note').textContent);
+    }
     for (const id of Object.keys(MODES)) $('mode-' + id).setAttribute?.('data-tip', MODES[id][1]);
   }
   // call clock in the call bar
@@ -366,10 +377,12 @@ main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(30
   };
   const lastAgent = () => { try { return localStorage.getItem('pibot-voice-agent') || ''; } catch { return ''; } };
   const selected = () => agents.find(agent => agent.id === agentSelect.value);
+  const speechReady = () => mode === 'realtime' ? realtimeReady : audioReady;
   function controls() {
+    showMode();
     agentSelect.disabled = active || stopping || !agents.length;
     micSelect.disabled = stopping;
-    startButton.disabled = active || stopping || !validToken || !audioReady || !selected()?.available;
+    startButton.disabled = active || stopping || !validToken || !speechReady() || !selected()?.available;
     stopButton.disabled = !active;
     startButton.hidden = active; stopButton.hidden = !active; $('mute').hidden = !active;
     document.querySelector?.('main')?.classList.toggle('live', active);
@@ -378,7 +391,7 @@ main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(30
     refreshButton.disabled = active || stopping || !validToken;
     const agent = selected();
     $('agent-detail').textContent = agent && !agent.available ? (agent.reason || 'This agent is unavailable for voice.') : '';
-    renderTools(); showMode();
+    renderTools();
   }
   async function api(path, options = {}) {
     const response = await fetch(path, { ...options, signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(10000), credentials: 'omit', cache: 'no-store', headers: { 'Authorization': 'Bearer ' + secret, ...(options.body ? {'Content-Type':'application/json'} : {}) } });
@@ -390,6 +403,7 @@ main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(30
   async function loadTools() {
     const agentId = agentSelect.value;
     toolGroups = [];
+    if (selected()?.backend === 'hermes') { chosen = new Set(); renderTools(); return; }
     if (agentId && selected()?.available) {
       try {
         const data = await (await api('/api/tools?agentId=' + encodeURIComponent(agentId))).json();
@@ -406,18 +420,19 @@ main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(30
   let toolsOpen = false; try { toolsOpen = localStorage.getItem('pibot-voice-tools-open') === '1'; } catch {}
   function showToolsOpen() {
     $('tools-toggle').setAttribute?.('aria-expanded', String(toolsOpen));
-    $('tools-body').hidden = !toolsOpen; $('tools-presets').hidden = !toolsOpen;
+    $('tools-body').hidden = !toolsOpen; $('tools-presets').hidden = !toolsOpen || selected()?.backend === 'hermes';
     $('tools-head').classList?.toggle('closed', !toolsOpen);
   }
   function renderTools() {
     const box = $('tools'); if (!box?.replaceChildren || !document.createElement) return;
-    const total = allTools().length, on = allTools().filter(n => chosen.has(n)).length, locked = active || stopping;
+    const total = selected()?.backend === 'hermes' ? 0 : allTools().length, on = allTools().filter(n => chosen.has(n)).length, locked = active || stopping;
+    $('tools-presets').hidden = !toolsOpen || selected()?.backend === 'hermes';
     $('tool-count').textContent = total ? ` · ${on} of ${total}` : '';
     $('tools-none').setAttribute?.('aria-pressed', String(total > 0 && on === 0));
     $('tools-all').setAttribute?.('aria-pressed', String(total > 0 && on === total));
     $('tools-none').disabled = $('tools-all').disabled = locked || !total;
     box.replaceChildren();
-    if (!total) { const p = document.createElement('p'); p.className = 'empty'; p.textContent = selected()?.available ? 'This agent has no tools here — talk only.' : 'Pick an agent to see its tools.'; box.append(p); return; }
+    if (!total) { const p = document.createElement('p'); p.className = 'empty'; p.textContent = selected()?.backend === 'hermes' ? 'Tools remain enabled according to this Hermes session’s native policy. This page cannot restrict tools or approve actions.' : selected()?.available ? 'This agent has no tools here — talk only.' : 'Pick an agent to see its tools.'; box.append(p); return; }
     for (const group of toolGroups) {
       const names = group.tools.map(t => t.name), count = names.filter(n => chosen.has(n)).length;
       const wrap = document.createElement('div'); wrap.className = 'group';
@@ -523,7 +538,8 @@ main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(30
       else if (requestedAgent && agents.some(a => a.id === requestedAgent && a.available)) agentSelect.value = requestedAgent;
       else if (lastAgent() && agents.some(a => a.id === lastAgent() && a.available)) agentSelect.value = lastAgent();
       else if (agents.some(a => a.available)) agentSelect.value = agents.find(a => a.available).id;
-      status(!audioReady ? 'Speech isn’t set up — add the Deepgram key to the voice service, then reload' : agents.length ? 'Ready.' : 'No agents available.');
+      showMode();
+      status(!speechReady() ? 'Speech isn’t set up — add the Deepgram key to the voice service, then reload' : agents.length ? 'Ready.' : 'No agents available.');
       void listMicrophones();
       void loadTools(); void loadTasks();
     } catch (error) {
@@ -564,7 +580,7 @@ main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(30
     transcript.scrollTop = transcript.scrollHeight;
   }
   async function start() {
-    if (active || stopping || !selected()?.available || !validToken || !audioReady) return;
+    if (active || stopping || !selected()?.available || !validToken || !speechReady()) return;
     active = true; const current = ++generation; controller = new AbortController(); const signal = controller.signal;
     callStarted = Date.now(); liveState = ''; liveWarn = false; clearInterval(clock); clock = setInterval(tickClock, 1000); tickClock();
     timer = setTimeout(() => void stop('15-minute limit reached.'), 15 * 60 * 1000);
@@ -600,7 +616,8 @@ main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(30
       await waitForIce(connection, signal);
       if (current !== generation) return;
       // tools: only send a choice when the agent's tools loaded; otherwise the agent keeps its own set
-      const offer = {agentId:agentSelect.value, sdp:connection.localDescription.sdp, type:'offer', mode, ...(toolGroups.length ? {tools:allTools().filter(n => chosen.has(n))} : {})};
+      const hermes = selected()?.backend === 'hermes';
+      const offer = {agentId:agentSelect.value, sdp:connection.localDescription.sdp, type:'offer', mode, ...(!hermes && toolGroups.length ? {tools:allTools().filter(n => chosen.has(n))} : {})};
       const response = await api('/api/offer', {method:'POST', signal, body:JSON.stringify(offer)});
       const answer = await response.json();
       if (current !== generation) return;
@@ -619,7 +636,7 @@ main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(30
       await stop(message);
     }
   }
-  agentSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-agent', agentSelect.value); } catch {} controls(); void loadTools(); void loadTasks(); });
+  agentSelect.addEventListener('change', () => { try { localStorage.setItem('pibot-voice-agent', agentSelect.value); } catch {} showMode(); controls(); void loadTools(); void loadTasks(); });
   // Switching the microphone mid-call swaps the sent track in place; the call keeps running.
   async function switchMicrophone() {
     if (!active || !pc || !stream) return;
@@ -639,7 +656,7 @@ main.live{grid-template-columns:minmax(300px,1fr) minmax(340px,1.25fr) minmax(30
   stopButton.addEventListener('click', () => void stop());
   refreshButton.addEventListener('click', () => void refresh());
   $('mute').addEventListener('click', () => setMuted(!muted));
-  for (const value of Object.keys(MODES)) $('mode-' + value).addEventListener('click', () => { mode = value; try { localStorage.setItem('pibot-voice-mode', mode); } catch {} showMode(); });
+  for (const value of Object.keys(MODES)) $('mode-' + value).addEventListener('click', () => { mode = value; try { localStorage.setItem('pibot-voice-mode', mode); } catch {} controls(); });
   document.addEventListener?.('keydown', event => {
     if (!active || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.key.toLowerCase() !== 'm') return;
     if (['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target?.tagName)) return;
