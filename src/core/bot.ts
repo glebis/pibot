@@ -3254,6 +3254,11 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       this.commsHooks()
     );
     if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("target agent is busy");
+    // pibot-dff: extract only assistant text PRODUCED BY THIS TURN. The old last-assistant
+    // extractor made a silently-failed turn (empty model output — researcher, Oct 12–20)
+    // return the PREVIOUS turn's text: every fresh ask re-delivered the stale Oct-14
+    // digest byte-identically. An ask now either produces new content or fails loudly.
+    const beforeCount = (((session as { agent?: { state?: { messages?: unknown[] } } }).agent?.state?.messages) ?? []).length;
     const envelopeText = originChat
       ? `${text}\n\n(Reply-to (owner's chat): ${originChat.transport}:${originChat.chatId} — when you finish or need input, your final reply is delivered back to that chat automatically.)`
       : text;
@@ -3270,10 +3275,10 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       () => session.prompt(envelope(`[agent-message from "${fromAgent}"]\n\n${envelopeText}`)));
     const reply = timeoutMs
       ? await Promise.race([
-          run.then(() => extractAssistantTextFromSession(session)),
+          run.then(() => this.freshAssistantText(session, beforeCount)),
           new Promise<string>((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
         ])
-      : await run.then(() => extractAssistantTextFromSession(session));
+      : await run.then(() => this.freshAssistantText(session, beforeCount));
     const finalReply = reply || "(no reply)";
     if (originChat) {
       // owner-facing status: the reply lands in the chat the work was requested from
@@ -3289,6 +3294,21 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     }
     this.maybeEmitTaskAck(agentId, fromAgent, text, finalReply);
     return finalReply;
+  }
+
+  /**
+   * Assistant text produced by this turn only (messages after beforeCount); throws on a
+   * provider error recorded on the turn's own assistant message (prompt() resolves, does
+   * not throw, on provider failures — same lesson as promptTaskWithCascade). Fresh-only
+   * extraction is the pibot-dff anti-replay guard.
+   */
+  private freshAssistantText(session: AgentSession, beforeCount: number): string | null {
+    const messages = (((session as { agent?: { state?: { messages?: unknown[] } } }).agent?.state?.messages) ?? []).slice(beforeCount);
+    const text = extractAssistantText(messages);
+    if (text) return text;
+    const err = lastAssistantError(messages);
+    if (err) throw new Error(`model error: ${truncate(err, 300)}`);
+    return null;
   }
 
   /** Durable task runner (pibot-e9t): one background turn of the agent in the task's own

@@ -1609,9 +1609,12 @@ describe("voice transcript echo", () => {
 
 describe("task ack confirmations", () => {
   function sessionWithReply(text: string) {
+    const messages: unknown[] = []; // prompt() appends the reply — fresh-only extraction reads this turn's own output
     return {
-      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text }] }] } },
-      prompt: vi.fn(async () => {}),
+      agent: { state: { messages } },
+      prompt: vi.fn(async () => {
+        messages.push({ role: "assistant", content: [{ type: "text", text }] });
+      }),
       subscribe: vi.fn(() => () => {}),
       isStreaming: false,
     };
@@ -1631,8 +1634,10 @@ describe("task ack confirmations", () => {
   it("origin-chat routing: delegated work reports back to the chat the owner typed in", async () => {
     const t = makeBot();
     const sess = {
-      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] }] } },
-      prompt: vi.fn(async () => {}),
+      agent: { state: { messages: [] as unknown[] } },
+      prompt: vi.fn(async () => {
+        sess.agent.state.messages.push({ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] });
+      }),
       subscribe: vi.fn(() => () => {}),
       isStreaming: false,
     };
@@ -2157,8 +2162,10 @@ describe("acceptance acks for delegated work", () => {
   it("origin chat sees an immediate accepted-ack before the final result", async () => {
     const t = makeBot();
     const sess = {
-      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] }] } },
-      prompt: vi.fn(async () => {}),
+      agent: { state: { messages: [] as unknown[] } },
+      prompt: vi.fn(async () => {
+        sess.agent.state.messages.push({ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] });
+      }),
       subscribe: vi.fn(() => () => {}),
       isStreaming: false,
     };
@@ -2166,7 +2173,7 @@ describe("acceptance acks for delegated work", () => {
     // release the session prompt only after a tick so the ack has time to land first
     let release: () => void = () => {};
     const gate = new Promise<void>((r) => (release = r));
-    sess.prompt = vi.fn(async () => { await gate; });
+    sess.prompt = vi.fn(async () => { await gate; sess.agent.state.messages.push({ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] }); });
     setTimeout(release, 20);
     await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
       "fitness", "assistant", "implement the dashboard", undefined, { transport: "mock", chatId: "42" }
@@ -2177,6 +2184,43 @@ describe("acceptance acks for delegated work", () => {
     expect(ackIdx).toBeGreaterThanOrEqual(0);
     expect(ackIdx).toBeLessThan(doneIdx); // ack precedes the result
     expect(texts[ackIdx]).toContain("[assistant]");
+  });
+
+  it("agentAsk never replays prior-turn assistant text when this turn produced none (pibot-dff)", async () => {
+    const t = makeBot();
+    const sess = {
+      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: "1. https://sierra.ai/blog/introducing-personal-agent-protocol — the stale Oct-14 digest" }] }] } },
+      prompt: vi.fn(async () => {
+        // wedged session: the model appends an EMPTY assistant message, nothing else
+        (sess.agent.state.messages as unknown[]).push({ role: "assistant", content: [] });
+      }),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
+    const reply = await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
+      "fitness", "assistant", "fresh digest, do NOT list any sources"
+    );
+    expect(reply).toBe("(no reply)"); // NOT the stale Sierra digest — replay is dead
+  });
+
+  it("agentAsk surfaces an explicit model error instead of stale content (pibot-dff)", async () => {
+    const t = makeBot();
+    const sess = {
+      agent: { state: { messages: [] as unknown[] } },
+      prompt: vi.fn(async () => {
+        // provider failure: prompt() resolves, the error lands on the assistant message
+        (sess.agent.state.messages as unknown[]).push({ role: "assistant", errorMessage: "HTTP 502 from ollama gateway", content: [] });
+      }),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
+    await expect(
+      (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
+        "fitness", "assistant", "anything"
+      )
+    ).rejects.toThrow(/model error: HTTP 502 from ollama gateway/);
   });
 });
 
