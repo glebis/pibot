@@ -207,6 +207,9 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/fathom/scripts/fetch.py")] },
   // read-only GitHub fetches for link-saves (host-pinned curl; exactly one URL, so no extra flags like -o can ride along)
   { bin: "curl", pin: ["-sL", "--max-time", "15"], urlsUnder: ["https://api.github.com/", "https://github.com/", "https://raw.githubusercontent.com/"] },
+  // arbitrary-https READ-ONLY GET (link-saves/fetches): pinned flags cap runtime, exactly one URL
+  // positional so no -o/-K/-H/--data/--next can ride along and no body can be sent. GET only.
+  { bin: "curl", pin: ["-sL", "--max-time", "20"], urlsUnder: ["https://"] },
   {
     bin: "gh",
     pin: ["repo", "view"],

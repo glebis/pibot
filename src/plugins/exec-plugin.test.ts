@@ -355,6 +355,14 @@ describe("default allowlist hardening (bypass regressions)", () => {
       expect((await curl("-sL", "--max-time", "15", "--next", "https://evil.example/y")).error).toMatch(/exactly one/);
       expect((await curl("-sL", "https://api.github.com/x")).error).toMatch(/pinned/);
     });
+
+    it("arbitrary-https entry permits exactly one https URL GET, no extra flags, sibling of the github pin (pibot fleet Oct 20)", async () => {
+      const curl20 = (...args: string[]) => run("curl:-sL --max-time 20", ...args);
+      expect((await curl20("-sL", "--max-time", "20", "https://www.ai-first.company/")).error).toBeUndefined();
+      expect((await curl20("-sL", "--max-time", "20", "http://insecure.example/x")).error).toMatch(/exactly one/);
+      expect((await curl20("-sL", "--max-time", "20", "https://a.example/x", "-H", "Cookie: x")).error).toMatch(/exactly one/);
+      expect((await curl20("-sL", "-o", "/tmp/x", "https://a.example/x")).error).toMatch(/pinned|exactly one/);
+    });
   });
 });
 
