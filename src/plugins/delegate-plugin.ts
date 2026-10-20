@@ -9,12 +9,41 @@ import { truncate } from "../core/util.js";
 
 const run = promisify(execFile);
 
-export const DELEGATE_CLIS: Record<string, { args: (prompt: string) => string[]; label: string; passthrough: string[] }> = {
+export interface DelegateCliSpec {
+  args: (prompt: string) => string[];
+  label: string;
+  passthrough: string[];
+  /** Executable to run, read at call time; defaults to the CLI name on PATH. Undefined/empty = not installed. */
+  command?: () => string | undefined;
+  /** Per-CLI run deadline (default TIMEOUT). */
+  timeoutMs?: number;
+}
+
+export const DELEGATE_CLIS: Record<string, DelegateCliSpec> = {
   // claude/codex authenticate via keychain / ~/.claude / ~/.codex — no env secrets needed
   claude: { args: (p) => ["-p", p, "--output-format", "text"], label: "Claude Code", passthrough: [] },
   codex: { args: (p) => ["exec", p], label: "Codex CLI", passthrough: [] },
   gemini: { args: (p) => ["-p", p], label: "Gemini CLI", passthrough: ["GEMINI_API_KEY", "GOOGLE_API_KEY"] },
+  // Office-document agent (docx/xlsx/pptx/pdf): an absolute path to a wrapper such as
+  // paperinstruments/pi-office/bin/pi-office, which loads its own API key; nothing is passed through.
+  office: {
+    args: (p) => [p],
+    label: "Office agent (Word/Excel/PowerPoint/PDF)",
+    passthrough: [],
+    command: () => {
+      const command = process.env.PIBOT_OFFICE_CLI;
+      return command && path.isAbsolute(command) ? command : undefined;
+    },
+    timeoutMs: 30 * 60_000,
+  },
 };
+
+/** The executable for a delegate CLI, or undefined when it is unknown or unconfigured. */
+export function delegateCommand(cli: string): string | undefined {
+  const spec = DELEGATE_CLIS[cli];
+  if (!spec) return undefined;
+  return spec.command ? spec.command() || undefined : cli;
+}
 
 /** Resolve a model-supplied cwd; it must live inside `root` (realpath, symlinks followed). */
 export function resolveDelegateCwd(requested: string | undefined, root: string | undefined): { ok: true; cwd: string | undefined } | { ok: false; error: string } {
@@ -62,9 +91,9 @@ export function delegatePlugin(deps: DelegatePluginDeps = {}): InlineExtension {
       pi.registerTool({
         name: "delegate_cli",
         label: "Delegate to CLI",
-        description: `Delegate a self-contained task to an external coding CLI and wait for the result. Available: ${Object.entries(DELEGATE_CLIS).map(([k, v]) => `${k} (${v.label})`).join(", ")}. The CLI runs non-interactively with its own auth — use for tasks that benefit from a different agent's toolset (deep code work, research). Prompt must be self-contained.`,
+        description: `Delegate a self-contained task to an external coding CLI and wait for the result. Available: ${Object.entries(DELEGATE_CLIS).filter(([k]) => allowed.has(k)).map(([k, v]) => `${k} (${v.label})`).join(", ")}. The CLI runs non-interactively with its own auth — use for tasks that benefit from a different agent's toolset (deep code work, research${allowed.has("office") ? "; office creates or edits .docx/.xlsx/.pptx/.pdf files — name input paths and an absolute output directory, and it replies with the produced file paths" : ""}). Prompt must be self-contained.`,
         parameters: Type.Object({
-          cli: Type.String({ description: "claude | codex | gemini" }),
+          cli: Type.String({ description: [...allowed].join(" | ") }),
           prompt: Type.String({ description: "Self-contained task prompt for the CLI" }),
           cwd: Type.Optional(Type.String({ description: "Working directory for the run; must be inside the agent workspace (default: the workspace)" })),
         }),
@@ -79,14 +108,17 @@ export function delegatePlugin(deps: DelegatePluginDeps = {}): InlineExtension {
           } else if (deps.allowed && !deps.allowed.includes(params.cli)) {
             text = `ERROR: "${params.cli}" is not in the allowed delegation list.`;
             details = { ok: false };
+          } else if (!delegateCommand(params.cli)) {
+            text = `ERROR: "${params.cli}" executable is not configured with an absolute path.`;
+            details = { ok: false };
           } else if (!(resolved = resolveDelegateCwd(params.cwd, deps.cwd)).ok) {
             text = `ERROR: ${resolved.error}.`;
             details = { ok: false };
           } else {
             try {
               const cwd = resolved.cwd;
-              const { stdout } = await (deps.run ?? run)(params.cli, spec.args(params.prompt), {
-                timeout: TIMEOUT,
+              const { stdout } = await (deps.run ?? run)(delegateCommand(params.cli) ?? params.cli, spec.args(params.prompt), {
+                timeout: spec.timeoutMs ?? TIMEOUT,
                 maxBuffer: 4 * 1024 * 1024,
                 cwd,
                 env: childEnv({ passthrough: [...spec.passthrough, ...(deps.envPassthrough ?? [])] }),

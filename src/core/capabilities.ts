@@ -6,7 +6,7 @@ import { telegramSendPlugin, type TelegramSendHooks } from "../plugins/telegram-
 import { avatarPlugin } from "../plugins/avatar-plugin.js";
 import { attendPlugin, ATTEND_CLI } from "../plugins/attend-plugin.js";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
-import { delegatePlugin, DELEGATE_CLIS } from "../plugins/delegate-plugin.js";
+import { delegateCommand, delegatePlugin, DELEGATE_CLIS } from "../plugins/delegate-plugin.js";
 import { devToolsPlugin } from "../plugins/dev-tools-plugin.js";
 import { docsPlugin } from "../plugins/docs-plugin.js";
 import { execPlugin } from "../plugins/exec-plugin.js";
@@ -101,7 +101,10 @@ export function executableAvailable(command: string): boolean {
   });
 }
 
-const installedDelegateClis = () => Object.keys(DELEGATE_CLIS).filter(executableAvailable);
+const installedDelegateClis = () => Object.keys(DELEGATE_CLIS).filter((cli) => {
+  const command = delegateCommand(cli);
+  return command !== undefined && executableAvailable(command);
+});
 
 const confirmMutation = (ctx: CapabilityContext) => async (description: string): Promise<boolean> => {
   if (!ctx.ask) return false;
