@@ -20,7 +20,7 @@ export interface AudioMediaDeps {
 }
 
 export type PreparedAudio =
-  | { ok: true; filePath: string; durationSec: number; cleanup: () => Promise<void> }
+  | { ok: true; filePath: string; durationSec: number; retainVideo?: () => string; cleanup: () => Promise<void> }
   | { ok: false; error: string };
 
 interface ProbeJson {
@@ -45,6 +45,7 @@ export class AudioMediaProcessor {
         return { ok: false, error: "media path is outside the private media directory" };
       }
       cleanupPaths.add(resolvedSource);
+      await fsp.chmod(resolvedSource, 0o600);
       const probe = await this.probe(resolvedSource);
       if (!probe.hasAudio) throw new Error("media has no audio track");
       const maxDuration = media.kind === "audio" || media.kind === "audio_document"
@@ -64,7 +65,13 @@ export class AudioMediaProcessor {
       const stat = await fsp.stat(output);
       if (!stat.isFile() || stat.size === 0 || stat.size > 20 * 1024 * 1024) throw new Error("extracted audio is empty or too large");
       await fsp.chmod(output, 0o600);
-      return { ok: true, filePath: output, durationSec: probe.durationSec, cleanup: () => this.cleanup(cleanupPaths) };
+      return {
+        ok: true, filePath: output, durationSec: probe.durationSec,
+        // Only a successful private transcription opts into retaining the video.
+        // Extraction failures and ordinary cleanup still remove both files.
+        retainVideo: () => { cleanupPaths.delete(resolvedSource); return resolvedSource; },
+        cleanup: () => this.cleanup(cleanupPaths),
+      };
     } catch (error) {
       await this.cleanup(cleanupPaths);
       return { ok: false, error: errorMessage(error) };
