@@ -425,6 +425,17 @@ function keyboard(card: Card | undefined) {
  * set PIBOT_TELEGRAM_OPEN=1 to restore open behavior (opt-in).
  * Each chat picks its agent with /agent.
  */
+/** Last-mile guard: operational notices never become participant group replies.
+ * Sentence-level filtering also catches notices appended inside an answer.
+ * Owner DMs bypass this guard; ordinary course words like “status” stay intact.
+ */
+function labGroupReply(text: string): string {
+  const operational = /fallback(?: model)?|answering on (?:a )?(?:backup|fallback)|primary.{0,100}unavailable|the reply above was produced|\/cascade\b|couldn['’]t reach any model|removed from rotation|circuit.breaker|^\s*(?:[⚠︎️🔀🪫]+\s*)?status:\s*(?:provider|model|retry)|резервн.{0,30}модел|служебн.{0,20}уведомлен/iu;
+  return text.split(/((?<=[.!?])\s+|\n+)/u)
+    .filter((part) => !operational.test(part))
+    .join("").trim();
+}
+
 export class TelegramTransport implements Transport {
   readonly name: string;
   readonly boundAgentId?: string;
@@ -1097,6 +1108,15 @@ export class TelegramTransport implements Transport {
   };
 
   async push(chatId: string, opts: PushOptions): Promise<void> {
+    if (this.name === "telegram:lab" && this.boundAgentId === "lab") {
+      // Origin-tagged proactive output may only reach an allowlisted owner DM.
+      if (/\[heartbeat\]/i.test(opts.text) && (!/^[1-9]\d*$/.test(chatId) || !this.allowed.has(chatId))) return;
+      if (chatId.startsWith("-")) {
+        const text = labGroupReply(opts.text);
+        if (!text) return;
+        opts = { ...opts, text, ...(opts.card ? { card: { ...opts.card, text: labGroupReply(opts.card.text) } } : {}) };
+      }
+    }
     return this.enqueue(chatId, async () => {
       const raw = stripAcpLeak(opts.text);
       // Long texts (Bot API 10.1+): rich messages carry 32k chars — well past the

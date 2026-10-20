@@ -3569,6 +3569,12 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       card = nudgeCard(nudgeId);
     }
     let all = [...(this.agentChats.get(agentId) ?? new Set<string>())];
+    if (opts.origin === "heartbeat" && agentId === "lab") {
+      all = all.filter((ck) => {
+        const { chatId } = this.splitChatKey(ck);
+        return /^[1-9]\d*$/.test(chatId) && this.deps.config.allowedChats.includes(chatId);
+      });
+    }
     if (opts.onlyChat) all = all.filter((ck) => ck === opts.onlyChat); // thread-target chat only
     const dedicated = all.filter((ck) => {
       const { transport } = this.splitChatKey(ck);
