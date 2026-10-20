@@ -57,6 +57,18 @@ describe("durable task ledger", () => {
     } finally { await ledger.close(); }
   });
 
+  it("treats an empty runner result as a failure instead of a fake success", async () => {
+    const { r, notes } = runner(async () => "   ");
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      expect(await until(() => ledger.get(t.id), (e) => e?.status === "failed")).toMatchObject({ error: "Task finished without a result summary" });
+      await until(async () => notes.length, (n) => n === 1);
+      expect(notes[0]).toContain("Task failed");
+      expect(notes[0]).not.toContain("finished without a summary");
+    } finally { await ledger.close(); }
+  });
+
   it("records a failure and reports it", async () => {
     const { r, notes } = runner(async () => { throw new Error("tool exploded"); });
     const ledger = await openTaskLedger({ runner: r });

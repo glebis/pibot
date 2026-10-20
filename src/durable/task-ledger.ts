@@ -141,7 +141,11 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
         let ok = true;
         let text: string;
         try {
-          text = (await runner.run({ ...input, taskId: ledgerId, attempt, resumed: attempt > 1, signal: rt.signal })).trim() || "(finished without a summary)";
+          const result = (await runner.run({ ...input, taskId: ledgerId, attempt, resumed: attempt > 1, signal: rt.signal })).trim();
+          // Empty output is not a successful result: record an explicit failure
+          // rather than delivering a fabricated success summary.
+          if (!result) throw new Error("Task finished without a result summary");
+          text = result;
         } catch (error) {
           if (rt.signal.aborted) throw error; // cancelled or shutting down: the abort protocol / resume owns the outcome
           ok = false;
