@@ -789,6 +789,88 @@ describe("PiBot fire delivery", () => {
     expect(arg).toContain("compose me");
   });
 
+  it("work-item wakes lead with EXECUTE and demand an outcome; reminders keep the compose wake", async () => {
+    const t = makeBot();
+    await t.transport.say("remember this chat");
+    t.promptSpy.mockClear();
+    // workflow task: EXECUTE directive, no announce-only imperative
+    await t.bot.deliverFire(
+      {
+        id: "sc20", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+        title: "research digest", detail: "TOKEN-SMALL. delegate scoped search, max 5 links",
+        kind: "task", dueAt: Date.now(), wake: "normal",
+        delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    const workArg = t.promptSpy.mock.calls[0][0] as string;
+    expect(workArg).toContain("[scheduler] EXECUTE now:");
+    expect(workArg).toContain("research digest");
+    expect(workArg).toContain("Do NOT merely announce that the item is due");
+    expect(workArg).toContain("completed / blocked / failed");
+    expect(workArg).not.toContain("Compose a short, natural message");
+    // reminder kind: compose-a-message wake preserved
+    t.promptSpy.mockClear();
+    await t.bot.deliverFire(
+      {
+        id: "sc21", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+        title: "stretch", kind: "reminder", dueAt: Date.now(), wake: "normal",
+        delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    expect(t.promptSpy.mock.calls[0][0] as string).toContain("Compose a short, natural message telling the user this is due now");
+    // explicit wake:"notify" on a task kind forces the compose wake
+    t.promptSpy.mockClear();
+    await t.bot.deliverFire(
+      {
+        id: "sc22", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+        title: "scorecard", detail: "proactive scorecard stats", kind: "task",
+        dueAt: Date.now(), wake: "notify", delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    expect(t.promptSpy.mock.calls[0][0] as string).toContain("Compose a short, natural message telling the user this is due now");
+  });
+
+  it("scheduled wake with an empty model output emits a missed-run receipt", async () => {
+    const t = makeBot();
+    await t.transport.say("remember this chat");
+    t.promptSpy.mockClear();
+    const agents = t.agents as unknown as { getOrCreateSession: (...a: unknown[]) => Promise<unknown> };
+    const session = (await agents.getOrCreateSession()) as { agent: { state: { messages: unknown[] } } };
+    session.agent.state.messages = []; // no assistant output at all
+    await t.bot.deliverFire(
+      {
+        id: "sc23", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+        title: "wedge probe", kind: "task", dueAt: Date.now(), wake: "normal",
+        delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    expect(t.transport.lastText()).toContain("produced no model output");
+    expect(t.transport.lastText()).toContain("wedge probe");
+    expect(vi.mocked(t.events.log).mock.calls.some(([, kind, msg]) => kind === "system" && String(msg).includes("wedge probe"))).toBe(true);
+  });
+
+  it("scheduled wake with real agent output does NOT emit the missed-run receipt", async () => {
+    const t = makeBot();
+    await t.transport.say("remember this chat");
+    t.promptSpy.mockClear();
+    const agents = t.agents as unknown as { getOrCreateSession: (...a: unknown[]) => Promise<unknown> };
+    const session = (await agents.getOrCreateSession()) as { agent: { state: { messages: unknown[] } } };
+    session.agent.state.messages = [{ role: "assistant", content: [{ type: "text", text: "Ran the digest — 3 links saved to vault." }] }];
+    await t.bot.deliverFire(
+      {
+        id: "sc24", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+        title: "healthy probe", kind: "task", dueAt: Date.now(), wake: "normal",
+        delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    expect(t.transport.lastText()).not.toContain("produced no model output");
+  });
+
   it("agent delivery with the synthetic 'agent' transport resolves the agent's remembered chat", async () => {
     const t = makeBot();
     // agent→chat bindings persist in state.json; simulate a restored binding (both maps)
@@ -1311,6 +1393,17 @@ describe("cascade dead-letter loop guards", () => {
 
     const notices = t.transport.pushed.filter((p) => p.opts.text.includes("answering on fallback model"));
     expect(notices).toHaveLength(1);
+  });
+
+  it("does not repeat fallback notices after recovery or a different fallback", async () => {
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["primary/m", "fallback/m", "other/m"]);
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "model" } as never);
+    t.promptSpy.mockResolvedValue(undefined);
+    for (const model of ["fallback/m", "primary/m", "fallback/m", "other/m"]) {
+      await (t.bot as unknown as { maybeNotifyFallback: (...args: unknown[]) => Promise<void> })
+        .maybeNotifyFallback(t.transport, "42", "mock::42", "assistant", model, "primary/m", "hello");
+    }
+    expect(t.transport.pushed.filter((p) => p.opts.text.includes("answering on fallback model"))).toHaveLength(1);
   });
 
   it("does not mistake historical assistant text for partial output on a terminal error", async () => {

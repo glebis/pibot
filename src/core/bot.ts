@@ -4,6 +4,8 @@ import { CanonicalTurnGate, VOICE_CALL_DIRECTIVE, type ActiveVoiceTurn, type Bot
 import { CAPABILITY_REGISTRY } from './capabilities.js';
 import type { VoiceOwnerCommands } from '../voice/owner-commands.js';
 import type { TaskRun, LedgerEntry } from '../durable/task-ledger.js';
+import { listChildProcesses, type ChildProcess, type ProcessControl } from './processes.js';
+import { beginActivity, liveActivities, trackActivity } from './activity.js';
 import { VoiceFront, type CallRecord, type TaskEvent } from '../voice/front.js';
 import type { AssistantMessage, Message, Tool } from '@earendil-works/pi-ai';
 import { LabEnrollmentFlow, type LabEnrollmentControl } from "./lab-enrollment-flow.js";
@@ -172,6 +174,37 @@ export class PiBot implements HeartbeatHost {
     return this.inboxStore ??= new LabAdminInbox(root);
   }
 
+  /** Live view of everything the daemon is doing, for the /processes admin page. */
+  processControl(): ProcessControl {
+    return {
+      snapshot: async () => {
+        const ledger = this.deps.agents.tasks;
+        const entries = ledger
+          ? (await Promise.all(this.deps.agents.list().map((a) => ledger.list({ agentId: a.id }).catch(() => [])))).flat()
+          : [];
+        const isActive = (e: LedgerEntry) => e.status === "queued" || e.status === "running";
+        let children: ChildProcess[] = [];
+        let childrenError: string | undefined;
+        try { children = await listChildProcesses(); } catch (e) { childrenError = errorMessage(e); }
+        return {
+          takenAt: Date.now(),
+          daemon: { pid: process.pid, uptimeSec: Math.round(process.uptime()), rssKb: Math.round(process.memoryUsage().rss / 1024) },
+          turns: liveActivities(),
+          tasks: {
+            active: entries.filter(isActive).sort((a, b) => a.createdAt - b.createdAt),
+            recent: entries.filter((e) => !isActive(e)).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 25),
+          },
+          goals: [...this.goals.entries()].filter(([, g]) => g.status === "active")
+            .map(([chatKey, g]) => ({ chatKey, objective: g.objective, turnsUsed: g.turnsUsed, maxTurns: g.maxTurns, createdAt: g.createdAt, lastTurnAt: g.lastTurnAt })),
+          voiceCalls: [...this.activeVoiceTurns.values()].filter((v) => !v.detached).map((v) => ({ agentId: v.input.agentId, chatKey: v.input.chatKey })),
+          children,
+          childrenError,
+        };
+      },
+      cancelTask: async (id) => (await this.deps.agents.tasks?.cancel(id)) ?? false,
+    };
+  }
+
   labInboxControl(): InboxControl {
     const store = () => { const inbox = this.inboxFor(); if (!inbox) throw new Error("Lab inbox unavailable"); return inbox; };
     return {
@@ -253,8 +286,8 @@ export class PiBot implements HeartbeatHost {
 
   private pendingPushes = new Map<string, Promise<void>>();
   private sessionTurnFailures = new Map<string, { error: string; hadPartialText: boolean }>();
-  /** chatKey::agentId → last model that completed a turn (drives the "answering on fallback" notice) */
-  private lastAnswerModel = new Map<string, string>();
+  /** Sessions already given their one fallback notice, keyed by chatKey::agentId. */
+  private fallbackNotified = new Set<string>();
   private probing = false; // one recovery probe at a time
 
   /** @internal session cache access for handoff context extraction */
@@ -263,6 +296,8 @@ export class PiBot implements HeartbeatHost {
   }
   private canonicalTurns = new CanonicalTurnGate();
   private activeVoiceTurns = new Map<string, ActiveVoiceTurn>();
+  /** end-of-turn callbacks for the activity registry (/processes page), per agent::chat */
+  private turnActivity = new Map<string, () => void>();
   /** utterances queued behind a busy chat during a voice call, per agent::chat */
   private voiceQueued = new Map<string, number>();
   /** a session's full tool set while a voice turn has narrowed it, per agent::chat */
@@ -1450,8 +1485,13 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
         await t.push(media.chatId, { text: "🎙 Couldn't make out any words — try again a bit closer?" });
         return;
       }
-      // the transcript IS the prompt — bare text, exactly like typing
-      await this.routeUserTurn(t, media.chatId, body, undefined, agentId);
+      // Keep the original private video available for explicit save/edit requests.
+      // Never attach it to a vision provider or start an edit automatically.
+      const videoPath = media.kind === "video_note" ? prepared.retainVideo?.() : undefined;
+      const prompt = videoPath
+        ? `${body}\n\n[Video note attachment: ${JSON.stringify(videoPath)}. Original video retained privately; save, forward to an editing agent, or edit only when requested. Do not echo its private path unless explicitly asked.]`
+        : body;
+      await this.routeUserTurn(t, media.chatId, prompt, undefined, agentId);
     } finally {
       await prepared.cleanup();
     }
@@ -1550,6 +1590,10 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       // the reply this turn produces is deduped by turn identity, never by text:
       // answering two questions with the same words is normal, not a duplicate.
       this.turnKeys.set(`${agentId}::${ck}`, opts.incomingMessageId ? `${ck}:msg:${opts.incomingMessageId}` : `${ck}:turn:${uid("t")}`);
+      this.turnActivity.set(`${agentId}::${ck}`, beginActivity({
+        kind: opts.voiceTurn ? "voice" : opts.recoveringDeadLetter ? "dead-letter" : text.startsWith("[scheduler]") ? "scheduled" : "chat",
+        label: text, agentId, chatKey: ck, session,
+      }));
       // The filter can strip a URL; only the model can decide that "the redirect bug
       // in the auth middleware" is what "fixed src/auth/mw.ts:42" SOUNDS like.
       // an explicit path request is remembered for this turn: the directive allows a
@@ -1604,6 +1648,8 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       }
     } finally {
       this.turnKeys.delete(`${agentId}::${ck}`);
+      this.turnActivity.get(`${agentId}::${ck}`)?.();
+      this.turnActivity.delete(`${agentId}::${ck}`);
       this.wantsFullPath.delete(ck);
       t.setTyping?.(chatId, false);
     }
@@ -1775,10 +1821,8 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
   /**
    * Notify the user in plain, deterministic text when a turn was answered on a
    * fallback model because the agent's primary could not be used (circuit-open /
-   * failed). Fires once per (chat, agent) per distinct fallback model, so a burst
-   * of messages while the primary is down doesn't re-spam the identical notice,
-   * but a genuine re-switch (primary recovered then dropped again) reports again.
-   * Never model-generated; internal host prompts are excluded.
+   * failed). Fires at most once per conversation session, regardless of model
+   * changes or primary recovery. Internal host prompts do not consume the notice.
    */
   private async maybeNotifyFallback(
     t: Transport,
@@ -1790,10 +1834,10 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     text: string,
   ): Promise<void> {
     const key = `${ck}::${agentId}`;
-    const last = this.lastAnswerModel.get(key);
     const internal = INTERNAL_PROMPT_PREFIXES.some((p) => text.startsWith(p));
     const switchedToFallback = Boolean(spec && primary && spec !== primary);
-    if (switchedToFallback && !internal && last !== spec) {
+    if (switchedToFallback && !internal && !this.fallbackNotified.has(key)) {
+      this.fallbackNotified.add(key);
       const msg =
         `🔀 Heads up — *${agentId}* is answering on fallback model \`${spec}\` because the primary **${primary}** is currently unavailable. ` +
         `The reply above was produced normally — just via a backup model. \`/cascade\` for status.`;
@@ -1803,7 +1847,6 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
         /* notice is best-effort */
       }
     }
-    this.lastAnswerModel.set(key, spec || primary || "");
   }
 
   /**
@@ -2469,6 +2512,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       resetSession: async (agentId, ck) => {
         const { transport, chatId } = this.splitChatKey(ck);
         await this.deps.agents.resetSession(agentId, ck, { transport, chatId }, this.deps.scheduler);
+        this.fallbackNotified.delete(`${ck}::${agentId}`);
         // the fresh session object must be re-subscribed or its replies never reach the chat
         this.wired.delete(`${agentId}::${ck}`);
       },
@@ -3032,12 +3076,18 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
         const { transport, chatId } = this.splitChatKey(ck);
         const t = this.transports.get(transport);
         if (t) {
-          await this.promptAgent(
-            t,
-            chatId,
-            job.agentId,
-            `[scheduler] It's time for “${job.title}”${job.detail ? ` — ${job.detail}` : ""}. Compose a short, natural message telling the user this is due now${snoozed ? " (it fired during their snooze — acknowledge that lightly)" : ""}.`
-          );
+          // Scoped fix (Gleb-ordered digest audit, Oct 20): the old trailing imperative
+          // (“Compose a short, natural message telling the user this is due now”) made
+          // agents treat workflow items as notification-only — knower read it as “just
+          // notify” and skipped the research (observed Oct 16 06:00 turn). Work items
+          // (task/subject) now lead with an EXECUTE directive and demand an outcome
+          // push; reminders and explicit wake:"notify" keep the compose-a-message wake.
+          const workItem = (job.kind === "task" || job.kind === "subject") && job.wake !== "notify";
+          const directive = workItem
+            ? `[scheduler] EXECUTE now: “${job.title}” — ${job.detail ?? "(no detail)"}. Run the actual work this turn (delegations included). Do NOT merely announce that the item is due: when done (or blocked), push the outcome to this chat yourself — completed / blocked / failed + a one-line why.`
+            : `[scheduler] It's time for “${job.title}”${job.detail ? ` — ${job.detail}` : ""}. Compose a short, natural message telling the user this is due now${snoozed ? " (it fired during their snooze — acknowledge that lightly)" : ""}.`;
+          await this.promptAgent(t, chatId, job.agentId, directive);
+          await this.scheduledTurnReceipt(t, ck, chatId, job);
           return;
         }
       }
@@ -3062,6 +3112,26 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
         ],
       },
     });
+  }
+
+  /**
+   * Missed-run receipt (scoped fix #3): a scheduled agent-wake whose turn produced NO model
+   * output (wedged/empty session — researcher Oct 12–20 pattern) would otherwise look delivered
+   * while nothing ran. Dead-lettered wakes keep their own honest all-models-down notice; this
+   * covers the turn-completed-but-empty case. Best effort — never throws out of deliverFire.
+   */
+  private async scheduledTurnReceipt(t: Transport, chatKey: string, chatId: string, job: Schedule): Promise<void> {
+    try {
+      const session = await this.sessionFor(t, chatId, job.agentId, chatKey);
+      const out = extractAssistantTextFromSession(session);
+      if (out && out.trim()) return;
+      this.deps.events.log(job.agentId, "system", `scheduled item “${job.title}” (${job.id}) fired but produced no model output — delivered-idle, needs review`);
+      await t.push(chatId, {
+        text: `⚠︎ Scheduled “${job.title}” fired but produced no model output — no reply, no work. Flagged for review; re-run it by asking ${job.agentId} directly.`,
+      });
+    } catch {
+      /* receipt is best-effort */
+    }
   }
 
   /** Structured question with tappable options; resolves on tap/vote/typed answer */
@@ -3112,7 +3182,8 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     });
     const targetSession = await this.sessionFor(t, chatId, toAgent, ck);
     if ((targetSession as { isStreaming?: boolean }).isStreaming) return { ok: false, error: `**${toAgent}** is mid-turn — try again in a moment.` };
-    await targetSession.prompt(envelope(buildHandoffEnvelope(fromAgent, brief, note)));
+    await trackActivity({ kind: "handoff", label: `handoff from ${fromAgent}${note ? `: ${note}` : ""}`, agentId: toAgent, chatKey: ck, session: targetSession },
+      () => targetSession.prompt(envelope(buildHandoffEnvelope(fromAgent, brief, note))));
     const ack = extractAssistantTextFromSession(targetSession) ?? "Ready.";
     // the chat now belongs to the target — the user's next message reaches them
     this.rememberChat(toAgent, ck);
@@ -3195,7 +3266,8 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
         this.deps.events.log(agentId, "send", `→ ${originChat.transport}:${originChat.chatId}: accepted ${truncate(text, 60)}`);
       }
     }
-    const run = session.prompt(envelope(`[agent-message from "${fromAgent}"]\n\n${envelopeText}`));
+    const run = trackActivity({ kind: "agent-message", label: `from ${fromAgent}: ${text}`, agentId, chatKey: originChat ? `${originChat.transport}:${originChat.chatId}` : undefined, session },
+      () => session.prompt(envelope(`[agent-message from "${fromAgent}"]\n\n${envelopeText}`)));
     const reply = timeoutMs
       ? await Promise.race([
           run.then(() => extractAssistantTextFromSession(session)),
@@ -3244,12 +3316,73 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     const limit = new Promise<never>((_, reject) => { timer = setTimeout(() => { void session.abort().catch(() => {}); reject(new Error("Task took longer than 30 minutes and was stopped.")); }, 30 * 60_000); });
     try {
       await Promise.race([
-        session.prompt(envelope(`[background task ${run.taskId}: "${run.title}" — requested from the owner's chat]\n\n${run.instructions}${resume}\n\nWork on it now with your tools. Finish with a short result summary for the owner; it is posted to their chat.`)),
+        trackActivity({ kind: "task", label: run.title, agentId: run.agentId, chatKey: run.chatKey, session }, () => this.promptTaskWithCascade(run.agentId, session, ck, `[background task ${run.taskId}: "${run.title}" — requested from the owner's chat]\n\n${run.instructions}${resume}\n\nWork on it now with your tools. Finish with a short result summary for the owner; it is posted to their chat.`)),
         stop, limit,
       ]);
       this.deps.events.log(run.agentId, "system", `task done ${run.taskId}: ${truncate(run.title, 60)}`);
+      // The final assistant message may be committed just after prompt() resolves
+      // (especially after a tool call or provider handoff). Yield once before
+      // reading the transcript so durable tasks do not finish with an empty result.
+      await new Promise<void>((resolve) => setImmediate(resolve));
       return extractAssistantTextFromSession(session) ?? "";
     } finally { clearTimeout(timer); }
+  }
+
+  /**
+   * A background task's prompt with model failover. prompt() resolves (it does not
+   * throw) when the provider fails — the error lands on the last assistant message —
+   * so without this a 429/402 on the agent's model finished the task as "done" with
+   * no text (Oct 2026: every task ended "(finished without a summary)" while the
+   * primary was weekly-rate-limited). Walks the agent's chain like turnWithCascade,
+   * but throws the provider error when the chain is exhausted so the ledger reports
+   * a failure with the reason instead of a fake success.
+   */
+  private async promptTaskWithCascade(agentId: string, session: AgentSession, ck: string, text: string): Promise<void> {
+    const messages = () => ((session as { agent?: { state?: { messages?: unknown[] } } }).agent?.state?.messages) ?? [];
+    const cascade = this.deps.cascade;
+    if (!cascade) {
+      await session.prompt(envelope(text));
+      const err = lastAssistantError(messages());
+      if (err) throw new Error(`model error: ${truncate(err, 300)}`);
+      return;
+    }
+    const chain = cascade.chainFor(this.deps.agents.getAgent(agentId)?.manifest ?? {});
+    const wkey = `${agentId}::${ck}`;
+    let spec = this.sessionSpec.get(wkey) ?? "";
+    if (!spec || !chain.includes(spec) || cascade.isOpen(spec)) {
+      // bind the first healthy model (a resumed task may still hold a now-broken one)
+      const healthy = cascade.firstHealthy(chain);
+      if (!healthy) throw new Error(`no model available for ${agentId} (${chain.join(", ") || "empty chain"} all failing — /cascade for status)`);
+      const m = cascade.resolveModel(healthy);
+      if (m) { try { await session.setModel(m); } catch { /* prompt will fail and triage */ } }
+      spec = healthy;
+      this.sessionSpec.set(wkey, spec);
+    }
+    const attempts: string[] = [];
+    let lastError = "";
+    let body = text;
+    for (let step = 0; step < chain.length + 2; step++) {
+      let err: string | null;
+      try {
+        await session.prompt(envelope(body));
+        err = lastAssistantError(messages());
+      } catch (e) {
+        err = errorMessage(e);
+      }
+      if (!err) { if (spec) cascade.noteSuccess(spec); return; }
+      lastError = err;
+      attempts.push(spec || "(auto)");
+      if (spec) cascade.noteFailure(spec, err);
+      this.deps.events.log(agentId, "system", `task model error on ${spec || "(auto)"} [${classifyModelError(err)}]: ${truncate(err, 160)}`);
+      const next = cascade.nextCandidate(chain, spec || undefined);
+      const model = next ? cascade.resolveModel(next) : undefined;
+      if (!next || !model) break;
+      try { await session.setModel(model); } catch (e) { cascade.noteFailure(next, `cannot bind model: ${errorMessage(e)}`); continue; }
+      spec = next;
+      this.sessionSpec.set(wkey, next);
+      body = `[cascade] Internal: the previous attempt hit a provider error on ${attempts[attempts.length - 1]} — continue the background task with the switched model and finish with the result summary. Do not mention models, errors, or failover.`;
+    }
+    throw new Error(`every model failed (${attempts.join(" → ")}): ${truncate(lastError, 300)}`);
   }
 
   /** Post a ledger notice (task result, failure, cancellation) to an owner chat. */

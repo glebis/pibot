@@ -32,14 +32,14 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
         description: [
           `Schedule a future event: reminders, tasks, notes to take, subjects to revisit, anything.`,
           `"when" accepts natural language: "in 20m", "2h30m", "at 18:00", "tomorrow 9am", "daily at 08:00", "every 2h", "hourly", "friday 18:00".`,
-          `Scheduling is immediate — no user confirmation needed. Use wake:"important" only for hard commitments (deadlines, meds).`,
+          `Scheduling is immediate — no user confirmation needed. Use wake:"important" only for hard commitments (deadlines, meds); use wake:"notify" when a task-kind item should only be announced, not executed.`,
         ].join(" "),
         parameters: Type.Object({
           title: Type.String({ description: "Short title of the item, e.g. 'stretch break' or 'take meds'" }),
           when: Type.String({ description: 'When it should fire. Examples: "in 20m", "tomorrow 9am", "daily at 08:00", "every 2h", "friday 18:00"' }),
           kind: Type.Optional(Type.String({ description: KINDS })),
           detail: Type.Optional(Type.String({ description: "Optional extra context included when it fires" })),
-          wake: Type.Optional(Type.String({ description: '"normal" (default) or "important" — important fires even when the user snoozed everything' })),
+          wake: Type.Optional(Type.String({ description: '"normal" (default), "important" (fires even when the user snoozed everything), or "notify" (awareness-only: the agent composes a due-notification instead of executing)' })),
           delivery: Type.Optional(Type.String({ description: '"direct" (default, quick ping) or "agent" (you compose the message when it fires)' })),
         }),
         async execute(_toolCallId, params) {
@@ -51,7 +51,7 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
             details = { scheduleId: "", dueAt: 0 };
           } else {
             try {
-              const wake = params.wake === "important" ? "important" : "normal";
+              const wake = params.wake === "important" ? "important" : params.wake === "notify" ? "notify" : "normal";
               const delivery = params.delivery === "agent" ? "agent" : "direct";
               const kind = (params.kind as never) ?? "reminder";
               const job = scheduler.create({
@@ -67,7 +67,7 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
                 cardPending: !jobIsInternal(kind),
               });
               const when = fmtWhen(job.dueAt) + (job.repeat ? " ↻" : "");
-              text = `Scheduled ✅ "${job.title}" fires ${when} (id ${job.id})${wake === "important" ? ", pierces snooze" : ""}`;
+              text = `Scheduled ✅ "${job.title}" fires ${when} (id ${job.id})${wake === "important" ? ", pierces snooze" : wake === "notify" ? ", notify-only" : ""}`;
               details = { scheduleId: job.id, dueAt: job.dueAt };
             } catch (error) {
               text = `ERROR: ${error instanceof Error ? error.message : String(error)}`;

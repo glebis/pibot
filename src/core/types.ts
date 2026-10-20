@@ -25,8 +25,8 @@ export interface Schedule {
   kind: ScheduleKind;
   dueAt: number;
   repeat?: ScheduleRepeat;
-  /** important items pierce snooze */
-  wake: "normal" | "important";
+  /** important items pierce snooze; notify marks an awareness-only wake (agent composes a due-notification instead of executing) */
+  wake: "normal" | "important" | "notify";
   /** direct: host formats the ping. agent: full agent session composes it */
   delivery: "direct" | "agent";
   status: "pending" | "paused" | "done" | "cancelled";
