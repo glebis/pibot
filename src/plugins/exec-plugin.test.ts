@@ -431,3 +431,21 @@ describe("exec plugin tool", () => {
     expect(twoPos.error).toMatch(/positional/);
   });
 
+
+  it("groq key setup: pin-only intake takes no positionals (dialog-driven, zero argv surface)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-groqsetup-"));
+    const py = path.join(dir, "fake-py");
+    fs.writeFileSync(py, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(py, 0o755);
+    const pin = path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_key_setup.py");
+    const allowBB: ExecAllowEntry[] = [{ bin: py, pin: [pin], allowPositionalRe: /^[^-]/, positionals: { max: 2 } }];
+    const deps = { workspace: dir, agentDir: dir };
+    const ok = await resolveExec([py, pin, "keychain"], deps, allowBB);
+    expect(ok.error).toBeUndefined();
+    const ok2 = await resolveExec([py, pin, "sops"], deps, allowBB);
+    expect(ok2.error).toBeUndefined();
+    const dash = await resolveExec([py, pin, "--env-file", "x"], deps, allowBB);
+    expect(dash.error).toMatch(/flag-like|not allowed/);
+    const three = await resolveExec([py, pin, "keychain", "sops", "extra"], deps, allowBB);
+    expect(three.error).toBeTruthy();
+  });

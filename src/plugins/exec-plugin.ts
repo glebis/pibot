@@ -212,6 +212,9 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
   // Groq parts-transcription wrapper (free-tier pinned: key from 0600 file/Keychain at runtime,
   // 1 concurrent + 8 calls/day local caps, <=15-min owner rule, adaptive 22MB part sizing):
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_parts.py")], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
+  // Groq key intake (native hidden dialog; stores to 0600 file / Keychain / sops-encrypted copy),
+  // and a no-arg config-setter entry so the sops key path can be registered without shell:
+  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_key_setup.py")] },
   // read-only GitHub fetches for link-saves (host-pinned curl; exactly one URL, so no extra flags like -o can ride along)
   { bin: "curl", pin: ["-sL", "--max-time", "15"], urlsUnder: ["https://api.github.com/", "https://github.com/", "https://raw.githubusercontent.com/"] },
   // arbitrary-https READ-ONLY GET (link-saves/fetches): pinned flags cap runtime, exactly one URL
