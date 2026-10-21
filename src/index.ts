@@ -253,12 +253,12 @@ async function main(): Promise<void> {
   bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, commitments, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir), goalIO });
   diskGuard?.setNotify((text) => void bot.notifyOwnerEvent(text));
 
-  await bot.start();
-  await coordinator?.start();
-  scheduler.rearm();
-
-  // Durable background tasks (pi-durable ledger, bead pibot-e9t). Opened after the bot is up:
-  // tasks left unfinished by the last process resume at once and post their results.
+  // Durable background tasks (pi-durable ledger, bead pibot-e9t). Wired BEFORE bot.start():
+  // any session created by transports/heartbeat/scheduler delivery after that sees the tasks
+  // capability — a session built before the wiring was cached for the whole process lifetime
+  // with no task tools (creator/knower/worker tools-not-found, Oct 21). Tasks left unfinished
+  // by the last process resume here; runLedgerTask waits for the started gate, so their result
+  // posts and owner questions always have a live delivery route.
   const taskDir = path.join(config.dataDir, "durable", "tasks");
   fs.mkdirSync(taskDir, { recursive: true, mode: 0o700 });
   const taskLedger = await (await import("./durable/task-ledger.js")).openTaskLedger({
@@ -267,6 +267,9 @@ async function main(): Promise<void> {
   }).catch((e) => { console.error("[pibot] task ledger unavailable:", e instanceof Error ? e.message : e); return undefined; });
   agents.tasks = taskLedger;
 
+  await bot.start();
+  await coordinator?.start();
+  scheduler.rearm();
   // pilot governance on boot: weekly scorecard jobs follow the manifest flags
   for (const a of agents.list()) commitments.syncPilotGovernance(a.id);
 

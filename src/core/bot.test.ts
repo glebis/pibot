@@ -203,6 +203,8 @@ export function makeBot(evolution?: unknown, configPatch?: Partial<Config>) {
   };
   const runBd = vi.fn(async () => "✓ Created issue: pibot-test (P2)");
   const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never, audioMedia: audioMedia as never, runBd: runBd as never, evolution: evolution as never });
+  // tests never call bot.start(); durable-task runners gate on it — arm the gate as production would
+  (bot as unknown as { resolveStarted?: () => void }).resolveStarted?.();
   return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt, audioMedia, emitSessionEvent, resetSession: agents.resetSession, runBd };
 }
 

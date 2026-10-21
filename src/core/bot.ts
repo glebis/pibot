@@ -598,6 +598,7 @@ export class PiBot implements HeartbeatHost {
     }
     for (const t of deps.transports) this.addTransport(t);
     deps.scheduler.setRouteValidator?.((job) => this.scheduleRouteError(job));
+    this._startGate = new Promise<void>((resolve) => { this.resolveStarted = resolve; });
   }
 
   private scheduleRouteError(job: Pick<Schedule, "agentId" | "chat" | "delivery" | "internal">): string | undefined {
@@ -811,7 +812,15 @@ export class PiBot implements HeartbeatHost {
       this.labTimer.unref();
     }
     console.log(`[pibot] running · agents: ${this.deps.agents.list().map((a) => a.id).join(", ")} · transport: ${[...this.transports.keys()].join("+")}`);
+    this.resolveStarted?.();
   }
+
+  /** Resolves once start() has armed transports and engines. Durable-task resume waits
+   *  for this so a resumed run never races its own result-post/question routing into a
+   *  process where the transports are not up yet (creator tools-not-found, Oct 21). */
+  get started(): Promise<void> { return this._startGate ?? Promise.resolve(); }
+  private _startGate?: Promise<void>;
+  private resolveStarted?: () => void;
 
   async stop(): Promise<void> {
     if (this.labTimer) clearInterval(this.labTimer);
@@ -3331,6 +3340,9 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
    *  status and the result post; cancelling or shutting down aborts the turn. */
   async runLedgerTask(run: TaskRun): Promise<string> {
     if (!this.deps.agents.getAgent(run.agentId)) throw new Error(`unknown agent "${run.agentId}"`);
+    // A resumed task may start while the previous process's transports are still arming:
+    // wait for start() so result posts and owner questions have a live delivery route.
+    await this.started;
     const originChat = this.splitChatKey(run.chatKey);
     const ck = `agent::${run.agentId}::task-${run.taskId}`;
     const session = await this.deps.agents.getOrCreateSession(
