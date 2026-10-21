@@ -2231,7 +2231,7 @@ describe("acceptance acks for delegated work", () => {
       (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
         "fitness", "assistant", "anything"
       )
-    ).rejects.toThrow(/model error: HTTP 502 from ollama gateway/);
+    ).rejects.toThrow(/HTTP 502 from ollama gateway/);
   });
 });
 

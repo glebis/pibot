@@ -3287,7 +3287,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       }
     }
     const run = trackActivity({ kind: "agent-message", label: `from ${fromAgent}: ${text}`, agentId, chatKey: originChat ? `${originChat.transport}:${originChat.chatId}` : undefined, session },
-      () => session.prompt(envelope(`[agent-message from "${fromAgent}"]\n\n${envelopeText}`)));
+      () => this.promptTaskWithCascade(agentId, session, ck, `[agent-message from "${fromAgent}"]\n\n${envelopeText}`));
     const reply = timeoutMs
       ? await Promise.race([
           run.then(() => this.freshAssistantText(session, beforeCount)),
