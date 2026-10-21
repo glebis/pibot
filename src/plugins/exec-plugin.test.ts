@@ -413,3 +413,21 @@ describe("exec plugin tool", () => {
     }
   });
 });
+  it("groq-parts pin: pin-only wrapper takes exactly one existing-file positional; dash args refused", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-groq-"));
+    const py = path.join(dir, "fake-py");
+    fs.writeFileSync(py, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(py, 0o755);
+    const pin = path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_parts.py");
+    const allowBB: ExecAllowEntry[] = [
+      { bin: py, pin: [pin], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
+    ];
+    const deps = { workspace: dir, agentDir: dir };
+    const ok = await resolveExec([py, pin, "/Users/x/chalmers.m4a"], deps, allowBB);
+    expect(ok.error).toBeUndefined();
+    const dash = await resolveExec([py, pin, "x.m4a", "--model", "whisper-large-v3-turbo"], deps, allowBB);
+    expect(dash.error).toMatch(/flag-like/);
+    const twoPos = await resolveExec([py, pin, "a.m4a", "b.m4a"], deps, allowBB);
+    expect(twoPos.error).toMatch(/positional/);
+  });
+

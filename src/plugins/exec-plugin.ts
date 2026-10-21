@@ -209,6 +209,9 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
   // API key from Keychain itself (never argv/logs) and enforces free-tier caps locally
   // (1 concurrent, 40/day + 300/month counters, refuses if project usage can't be verified).
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/browserbase-fetch/scripts/bb_fetch.py")], allowPositionalRe: /^https:\/\//, positionals: { min: 1, max: 1 } },
+  // Groq parts-transcription wrapper (free-tier pinned: key from 0600 file/Keychain at runtime,
+  // 1 concurrent + 8 calls/day local caps, <=15-min owner rule, adaptive 22MB part sizing):
+  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_parts.py")], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
   // read-only GitHub fetches for link-saves (host-pinned curl; exactly one URL, so no extra flags like -o can ride along)
   { bin: "curl", pin: ["-sL", "--max-time", "15"], urlsUnder: ["https://api.github.com/", "https://github.com/", "https://raw.githubusercontent.com/"] },
   // arbitrary-https READ-ONLY GET (link-saves/fetches): pinned flags cap runtime, exactly one URL
