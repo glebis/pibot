@@ -205,6 +205,10 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
   { bin: "whisperkit-cli" },
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/youtube-transcript/scripts/extract_transcript.py")] },
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/fathom/scripts/fetch.py")] },
+  // Browserbase Fetch-API fallback (read-only browser-grade retrieval): pinned wrapper reads the
+  // API key from Keychain itself (never argv/logs) and enforces free-tier caps locally
+  // (1 concurrent, 40/day + 300/month counters, refuses if project usage can't be verified).
+  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/browserbase-fetch/scripts/bb_fetch.py")], allowPositionalRe: /^https:\/\//, positionals: { min: 1, max: 1 } },
   // read-only GitHub fetches for link-saves (host-pinned curl; exactly one URL, so no extra flags like -o can ride along)
   { bin: "curl", pin: ["-sL", "--max-time", "15"], urlsUnder: ["https://api.github.com/", "https://github.com/", "https://raw.githubusercontent.com/"] },
   // arbitrary-https READ-ONLY GET (link-saves/fetches): pinned flags cap runtime, exactly one URL
@@ -243,6 +247,7 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
 
 
 /** Strict flag/positional check. Returns an error string or undefined. */
+/** Strict flag/positional check (single pass: flag values are consumed, never counted as positionals). */
 function checkAllowFlags(entry: ExecAllowEntry, rest: string[]): string | undefined {
   const flags = entry.allowFlags ?? [];
   let positionals = 0;
@@ -266,6 +271,20 @@ function checkAllowFlags(entry: ExecAllowEntry, rest: string[]): string | undefi
       positionals++;
       if (!entry.allowPositionalRe || !entry.allowPositionalRe.test(arg)) return `refused: ${entry.bin} argument "${arg}" is not allowed`;
     }
+  }
+  const min = entry.positionals?.min ?? 0;
+  const max = entry.positionals?.max ?? Infinity;
+  if (positionals < min || positionals > max) return `refused: ${entry.bin} expects ${min === max ? min : `${min}-${max === Infinity ? "n" : max}`} positional argument(s)`;
+  return undefined;
+}
+
+/** Pin-only entries (no allowFlags): every arg must be bare and positional-shaped — flag-like args are refused outright. */
+function checkBarePositionals(entry: ExecAllowEntry, rest: string[]): string | undefined {
+  let positionals = 0;
+  for (const arg of rest) {
+    if (arg.startsWith("-")) return `refused: ${entry.bin} flag-like argument "${arg}" is not allowed`;
+    positionals++;
+    if (!entry.allowPositionalRe || !entry.allowPositionalRe.test(arg)) return `refused: ${entry.bin} argument "${arg}" is not allowed`;
   }
   const min = entry.positionals?.min ?? 0;
   const max = entry.positionals?.max ?? Infinity;
@@ -384,6 +403,13 @@ export async function resolveExec(argv: string[], deps: ExecPluginDeps, allowlis
     }
     if (entry.allowFlags) {
       const bad = checkAllowFlags(entry, rest);
+      if (bad) {
+        constraintFailure = bad;
+        continue;
+      }
+    } else if (entry.allowPositionalRe || entry.positionals) {
+      // pin-style entries without a flag allowlist still enforce positional shape/count
+      const bad = checkBarePositionals(entry, rest);
       if (bad) {
         constraintFailure = bad;
         continue;

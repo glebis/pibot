@@ -97,6 +97,24 @@ describe("exec plugin allowlist resolution", () => {
     expect(missing.error).toMatch(/pinned/);
   });
 
+  it("browserbase-fetch pin: exactly one https positional, no flags (free-tier wrapper)", async () => {
+    const py = path.join(agentDir, "bin/fake-py");
+    const pin = path.join(os.homedir(), ".agents/skills/browserbase-fetch/scripts/bb_fetch.py");
+    const allowBB: ExecAllowEntry[] = [
+      { bin: py, pin: [pin], allowPositionalRe: /^https:\/\//, positionals: { min: 1, max: 1 } },
+    ];
+    const deps = { workspace: agentDir, agentDir };
+    const ok = await resolveExec([py, pin, "https://www.ai-first.company/"], deps, allowBB);
+    expect(ok.error).toBeUndefined();
+    expect((await resolveExec([py, pin, "http://insecure.example/"], deps, allowBB)).error).toMatch(/not allowed/);
+    const twoPos = await resolveExec([py, pin, "https://a.test/x", "https://b.test/y"], deps, allowBB);
+    expect(twoPos.error).toMatch(/positional/);
+    const flagRider = await resolveExec([py, pin, "https://a.test/x", "--header", "Cookie: x"], deps, allowBB);
+    expect(flagRider.error).toMatch(/positional|not allowed/);
+    const wrongPin = await resolveExec([py, "/tmp/fake/other.py", "https://a.test/x"], deps, allowBB);
+    expect(wrongPin.error).toMatch(/pinned/);
+  });
+
   it("enforces requireScriptUnder: script files must live under the agent dir", async () => {
     const osa = path.join(agentDir, "bin/fake-osa");
     const ok = await resolveExec([osa, path.join(agentDir, "inbox/wrapper.scpt"), "arg"], { workspace: agentDir, agentDir }, allow);
