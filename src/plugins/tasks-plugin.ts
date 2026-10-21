@@ -36,10 +36,16 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
         parameters: Type.Object({
           title: Type.String({ description: "Short title the owner will recognise, e.g. 'summarise this week's notes'" }),
           instructions: Type.String({ description: "Self-contained instructions with all needed context from this conversation" }),
+          timeoutMinutes: Type.Optional(Type.Number({ description: "Hard runtime cap in minutes for this task (default 30, max 480). Set higher for long local media work — a two-hour video transcription needs ~90; fetching + transcribing media counts inside the cap." })),
         }),
         async execute(toolCallId, params) {
           try {
-            const t = await ledger.start({ agentId, chatKey, title: params.title.slice(0, 120), instructions: params.instructions.slice(0, 8000) }, `${agentId}:${toolCallId}`);
+            const timeoutMinutes = params.timeoutMinutes && Number.isFinite(params.timeoutMinutes)
+              ? Math.max(1, Math.min(480, Math.round(params.timeoutMinutes)))
+              : undefined;
+            // pi-durable stores strict JSON: omit the key entirely when unset
+            const cap = timeoutMinutes !== undefined ? { timeoutMinutes } : {};
+            const t = await ledger.start({ agentId, chatKey, title: params.title.slice(0, 120), instructions: params.instructions.slice(0, 8000), ...cap }, `${agentId}:${toolCallId}`);
             return text(`Started task ${t.id} "${t.title}". It runs in the background; the result will be posted to this chat. Check it with task_status.`, { taskId: t.id });
           } catch (error) {
             return text(`ERROR: ${error instanceof Error ? error.message : String(error)}`);

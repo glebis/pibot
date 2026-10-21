@@ -26,6 +26,9 @@ export interface Config {
    *  (bead pibot-2dh, modeled on Verity's message_buffer.py); 0 disables.
    *  Undefined = legacy behavior off (kept so hand-built test configs default off). */
   messageBufferMs?: number;
+  /** Default hard stop for one background-task run, in minutes (bead agency kanban thread).
+   *  A single start_task can extend this via its own timeoutMinutes, clamped to a hard ceiling. */
+  taskTimeoutMinutes?: number;
 }
 
 // ─── runtime-editable settings (web-configurable, survives restarts) ───────
@@ -104,5 +107,6 @@ export function loadConfig(): Config {
     webRpId: (process.env.PIBOT_WEB_RP_ID || process.env.PIBOT_WEB_AUTH || "").trim() || undefined,
     webPort: parseInt(process.env.PIBOT_WEB_PORT || "7860", 10),
     messageBufferMs: (() => { const v = parseInt(process.env.PIBOT_BUFFER_MS || "2500", 10); return Number.isFinite(v) ? Math.max(0, v) : 2500; })(),
+    taskTimeoutMinutes: (() => { const v = parseInt(process.env.PIBOT_TASK_TIMEOUT_MIN || "30", 10); return Number.isFinite(v) && v > 0 ? v : 30; })(),
   };
 }

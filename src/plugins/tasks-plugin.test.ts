@@ -33,6 +33,23 @@ describe("tasks plugin", () => {
     } finally { await ledger.close(); }
   });
 
+  it("passes a per-task runtime cap to the runner, clamped to the 480-minute ceiling", async () => {
+    const run = vi.fn(async (_task: unknown) => "long work done");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    try {
+      const t = tools(tasksPlugin({ ledger, agentId: "knower", chat: { transport: "telegram", chatId: "42" } }));
+      await t.get("start_task")!.execute("call-a", { title: "Transcribe talk", instructions: "yt-dlp + transcript.", timeoutMinutes: 90 });
+      await t.get("start_task")!.execute("call-b", { title: "Absurd cap", instructions: "clamp me.", timeoutMinutes: 10000 });
+      const ids = Object.values((await ledger.list({ agentId: "knower" }))).map((e) => e.id);
+      for (let i = 0; i < 200 && Object.values(await ledger.list({ agentId: "knower" })).some((e) => e.status !== "done"); i++) await new Promise((r) => setTimeout(r, 10));
+      const caps = run.mock.calls.map((c) => (c[0] as { timeoutMinutes?: number }).timeoutMinutes);
+      expect(run).toHaveBeenCalledTimes(2);
+      expect(caps).toContain(90);
+      expect(caps).toContain(480); // clamped to the hard ceiling
+      expect(ids.length).toBe(2);
+    } finally { await ledger.close(); }
+  });
+
   it("comes with the scheduler and is never offered inside agent-only sessions", () => {
     const base = { agent: { id: "a1", dir: "/tmp", manifest: { name: "a1" } }, workspace: "/tmp", vaultDir: "/tmp", scheduler: {}, tasks: {} } as unknown as CapabilityContext;
     const owner = resolveCapabilities({ ...base, chat: { transport: "telegram", chatId: "1" } }, CAPABILITY_REGISTRY, ["scheduler"]);

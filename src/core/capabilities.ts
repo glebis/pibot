@@ -164,7 +164,7 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
   {
     id: "tasks", defaultEnabled: true,
     tools: ["start_task", "task_status", "list_tasks", "cancel_task"],
-    prompt: "start_task hands longer work (research, drafting, multi-step tool work) to a durable background run of you that survives restarts and posts its result to this chat; give it self-contained instructions. When the owner asks how a task is going or what came back, use list_tasks / task_status rather than guessing. cancel_task stops one. In a voice conversation, prefer start_task over long work inside the turn, and say the result will arrive in the chat.",
+    prompt: "start_task hands longer work (research, drafting, multi-step tool work) to a durable background run of you that survives restarts and posts its result to this chat; give it self-contained instructions. For heavier work pass timeoutMinutes (default 30, max 480): downloading + transcribing long media with yt-dlp needs ~90 minutes for a two-hour talk; fetch video audio with yt-dlp by default instead of relying on caption APIs (they rate-limit with 429s). When the owner asks how a task is going or what came back, use list_tasks / task_status rather than guessing. cancel_task stops one. In a voice conversation, prefer start_task over long work inside the turn, and say the result will arrive in the chat.",
     // never inside agent-only sessions (a task's own run, agent-to-agent): no tasks spawning tasks
     available: (ctx) => Boolean(ctx.tasks) && ctx.chat.transport !== "agent",
     create: (ctx) => tasksPlugin({ ledger: ctx.tasks!, agentId: ctx.agent.id, chat: ctx.chat }),

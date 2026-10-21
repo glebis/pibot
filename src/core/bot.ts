@@ -3348,7 +3348,11 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       if (run.signal.aborted) cancel(); else run.signal.addEventListener("abort", cancel, { once: true });
     });
     let timer: NodeJS.Timeout | undefined;
-    const limit = new Promise<never>((_, reject) => { timer = setTimeout(() => { void session.abort().catch(() => {}); reject(new Error("Task took longer than 30 minutes and was stopped.")); }, 30 * 60_000); });
+    // Hard stop for a runaway background run (bead kanban thread, Oct 2026: a two-hour talk's
+    // local transcription outlived the fixed 30-min cap and was killed mid-work). The caller
+    // can extend via timeoutMinutes; the config can raise the default; 8h absolute ceiling.
+    const capMinutes = Math.max(1, Math.min(8 * 60, Math.round(run.timeoutMinutes ?? this.deps.config.taskTimeoutMinutes ?? 30)));
+    const limit = new Promise<never>((_, reject) => { timer = setTimeout(() => { void session.abort().catch(() => {}); reject(new Error(`Task took longer than ${capMinutes} minutes and was stopped.`)); }, capMinutes * 60_000); });
     try {
       await Promise.race([
         trackActivity({ kind: "task", label: run.title, agentId: run.agentId, chatKey: run.chatKey, session }, () => this.promptTaskWithCascade(run.agentId, session, ck, `[background task ${run.taskId}: "${run.title}" — requested from the owner's chat]\n\n${run.instructions}${resume}\n\nWork on it now with your tools. Finish with a short result summary for the owner; it is posted to their chat.`)),

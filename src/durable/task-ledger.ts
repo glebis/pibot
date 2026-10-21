@@ -25,6 +25,9 @@ export interface LedgerTaskInput {
   instructions: string;
   /** owner-chosen tool names for the run (from a voice call); omitted = the agent's full set */
   allowedTools?: string[];
+  /** per-task hard stop in minutes; omitted = config default. Persisted with the task so
+   *  retries/resumes keep the same ceiling. Clamped in runLedgerTask: ≥1min, ≤8h ceiling. */
+  timeoutMinutes?: number;
 }
 
 export interface LedgerEntry extends LedgerTaskInput {
