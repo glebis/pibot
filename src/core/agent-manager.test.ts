@@ -233,3 +233,59 @@ describe("scrubbedBashTool", () => {
     }
   });
 });
+
+describe("live capability refresh — session staleness (bd: pibot-3w03)", () => {
+  let dir: string;
+  let mgr: AgentManager;
+
+  beforeEach(() => {
+    dir = tmpDir();
+    mgr = new AgentManager(dir, { getModels: () => [] } as never);
+    mgr.createAgent("alpha");
+    fs.writeFileSync(
+      path.join(dir, "alpha", "agent.json"),
+      JSON.stringify({ name: "alpha", model: "anthropic/claude-opus-4-6", providers: ["anthropic"], capabilities: ["memory"] }),
+    );
+    return mgr.discover();
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const file = () => path.join(dir, "alpha", "agent.json");
+
+  it("flags stale only when the on-disk manifest differs from the build-time fingerprint", async () => {
+    expect(mgr.isSessionStale("alpha")).toBe(false); // nothing built yet
+    mgr.noteSessionBuilt("alpha");
+    expect(mgr.isSessionStale("alpha")).toBe(false); // manifest unchanged on disk
+    const m = JSON.parse(fs.readFileSync(file(), "utf8"));
+    m.capabilities = [...(m.capabilities ?? []), "speech"];
+    fs.writeFileSync(file(), JSON.stringify(m, null, 2));
+    expect(mgr.isSessionStale("alpha")).toBe(true); // capability grant landed on disk
+    mgr.noteSessionBuilt("alpha");
+    expect(mgr.isSessionStale("alpha")).toBe(false);
+  });
+
+  it("an identical-byte rewrite (mtime-only refresh) never counts as stale", async () => {
+    mgr.noteSessionBuilt("alpha");
+    const before = fs.readFileSync(file(), "utf8");
+    fs.writeFileSync(file(), before); // same bytes, fresh mtime (bl_raqq2k-style refresh)
+    expect(mgr.isSessionStale("alpha")).toBe(false);
+  });
+
+  it("rebuilding hydrates the manifest from disk — new caps land without a restart", async () => {
+    const m = JSON.parse(fs.readFileSync(file(), "utf8"));
+    m.capabilities = ["memory", "speech"];
+    fs.writeFileSync(file(), JSON.stringify(m, null, 2));
+    (mgr as unknown as { refreshAgentFromDisk(id: string): LoadedAgent }).refreshAgentFromDisk("alpha");
+    expect(mgr.getAgent("alpha")!.manifest.capabilities).toContain("speech");
+  });
+
+  it("a deleted or unreadable manifest never flags stale (fail-safe session keep)", () => {
+    mgr.noteSessionBuilt("alpha");
+    fs.renameSync(file(), file() + ".bak");
+    expect(mgr.isSessionStale("alpha")).toBe(false);
+    fs.renameSync(file() + ".bak", file());
+  });
+});

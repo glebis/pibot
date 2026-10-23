@@ -38,6 +38,8 @@ export interface HeartbeatHost {
   escalateToAgent(agentId: string, instruction: string): Promise<void>;
   /** timestamp (ms) of the last message the user actually sent to this agent */
   lastUserMessageAt(agentId: string): number;
+  /** optional: the loop is auto-triaged at threshold — file a dev ticket with the escalation evidence (bd: pibot-3w03) */
+  fileDevTriage?(agentId: string, signature: string): Promise<void>;
 }
 
 const BRIEF_SYSTEM_PROMPT = `You deliver the user's MORNING BRIEF. Check calendar_today, then compose a short, warm brief in the agent's voice:
@@ -74,6 +76,7 @@ Call the heartbeat_act tool exactly once with your decision.`;
 interface HeartbeatAct {
   speak?: string;
   escalate?: string;
+
   note?: string;
   /** requested delay until this agent's next heartbeat tick (e.g. "10m", "3h") */
   wakeup?: string;
@@ -234,6 +237,7 @@ export function buildMaintenancePanel(agentDir: string, now = Date.now()): strin
 interface PersistedHeartbeatAgentState {
   lastSpeakFingerprint?: string;
   unansweredSpeaks?: number;
+  escalationLoop?: EscalationLoopState;
 }
 
 interface PersistedHeartbeatState {
@@ -263,7 +267,89 @@ export function isValuelessHeartbeatSpeak(text: string): boolean {
   return filler.some((rx) => rx.test(t));
 }
 
+// ─── Escalation-loop triage (bd: pibot-3w03 — stuck-agent lane) ─────────────
+
+export interface EscalationLoopState {
+  /** per-signature loops (LRU-capped); each tracks its own counter and triage cooldown */
+  loops: { sig: string; count: number; triagedUntil?: number; lastTs: number }[];
+}
+
+const ESCALATION_LOOP_THRESHOLD = 3;
+const ESCALATION_LOOP_COOLDOWN_MS = 12 * 3600e3;
+const ESCALATION_LOOP_MEMORY_MS = 24 * 3600e3;
+const ESCALATION_LOOP_MAX_TRACKED = 5;
+
+function contentTokens(text: string): Set<string> {
+  // 6-char prefixes: inflection-tolerant for Russian and English plurals
+  // ("инструментов"/"инструментам" → "инстру"), digits and punctuation dropped.
+  const words = text
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .split(/\s+/)
+    .filter((w) => /\p{L}{3,}/u.test(w))
+    .map((w) => (w.length >= 7 ? w.slice(0, 6) : w));
+  return new Set(words);
+}
+
+/** Normalized content signature of an escalation — wording-shuffled repeats normalize to the same tokens. */
+export function escalationSignature(text: string): string {
+  return [...contentTokens(text)].sort().join(" ");
+}
+
+/** Deliberately loose containment match: the same stuck problem re-worded must still match (creator Oct 22–23 case),
+ *  while escalations about genuinely different matters must not. False positives only cost one suppressed duplicate ping. */
+export function escalationsSimilar(a: string, b: string): boolean {
+  const A = contentTokens(a);
+  const B = contentTokens(b);
+  if (A.size < 3 || B.size < 3) return false;
+  let inter = 0;
+  for (const w of A) if (B.has(w)) inter++;
+  return inter / Math.min(A.size, B.size) >= 0.5;
+}
+
+/** Pure state machine deciding what happens to this tick's escalation text.
+ *  Similar escalations accumulate per signature: first threshold-1 deliver; at threshold the loop
+ *  auto-triages (dev ticket filed once, owner pings suppressed for the cooldown);
+ *  after the cooldown the counter restarts and delivery resumes. Off-topic escalations never join the loop. */
+export function triageEscalationLoop(
+  prev: EscalationLoopState | undefined,
+  text: string,
+  now: number,
+  opts?: { threshold?: number; cooldownMs?: number },
+): { deliver: boolean; triageNow: boolean; matchedCount: number; next: EscalationLoopState } {
+  const threshold = opts?.threshold ?? ESCALATION_LOOP_THRESHOLD;
+  const cooldownMs = opts?.cooldownMs ?? ESCALATION_LOOP_COOLDOWN_MS;
+  const sig = escalationSignature(text);
+  const loops = (prev?.loops ?? []).filter((l) => now - l.lastTs <= ESCALATION_LOOP_MEMORY_MS);
+  const existing = loops.find((l) => escalationsSimilar(l.sig, sig));
+  let triageNow = false;
+  let deliver = true;
+  if (existing) {
+    const expired = existing.triagedUntil !== undefined && now >= existing.triagedUntil;
+    existing.count = expired ? 1 : existing.count + 1;
+    existing.triagedUntil = expired ? undefined : existing.triagedUntil;
+    existing.lastTs = now;
+    if (existing.count >= threshold) {
+      const cooling = existing.triagedUntil !== undefined && now < existing.triagedUntil;
+      if (!cooling) {
+        existing.triagedUntil = now + cooldownMs;
+        triageNow = true;
+      }
+      deliver = false;
+    }
+  } else {
+    loops.push({ sig, count: 1, lastTs: now });
+  }
+  // LRU cap — long-tail escalation topics must not grow unbounded
+  loops.sort((a, b) => b.lastTs - a.lastTs);
+  while (loops.length > ESCALATION_LOOP_MAX_TRACKED) loops.pop();
+  const matchedCount = loops.find((l) => escalationsSimilar(l.sig, sig))?.count ?? 1;
+  return { deliver, triageNow, matchedCount, next: { loops } };
+}
+
 export class HeartbeatEngine {
+  private escalationLoop = new Map<string, EscalationLoopState>();
   private inflight = new Set<string>();
   /** proactive speaks that got no user reaction — 2 in a row = back off */
   private unansweredSpeaks = new Map<string, number>();
@@ -508,6 +594,20 @@ export class HeartbeatEngine {
     this.deps.events.log(agent.id, "heartbeat", summary);
 
     if (act.escalate) {
+      // bd: pibot-3w03 — escalations repeating tick after tick with the same signature mean the
+      // owner pings THEMSELVES are the loop: triage instead of repeating forever.
+      const tri = triageEscalationLoop(this.escalationLoop.get(agent.id), act.escalate, Date.now());
+      this.escalationLoop.set(agent.id, tri.next);
+      this.persistAgent(agent.id);
+      if (!tri.deliver) {
+        this.deps.events.log(
+          agent.id,
+          "heartbeat",
+          `(suppressed, escalation loop ${tri.matchedCount}x, triaged=${tri.triageNow ? "now" : "earlier"}) ${truncate(act.escalate, 160)}`,
+        );
+        if (tri.triageNow) await this.deps.host.fileDevTriage?.(agent.id, act.escalate);
+        return;
+      }
       await this.deps.host.escalateToAgent(agent.id, act.escalate);
     } else if (act.speak) {
       // Valueless status reports ("no immediate action needed — let me know if…")
@@ -558,6 +658,7 @@ export class HeartbeatEngine {
     const saved = this.persistedState.agents[fingerprint(agentId)];
     if (saved?.lastSpeakFingerprint) this.lastSpeakFingerprint.set(agentId, saved.lastSpeakFingerprint);
     if (saved?.unansweredSpeaks) this.unansweredSpeaks.set(agentId, saved.unansweredSpeaks);
+    if (saved?.escalationLoop) this.escalationLoop.set(agentId, saved.escalationLoop);
   }
 
   private persistAgent(agentId: string): void {
@@ -565,7 +666,10 @@ export class HeartbeatEngine {
     const key = fingerprint(agentId);
     const lastSpeakFingerprint = this.lastSpeakFingerprint.get(agentId);
     const unansweredSpeaks = this.unansweredSpeaks.get(agentId) ?? 0;
-    this.persistedState.agents[key] = { lastSpeakFingerprint, unansweredSpeaks };
+    const entry: PersistedHeartbeatAgentState = { lastSpeakFingerprint, unansweredSpeaks };
+    const loop = this.escalationLoop.get(agentId);
+    if (loop) entry.escalationLoop = loop;
+    this.persistedState.agents[key] = entry;
     writeJsonAtomic(this.deps.statePath, this.persistedState, 0o600);
   }
 

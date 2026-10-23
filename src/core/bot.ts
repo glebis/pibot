@@ -1128,6 +1128,14 @@ export class PiBot implements HeartbeatHost {
   }
 
   private async sessionFor(t: Transport, chatId: string, agentId: string, ck: string): Promise<AgentSession> {
+    if (this.deps.agents.isSessionStale(agentId)) {
+      // bd: pibot-3w03 — capability grants and manifest edits must reach live sessions;
+      // reset (same file resumes) so tools like video_note_send appear without /new or a restart.
+      this.deps.events.log(agentId, "system", `manifest changed on disk — resetting chat session to pick up current capabilities (${ck})`);
+      await this.deps.agents.resetSession(agentId, ck, { transport: t.name, chatId }, this.deps.scheduler);
+      this.wired.delete(`${agentId}::${ck}`);
+      this.fallbackNotified.delete(`${agentId}::${ck}`);
+    }
     const session = await this.deps.agents.getOrCreateSession(
       agentId,
       ck,
@@ -3692,6 +3700,30 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
     const ackFrom = threaded ? "you" : fromAgent;
     this.deps.events.log(agentId, "task-ack", `${ack} — ${truncate(taskText, 80)} (reply: ${truncate(reply, 80)})`);
     void this.deliverToAgent(agentId, line, { replyToMessageId: delivery.replyToMessageId, onlyChat: delivery.onlyChat, selfAttributed: true }).catch(() => {});
+  }
+
+  /** bd: pibot-3w03 — the heartbeat escalation loop auto-triaged: file a dev ticket with the evidence. */
+  async fileDevTriage(agentId: string, signature: string): Promise<void> {
+    try {
+      const out = await this.bdRun([
+        "create",
+        "--title",
+        `triage: repeated escalation loop from ${agentId}`,
+        "--type",
+        "bug",
+        "--priority",
+        "1",
+        "--description",
+        `Heartbeat escalations repeat with the same signature without owner resolution (stuck-agent triage lane, bd: pibot-3w03). Latest escalation: ${truncate(signature, 500)}. Investigate recent events of agents/${agentId} and resolve the root cause; owner pings are suppressed while the loop persists.`,
+      ]);
+      const id = out.match(/\b[a-z]+-[a-z0-9]+\b/i)?.[0] ?? "created";
+      await this.deliverToAgent(
+        "pibot-dev",
+        `[triage] ${agentId} escalates in a loop (${id}): ${truncate(signature, 220)}. Evidence: agents/${agentId}/state/events.jsonl — resolve the root cause; owner pings are suspended while the loop persists.`,
+      );
+    } catch (e) {
+      this.deps.events.log(agentId, "system", `dev-triage filing failed: ${errorMessage(e)}`);
+    }
   }
 
   async escalateToAgent(agentId: string, instruction: string): Promise<void> {

@@ -147,6 +147,7 @@ function fakeAgentManager(promptSpy = vi.fn()) {
     createAgent: vi.fn(() => undefined),
     resetSession: vi.fn(async () => {}),
     discover: vi.fn(async () => {}),
+    isSessionStale: vi.fn(() => false),
     getOrCreateSession: vi.fn(async (..._args: unknown[]) => fakeSession),
     resolveModel: vi.fn(() => undefined),
     getAgent: vi.fn((id: string) =>

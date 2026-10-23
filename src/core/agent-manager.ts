@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import {
   createAgentSession,
   createBashToolDefinition,
@@ -36,6 +37,7 @@ export interface LoadedAgent {
 export class AgentManager {
   private agents = new Map<string, LoadedAgent>();
   private sessions = new Map<string, AgentSession>(); // `${agentId}::${chatKey}` → session
+  private builtManifestShas = new Map<string, string>(); // agentId → manifest sha at session-build time
   /** measurable commitment loop (proactive pilot); set by the host after wiring */
   commitments?: CommitmentPluginEngine;
   /** durable research-intake sessions (wizard persistence) */
@@ -178,7 +180,7 @@ export class AgentManager {
     const cached = this.sessions.get(key);
     if (cached) return cached;
 
-    const agent = this.agents.get(agentId);
+    const agent = this.refreshAgentFromDisk(agentId);
     if (!agent) throw new Error(`Unknown agent "${agentId}"`);
 
     const sessionsDir = path.join(agent.dir, "sessions");
@@ -284,10 +286,54 @@ export class AgentManager {
     }
 
     this.sessions.set(key, session);
+    // fingerprint the manifest NOW so later on-disk grant/manifest edits flag the session stale (bd: pibot-3w03)
+    this.noteSessionBuilt(agentId);
     return session;
   }
 
   /** Start a fresh session for one agent+chat (the old file is kept on disk) */
+  /** Re-read agent.json into the in-memory manifest — grants/caps reach session builds without a restart (bd: pibot-3w03). */
+  private refreshAgentFromDisk(agentId: string): LoadedAgent | undefined {
+    const agent = this.agents.get(agentId);
+    if (!agent) return undefined;
+    const file = path.join(agent.dir, "agent.json");
+    if (fs.existsSync(file)) {
+      try {
+        const manifest = { ...defaultManifest(agentId), ...readJson<Partial<AgentManifest>>(file, {}) };
+        manifest.name = manifest.name || agentId;
+        agent.manifest = manifest;
+      } catch {
+        /* keep the in-memory manifest on parse trouble */
+      }
+    }
+    return agent;
+  }
+
+  private manifestShaOnDisk(agentId: string): string | undefined {
+    try {
+      const dir = this.agents.get(agentId)?.dir;
+      if (!dir) return undefined;
+      return createHash("sha256").update(fs.readFileSync(path.join(dir, "agent.json"))).digest("hex");
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Record the manifest fingerprint at session-build time (getOrCreateSession calls this; tests may too). */
+  noteSessionBuilt(agentId: string): void {
+    const sha = this.manifestShaOnDisk(agentId);
+    if (sha) this.builtManifestShas.set(agentId, sha);
+  }
+
+  /** True when the on-disk manifest differs from the one live sessions were built with — call resetSession so
+   *  capability grants and manifest edits reach the running session without /new or a daemon restart (bd: pibot-3w03). */
+  isSessionStale(agentId: string): boolean {
+    const built = this.builtManifestShas.get(agentId);
+    if (!built) return false;
+    const disk = this.manifestShaOnDisk(agentId);
+    return disk !== undefined && disk !== built;
+  }
+
   async resetSession(agentId: string, chatKey: string, chat: ChatRef, scheduler: Scheduler): Promise<void> {
     const key = `${agentId}::${chatKey}`;
     const old = this.sessions.get(key);

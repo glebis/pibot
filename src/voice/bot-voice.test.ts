@@ -9,7 +9,7 @@ function harness() {
  const pushed: string[]=[];const subscribers: Array<(e:any)=>void>=[];
  const t={name:'telegram',push:vi.fn(async (_chat:string,p:any)=>{pushed.push(p.text);}),notifyError:vi.fn(async()=>{}),setTyping:vi.fn(),onMessage:vi.fn(),onAction:vi.fn(),start:vi.fn(),stop:vi.fn()};
  const session={isStreaming:false,subscribe:vi.fn((f:any)=>{subscribers.push(f);}),setModel:vi.fn(async()=>{}),prompt:vi.fn(async()=>{subscribers.forEach(f=>f({type:'agent_end',messages:[{role:'assistant',content:[{type:'text',text:'Here is the answer.'}],stopReason:'stop'}]}));})};
- const agents={getAgent:vi.fn((id:string)=>id==='assistant'?{id,manifest:{name:id}}:undefined),getOrCreateSession:vi.fn(async()=>session)};
+ const agents={isSessionStale:vi.fn(()=>false),resetSession:vi.fn(async()=>{}),getAgent:vi.fn((id:string)=>id==='assistant'?{id,manifest:{name:id}}:undefined),getOrCreateSession:vi.fn(async()=>session)};
  const bot=new PiBot({config:{dataDir:'/tmp/voice-test-unused',allowedChats:['42']},transports:[t],agents,heartbeat:{noteUserMessage:vi.fn()},events:{log:vi.fn()},scheduler:{},secrets:{}} as any);
  const b=bot as any;b.chatAgent.set('telegram:42','assistant');b.agentChats.set('assistant',new Set(['telegram:42']));
  // No test writes to runtime state or invokes unrelated plugin services.

@@ -43,7 +43,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   };
 });
 
-import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine, recordMaintenanceNote, verifyMemoryClaim } from "./heartbeat.js";
+import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine, recordMaintenanceNote, verifyMemoryClaim, triageEscalationLoop, escalationsSimilar, type EscalationLoopState } from "./heartbeat.js";
 import { appendBacklogItems, loadBacklogItems } from "./backlog.js";
 import { clearSignalsCache } from "./research-signals.js";
 import type { LoadedAgent } from "./agent-manager.js";
@@ -638,5 +638,107 @@ describe("nudge-rating governor", () => {
       expect(engine.unansweredFor(agent.id)).toBe(0);
       expect(engine.takeNextWakeup(agent.id)).toBeNull();
     });
+  });
+});
+
+describe("HeartbeatEngine escalation-loop triage (bd: pibot-3w03)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = tmpAgentDir();
+    nextActs.length = 0;
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    nextActs.length = 0;
+    vi.mocked(PiAgent.createAgentSession).mockClear();
+    vi.mocked(PiAgent.getAgentDir).mockClear();
+  });
+
+  const t = (e: HeartbeatEngine) => e as unknown as { tickInner: (a: LoadedAgent, o?: { brief?: boolean }) => Promise<void> };
+
+  it("delivers similar escalations until threshold, then suppresses and files dev triage once", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const { engine, host, events } = makeEngine(agent, dir);
+    const fileDevTriage = vi.fn(async (_agentId: string, _signature: string) => {});
+    (host as HeartbeatHost).fileDevTriage = fileDevTriage;
+    // creator Oct 22-23 wording variants — inflected, re-worded, numbered
+    queueActs([
+      null,
+      { escalate: "Тик снова без инструментов (3-й подряд) — рендер от 16:15 ждёт проверки" },
+      { escalate: "Тик снова мёртв по инструментам: task_status, agent_message все not found уже 4-й раз подряд" },
+      { escalate: "Кратко: тик снова без инструментов (6-й подряд) — рендер и AGENTS.md всё ещё ждут рабочего тика" },
+      { escalate: "Кратко: тик снова без инструментов (7-й подряд) — рендер и AGENTS.md всё ещё ждут рабочего тика" },
+    ]);
+    const tick = () => t(engine).tickInner(agent, {});
+    await tick();
+    await tick();
+    await tick();
+    await tick();
+    await tick();
+    expect(host.escalateToAgent).toHaveBeenCalledTimes(2);
+    expect(fileDevTriage).toHaveBeenCalledTimes(1);
+    expect(fileDevTriage.mock.calls[0][0]).toBe("assistant");
+    expect(String(fileDevTriage.mock.calls[0][1])).toContain("инструмент");
+    const logs = (events.log as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[2]));
+    expect(logs.some((l) => l.includes("(suppressed, escalation loop 3x, triaged=now)"))).toBe(true);
+    expect(logs.some((l) => l.includes("triaged=earlier"))).toBe(true);
+  });
+
+  it("a genuinely different escalation escapes the loop and delivers", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const { engine, host, events } = makeEngine(agent, dir);
+    const fileDevTriage = vi.fn(async (_agentId: string, _signature: string) => {});
+    (host as HeartbeatHost).fileDevTriage = fileDevTriage;
+    queueActs([
+      { escalate: "Тик без инструментов: рендер ждёт проверки, исполнители недоступны" },
+      { escalate: "Тик без инструментов: рендер ждёт проверки, исполнители недоступны, 2-й раз" },
+      { escalate: "Утренний брифинг не уехал из-за сбоя календаря — проверить подключение" },
+      { escalate: "Тик без инструментов: рендер ждёт проверки, исполнители недоступны, 3-й раз" },
+    ]);
+    const tick = () => t(engine).tickInner(agent, {});
+    await tick();
+    await tick();
+    await tick();
+    await tick();
+    expect(host.escalateToAgent).toHaveBeenCalledTimes(3);
+    // the off-topic escalation resets the tool loop: threshold not yet reached after it
+    expect(fileDevTriage).toHaveBeenCalledTimes(1);
+    const logs = (events.log as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[2]));
+    expect(logs.some((l) => l.includes("(suppressed, escalation loop 3x, triaged=now)"))).toBe(true);
+  });
+
+  it("after the cooldown the same escalation starts a fresh loop that delivers again", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const { engine, host } = makeEngine(agent, dir);
+    queueActs([
+      { escalate: "Тик без инструментов: рендер ждёт проверки" },
+      { escalate: "Тик без инструментов: рендер ждёт проверки, повтор" },
+      { escalate: "Тик без инструментов: рендер ждёт проверки, третий тик" },
+    ]);
+    const tick = () => t(engine).tickInner(agent, {});
+    await tick();
+    await tick();
+    await tick();
+    expect(host.escalateToAgent).toHaveBeenCalledTimes(2);
+    // simulate cooldown expiry on the persisted/loop state
+    const engineState = (engine as unknown as { escalationLoop: Map<string, EscalationLoopState> }).escalationLoop.get(agent.id);
+    expect(engineState?.loops[0]?.count).toBe(3);
+    (engine as unknown as { escalationLoop: Map<string, EscalationLoopState> }).escalationLoop.set(agent.id, {
+      loops: engineState!.loops.map((l) => ({ ...l, triagedUntil: Date.now() - 1 })),
+    });
+    queueActs([{ escalate: "Тик без инструментов: рендер ждёт проверки, снова" }]);
+    await tick();
+    expect(host.escalateToAgent).toHaveBeenCalledTimes(3);
+  });
+
+  it("escalation fingerprints tolerate inflection but separate different topics (pure fns)", () => {
+    const a = "Тик без инструментов (6-й подряд) — рендер ждёт";
+    const b = "тики без инструментов подряд — рендер ждёт рабочего тика";
+    const c = "деньги пришли на счёт: счёт-фактура 2026 от клиента";
+    expect(triageEscalationLoop(undefined, a, 1).matchedCount).toBe(1);
+    const st = triageEscalationLoop(triageEscalationLoop(undefined, a, 1).next, b, 2);
+    expect(st.matchedCount).toBe(2);
+    expect(escalationsSimilar(a, b)).toBe(true);
+    expect(escalationsSimilar(a, c)).toBe(false);
   });
 });
