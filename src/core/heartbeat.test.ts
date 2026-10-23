@@ -742,3 +742,81 @@ describe("HeartbeatEngine escalation-loop triage (bd: pibot-3w03)", () => {
     expect(escalationsSimilar(a, c)).toBe(false);
   });
 });
+
+describe("passive bd-ticket pickup (bd: pibot-3w03)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = tmpAgentDir();
+    nextActs.length = 0;
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    nextActs.length = 0;
+    vi.mocked(PiAgent.createAgentSession).mockClear();
+    vi.mocked(PiAgent.getAgentDir).mockClear();
+  });
+
+  it("digest shows the assigned-tickets panel only when tickets exist", () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const scheduler = { list: vi.fn(() => []) } as unknown as import("./scheduler.js").Scheduler;
+    const events = { tail: vi.fn(() => []) } as unknown as import("./events.js").EventLog;
+    const without = buildHeartbeatDigest(agent, scheduler, events);
+    expect(without).not.toContain("Bd tickets assigned to you");
+    const withTickets = buildHeartbeatDigest(agent, scheduler, events, undefined, [
+      { id: "pibot-3w03", title: "triage lane for stuck agents" },
+      { id: "pibot-gahj", title: "another open ticket" },
+    ]);
+    expect(withTickets).toContain("# Bd tickets assigned to you");
+    expect(withTickets).toContain("- pibot-3w03: triage lane for stuck agents");
+    expect(withTickets).toContain("service <ticket-id>");
+  });
+
+  it("a passive tick with an assigned ticket escalates service into the main session", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const seen: string[] = [];
+    const acts = [
+      { escalate: "service pibot-3w03: verify capability-refresh wiring and close the ticket" },
+    ];
+    nextActs.length = 0;
+    nextActs.push(...(acts as never[]));
+    const { engine, host } = makeEngine(agent, dir, {}, undefined, undefined, undefined);
+    // bdAssigned feeds the digest
+    (engine as unknown as { deps: { bdAssigned: (id: string) => Promise<{ id: string; title: string }[]> } }).deps.bdAssigned =
+      vi.fn(async () => [{ id: "pibot-3w03", title: "triage lane for stuck agents" }]);
+    const t = (e: HeartbeatEngine) => e as unknown as { tickInner: (a: LoadedAgent, o?: { brief?: boolean }) => Promise<void> };
+    // capture the prompt text the tick sends
+    vi.mocked(PiAgent.createAgentSession).mockImplementationOnce(async (opts: unknown) => {
+      const o = opts as { customTools?: Array<{ name: string; execute: (id: string, params: unknown) => Promise<unknown> }> };
+      const actTool = o.customTools?.find((t) => t.name === "heartbeat_act");
+      const payload = nextActs.shift();
+      return {
+        session: {
+          prompt: async (text?: string) => {
+            seen.push(String(text));
+            if (actTool && payload) await actTool.execute("test-id", payload as never);
+          },
+          dispose() {},
+          agent: { state: { messages: [] } },
+        },
+        modelFallbackMessage: undefined,
+      } as never;
+    });
+    await t(engine).tickInner(agent, {});
+    expect(seen[0]).toContain("# Bd tickets assigned to you");
+    expect(seen[0]).toContain("- pibot-3w03: triage lane for stuck agents");
+    expect(host.escalateToAgent).toHaveBeenCalledTimes(1);
+    expect(String((host.escalateToAgent as ReturnType<typeof vi.fn>).mock.calls[0][1])).toContain("service pibot-3w03");
+  });
+
+  it("bd lookup failure never breaks a tick (panel simply omitted)", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const { engine, host } = makeEngine(agent, dir);
+    const t = (e: HeartbeatEngine) => e as unknown as { tickInner: (a: LoadedAgent, o?: { brief?: boolean }) => Promise<void> };
+    (engine as unknown as { deps: { bdAssigned: (id: string) => Promise<never> } }).deps.bdAssigned = vi.fn(async () => {
+      throw new Error("bd missing");
+    });
+    queueActs([{ note: "calm tick" }]);
+    await t(engine).tickInner(agent, {});
+    expect(host.escalateToAgent).not.toHaveBeenCalled();
+  });
+});

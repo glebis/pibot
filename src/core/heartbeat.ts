@@ -70,6 +70,7 @@ Maintenance rotation — keep your own house in order:
 - Service AT MOST ONE stale item per tick, rotating across ticks — never everything at once. What you did gets recorded via heartbeat_act "maintain" (a one-line durable note into your maintenance journal).
 - Your file tools can read the agent directory but write ONLY under memory/. Anything outside memory/ (persona, skills, scripts) cannot be edited from a tick: propose it with maintain "backlog: <summary>" or via speak instead.
 - If everything is fresh, record nothing and prefer a longer wakeup. Never let the same item stay stale for many cycles.
+- If the digest lists bd tickets assigned to you, service exactly ONE per tick: use escalate with "service <ticket-id>: what it needs" — your main session claims and executes it. Never a speak, never a user-facing ping about it.
 
 Call the heartbeat_act tool exactly once with your decision.`;
 
@@ -428,6 +429,8 @@ export class HeartbeatEngine {
       statePath?: string;
       /** event-log consolidation engine — powers the "consolidate events" maintenance verb */
       consolidation?: { consolidate(agentId: string): Promise<unknown> };
+      /** optional: open bd tickets assigned to this agent — surfaced so a passive tick services one via escalate (bd: pibot-3w03) */
+      bdAssigned?: (agentId: string) => Promise<{ id: string; title: string }[]>;
     }
   ) {
     this.persistedState = deps.statePath
@@ -462,7 +465,7 @@ export class HeartbeatEngine {
   }
 
   private async tickOnce(agent: LoadedAgent, opts: { brief?: boolean } = {}): Promise<HeartbeatAct | null> {
-    const digest = this.buildDigest(agent);
+    const digest = await this.buildDigest(agent);
     const act: HeartbeatAct = {};
     let called = false;
 
@@ -698,8 +701,14 @@ export class HeartbeatEngine {
     return model ? { model, spec: healthy } : {};
   }
 
-  private buildDigest(agent: LoadedAgent): string {
-    return buildHeartbeatDigest(agent, this.deps.scheduler, this.deps.events, this.deps.vaultDir);
+  private async buildDigest(agent: LoadedAgent): Promise<string> {
+    let assignedTickets: { id: string; title: string }[] | undefined;
+    try {
+      assignedTickets = await this.deps.bdAssigned?.(agent.id);
+    } catch {
+      assignedTickets = undefined; // bd absent or slow — the panel simply omits tickets
+    }
+    return buildHeartbeatDigest(agent, this.deps.scheduler, this.deps.events, this.deps.vaultDir, assignedTickets);
   }
 }
 
@@ -708,7 +717,8 @@ export function buildHeartbeatDigest(
   agent: LoadedAgent,
   scheduler: Pick<Scheduler, "list">,
   events: Pick<EventLog, "tail">,
-  vaultDir?: string
+  vaultDir?: string,
+  assignedTickets?: { id: string; title: string }[],
 ): string {
   const parts: string[] = [];
 
@@ -732,6 +742,18 @@ export function buildHeartbeatDigest(
     );
   } else {
     parts.push("# Pending scheduled items\n(none)");
+  }
+
+  // assigned bd tickets — passive pickup: one serviced per tick via escalate (bd: pibot-3w03)
+  if (assignedTickets?.length) {
+    parts.push(
+      `# Bd tickets assigned to you
+${assignedTickets
+        .slice(0, 3)
+        .map((t) => `- ${t.id}: ${truncate(t.title, 90)}`)
+        .join("\n")}
+Service exactly ONE per tick: escalate \`service <ticket-id>\` — your main session claims and executes it.`,
+    );
   }
 
   // recent events

@@ -1127,6 +1127,22 @@ export class PiBot implements HeartbeatHost {
     this.persistState();
   }
 
+  /** bd: pibot-3w03 — open tickets assigned to this agent, surfaced in the heartbeat digest so a passive tick services one. */
+  /** (public for index.ts wiring; read-only) */
+  async assignedTicketsFor(agentId: string): Promise<{ id: string; title: string }[]> {
+    try {
+      const out = await this.bdRun(["list", "--assignee", agentId, "--status", "open", "--json"]);
+      const parsed = JSON.parse(out);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter((t) => t && typeof t.id === "string" && typeof t.title === "string" && t.title.trim())
+        .slice(0, 3)
+        .map((t) => ({ id: t.id, title: t.title }));
+    } catch {
+      return []; // bd missing/slow — passive pickup just stays quiet
+    }
+  }
+
   private async sessionFor(t: Transport, chatId: string, agentId: string, ck: string): Promise<AgentSession> {
     if (this.deps.agents.isSessionStale(agentId)) {
       // bd: pibot-3w03 — capability grants and manifest edits must reach live sessions;
