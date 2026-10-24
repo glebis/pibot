@@ -14,8 +14,27 @@ import { createModels } from "@earendil-works/pi-ai";
 import { Harness, createRegistry, defineDoc, defineExtension, defineTask, type JsonObject } from "@earendil-works/pi-durable";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
+import { truncate } from "../core/util.js";
 
-export type LedgerStatus = "queued" | "running" | "done" | "failed" | "cancelled";
+export type LedgerStatus = "queued" | "running" | "done" | "partial" | "blocked" | "failed" | "cancelled";
+
+/** Evidence that a task's output was actually delivered (bd pibot-zy70). */
+export interface Delivery {
+  /** id of the Telegram message that carried the result / final notice */
+  messageId?: number;
+  /** actually delivered medium: "video_note" | "video" | "text" | … (undefined = only a text notice went out) */
+  mediaType?: string;
+  deliveredAt?: number;
+}
+
+/** A runner could not proceed because a prerequisite is missing (tool, credential, provider) —
+ *  distinct from a plain failure so the ledger can record a blocker instead of a bogus retry loop. */
+export class BlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BlockedError";
+  }
+}
 
 export interface LedgerTaskInput {
   agentId: string;
@@ -28,6 +47,9 @@ export interface LedgerTaskInput {
   /** per-task hard stop in minutes; omitted = config default. Persisted with the task so
    *  retries/resumes keep the same ceiling. Clamped in runLedgerTask: ≥1min, ≤8h ceiling. */
   timeoutMinutes?: number;
+  /** medium the owner explicitly asked for (e.g. "video_note"); set only when delivery of that
+   *  medium is part of the expected output — then `done` requires the receipt to match it. */
+  expectedMedia?: string;
 }
 
 export interface LedgerEntry extends LedgerTaskInput {
@@ -38,6 +60,10 @@ export interface LedgerEntry extends LedgerTaskInput {
   attempts: number;
   result?: string;
   error?: string;
+  /** set when the runner asked for a specific medium but the delivered one differed/unverified */
+  blocker?: string;
+  /** delivery receipt for the verified output (bd pibot-zy70) */
+  delivery?: Delivery;
   /** pi-durable task id, kept so cancel() works after a restart */
   durableId?: number;
 }
@@ -51,10 +77,12 @@ export interface TaskRun extends LedgerTaskInput {
 }
 
 export interface TaskRunner {
-  /** do the work; resolves with the owner-facing result text */
-  run(task: TaskRun): Promise<string>;
-  /** post a message to the owner chat (at-least-once: a crash right after posting may repeat it) */
-  notify(chatKey: string, text: string): Promise<void>;
+  /** do the work; resolves with the owner-facing result text — or a result plus a delivery receipt
+   *  (message id and actual media type) so completion can be verified against expected output */
+  run(task: TaskRun): Promise<string | { text: string; delivery?: Omit<Delivery, "deliveredAt"> }>;
+  /** post a message to the owner chat (at-least-once: a crash right after posting may repeat it;
+   *  may return a receipt with the sent message id) */
+  notify(chatKey: string, text: string): Promise<Delivery | void>;
 }
 
 export interface TaskLedger {
@@ -95,9 +123,20 @@ const ledgerDoc = async (tx: unknown, conversationId: unknown) =>
 type Checkpoint =
   | { phase: "run"; attempts: number }
   | { phase: "work"; attempt: number }
-  | { phase: "notify"; ok: boolean; text: string };
+  | { phase: "notify"; ok: boolean; text: string;
+      /** post-work verdict carried into the notice. Older checkpoints predate `final`
+       *  (treated from `ok`); the `partial` verdict is always an explicit newer commit. */
+      final?: "done" | "partial" | "failed" | "blocked";
+      /** delivery receipt returned by run(), kept for the notify-phase entry update */
+      delivery?: Omit<Delivery, "deliveredAt">;
+};
 
 const active = (s: LedgerStatus) => s === "queued" || s === "running";
+
+/** drop keys with undefined values — pi-durable stores strict JSON (bd pibot-zy70) */
+function filterUndefined<T extends object>(o: T): T {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T;
+}
 
 function prune(doc: LedgerDoc): void {
   const finished = Object.values(doc.tasks).filter((t) => !active(t.status)).sort((a, b) => b.updatedAt - a.updatedAt);
@@ -141,32 +180,79 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
         // shutting down or cancelled before the work began: never hand a dead signal to the runner
         if (rt.signal.aborted) throw new Error("task invocation ended before it started");
         const { ledgerId, ...input } = task.input;
+        const expect = task.input.expectedMedia?.trim() || undefined;
         let ok = true;
         let text: string;
+        let final: "done" | "partial" | "failed" | "blocked" = "done";
+        let delivery: Omit<Delivery, "deliveredAt"> | undefined;
         try {
-          const result = (await runner.run({ ...input, taskId: ledgerId, attempt, resumed: attempt > 1, signal: rt.signal })).trim();
+          const raw = await runner.run({ ...input, taskId: ledgerId, attempt, resumed: attempt > 1, signal: rt.signal });
+          // A runner may return a bare string or a { text, delivery } receipt
+          text = (typeof raw === "string" ? raw : raw.text).trim();
+          delivery = typeof raw === "string" ? undefined : raw.delivery;
           // Empty output is not a successful result: record an explicit failure
           // rather than delivering a fabricated success summary.
-          if (!result) throw new Error("Task finished without a result summary");
-          text = result;
+          if (!text) throw new Error("Task finished without a result summary");
         } catch (error) {
           if (rt.signal.aborted) throw error; // cancelled or shutting down: the abort protocol / resume owns the outcome
           ok = false;
           text = error instanceof Error ? error.message : String(error);
+          if (error instanceof BlockedError) final = "blocked";
+        }
+        if (ok && expect && (!delivery || delivery.mediaType !== expect)) {
+          // Verified-completion gate (bd pibot-zy70): when the owner asked for a specific
+          // medium, `done` requires the receipt to name that same medium.
+          final = "partial";
         }
         text = text.slice(0, RESULT_CHARS);
         await rt.commit(async (tx) => {
           const entry = (await ledgerDoc(tx, rt.conversationId)).tasks[ledgerId];
-          if (entry) Object.assign(entry, ok ? { status: "done", result: text } : { status: "failed", error: text }, { updatedAt: now() });
-          return { status: "running", checkpoint: { phase: "notify", ok, text } };
+          if (entry) {
+            if (final === "blocked") Object.assign(entry, { status: "blocked", blocker: text }, { updatedAt: now() });
+            else if (final === "partial") {
+              const mismatch = expect ?
+                (delivery?.mediaType ? `requested ${expect} but delivered ${delivery.mediaType}` : `requested ${expect} but the delivery was not verified (no media receipt)`) : "output only partly delivered";
+              Object.assign(entry, { status: "partial", error: mismatch, result: text, updatedAt: now() });
+            } else if (ok) Object.assign(entry, { status: "done", result: text }, { updatedAt: now() });
+            else Object.assign(entry, { status: "failed", error: text }, { updatedAt: now() });
+          }
+          return { status: "running", checkpoint: { phase: "notify", ok, text, final, ...(delivery !== undefined && Object.entries(delivery).some(([, v]) => v !== undefined) ? { delivery: filterUndefined(delivery) } : {}) } };
         }, ctx);
       },
       notify: async (task, rt, ctx) => {
-        const { ok, text } = task.state.checkpoint;
-        const head = ok ? `✅ Task done: **${task.input.title}**` : `⚠️ Task failed: **${task.input.title}**`;
-        await runner.notify(task.input.chatKey, `${head}\n\n${text}`).catch((e) => rt.report(e));
+        const { ok, text, final = ok ? "done" : "failed", delivery } = task.state.checkpoint;
+        const head = final === "blocked" ? `🛑 Task blocked: **${task.input.title}**`
+          : final === "partial" ? `🟡 Task partial: **${task.input.title}**`
+          : ok ? `✅ Task done: **${task.input.title}**`
+          : `⚠️ Task failed: **${task.input.title}**`;
+        let receipt: Delivery | void;
+        try {
+          receipt = await runner.notify(task.input.chatKey, `${head}\n\n${text}`);
+        } catch (e) {
+          // The owner never saw the result, so the ledger must not claim done (bd pibot-zy70).
+          // rt.report keeps the harness retry semantics; the entry stops saying ✅.
+          await rt.commit(async (tx) => {
+            const entry = (await ledgerDoc(tx, rt.conversationId)).tasks[task.input.ledgerId];
+            if (entry && entry.status === "done") Object.assign(entry, { status: "partial", blocker: `delivery failed: ${truncate(e instanceof Error ? e.message : String(e), 200)}`, updatedAt: now() });
+            return { status: "running", checkpoint: task.state.checkpoint };
+          }, ctx);
+          rt.report(e);
+          return;
+        }
         await rt.commit(async (tx) => {
-          prune(await ledgerDoc(tx, rt.conversationId));
+          const doc = await ledgerDoc(tx, rt.conversationId);
+          const entry = doc.tasks[task.input.ledgerId];
+          if (entry && (final === "done" || final === "partial")) {
+            // Delivery receipt (bd pibot-zy70): the result's message id comes from the runner's
+            // own receipt (the media send), falling back to the notice push id for text results;
+            // media type from the runner; keys with no evidence stay unset (strict JSON).
+            const d: Delivery = { deliveredAt: now() };
+            if (delivery?.messageId !== undefined) d.messageId = delivery.messageId;
+            else if (typeof receipt === "object" && receipt?.messageId !== undefined) d.messageId = receipt.messageId;
+            if (delivery?.mediaType !== undefined) d.mediaType = delivery.mediaType;
+            entry.delivery = d;
+          }
+          prune(doc);
           return { status: "terminal", outcome: ok ? { status: "completed", result: text } : { status: "failed", error: { message: text } } };
         }, ctx);
       },

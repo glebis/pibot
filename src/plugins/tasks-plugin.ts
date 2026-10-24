@@ -12,7 +12,10 @@ export interface TasksPluginDeps {
 }
 
 function line(t: LedgerEntry): string {
-  const tail = t.status === "done" ? ` — ${t.result?.slice(0, 160) ?? ""}` : t.status === "failed" ? ` — ${t.error?.slice(0, 160) ?? ""}` : "";
+  const tail = t.status === "done" ? ` — ${t.result?.slice(0, 160) ?? ""}`
+    : t.status === "failed" || t.status === "partial" ? ` — ${t.error?.slice(0, 160) ?? t.blocker?.slice(0, 160) ?? ""}`
+    : t.status === "blocked" ? ` — blocked: ${t.blocker?.slice(0, 160) ?? ""}`
+    : "";
   return `${t.id} [${t.status}] "${t.title}" (started ${fmtWhen(t.createdAt)})${tail}`;
 }
 
@@ -37,6 +40,7 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
           title: Type.String({ description: "Short title the owner will recognise, e.g. 'summarise this week's notes'" }),
           instructions: Type.String({ description: "Self-contained instructions with all needed context from this conversation" }),
           timeoutMinutes: Type.Optional(Type.Number({ description: "Hard runtime cap in minutes for this task (default 30, max 480). Set higher for long local media work — a two-hour video transcription needs ~90; fetching + transcribing media counts inside the cap." })),
+          expectedMedia: Type.Optional(Type.String({ description: "Set ONLY when the owner explicitly requested one specific medium for the task output (e.g. 'video_note' for a Telegram video note). Then the task completes only when the actually delivered media matches; a mismatch records 'partial', not 'done'." })),
         }),
         async execute(toolCallId, params) {
           try {
@@ -45,7 +49,8 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
               : undefined;
             // pi-durable stores strict JSON: omit the key entirely when unset
             const cap = timeoutMinutes !== undefined ? { timeoutMinutes } : {};
-            const t = await ledger.start({ agentId, chatKey, title: params.title.slice(0, 120), instructions: params.instructions.slice(0, 8000), ...cap }, `${agentId}:${toolCallId}`);
+            const expected = params.expectedMedia ? { expectedMedia: params.expectedMedia.slice(0, 40) } : {};
+            const t = await ledger.start({ agentId, chatKey, title: params.title.slice(0, 120), instructions: params.instructions.slice(0, 8000), ...cap, ...expected }, `${agentId}:${toolCallId}`);
             return text(`Started task ${t.id} "${t.title}". It runs in the background; the result will be posted to this chat. Check it with task_status.`, { taskId: t.id });
           } catch (error) {
             return text(`ERROR: ${error instanceof Error ? error.message : String(error)}`);
@@ -60,8 +65,12 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
         async execute(_id, params) {
           const t = await ledger.get(params.id);
           if (!t || t.agentId !== agentId) return text(`No task ${params.id} for this agent.`);
-          const body = t.status === "done" ? `\n\nResult:\n${t.result}` : t.status === "failed" ? `\n\nError: ${t.error}` : "";
-          return text(`${line(t)}; attempts ${t.attempts}${body}`, { status: t.status });
+          const body = t.status === "done" ? `\n\nResult:\n${t.result}`
+            : t.status === "failed" || t.status === "partial" ? `\n\nError: ${t.error ?? t.blocker ?? ""}`
+            : t.status === "blocked" ? `\n\nBlocker: ${t.blocker ?? ""}`
+            : "";
+          const receipt = t.delivery ? `\n\nDelivery: ${t.delivery.mediaType ?? "text"}${t.delivery.messageId !== undefined ? ` (message ${t.delivery.messageId})` : ""}` : "";
+          return text(`${line(t)}; attempts ${t.attempts}${body}${receipt}`, { status: t.status });
         },
       });
       pi.registerTool({

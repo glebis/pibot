@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { Bot, InputFile, type Context } from "grammy";
 import type { InlineKeyboardButton } from "grammy/types";
-import type { Card, IncomingMedia, PushOptions, ReplyContext, Transport } from "../core/types.js";
+import type { Card, DeliveryReceipt, IncomingMedia, PushOptions, ReplyContext, Transport } from "../core/types.js";
 import { truncate } from "../core/util.js";
 
 const TG_LIMIT = 4000;
@@ -1107,7 +1107,7 @@ export class TelegramTransport implements Transport {
     is_persistent: false,
   };
 
-  async push(chatId: string, opts: PushOptions): Promise<void> {
+  async push(chatId: string, opts: PushOptions): Promise<DeliveryReceipt | void> {
     if (this.name === "telegram:lab" && this.boundAgentId === "lab") {
       // Origin-tagged proactive output may only reach an allowlisted owner DM.
       if (/\[heartbeat\]/i.test(opts.text) && (!/^[1-9]\d*$/.test(chatId) || !this.allowed.has(chatId))) return;
@@ -1117,7 +1117,7 @@ export class TelegramTransport implements Transport {
         opts = { ...opts, text, ...(opts.card ? { card: { ...opts.card, text: labGroupReply(opts.card.text) } } : {}) };
       }
     }
-    return this.enqueue(chatId, async () => {
+    return this.enqueue(chatId, async (): Promise<DeliveryReceipt | void> => {
       const raw = stripAcpLeak(opts.text);
       // Long texts (Bot API 10.1+): rich messages carry 32k chars — well past the
       // classic 4k, so a multi-paragraph push needs no truncation or splitting as
@@ -1151,6 +1151,8 @@ export class TelegramTransport implements Transport {
       this.recordCardMessage(chatId, sentId, Boolean(opts.card));
       await this.sweepStaleCards(chatId);
       this.duplicateGuard.markSent(chatId, dedupeKey);
+      // delivery receipt for task records (bd pibot-zy70); nothing observable when suppresssed
+      return sentId !== undefined ? { messageId: sentId } : undefined;
     });
   }
 

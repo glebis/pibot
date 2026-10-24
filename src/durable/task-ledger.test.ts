@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { MAX_ACTIVE_PER_AGENT, openTaskLedger, type TaskRun, type TaskRunner } from "./task-ledger.js";
+import { BlockedError, MAX_ACTIVE_PER_AGENT, openTaskLedger, type TaskRun, type TaskRunner } from "./task-ledger.js";
 
 const input = { agentId: "coach", chatKey: "telegram:42", title: "Draft the weekly note", instructions: "Write it." };
 
@@ -12,7 +12,7 @@ const untilAborted = (t: TaskRun) => new Promise<string>((_, reject) => {
   t.signal.addEventListener("abort", () => reject(new Error("aborted")));
 });
 
-function runner(run: (t: TaskRun) => Promise<string>) {
+function runner(run: (t: TaskRun) => Promise<string | { text: string; delivery?: { messageId?: number; mediaType?: string } }>) {
   const notes: string[] = [];
   const r: TaskRunner = { run: vi.fn(run), notify: vi.fn(async (_ck: string, text: string) => { notes.push(text); }) };
   return { r, notes };
@@ -133,6 +133,96 @@ describe("durable task ledger", () => {
       for (let i = 0; i < MAX_ACTIVE_PER_AGENT; i++) await ledger.start({ ...input, title: `t${i}` });
       await expect(ledger.start(input)).rejects.toThrow(/active tasks/);
       await expect(ledger.start({ ...input, agentId: "knower" })).resolves.toBeTruthy();
+    } finally { await ledger.close(); }
+  });
+
+  // ─── verified completion gate (bd pibot-zy70) ───
+
+  it("marks done and records the delivery receipt when the expected medium matches", async () => {
+    const { r, notes } = runner(async () => ({ text: "here is your note", delivery: { messageId: 7, mediaType: "video_note" } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedMedia: "video_note" });
+      const done = await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      expect(done!).toMatchObject({ result: "here is your note", delivery: { messageId: 7, mediaType: "video_note" } });
+      expect(done!.delivery?.deliveredAt).toBeTruthy();
+      await until(async () => notes.length, (n) => n === 1);
+      expect(notes[0]).toContain("Task done");
+    } finally { await ledger.close(); }
+  });
+
+  it("records partial when the delivered medium is not the requested one", async () => {
+    const { r, notes } = runner(async () => ({ text: "a normal video", delivery: { messageId: 8, mediaType: "video" } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedMedia: "video_note" });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial");
+      expect(entry!.result).toBe("a normal video");
+      expect(entry!.error).toContain("requested video_note but delivered video");
+      expect(entry!.delivery).toMatchObject({ messageId: 8, mediaType: "video" });
+      await until(async () => notes.length, (n) => n === 1);
+      expect(notes[0]).toContain("Task partial");
+      expect(notes[0]).not.toContain("Task done");
+    } finally { await ledger.close(); }
+  });
+
+  it("records partial when the runner asked-for medium was never verified", async () => {
+    const { r } = runner(async () => "wrote the text only");
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedMedia: "video_note" });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial");
+      expect(entry!.error).toContain("not verified");
+    } finally { await ledger.close(); }
+  });
+
+  it("keeps a plain text task done with the notice message id as its receipt", async () => {
+    const { r } = runner(async () => "plain text result");
+    const notes: string[] = [];
+    const ledger = await openTaskLedger({
+      runner: {
+        run: r.run,
+        notify: vi.fn(async (_ck: string, text: string) => { notes.push(text); return { messageId: 55 }; }),
+      },
+    });
+    try {
+      const t = await ledger.start(input);
+      const done = await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      expect(done!.delivery).toMatchObject({ messageId: 55 });
+      expect(done!.delivery?.mediaType).toBeUndefined();
+      expect(done!.delivery?.deliveredAt).toBeTruthy();
+      await until(async () => notes.length, (n) => n === 1);
+    } finally { await ledger.close(); }
+  });
+
+  it("records blocked when the runner cannot proceed, not failed-with-retry", async () => {
+    const { r, notes } = runner(async () => { throw new BlockedError("no telegram token for the lab bot"); });
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "blocked");
+      expect(entry!.blocker).toBe("no telegram token for the lab bot");
+      expect(entry!.error).toBeUndefined();
+      await until(async () => notes.length, (n) => n === 1);
+      expect(notes[0]).toContain("Task blocked");
+    } finally { await ledger.close(); }
+  });
+
+  it("stops claiming done when the result was never delivered", async () => {
+    const { r } = runner(async () => "great result nobody saw");
+    const notes: string[] = [];
+    const ledger = await openTaskLedger({
+      runner: {
+        run: r.run,
+        notify: vi.fn(async (_ck: string, _text: string) => { notes.push(_text); throw new Error("transport wedged"); }),
+      },
+    });
+    try {
+      const t = await ledger.start(input);
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial");
+      expect(entry!.blocker).toContain("delivery failed");
+      expect(entry!.blocker).toContain("transport wedged");
+      expect(entry!.result).toBe("great result nobody saw");
     } finally { await ledger.close(); }
   });
 });

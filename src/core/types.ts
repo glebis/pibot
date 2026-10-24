@@ -77,6 +77,11 @@ export interface PushOptions {
   dedupeKey?: string;
 }
 
+/** Delivery receipt from a transport push (bd pibot-zy70): id of the sent message, when observable. */
+export interface DeliveryReceipt {
+  messageId?: number;
+}
+
 /** Context about a Telegram message the user replied to (transport-supplied). */
 export interface ReplyContext {
   /** id of the quoted message */
@@ -110,8 +115,9 @@ export interface Transport {
   readonly boundAgentId?: string;
   start(): Promise<void>;
   stop(): Promise<void>;
-  /** Send a message (and optional button card) to a chat */
-  push(chatId: string, opts: PushOptions): Promise<void>;
+  /** Send a message (and optional button card) to a chat. May resolve with a delivery receipt
+   *  (id of the sent message) when the transport can observe it — evidence for task records. */
+  push(chatId: string, opts: PushOptions): Promise<DeliveryReceipt | void>;
   /** System-level error notice (agent crashed, bad model, …) */
   notifyError(chatId: string, message: string): Promise<void>;
   onMessage(cb: (text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>): void;

@@ -15,7 +15,7 @@ export function formatAge(sec: number): string {
 const clock = (ms: number) =>
   new Date(ms).toLocaleString("en-GB", { timeZone: "Europe/Berlin", hour: "2-digit", minute: "2-digit", second: "2-digit", day: "2-digit", month: "short", hour12: false });
 
-const STATUS_PILL: Record<string, string> = { running: "on", queued: "", done: "on", failed: "bad", cancelled: "" };
+const STATUS_PILL: Record<string, string> = { running: "on", queued: "", done: "on", partial: "on", blocked: "bad", failed: "bad", cancelled: "" };
 
 /** Body of the /processes page (wrapped in the dashboard layout by the caller). */
 export function renderProcesses(snap: ProcessSnapshot, esc: Esc, csrfField: () => string): string {

@@ -34,7 +34,7 @@ import { QuestionBus, type QuestionSpec } from "./questions.js";
 import { MessageCoalescer } from "./message-coalescer.js";
 import { ScheduleRouteError, type Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
-import type { Card, ChatRef, IncomingMedia, ReplyContext, Schedule, Transport } from "./types.js";
+import type { Card, ChatRef, DeliveryReceipt, IncomingMedia, ReplyContext, Schedule, Transport } from "./types.js";
 import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
@@ -3461,11 +3461,11 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
   }
 
   /** Post a ledger notice (task result, failure, cancellation) to an owner chat. */
-  async notifyChat(chatKey: string, text: string): Promise<void> {
+  async notifyChat(chatKey: string, text: string): Promise<DeliveryReceipt | void> {
     const { transport, chatId } = this.splitChatKey(chatKey);
     const t = this.transports.get(transport);
     if (!t) throw new Error(`no transport "${transport}"`);
-    await t.push(chatId, { text: truncate(text, 4000) });
+    return await t.push(chatId, { text: truncate(text, 4000) });
   }
 
   /** Agent-initiated handoff: move the sender's conversation to the target when the sender owns a rebindable (non-subbot) chat; otherwise deliver the brief into the target's pair session (status routes back to the origin chat). */
