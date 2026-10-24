@@ -191,6 +191,17 @@ describe("durable task ledger", () => {
     } finally { await ledger.close(); }
   });
 
+  it.each([undefined, 0, -1, 1.5])("requires a valid result message id, not just the medium (%s)", async (messageId) => {
+    const { r } = runner(async () => ({ text: "round note", delivery: { mediaType: "video_note", ...(messageId !== undefined ? { messageId } : {}) } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedMedia: "video_note" });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial" || e?.status === "done");
+      expect(entry!.status).toBe("partial");
+      expect(entry!.error).toContain("message ID");
+    } finally { await ledger.close(); }
+  });
+
   it("records partial when the runner asked-for medium was never verified", async () => {
     const { r } = runner(async () => "wrote the text only");
     const ledger = await openTaskLedger({ runner: r });

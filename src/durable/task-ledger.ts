@@ -221,7 +221,8 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
           text = error instanceof Error ? error.message : String(error);
           if (error instanceof BlockedError) final = "blocked";
         }
-        if (ok && expect && (!delivery || delivery.mediaType !== expect)) {
+        const validMessageId = typeof delivery?.messageId === "number" && Number.isSafeInteger(delivery.messageId) && delivery.messageId > 0;
+        if (ok && expect && (!delivery || delivery.mediaType !== expect || !validMessageId)) {
           // Verified-completion gate (bd pibot-zy70): when the owner asked for a specific
           // medium, `done` requires the receipt to name that same medium.
           final = "partial";
@@ -240,7 +241,7 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
             if (final === "blocked") Object.assign(entry, { status: "blocked", blocker: text }, { updatedAt: now() });
             else if (final === "partial") {
               const mismatch = expect ?
-                (delivery?.mediaType ? `requested ${expect} but delivered ${delivery.mediaType}` : `requested ${expect} but the delivery was not verified (no media receipt)`) : "output only partly delivered";
+                (delivery?.mediaType === expect && !validMessageId ? `requested ${expect} but delivery has no valid message ID` : delivery?.mediaType ? `requested ${expect} but delivered ${delivery.mediaType}` : `requested ${expect} but the delivery was not verified (no media receipt)`) : "output only partly delivered";
               Object.assign(entry, { status: "partial", error: mismatch, result: text, updatedAt: now() });
             } else if (ok) Object.assign(entry, { status: "done", result: text }, { updatedAt: now() });
             else Object.assign(entry, { status: "failed", error: text }, { updatedAt: now() });
