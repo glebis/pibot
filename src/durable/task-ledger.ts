@@ -15,6 +15,7 @@ import { Harness, createRegistry, defineDoc, defineExtension, defineTask, type J
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
 import { truncate } from "../core/util.js";
+import { scanNumericClaims } from "../core/fact-check.js";
 
 export type LedgerStatus = "queued" | "running" | "done" | "partial" | "blocked" | "failed" | "cancelled";
 
@@ -75,6 +76,8 @@ export interface LedgerEntry extends LedgerTaskInput {
   error?: string;
   /** set when the runner asked for a specific medium but the delivered one differed/unverified */
   blocker?: string;
+  /** programmatic arithmetic check of the result's numeric claims (bd pibot-wr9m) */
+  factCheck?: { checked: number; inconsistent: number; failures: string[] };
   /** delivery receipt for the verified output (bd pibot-zy70) */
   delivery?: Delivery;
   /** pi-durable task id, kept so cancel() works after a restart */
@@ -224,9 +227,16 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
           final = "partial";
         }
         text = text.slice(0, RESULT_CHARS);
+        // Programmatic fact-check of numeric claims (bd pibot-wr9m): only mechanical
+        // arithmetic, only on work results (error texts are not claim prose).
+        const factCheck = ok ? scanNumericClaims(text) : { checked: 0, inconsistent: 0, failures: [] as string[] };
+        if (factCheck.inconsistent > 0) {
+          text += `\n\n⚠️ fact-check: ${factCheck.inconsistent} of ${factCheck.checked} numeric claim(s) inconsistent — e.g. "${truncate(factCheck.failures[0], 80)}"`;
+        }
         await rt.commit(async (tx) => {
           const entry = (await ledgerDoc(tx, rt.conversationId)).tasks[ledgerId];
           if (entry) {
+            if (factCheck.checked > 0 && factCheck !== undefined) entry.factCheck = factCheck;
             if (final === "blocked") Object.assign(entry, { status: "blocked", blocker: text }, { updatedAt: now() });
             else if (final === "partial") {
               const mismatch = expect ?

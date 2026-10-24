@@ -136,6 +136,31 @@ describe("durable task ledger", () => {
     } finally { await ledger.close(); }
   });
 
+  // ─── programmatic fact-check (bd pibot-wr9m) ───
+
+  it("persists and annotates inconsistent arithmetic instead of passing it silently", async () => {
+    const { r, notes } = runner(async () => "The batch is 15% of 2,000 is 450 — great news.");
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      const done = await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      expect(done!.factCheck).toMatchObject({ checked: 1, inconsistent: 1 });
+      expect(done!.result).toContain("⚠️ fact-check");
+      expect(notes[0]).toContain("⚠️ fact-check");
+    } finally { await ledger.close(); }
+  });
+
+  it("keeps clean numeric results fact-check-verified with no annotation", async () => {
+    const { r } = runner(async () => "15% of 2,000 is 300, and 40 + 60 = 100.");
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      const done = await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      expect(done!.factCheck).toMatchObject({ checked: 2, inconsistent: 0 });
+      expect(done!.result).not.toContain("fact-check");
+    } finally { await ledger.close(); }
+  });
+
   // ─── verified completion gate (bd pibot-zy70) ───
 
   it("marks done and records the delivery receipt when the expected medium matches", async () => {
