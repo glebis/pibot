@@ -9,6 +9,11 @@ export interface TasksPluginDeps {
   agentId: string;
   /** owner chat this session serves; task results are posted back here */
   chat: ChatRef;
+  /** resource preflight (bd pibot-kdpg): disk/credential/lane-cap checks before expensive work */
+  preflight?: {
+    check(input: { lane?: "download" | "transcribe" | "render" | "delegate" }, acquire?: boolean): Promise<{ ok: boolean; issues: string[] }>;
+    release(lane: "download" | "transcribe" | "render" | "delegate"): void;
+  };
 }
 
 function line(t: LedgerEntry): string {
@@ -31,7 +36,7 @@ function line(t: LedgerEntry): string {
  * pi-durable ledger that survives restarts; the result is posted to this chat.
  */
 export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
-  const { ledger, agentId, chat } = deps;
+  const { ledger, agentId, chat, preflight } = deps;
   const chatKey = `${chat.transport}:${chat.chatId}`;
   const text = (t: string, details: Record<string, unknown> = {}) => ({ content: [{ type: "text" as const, text: t }], details });
 
@@ -66,6 +71,25 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
               ...(params.outputLocation ? { outputLocation: params.outputLocation.slice(0, 500) } : {}),
               ...(params.linearRef ? { linearRef: params.linearRef.slice(0, 120) } : {}),
             };
+            if (preflight) {
+              // start-burst cap (bd pibot-kdpg): bounds SIMULTANEOUS task starts;
+              // the ledger's own MAX_ACTIVE_PER_AGENT (5) bounds running tasks.
+              let acquired = false;
+              try {
+                const acq = await preflight.check({ lane: "delegate" }, true);
+                if (!acq.ok) {
+                  return text(`REFUSED by resource preflight: ${acq.issues.join("; ")}. Fix / wait, then retry — nothing started.`, { refused: true });
+                }
+                acquired = true;
+                const t = await ledger.start({ agentId, chatKey, title: params.title.slice(0, 120), instructions: params.instructions.slice(0, 8000), ...cap, ...expected, ...canon }, `${agentId}:${toolCallId}`);
+                return text(`Started task ${t.id} "${t.title}". It runs in the background; the result will be posted to this chat. Check it with task_status.`, { taskId: t.id });
+              } catch (error) {
+                if (!acquired) return text(`ERROR: ${error instanceof Error ? error.message : String(error)}`);
+                throw error; // finally releases the slot; the ledger error surfaces
+              } finally {
+                if (acquired) preflight.release("delegate");
+              }
+            }
             const t = await ledger.start({ agentId, chatKey, title: params.title.slice(0, 120), instructions: params.instructions.slice(0, 8000), ...cap, ...expected, ...canon }, `${agentId}:${toolCallId}`);
             return text(`Started task ${t.id} "${t.title}". It runs in the background; the result will be posted to this chat. Check it with task_status.`, { taskId: t.id });
           } catch (error) {

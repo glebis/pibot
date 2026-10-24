@@ -102,3 +102,32 @@ describe("task-record-canon (bd pibot-r47f)", () => {
     ledger.close();
   });
 });
+
+describe("resource preflight (bd pibot-kdpg)", () => {
+  it("refuses start_task when the preflight refuses; acquires+releases when green", async () => {
+    const run = vi.fn(async () => "ok");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    const releases: string[] = [];
+    const preflight = {
+      check: async (_lane: unknown, acquire?: boolean) => {
+        if (acquire && (preflight as { saturate?: boolean }).saturate) return { ok: false, issues: ["lane \"delegate\" at concurrency cap"] };
+        if (acquire) releases.push("acquired");
+        return { ok: true, issues: [] };
+      },
+      release: (lane: string) => releases.push(`released:${lane}`),
+      saturate: false as boolean,
+    };
+    const t = tools(tasksPlugin({ ledger, agentId: "saturated-test", chat: { transport: "telegram", chatId: "42" }, preflight: preflight as never }));
+
+    preflight.saturate = true;
+    const blocked = await t.get("start_task")!.execute("b1", { title: "big job", instructions: "run" });
+    expect(blocked.content[0].text).toContain("REFUSED by resource preflight");
+
+    preflight.saturate = false;
+    const go = await t.get("start_task")!.execute("b2", { title: "normal job", instructions: "run" });
+    expect(go.content[0].text).toContain("Started task");
+    expect(releases).toContain("acquired");
+    expect(releases).toContain("released:delegate");
+    ledger.close();
+  });
+});
