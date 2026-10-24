@@ -58,3 +58,47 @@ describe("tasks plugin", () => {
     expect(taskRun.tools).not.toContain("start_task");
   });
 });
+
+describe("task-record-canon (bd pibot-r47f)", () => {
+  it("starts with lane/acceptance/output/linear fields and renders them; lanes filter", async () => {
+    const run = vi.fn(async () => "result ok");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    const t = tools(tasksPlugin({ ledger, agentId: "creator", chat: { transport: "telegram", chatId: "42" } }));
+    const r = await t.get("start_task")!.execute("c1", {
+      title: "caption research", instructions: "do the dig",
+      lane: "cross-agent", acceptanceCriteria: "ffprobe shows <=60s and h264+aac",
+      outputLocation: "/media/vnote/note.mp4", linearRef: "MHT-12",
+    });
+    const taskId = ((r as unknown as { details?: { taskId?: string } }).details)?.taskId ?? "";
+    for (let i = 0; i < 200 && (await ledger.get(taskId))?.status !== "done"; i++) await new Promise((x) => setTimeout(x, 10));
+
+    const done = await ledger.get(taskId);
+    expect(done).toMatchObject({ lane: "cross-agent", acceptanceCriteria: "ffprobe shows <=60s and h264+aac", linearRef: "MHT-12" });
+    const listed = (await t.get("list_tasks")!.execute("l1", {})).content[0].text;
+    expect(listed).toContain("lane:cross-agent");
+    expect(listed).toContain("MHT-12");
+    expect((await t.get("list_tasks")!.execute("l2", { lane: "dev" })).content[0].text).toBe("No background tasks yet.");
+    ledger.close();
+  });
+
+  it("task_update sets nextAction/outputLocation on live tasks and refuses finished ones", async () => {
+    let resolveRun!: (v: string) => void;
+    const gate = new Promise<string>((res) => (resolveRun = res));
+    const run = vi.fn(async () => gate);
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    const t = tools(tasksPlugin({ ledger, agentId: "worker", chat: { transport: "telegram", chatId: "42" } }));
+    const started = (await t.get("start_task")!.execute("k1", { title: "long render", instructions: "run" })) as unknown as { details?: { taskId?: string } };
+    const taskId = started.details?.taskId ?? "";
+    await new Promise((r) => setTimeout(r, 120)); // let it enter running
+    const up = await t.get("task_update")!.execute("k2", { id: taskId, nextAction: "await GPU slot", outputLocation: "/tmp/artifacts" });
+    expect(up.content[0].text).toContain("record updated");
+    const live = await ledger.get(taskId);
+    expect(live).toMatchObject({ nextAction: "await GPU slot", outputLocation: "/tmp/artifacts" });
+    // finish it, then the record update must refuse
+    resolveRun("done");
+    for (let i = 0; i < 200 && (await ledger.get(taskId))?.status !== "done"; i++) await new Promise((r) => setTimeout(r, 10));
+    const after = await t.get("task_update")!.execute("k4", { id: taskId, nextAction: "post-finish" });
+    expect(after.content[0].text).toMatch(/No task|ERROR/);
+    ledger.close();
+  });
+});

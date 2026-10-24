@@ -50,6 +50,19 @@ export interface LedgerTaskInput {
   /** medium the owner explicitly asked for (e.g. "video_note"); set only when delivery of that
    *  medium is part of the expected output — then `done` requires the receipt to match it. */
   expectedMedia?: string;
+  /** work lane: "dev" (pibot source work, pibot-dev's lane) vs "cross-agent" (owner-facing
+   *  content/tooling tasks) — task-record-canon keeps the two from mixing (bd pibot-r47f) */
+  lane?: "dev" | "cross-agent";
+  /** id of the owner/source message that requested this task, when the caller knows it */
+  sourceMessageId?: number;
+  /** verifiable acceptance criteria — the gate a completed task must satisfy */
+  acceptanceCriteria?: string;
+  /** what would unblock/advance this task next (task-record-canon) */
+  nextAction?: string;
+  /** where the task's artifacts live on disk (absolute paths) */
+  outputLocation?: string;
+  /** reference-only link to the tracker (Linear/beads) — the ledger stays authoritative */
+  linearRef?: string;
 }
 
 export interface LedgerEntry extends LedgerTaskInput {
@@ -89,6 +102,12 @@ export interface TaskLedger {
   start(input: LedgerTaskInput, requestId?: string): Promise<LedgerEntry>;
   /** Return the newest active task for an agent/chat, if any. */
   latestActive(agentId: string, chatKey: string): Promise<LedgerEntry | undefined>;
+  /**
+   * Update a task's canonical record fields (task-record-canon, bd pibot-r47f):
+   * nextAction / outputLocation. scoped to the owning agent; only pending/running
+   * (and blocked) tasks accept record updates — finished tasks are history.
+   */
+  updateRecord(id: string, agentId: string, patch: { nextAction?: string; outputLocation?: string }): Promise<LedgerEntry | undefined>;
   get(id: string): Promise<LedgerEntry | undefined>;
   list(filter: { agentId: string; chatKey?: string }): Promise<LedgerEntry[]>;
   /** true when an abort was requested for a live task */
@@ -321,6 +340,17 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
       if (!entry?.durableId || !active(entry.status)) return false;
       await harness.abortTask(entry.durableId as never, C);
       return true;
+    },
+    async updateRecord(id, agentId, patch) {
+      const entry = (await snapshot()).tasks[id];
+      if (!entry || entry.agentId !== agentId || !active(entry.status)) return undefined;
+      await root.commit(async (tx) => {
+        const doc = await ledgerDoc(tx, root.id);
+        const task = doc.tasks[id];
+        if (task) Object.assign(task, patch, { updatedAt: now() });
+        return undefined;
+      }, C);
+      return (await snapshot()).tasks[id];
     },
     async close() {
       await harness.close(C);
