@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import { scanNumericClaims } from "./fact-check.js";
 
 describe("scanNumericClaims (bd pibot-wr9m)", () => {
+  it("rejects off-by-one arithmetic and large relative errors", () => {
+    expect(scanNumericClaims("1 + 1 = 3").inconsistent).toBe(1);
+    expect(scanNumericClaims("1000 * 1000 = 1005000").inconsistent).toBe(1);
+    expect(scanNumericClaims("0.1 + 0.2 = 0.3").inconsistent).toBe(0);
+  });
+
   it("verifies multiplication/addition claims", () => {
     const ok = scanNumericClaims("Each unit costs 120 * 3 = 360, and the parts 40 + 60 = 100 in total.");
     expect(ok).toMatchObject({ checked: 2, inconsistent: 0 });

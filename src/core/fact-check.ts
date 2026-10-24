@@ -20,10 +20,17 @@ function num(token: string): number {
   return Number(token.replace(/[,%€$]/g, "").trim());
 }
 
-/** true when the two sides agree within ±1 or 1% (rounding-friendly) */
+/** Arithmetic must agree apart from floating-point representation noise. */
 function close(actual: number, expected: number): boolean {
-  const tolerance = Math.max(1, Math.abs(expected) * 0.01);
-  return Math.abs(actual - expected) <= tolerance;
+  const tolerance = Number.EPSILON * 8 * Math.max(1, Math.abs(actual), Math.abs(expected));
+  return Number.isFinite(actual) && Number.isFinite(expected) && Math.abs(actual - expected) <= tolerance;
+}
+
+/** Percentage prose may round to the precision of the stated result, not an arbitrary 1%. */
+function rounded(actual: number, stated: string): boolean {
+  const expected = num(stated);
+  const decimals = stated.replace(/,/g, "").split(".")[1]?.length ?? 0;
+  return close(actual, expected) || (Number.isFinite(actual) && Math.abs(actual - expected) < 0.5 * 10 ** -decimals);
 }
 
 function makeCheck(): FactCheck {
@@ -59,14 +66,14 @@ export function scanNumericClaims(text: string): FactCheck {
   // percentage of: "15% of 2,000 is 300" / "15% of 2,000 = 300"
   for (const m of text.matchAll(new RegExp(`(${NUM})\\s*%\\s*of\\s*(${NUM})\\s*(?:=|equals|is)\\s*(${NUMS})`, "gi"))) {
     const [claim, pct, base, z] = m;
-    verdict(check, claim, close((num(pct) / 100) * num(base), num(z)));
+    verdict(check, claim, rounded((num(pct) / 100) * num(base), z));
   }
 
   // denominator share: "5 out of 8 is 62.5%"
   for (const m of text.matchAll(new RegExp(`(${NUM})\\s+out of\\s+(${NUM})\\s*(?:=|equals|is)\\s*(${NUMS})\\s*%`, "gi"))) {
     const [claim, part, whole, pct] = m;
     const wholeN = num(whole);
-    verdict(check, claim, wholeN === 0 ? false : close((num(part) / wholeN) * 100, num(pct)));
+    verdict(check, claim, wholeN === 0 ? false : rounded((num(part) / wholeN) * 100, pct));
   }
 
   return check;
