@@ -3381,9 +3381,10 @@ export class PiBot implements HeartbeatHost {
     const resume = run.resumed
       ? "\n\nNote: an earlier attempt of this task was interrupted by a restart. This session shows what it already did — check before repeating any action (messages, writes, bookings)."
       : "";
+    let cancelHandler: (() => void) | null = null;
     const stop = new Promise<never>((_, reject) => {
-      const cancel = () => { void session.abort().catch(() => {}); reject(new Error("cancelled")); };
-      if (run.signal.aborted) cancel(); else run.signal.addEventListener("abort", cancel, { once: true });
+      cancelHandler = () => { void (session as { abort?: () => Promise<void> }).abort?.().catch(() => {}); reject(new Error("cancelled")); };
+      if (run.signal.aborted) cancelHandler(); else run.signal.addEventListener("abort", cancelHandler, { once: true });
     });
     let timer: NodeJS.Timeout | undefined;
     // Hard stop for a runaway background run (bead kanban thread, Oct 2026: a two-hour talk's
@@ -3419,7 +3420,12 @@ export class PiBot implements HeartbeatHost {
       }
       if (delivery) return { text: cleanText || "📎 (media delivered)", delivery };
       return cleanText;
-    } finally { clearTimeout(timer); }
+    } finally {
+      // pi-durable aborts the invocation signal at task end (after a normal result too) —
+      // the late abort must not re-trigger the cancel path or session.abort (bd pibot-7jqj e2e)
+      if (cancelHandler) run.signal.removeEventListener("abort", cancelHandler);
+      clearTimeout(timer);
+    }
   }
 
   /** Deliver one background-task MEDIA attachment to the origin chat (bd pibot-zy70).

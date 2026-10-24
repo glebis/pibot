@@ -2730,6 +2730,68 @@ describe("task media delivery receipts (bd pibot-zy70)", () => {
     });
     await expect(t.bot.runLedgerTask(run())).resolves.toBe("Found it: the answer.");
     expect(t.transport.mediaSends).toEqual([]);
+    expect(t.transport.videoNoteSeen).toEqual([]);
+  });
+});
+
+// ─── delivery-proof logging: the real composition PiBot + durable ledger (bd pibot-7jqj) ───
+const pollUntil = async <T>(read: () => Promise<T>, ok: (v: T) => boolean, ms = 3000): Promise<T> => {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = await read();
+    if (ok(v)) return v;
+    if (Date.now() > end) throw new Error("poll timed out");
+    await new Promise((res) => setTimeout(res, 10));
+  }
+};
+
+describe("task ledger integration: media-type gate end to end", () => {
+  let t: ReturnType<typeof makeBot>;
+  let ledger: import("../durable/task-ledger.js").TaskLedger;
+  let notes: string[];
+
+  beforeEach(async () => {
+    t = makeBot();
+    notes = [];
+    const { openTaskLedger } = await import("../durable/task-ledger.js");
+    ledger = await openTaskLedger({
+      // the exact composition the daemon runs (src/index.ts): runner through the bot
+      runner: { run: (task) => t.bot.runLedgerTask(task), notify: async (ck, text) => { notes.push(text); await t.bot.notifyChat(ck, text); } },
+    });
+  });
+  afterEach(async () => {
+    await ledger.close();
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  async function stubTaskTurn(text: string) {
+    // the fake sessions are promptSpy-driven; the mock fires on the next prompt() — the task turn
+    const session = await t.agents.getOrCreateSession("assistant", "probe", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: 2 });
+    });
+  }
+
+  it("records done with a video_note receipt when the task really delivered a round note", async () => {
+    await stubTaskTurn("MEDIA: /tmp/note-it1.mp4\nHere is your round note.");
+    const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "video note", instructions: "make it", expectedMedia: "video_note" });
+    const done = await pollUntil(() => ledger.get(task.id), (e) => e?.status === "done");
+    expect(done!.delivery).toMatchObject({ messageId: 66, mediaType: "video_note" });
+    expect(done!.delivery!.deliveredAt).toBeTruthy();
+    expect(t.transport.videoNoteSeen).toEqual([{ chatId: "42", filePath: "/tmp/note-it1.mp4" }]);
+    expect(notes[0]).toContain("✅ Task done");
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Task done"))).toBe(true);
+  });
+
+  it("records partial with evidence when the delivered medium is not the requested kind", async () => {
+    await stubTaskTurn("MEDIA: /tmp/report-it2.pdf\nHere is the pdf.");
+    const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "video note", instructions: "make it", expectedMedia: "video_note" });
+    const entry = await pollUntil(() => ledger.get(task.id), (e) => e?.status === "partial");
+    expect(entry!.delivery).toMatchObject({ mediaType: "document" });
+    expect(entry!.error).toContain("requested video_note but delivered document");
+    expect(notes[0]).toContain("🟡 Task partial");
+    expect(notes[0]).not.toContain("Task done");
   });
 });
 
