@@ -10,7 +10,7 @@ import type { HeartbeatEngine } from "./heartbeat.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
 import type { ModelCascade } from "./cascade.js";
-import type { PushOptions, ReplyContext, Schedule, Transport, IncomingMedia } from "./types.js";
+import type { PushOptions, ReplyContext, Schedule, Transport, IncomingMedia, DeliveryReceipt } from "./types.js";
 import { OWNER_CHAT_ID, ownerChatKey } from "../test-fixtures.js";
 
 // The /newagent wizard runs the LLM-backed ambiguity gate before creating the
@@ -88,8 +88,15 @@ class MockTransport implements Transport {
   async sendAudio(chatId: string, filePath: string, caption?: string): Promise<void> {
     this.speechSeen.push({ kind: "audio", chatId, filePath, caption });
   }
-  async sendVideoNote(chatId: string, filePath: string): Promise<void> {
+  mediaSends: Array<{ chatId: string; source: string }> = [];
+  async sendMedia(chatId: string, source: string): Promise<DeliveryReceipt> {
+    this.mediaSends.push({ chatId, source });
+    const image = /\.(jpe?g|png|webp|gif|heic)$/i.test(source) || /^https?:/.test(source);
+    return { messageId: 77, mediaType: image ? "photo" : "document" };
+ }
+  async sendVideoNote(chatId: string, filePath: string): Promise<DeliveryReceipt> {
     this.videoNoteSeen.push({ chatId, filePath });
+    return { messageId: 66, mediaType: "video_note" };
   }
   onMessage(cb: (text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>): void {
     this.messageCb = cb;
@@ -1576,6 +1583,7 @@ describe("MEDIA delivery observability", () => {
 
   it("records a dropped-media event when the transport cannot send media", async () => {
     const t = makeBot();
+    (t.transport as { sendMedia?: unknown }).sendMedia = undefined; // exercise the no-capability path (the mock now defaults to sending)
     primeTurn(t);
     await t.transport.say("attach test");
     expect(t.transport.pushed.map((p) => p.opts.text)).toEqual(["Files attached."]);
@@ -2680,6 +2688,48 @@ describe("background task model failover", () => {
     t.promptSpy.mockImplementation(async () => { messages.push(failed); });
 
     await expect(t.bot.runLedgerTask(run())).rejects.toThrow(/every model failed \(ollama\/test\): 429: weekly usage limit/);
+  });
+});
+
+describe("task media delivery receipts (bd pibot-zy70)", () => {
+  let t: ReturnType<typeof makeBot>;
+  const run = (extra: Record<string, unknown> = {}) =>
+    ({ agentId: "assistant", chatKey: "mock:42", taskId: "tk9", title: "make the circle", instructions: "send the video note", attempt: 1, resumed: false, signal: new AbortController().signal, ...extra }) as never;
+
+  beforeEach(() => { t = makeBot(); });
+  afterEach(() => { fs.rmSync(t.dir, { recursive: true, force: true }); });
+
+  it("delivers a MEDIA mp4 as a native video note when that was expected, with the receipt", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "MEDIA: /tmp/note-tk9.mp4\nHere is your round note." }], stopReason: "stop", timestamp: 2 });
+    });
+    const result = await t.bot.runLedgerTask(run({ expectedMedia: "video_note" }));
+    expect(t.transport.videoNoteSeen).toEqual([{ chatId: "42", filePath: "/tmp/note-tk9.mp4" }]);
+    expect(result).toMatchObject({ text: "Here is your round note.", delivery: { messageId: 66, mediaType: "video_note" } });
+  });
+
+  it("sends an ordinary non-mp4 attachment via sendMedia and stamps the actual media kind", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "MEDIA: /tmp/report-tk9.pdf\nThe report is attached." }], stopReason: "stop", timestamp: 2 });
+    });
+    const result = await t.bot.runLedgerTask(run());
+    expect(t.transport.videoNoteSeen).toEqual([]);
+    expect(t.transport.mediaSends).toEqual([{ chatId: "42", source: "/tmp/report-tk9.pdf" }]);
+    expect(result).toMatchObject({ text: "The report is attached.", delivery: { messageId: 77, mediaType: "document" } });
+  });
+
+  it("delivers text-only results unchanged, with no delivery field", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "Found it: the answer." }], stopReason: "stop", timestamp: 2 });
+    });
+    await expect(t.bot.runLedgerTask(run())).resolves.toBe("Found it: the answer.");
+    expect(t.transport.mediaSends).toEqual([]);
   });
 });
 

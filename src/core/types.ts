@@ -80,6 +80,8 @@ export interface PushOptions {
 /** Delivery receipt from a transport push (bd pibot-zy70): id of the sent message, when observable. */
 export interface DeliveryReceipt {
   messageId?: number;
+  /** actually delivered medium: "photo" | "document" | "video_note" | … (absent = plain text) */
+  mediaType?: string;
 }
 
 /** Context about a Telegram message the user replied to (transport-supplied). */
@@ -136,8 +138,9 @@ export interface Transport {
   sendPoll?(chatId: string, question: string, options: string[]): Promise<{ pollId: string }>;
   /** Poll votes (optional) */
   onPollAnswer?(cb: (pollId: string, optionIndex: number, voterId: string) => Promise<void>): void;
-  /** Send an image/document by URL (optional; Telegram only) */
-  sendMedia?(chatId: string, url: string): Promise<void>;
+  /** Send an image/document by URL (optional; Telegram only). May resolve with a
+   *  delivery receipt (message id + actual media kind) for task records (bd pibot-zy70). */
+  sendMedia?(chatId: string, url: string): Promise<DeliveryReceipt | void>;
   /** Set this bot identity's profile photo (optional; Telegram only). */
   setProfilePhoto?(filePath: string): Promise<void>;
   /** Send a local OGG/Opus voice artifact through this transport. */
@@ -145,7 +148,7 @@ export interface Transport {
   /** Send a local MP3/M4A music-player artifact through this transport. */
   sendAudio?(chatId: string, filePath: string, caption?: string): Promise<void>;
   /** native round video note (Bot API sendVideoNote) — externally produced square MP4 */
-  sendVideoNote?(chatId: string, filePath: string): Promise<void>;
+  sendVideoNote?(chatId: string, filePath: string): Promise<DeliveryReceipt | void>;
   /** Manager-mode bots receive managed-bot creation/token updates (optional) */
   onManagedBot?(cb: (info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>): void;
 }

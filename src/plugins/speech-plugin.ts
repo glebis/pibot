@@ -10,7 +10,7 @@ export interface SpeechPluginOptions {
   store: SpeechArtifactStore;
   send: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>;
   /** native round video note (Bot API sendVideoNote) from an existing local MP4 */
-  sendVideoNote?: (transport: string, chatId: string, filePath: string) => Promise<void>;
+  sendVideoNote?: (transport: string, chatId: string, filePath: string) => Promise<void | import("../core/types.js").DeliveryReceipt>;
   /**
    * Applied to `text` BEFORE synthesis. Filtering after the fact would leave the
    * audio saying "slash Users slash gleb slash…" while the transcript looked clean

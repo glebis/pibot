@@ -60,7 +60,7 @@ export interface CapabilityContext {
     store: SpeechArtifactStore;
     send: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>;
     /** native round video note (Bot API sendVideoNote) — externally produced MP4 */
-    sendVideoNote?: (transport: string, chatId: string, filePath: string) => Promise<void>;
+    sendVideoNote?: (transport: string, chatId: string, filePath: string) => Promise<void | import("../core/types.js").DeliveryReceipt>;
   };
   /** global STT custom-vocabulary store (bot-wide data dir) */
   dictionary?: {

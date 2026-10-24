@@ -170,7 +170,7 @@ export class AgentManager {
     comms?: CommsHooks,
     applyProfilePhoto?: (transport: string, filePath: string) => Promise<void>,
     sendSpeech?: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>,
-    sendVideoNote?: (transport: string, chatId: string, filePath: string) => Promise<void>,
+    sendVideoNote?: (transport: string, chatId: string, filePath: string) => Promise<void | import("./types.js").DeliveryReceipt>,
     telegramSend?: TelegramSendHooks,
     /** minimal-voice shaping applied to spoken text before synthesis (bd: minimal voice).
      *  Last on purpose: the call site appends it without disturbing existing arg positions. */

@@ -58,6 +58,7 @@ import { execFile } from "node:child_process";
 /** A pending sub-bot creation request expires after this long — long enough for
  *  a user to get around to BotFather, short enough to not catch stale updates. */
 const PENDING_SUBBOT_TTL_MS = 24 * 3600e3;
+const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
 
 /** How often the sub-bot wiring re-probe runs while requests are armed. Telegram's
  *  creator-record propagation can outlast the initial in-handler retry window
@@ -1235,7 +1236,6 @@ export class PiBot implements HeartbeatHost {
         this.sessionTurnFailures.delete(key);
         if (text) {
           const { text: cleanText, media } = splitMediaLines(text);
-const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
 
           for (const source of media) {
             if (!t.sendMedia) {
@@ -3361,8 +3361,10 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
 
   /** Durable task runner (pibot-e9t): one background turn of the agent in the task's own
    *  session (full tools; questions route to the owner chat). The ledger owns retries,
-   *  status and the result post; cancelling or shutting down aborts the turn. */
-  async runLedgerTask(run: TaskRun): Promise<string> {
+   *  status and the result post; cancelling or shutting down aborts the turn.
+   *  MEDIA lines in the result are delivered to the origin chat (receipts recorded) so the
+   *  ledger's verified-completion gate sees the actual medium (bd pibot-zy70). */
+  async runLedgerTask(run: TaskRun): Promise<string | { text: string; delivery?: { messageId?: number; mediaType?: string } }> {
     if (!this.deps.agents.getAgent(run.agentId)) throw new Error(`unknown agent "${run.agentId}"`);
     // A resumed task may start while the previous process's transports are still arming:
     // wait for start() so result posts and owner questions have a live delivery route.
@@ -3399,8 +3401,44 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024; // mirrors transports/telegram.ts cap
       // (especially after a tool call or provider handoff). Yield once before
       // reading the transcript so durable tasks do not finish with an empty result.
       await new Promise<void>((resolve) => setImmediate(resolve));
-      return extractAssistantTextFromSession(session) ?? "";
+      const resultText = extractAssistantTextFromSession(session) ?? "";
+      // MEDIA lines become real sends to the origin chat (they used to travel as literal
+      // text in the result post). Successful sends carry receipts; failures are logged —
+      // the ledger's gate records the missing receipt as partial, never as done.
+      const { text: cleanText, media } = splitMediaLines(resultText);
+      let delivery: { messageId?: number; mediaType?: string } | undefined;
+      const tr = this.transports.get(originChat.transport);
+      for (const source of media) {
+        try {
+          if (!tr) throw new Error(`no transport "${originChat.transport}"`);
+          const r = await this.sendTaskMedia(tr, originChat.chatId, run.agentId, source, run.expectedMedia);
+          if (r && (r.messageId !== undefined || r.mediaType !== undefined)) delivery = { ...r };
+        } catch (e) {
+          this.deps.events.log(run.agentId, "system", `task media send failed: ${truncate(source, 120)} — ${truncate(errorMessage(e), 160)}`);
+        }
+      }
+      if (delivery) return { text: cleanText || "📎 (media delivered)", delivery };
+      return cleanText;
     } finally { clearTimeout(timer); }
+  }
+
+  /** Deliver one background-task MEDIA attachment to the origin chat (bd pibot-zy70).
+   *  MP4s route through the native round sendVideoNote only when the task's owner request
+   *  asked for a video note — ordinary MP4 attachments keep the turn-path behavior (document). */
+  private async sendTaskMedia(t: Transport, chatId: string, agentId: string, source: string, expectedMedia?: string): Promise<DeliveryReceipt | void> {
+    const size = localFileSize(source);
+    if (size != null && size > MEDIA_MAX_BYTES) {
+      // Same owner decision as the turn path (2026-09-23): oversized files get a private
+      // tailnet link instead of a doomed upload — and links carry no verifiable receipt.
+      void this.deliverLargeFileLink(t, chatId, agentId, source, size).catch(() => {});
+      return undefined;
+    }
+    if (expectedMedia === "video_note" && /\.mp4$/i.test(source)) {
+      if (!t.sendVideoNote) throw new Error(`the transport "${t.name}" cannot send native video notes`);
+      return await t.sendVideoNote(chatId, source);
+    }
+    if (!t.sendMedia) throw new Error(`transport "${t.name}" cannot send media`);
+    return await t.sendMedia(chatId, source);
   }
 
   /**

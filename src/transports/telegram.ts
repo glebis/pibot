@@ -580,12 +580,11 @@ export class TelegramTransport implements Transport {
   }
 
   /** Telegram requires a fresh multipart upload for every profile-photo change. */
-  async sendMedia(chatId: string, source: string): Promise<void> {
+  async sendMedia(chatId: string, source: string): Promise<DeliveryReceipt | void> {
     // http(s) URL → Telegram fetches it; absolute local path → upload from disk.
-    return this.enqueue(chatId, async () => {
+    return this.enqueue(chatId, async (): Promise<DeliveryReceipt | void> => {
       if (/^https?:\/\//i.test(source)) {
-        await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, source));
-        return;
+        return { messageId: messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, source))), mediaType: "photo" };
       }
       const local = path.resolve(source);
       if (!fs.existsSync(local)) throw new Error(`MEDIA file not found: ${local}`);
@@ -594,10 +593,9 @@ export class TelegramTransport implements Transport {
       const lower = local.toLowerCase();
       const isImage = /\.(jpe?g|png|webp|gif|heic)$/.test(lower);
       if (isImage) {
-        await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, new InputFile(local)));
-      } else {
-        await this.sendTelegram(chatId, () => this.bot.api.sendDocument(chatId, new InputFile(local)));
+        return { messageId: messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, new InputFile(local)))), mediaType: "photo" };
       }
+      return { messageId: messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendDocument(chatId, new InputFile(local)))), mediaType: "document" };
     });
   }
 
@@ -640,7 +638,7 @@ export class TelegramTransport implements Transport {
     });
   }
 
-    async sendVideoNote(chatId: string, filePath: string): Promise<void> {
+    async sendVideoNote(chatId: string, filePath: string): Promise<DeliveryReceipt | void> {
     const resolved = path.resolve(filePath);
     // Sync lstat here keeps the guard simple: no symlinks, regular files only.
     const st = fs.lstatSync(resolved);
@@ -649,12 +647,12 @@ export class TelegramTransport implements Transport {
     if (path.extname(resolved).toLowerCase() !== ".mp4") throw new Error("Telegram video notes must be MP4 (H.264 up to 60s)");
     const digest = createHash("sha256").update(fs.readFileSync(resolved)).digest("hex");
     const payload = `videonote:${digest}`;
-    await this.enqueue(chatId, async () => {
+    return this.enqueue(chatId, async (): Promise<DeliveryReceipt | void> => {
       if (!this.duplicateGuard.shouldSend(chatId, payload)) {
         console.warn(`[telegram] suppressed duplicate video-note send to chat ${chatId}`);
         return;
       }
-      await this.sendTelegram(chatId, () => {
+      const sent = await this.sendTelegram(chatId, () => {
         const input = new InputFile(resolved, path.basename(resolved));
         // Native round note: sendVideoNote — never ordinary video (sendVideo would
         // deliver a rectangular clip, not a circle). No caption field exists for
@@ -662,6 +660,8 @@ export class TelegramTransport implements Transport {
         return this.bot.api.sendVideoNote(chatId, input);
       });
       this.duplicateGuard.markSent(chatId, payload);
+      // receipt for the verified-completion gate (bd pibot-zy70): the round note's message id
+      return { messageId: messageIdOf(sent), mediaType: "video_note" };
     });
   }
 
