@@ -4,6 +4,33 @@ Notable changes to pibot. Format follows [Keep a Changelog](https://keepachangel
 dates are local. Entries here describe what shipped and what it costs the owner,
 not just what the commit touched.
 
+## 2026-10-27
+
+### Added
+
+- **Agent Client Protocol (ACP) support, on both sides of the wire.** pibot now speaks ACP —
+  JSON-RPC 2.0 over stdio, one message per line — the protocol editors (Zed, …) use to drive
+  coding agents.
+  - **As a client (the `acp` capability):** `acp_run` hands one self-contained coding task to an
+    external ACP agent and returns its answer plus the tool calls it made. The registered target is
+    **`cmd acp`** (Command Code) — the execution method `/goal` has always documented but that had no
+    implementation target. The agent runs as a subprocess with an allowlisted environment; while it
+    works, pibot answers its `session/request_permission` (default `allow`, `reject` available) and
+    serves `fs/read_text_file` / `fs/write_text_file` **confined to the workspace**; the terminal
+    capability is withheld so the agent uses its own tools. The subprocess is always disposed, even
+    on failure or timeout.
+  - **As an agent (`npm run acp`):** pibot can be an ACP agent itself, serving one of its agents to
+    any ACP client over stdio (`PIBOT_ACP_AGENT` selects which). Each ACP session maps to one pibot
+    chat session (`<agentId>::acp-<sessionId>`); streamed text, thoughts and tool executions become
+    `agent_message_chunk` / `agent_thought_chunk` / `tool_call(_update)`, and `session/cancel` aborts
+    the running turn. `loadSession` is **not** advertised, and the ACP `cwd` does not override the
+    agent's workspace — agent isolation stays intact.
+  - Cost: the `acp` capability is **opt-in** and offered only when `cmd` resolves on PATH; the server
+    is a separate process with its own sessions and a throwaway scheduler, independent of the daemon.
+  - Tests: framing (incl. multi-byte splits), the server's routing/cancel/error paths, the
+    event→update mapping, and the client driven against a real ACP subprocess — plus a live smoke
+    harness (`npm run test:acp`) that drives the real `cmd acp`.
+
 ## 2026-10-05
 
 ### Added
