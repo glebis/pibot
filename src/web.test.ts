@@ -145,6 +145,7 @@ describe("web dashboard", () => {
 
   it("POST manifest saves heartbeat/evolution config", async () => {
     const form = new FormData();
+    form.set("_form", "manifest");
     form.set("description", "The everyday one");
     form.set("model", "");
     form.set("thinking", "low");
@@ -172,6 +173,117 @@ describe("web dashboard", () => {
     withCsrf(form, app);
     const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form });
     expect(res.headers.get("location")).toContain("Invalid%20interval");
+  });
+
+  it("manifest save is field-level: grants the form omits and unrelated nested fields survive", async () => {
+    fs.writeFileSync(
+      path.join(dir, "assistant", "agent.json"),
+      JSON.stringify({
+        name: "assistant",
+        description: "old",
+        capabilities: ["memory", "tasks", "commitments"],
+        speech: { sttProviders: ["groq"], allowExternalStt: true, minimal: true },
+      }),
+    );
+    await agents.discover();
+    const form = new FormData();
+    form.set("description", "kept");
+    form.set("stt_providers", "groq");
+    form.set("allow_external_stt", "on");
+    withCsrf(form, app);
+    const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form });
+    expect(res.status).toBe(302);
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, "assistant", "agent.json"), "utf8"));
+    expect(saved.capabilities).toEqual(["memory", "tasks", "commitments"]); // never dropped by omission
+    expect(saved.description).toBe("kept");
+    expect(saved.speech.minimal).toBe(true); // unrelated nested field preserved
+    expect(saved.speech.sttProviders).toEqual(["groq"]);
+  });
+
+  it("a description-only POST preserves every other field, including speech privacy", async () => {
+    fs.writeFileSync(
+      path.join(dir, "assistant", "agent.json"),
+      JSON.stringify({
+        name: "assistant",
+        description: "old",
+        model: "anthropic/claude-opus-4-6",
+        thinking: "high",
+        capabilities: ["memory", "tasks"],
+        providers: ["anthropic"],
+        speech: { sttProviders: ["whisperkit", "groq"], allowExternalStt: true, minimal: true },
+        heartbeat: { enabled: true, interval: "20m", model: "same", quietHours: { from: "01:00", to: "02:00" } },
+        proactive: { pilot: true, dailyBudget: 3 },
+        comms: { taskAcks: true },
+      }),
+    );
+    await agents.discover();
+    const form = new FormData();
+    form.set("description", "new only");
+    withCsrf(form, app); // NOTE: no _form sentinel → a partial patch, not the full form
+    const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form });
+    expect(res.status).toBe(302);
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, "assistant", "agent.json"), "utf8"));
+    expect(saved.description).toBe("new only");
+    expect(saved.model).toBe("anthropic/claude-opus-4-6"); // not reset to undefined
+    expect(saved.thinking).toBe("high");
+    expect(saved.capabilities).toEqual(["memory", "tasks"]);
+    expect(saved.providers).toEqual(["anthropic"]);
+    // the whole speech object survives: a description-only save must not touch it
+    expect(saved.speech).toEqual({ sttProviders: ["whisperkit", "groq"], allowExternalStt: true, minimal: true });
+    expect(saved.heartbeat).toMatchObject({ enabled: true, interval: "20m", quietHours: { from: "01:00", to: "02:00" } });
+    expect(saved.proactive).toMatchObject({ pilot: true, dailyBudget: 3 });
+    expect(saved.comms).toMatchObject({ taskAcks: true });
+  });
+
+  it("the full manifest form carries the _form sentinel (omitted checkbox = false)", async () => {
+    const html = await (await app.request("/agents/assistant")).text();
+    expect(html).toContain('name="_form" value="manifest"');
+  });
+
+  it("manifest save refuses an unacknowledged capability removal and names it", async () => {
+    fs.writeFileSync(
+      path.join(dir, "assistant", "agent.json"),
+      JSON.stringify({ name: "assistant", capabilities: ["memory", "tasks"] }),
+    );
+    await agents.discover();
+    const form = new FormData();
+    form.set("description", "assistant");
+    form.set("capabilities", "memory");
+    withCsrf(form, app);
+    const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form });
+    expect(res.status).toBe(302);
+    expect(decodeURIComponent(res.headers.get("location") ?? "")).toContain("acknowledgement");
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, "assistant", "agent.json"), "utf8"));
+    expect(saved.capabilities).toEqual(["memory", "tasks"]); // unchanged
+  });
+
+  it("manifest save applies a removal once it is explicitly acknowledged", async () => {
+    fs.writeFileSync(
+      path.join(dir, "assistant", "agent.json"),
+      JSON.stringify({ name: "assistant", capabilities: ["memory", "tasks"] }),
+    );
+    await agents.discover();
+    const form = new FormData();
+    form.set("description", "assistant");
+    form.set("capabilities", "memory");
+    form.set("ack_removals", "on");
+    withCsrf(form, app);
+    const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form });
+    expect(res.status).toBe(302);
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, "assistant", "agent.json"), "utf8"));
+    expect(saved.capabilities).toEqual(["memory"]);
+  });
+
+  it("manifest save refuses a stale compare-and-swap write", async () => {
+    const form = new FormData();
+    form.set("description", "later");
+    form.set("_sha", "deadbeef".repeat(8));
+    withCsrf(form, app);
+    const res = await app.request("/agents/assistant/manifest", { method: "POST", body: form });
+    expect(res.status).toBe(302);
+    expect(decodeURIComponent(res.headers.get("location") ?? "")).toContain("compare-and-swap");
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, "assistant", "agent.json"), "utf8"));
+    expect(saved.description).not.toBe("later");
   });
 
   it("POST persona and memory save files", async () => {

@@ -1,11 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
   advanceGoal, buildJudgePrompt, GOAL_MAX_PARSE_FAILURES, GOAL_MAX_TURNS_DEFAULT, goalCard, hasContract, newGoal,
-  parseGoalVerdict, renderGoalBlock, renderGoalStatus, shouldContinue,
+  parseGoalVerdict, renderGoalBlock, renderGoalStatus, shouldContinue, withMethodBlocker,
 } from "./goals.js";
+import { validateGoalMethods, type GoalMethodBlocker, type MethodProbe } from "./method-resolution.js";
 
 const state = (over = {}) => ({ ...newGoal("research three agent memory systems", { now: 1_000 }), ...over });
 const verdict = (v: "done" | "continue" | "wait", reason = "because") => ({ verdict: v, reason });
+
+const probe = (over: Partial<MethodProbe> = {}): MethodProbe => ({ which: () => null, docs: () => [], ...over });
+const blockerFor = (objective: string, over: Partial<MethodProbe> = {}): GoalMethodBlocker => {
+  const resolution = validateGoalMethods(objective, undefined, probe(over));
+  if (resolution.status !== "blocked") throw new Error("expected a blocked method");
+  return resolution.blocker;
+};
 
 describe("goal state", () => {
   it("starts active, unspent, contracts empty", () => {
@@ -140,5 +148,96 @@ describe("goalCard — contextual pause/resume buttons", () => {
   it("done or absent goals render no card", () => {
     expect(goalCard(state({ status: "done" }))).toBeUndefined();
     expect(goalCard(undefined)).toBeUndefined();
+  });
+});
+
+describe("unresolved execution method — one blocker, not repeated turns (bd pibot-0xpf.1)", () => {
+  it("attaches the blocker and stamps the turn it arrived on", () => {
+    const g = withMethodBlocker(state({ turnsUsed: 2 }), blockerFor("implement using cmd acp"));
+    expect(g.methodBlocker).toMatchObject({ id: "method:cmd:unknown_method", reason: "unknown_method" });
+    expect(g.methodBlockedAt).toBe(2);
+  });
+
+  it("treats an identical blocker as a no-op — it must not become a fresh turn", () => {
+    const g = withMethodBlocker(state({ turnsUsed: 3 }), blockerFor("implement using cmd acp"));
+    expect(withMethodBlocker(g, blockerFor("use cmd acp"))).toBe(g);
+    expect(withMethodBlocker(g, blockerFor("implement using cmd acp"))).toBe(g);
+  });
+
+  it("replaces a different blocker and re-stamps it", () => {
+    const first = withMethodBlocker(state({ turnsUsed: 1 }), blockerFor("implement using cmd acp"));
+    const next = withMethodBlocker(first, blockerFor("run pytest"));
+    expect(next.methodBlocker?.id).toBe("method:pytest:unknown_method");
+    expect(next.methodBlockedAt).toBe(1);
+  });
+
+  it("clears the blocker when the owner resolves the method (clarification)", () => {
+    const g = withMethodBlocker(state(), blockerFor("implement using cmd acp"));
+    expect(withMethodBlocker(g, undefined).methodBlocker).toBeUndefined();
+    expect(withMethodBlocker(g, undefined).methodBlockedAt).toBeUndefined();
+    const clean = state();
+    expect(withMethodBlocker(clean, undefined)).toBe(clean);
+  });
+
+  it("stops the loop at the blocker, and resumes once it is cleared", () => {
+    const g = withMethodBlocker(state({ turnsUsed: 1, maxTurns: 8 }), blockerFor("implement using cmd acp"));
+    expect(shouldContinue(g)).toEqual({ continue: false, reason: "method_blocked" });
+    expect(shouldContinue(withMethodBlocker(g, undefined))).toEqual({ continue: true });
+  });
+
+  it("preserves independent work: attaching a blocker spends no turn and changes no goal content", () => {
+    const base = state({ turnsUsed: 3, contract: { outcome: "a written comparison" }, subgoals: ["include pricing"] });
+    const g = withMethodBlocker(base, blockerFor("implement using cmd acp"));
+    expect(g.status).toBe("active");
+    expect(g.turnsUsed).toBe(3);
+    expect(g.objective).toBe(base.objective);
+    expect(g.contract).toEqual(base.contract);
+    expect(g.subgoals).toEqual(base.subgoals);
+  });
+
+  it("carries the blocker into the turn block and the status render", () => {
+    const g = withMethodBlocker(state(), blockerFor("implement using cmd acp", {}));
+    expect(renderGoalBlock(g)).toContain("blocked method:");
+    expect(renderGoalBlock(g)).toMatch(/Do NOT retry/);
+    expect(renderGoalBlock(g)).toMatch(/ONE precise question/);
+    expect(renderGoalStatus(g)).toContain("method blocked (unknown_method)");
+  });
+
+  it("distinguishes a documented-but-missing method from an unknown one", () => {
+    const documented = blockerFor("implement using cmd acp", { docs: () => ["/skills/herdr/SKILL.md"] });
+    expect(documented.reason).toBe("not_on_path");
+    expect(renderGoalStatus(withMethodBlocker(state(), documented))).toContain("method blocked (not_on_path)");
+  });
+
+  it("a required-all goal blocks on the missing method even when another tool is installed", () => {
+    // "use cmd acp and run pytest" — pytest resolves, cmd does not: one blocker on cmd, not a pass
+    const resolution = validateGoalMethods("use cmd acp and run pytest", undefined, probe({
+      which: (c) => (c === "pytest" ? "/usr/bin/pytest" : null),
+    }));
+    expect(resolution.status).toBe("blocked");
+    if (resolution.status !== "blocked") return;
+    expect(resolution.blocker.method.command).toBe("cmd");
+    const g = withMethodBlocker(state({ turnsUsed: 1 }), resolution.blocker);
+    expect(shouldContinue(g)).toEqual({ continue: false, reason: "method_blocked" });
+  });
+
+  it("attaches no blocker and the loop continues once the method resolves", () => {
+    const resolution = validateGoalMethods("implement using cmd acp", undefined, probe({
+      which: () => "/Users/me/.hermes/node/bin/cmd",
+    }));
+    expect(resolution.status).toBe("resolved");
+    const g = state({ turnsUsed: 1 });
+    const attached = resolution.status === "blocked" ? withMethodBlocker(g, resolution.blocker) : g;
+    expect(attached.methodBlocker).toBeUndefined();
+    expect(shouldContinue(attached)).toEqual({ continue: true });
+  });
+
+  it("an explicit alternative goal only blocks when every branch is missing", () => {
+    const resolved = validateGoalMethods("use cmd acp or run pytest", undefined, probe({
+      which: (c) => (c === "pytest" ? "/usr/bin/pytest" : null),
+    }));
+    expect(resolved.status).toBe("resolved");
+    const blocked = validateGoalMethods("use cmd acp or run kubectl", undefined, probe());
+    expect(blocked.status).toBe("blocked");
   });
 });

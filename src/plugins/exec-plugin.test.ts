@@ -449,3 +449,54 @@ describe("exec plugin tool", () => {
     const three = await resolveExec([py, pin, "keychain", "sops", "extra"], deps, allowBB);
     expect(three.error).toBeTruthy();
   });
+
+describe('exec trace tools', () => {
+  it('registers private audit search and confined output reader, and traces refusals', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-audit-tools-'));
+    try {
+      const { pi, tools } = captureTools();
+      factoryOf(execPlugin({ agentDir: dir, workspace: dir, allowlist: [] }))(pi);
+      expect(tools.has('exec_audit_search')).toBe(true);
+      expect(tools.has('exec_result_read')).toBe(true);
+      await tools.get('exec_run')!.execute('call-youtube', { argv: ['/bin/echo', 'https://youtube.com/shorts/N8mV_E3IcZU?token=SECRET'], taskId: 'task-short' });
+      const rows = await tools.get('exec_audit_search')!.execute('search', { query: 'task-short' });
+      expect(rows.content[0].text).toContain('refused');
+      expect(rows.content[0].text).toContain('call-youtube');
+      expect(rows.content[0].text).not.toContain('SECRET');
+      const denied = await tools.get('exec_result_read')!.execute('read', { path: '../../agent.json' });
+      expect(denied.details.ok).toBe(false);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('exec outcome audit', () => {
+  it('records actual success and failure while keeping stdout out of the audit', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-outcomes-'));
+    try {
+      const script = path.join(dir, 'exit-two'); fs.writeFileSync(script, '#!/bin/sh\nexit 2\n'); fs.chmodSync(script, 0o700);
+      const { pi, tools } = captureTools();
+      factoryOf(execPlugin({ agentDir: dir, workspace: dir, allowlist: [{ bin: '/bin/echo' }, { bin: script }] }))(pi);
+      await tools.get('exec_run')!.execute('ok', { argv: ['/bin/echo', 'PRIVATE_STDOUT'], taskId: 'outcome' });
+      await tools.get('exec_run')!.execute('bad', { argv: [script], taskId: 'outcome' });
+      const raw = fs.readFileSync(path.join(dir, 'runtime', 'exec-audit.jsonl'), 'utf8');
+      expect(raw).not.toContain('PRIVATE_STDOUT');
+      const rows = raw.trim().split('\n').map((s) => JSON.parse(s));
+      expect(rows.map((r) => r.outcome)).toEqual(['started', 'succeeded', 'started', 'failed']);
+      expect(rows[3].exitCode).toBe(2);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('never starts a command when the audit boundary is unsafe', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-fail-closed-'));
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-symlink-'));
+    try {
+      fs.symlinkSync(other, path.join(dir, 'runtime'));
+      const marker = path.join(dir, 'should-not-exist');
+      const script = path.join(dir, 'marker-script'); fs.writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\n`); fs.chmodSync(script, 0o700);
+      const { pi, tools } = captureTools();
+      factoryOf(execPlugin({ agentDir: dir, workspace: dir, allowlist: [{ bin: script }] }))(pi);
+      const result = await tools.get('exec_run')!.execute('unsafe', { argv: [script] });
+      expect(result.details.ok).toBe(false); expect(fs.existsSync(marker)).toBe(false);
+      expect(fs.readdirSync(other)).toEqual([]);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(other, { recursive: true, force: true }); }
+  });
+});

@@ -12,10 +12,11 @@ import type { Commitment, ProactiveLoop, ProactiveStore } from "./core/proactive
 import { summarize } from "./core/proactive-store.js";
 import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
+import type { ManifestPatch } from "./core/manifest-policy.js";
 import { buildManifest, buildPersona, createAgentFromSpec, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
 import { taskAcksEnabled } from "./core/task-acks.js";
 import { CAPABILITY_REGISTRY } from "./core/capabilities.js";
-import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
+import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate } from "./core/util.js";
 import { providerRowHtml } from "./core/providers.js";
 import { getMediaLinkKey, mediaDirFor, verifyMediaToken } from "./core/media-links.js";
 import { registerInboxRoutes, type InboxControl } from "./web-inbox-routes.js";
@@ -343,7 +344,7 @@ input.oninput=()=>{filter();const url=new URL(location.href);if(input.value)url.
 </body></html>`;
 }
 
-function manifestForm(agent: LoadedAgent, csrf: string): string {
+function manifestForm(agent: LoadedAgent, csrf: string, manifestSha?: string): string {
   const m = agent.manifest;
   const hb = m.heartbeat ?? { enabled: false, interval: "45m", model: "same" };
   const ev = m.evolution ?? { enabled: false, interval: "6h", model: "same" };
@@ -351,6 +352,8 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
   return `
 <form method="post" action="/agents/${esc(agent.id)}/manifest" class="card">
   <input type="hidden" name="_csrf" value="${esc(csrf)}">
+  <input type="hidden" name="_form" value="manifest">
+  ${manifestSha ? `<input type="hidden" name="_sha" value="${esc(manifestSha)}">` : ""}
   <div class="row">
     <div><label>Description</label><input type="text" name="description" value="${esc(m.description ?? "")}"></div>
     <div><label>Model (pi shorthand, empty = auto)</label><input type="text" name="model" value="${esc(m.model ?? "")}" placeholder="sonnet:medium"></div>
@@ -400,6 +403,10 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
     <div><label class="mono">enabled <input type="checkbox" name="ev_enabled" ${ev.enabled ? "checked" : ""} style="width:auto"></label></div>
     <div><label>Interval</label><input type="text" name="ev_interval" value="${esc(ev.interval ?? "6h")}"></div>
     <div><label>Model</label><input type="text" name="ev_model" value="${esc(ev.model ?? "same")}"></div>
+  </div>
+  <div class="row">
+    <div><label class="mono">acknowledge capability/tool/provider removals <input type="checkbox" name="ack_removals" style="width:auto"></label>
+      <div class="muted">A save only changes the fields above and never drops an unlisted grant. If a list would lose entries (e.g. clearing capabilities, or a removal made here), the save is refused and the removals are named until this box is checked.</div></div>
   </div>
   <button type="submit">Save manifest</button>
 </form>`;
@@ -983,7 +990,13 @@ ${hasToken ? `<div class="card">
     const err = deps.agents.createAgent(name, buildPersona(draft));
     if (err) return c.redirect(`/agents/new?msg=${encodeURIComponent(err)}`);
     const agent = deps.agents.getAgent(name)!;
-    writeJsonAtomic(path.join(agent.dir, "agent.json"), buildManifest(draft));
+    // Field-level write (bd pibot-4wq1) so the scaffolded manifest keeps every
+    // field the creation form does not own instead of being replaced wholesale.
+    const built = buildManifest(draft);
+    const creationPatch: Partial<AgentManifest> = { description: built.description, heartbeat: built.heartbeat };
+    if (built.evolution) creationPatch.evolution = built.evolution;
+    const created = deps.agents.updateManifest(name, creationPatch);
+    if (!created.ok) return c.redirect(`/agents/new?msg=${encodeURIComponent(created.error ?? "Manifest write refused")}`);
     await deps.agents.discover();
     const fresh = deps.agents.getAgent(name)!;
     const hb = fresh.manifest.heartbeat;
@@ -1187,7 +1200,7 @@ ${staged.length ? `<div class="flash warn" id="staged-banner"><a href="/review?a
 </div>
 
 <h2>Rhythm & model</h2>
-${manifestForm(agent, csrfToken)}
+${manifestForm(agent, csrfToken, deps.agents.manifestSha(agent.id))}
 
 <h2>Persona <span class="muted">(AGENTS.md)</span></h2>
 <form method="post" action="/agents/${esc(agent.id)}/persona" class="card">
@@ -1292,46 +1305,90 @@ ${manifestForm(agent, csrfToken)}
     const str = (k: string) => String(b[k] ?? "").trim();
     const on = (k: string) => b[k] === "on";
 
-    const hbInterval = str("hb_interval") || "45m";
-    const hbMin = str("hb_min") || "5m";
-    const hbMax = str("hb_max") || "12h";
-    const evInterval = str("ev_interval") || "6h";
-    if (!parseDuration(hbInterval) || !parseDuration(evInterval) || !parseDuration(hbMin) || !parseDuration(hbMax)) {
+    // Explicit form intent (bd pibot-4wq1 review): the full manifest form submits
+    // `_form=manifest`, so an ABSENT control there means "intended false" (an unticked
+    // checkbox). A partial POST without the sentinel only changes the keys it actually
+    // carries — an omitted field is preserved, never reset. Without this, a
+    // description-only POST reset model/thinking/speech/heartbeat/proactive/etc.
+    const fullForm = str("_form") === "manifest";
+    const has = (k: string) => Object.prototype.hasOwnProperty.call(b, k);
+    const write = (k: string) => fullForm || has(k);
+
+    const HB_KEYS = ["hb_enabled", "hb_interval", "hb_model", "hb_from", "hb_to", "hb_morning_brief", "hb_min", "hb_max"];
+    const EV_KEYS = ["ev_enabled", "ev_interval", "ev_model"];
+    const list = (k: string): string[] | undefined =>
+      str(k) ? str(k).split(",").map((value) => value.trim()).filter(Boolean) : undefined;
+
+    // Field-level, compare-and-swap patch (bd pibot-4wq1): only the fields the submission
+    // owns change; every other authorised field (including `capabilities` entries the form
+    // does not carry) is preserved verbatim. Nested objects are MERGED by the manifest
+    // planner, so a one-field save cannot drop a sibling key. Removals from
+    // capability/tool/provider lists are refused and named unless acknowledged explicitly.
+    const patch: ManifestPatch = {};
+    if (write("thinking")) patch.thinking = (str("thinking") as AgentManifest["thinking"]) || "off";
+    if (write("model")) patch.model = str("model") || undefined;
+    if (write("description")) patch.description = str("description") || undefined;
+    if (write("tools")) patch.tools = list("tools");
+    if (write("providers")) patch.providers = list("providers");
+    if (write("capabilities")) patch.capabilities = list("capabilities");
+    if (write("task_acks")) patch.comms = { taskAcks: on("task_acks") };
+    if (write("pilot_enabled") || write("pilot_budget")) {
+      patch.proactive = {
+        ...(write("pilot_enabled") ? { pilot: on("pilot_enabled") } : {}),
+        ...(write("pilot_budget") ? { dailyBudget: Math.max(1, parseInt(str("pilot_budget"), 10) || 6) } : {}),
+      };
+    }
+    if (write("stt_providers") || write("allow_external_stt")) {
+      patch.speech = {
+        ...(write("stt_providers")
+          ? { sttProviders: list("stt_providers") as Array<"whisperkit" | "local_whisper" | "groq"> | undefined }
+          : {}),
+        ...(write("allow_external_stt") ? { allowExternalStt: on("allow_external_stt") } : {}),
+      };
+    }
+    if (fullForm || HB_KEYS.some(has)) {
+      patch.heartbeat = {
+        ...(write("hb_enabled") ? { enabled: on("hb_enabled") } : {}),
+        ...(write("hb_interval") ? { interval: str("hb_interval") || "45m" } : {}),
+        ...(write("hb_model") ? { model: str("hb_model") || "same" } : {}),
+        ...(write("hb_from") || write("hb_to") ? { quietHours: { from: str("hb_from") || "23:00", to: str("hb_to") || "08:00" } } : {}),
+        ...(write("hb_morning_brief") ? { morningBrief: on("hb_morning_brief") || undefined } : {}),
+        ...(write("hb_min") ? { minInterval: str("hb_min") || "5m" } : {}),
+        ...(write("hb_max") ? { maxInterval: str("hb_max") || "12h" } : {}),
+      };
+    }
+    if (fullForm || EV_KEYS.some(has)) {
+      patch.evolution = {
+        ...(write("ev_enabled") ? { enabled: on("ev_enabled") } : {}),
+        ...(write("ev_interval") ? { interval: str("ev_interval") || "6h" } : {}),
+        ...(write("ev_model") ? { model: str("ev_model") || "same" } : {}),
+      };
+    }
+
+    // Validate only the intervals this submission actually writes.
+    const intervals: string[] = [];
+    if (write("hb_interval")) intervals.push(str("hb_interval") || "45m");
+    if (write("hb_min")) intervals.push(str("hb_min") || "5m");
+    if (write("hb_max")) intervals.push(str("hb_max") || "12h");
+    if (write("ev_interval")) intervals.push(str("ev_interval") || "6h");
+    if (intervals.some((value) => !parseDuration(value))) {
       return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Invalid interval (try 45m, 2h, 6h)")}`);
     }
 
-    const manifest: AgentManifest = {
-      ...agent.manifest,
-      description: str("description") || agent.manifest.description,
-      model: str("model") || undefined,
-      thinking: (str("thinking") as AgentManifest["thinking"]) || "off",
-      tools: str("tools") ? str("tools").split(",").map((t) => t.trim()).filter(Boolean) : undefined,
-      providers: str("providers") ? str("providers").split(",").map((provider) => provider.trim()).filter(Boolean) : undefined,
-      capabilities: str("capabilities") ? str("capabilities").split(",").map((v) => v.trim()).filter(Boolean) : undefined,
-      comms: { ...agent.manifest.comms, taskAcks: on("task_acks") },
-      proactive: { pilot: on("pilot_enabled"), dailyBudget: Math.max(1, parseInt(str("pilot_budget"), 10) || 6) },
-      speech: {
-        sttProviders: str("stt_providers")
-          ? (str("stt_providers").split(",").map((v) => v.trim()).filter(Boolean) as Array<"whisperkit" | "local_whisper" | "groq">)
-          : undefined,
-        allowExternalStt: on("allow_external_stt"),
-      },
-      heartbeat: {
-        enabled: on("hb_enabled"),
-        interval: hbInterval,
-        model: str("hb_model") || "same",
-        morningBrief: on("hb_morning_brief") || undefined,
-        quietHours: { from: str("hb_from") || "23:00", to: str("hb_to") || "08:00" },
-        minInterval: hbMin,
-        maxInterval: hbMax,
-      },
-      evolution: {
-        enabled: on("ev_enabled"),
-        interval: evInterval,
-        model: str("ev_model") || "same",
-      },
-    };
-    writeJsonAtomic(path.join(agent.dir, "agent.json"), manifest);
+    const expectedSha = str("_sha") || undefined;
+    let result = deps.agents.updateManifest(agent.id, patch, { expectedSha });
+    // An unacknowledged list removal is refused (not applied). When the operator
+    // ticked the acknowledgement, re-run naming the exact ids so the removal is
+    // explicit and auditable; a compare-and-swap refusal is never auto-retried.
+    if (!result.ok && result.diff && Object.keys(result.diff.removed).length && !result.error?.includes("compare-and-swap") && on("ack_removals")) {
+      result = deps.agents.updateManifest(agent.id, patch, {
+        expectedSha,
+        acknowledgeRemovals: [...new Set(Object.values(result.diff.removed).flat())],
+      });
+    }
+    if (!result.ok) {
+      return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent(result.error ?? "Manifest update refused")}`);
+    }
     await deps.agents.discover(); // reload manifests
     deps.commitments?.syncGovernance(agent.id); // scorecard job follows the pilot toggle
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Manifest saved — rhythm changes apply on next restart of jobs (or via chat)")}`);

@@ -11,6 +11,8 @@
 // Bounds are the point of the design, not an afterthought: an autonomous loop is
 // the one feature that can spend money while nobody is watching.
 
+import { methodBlockerSignature, type GoalMethodBlocker } from "./method-resolution.js";
+
 /** Structured completion contract — what makes "done" evidence-based. */
 export type GoalContract = {
   /** the observable end state */
@@ -41,6 +43,14 @@ export type GoalState = {
   parseFailures: number;
   /** criteria added mid-loop; both the judge and the continuation see them */
   subgoals: string[];
+  /**
+   * One validated execution-method blocker (bd pibot-0xpf.1). When the method a goal
+   * depends on cannot be resolved, the loop stops here — ONE tracked blocker instead
+   * of re-spending turns on the same "undefined command".
+   */
+  methodBlocker?: GoalMethodBlocker;
+  /** turn count when the blocker was first recorded; a repeat of the same blocker is not new work */
+  methodBlockedAt?: number;
 };
 
 export const GOAL_MAX_TURNS_DEFAULT = 8;
@@ -70,6 +80,20 @@ export function hasContract(state: GoalState): boolean {
   return Boolean(state.contract?.outcome || state.contract?.verification);
 }
 
+/**
+ * Attach (or clear) the goal's execution-method blocker. An IDENTICAL blocker is a
+ * no-op — the same unresolved method must not be recorded, reported or re-spent as
+ * a fresh turn. Clearing happens when the owner resolves the method (e.g. installs
+ * it or clarifies the term).
+ */
+export function withMethodBlocker(state: GoalState, blocker: GoalMethodBlocker | undefined): GoalState {
+  if (!blocker) {
+    return state.methodBlocker ? { ...state, methodBlocker: undefined, methodBlockedAt: undefined } : state;
+  }
+  if (state.methodBlocker && methodBlockerSignature(state.methodBlocker) === methodBlockerSignature(blocker)) return state;
+  return { ...state, methodBlocker: blocker, methodBlockedAt: state.turnsUsed };
+}
+
 /** The compact block appended to a turn's prompt. Suffix, so internal-prefix detection is untouched. */
 export function renderGoalBlock(state: GoalState): string {
   const lines = [`[goal] ${state.objective}`, `progress: turn ${state.turnsUsed + 1} of ${state.maxTurns}`];
@@ -79,6 +103,12 @@ export function renderGoalBlock(state: GoalState): string {
   if (c.constraints) lines.push(`constraints: ${c.constraints}`);
   if (c.boundaries) lines.push(`boundaries: ${c.boundaries}`);
   if (state.subgoals.length) lines.push(`extra criteria:\n${state.subgoals.map((s, i) => `- ${i + 1}. ${s}`).join("\n")}`);
+  if (state.methodBlocker) {
+    lines.push(
+      `blocked method: ${state.methodBlocker.detail}. Do NOT retry it or substitute a different command. ` +
+        `Preserve any work that does not depend on it, and ask the owner ONE precise question to resolve it.`,
+    );
+  }
   lines.push(
     "Work the next concrete step toward this goal, then report what you did in one or two sentences. " +
       "If the goal is fully satisfied, say so explicitly — the loop stops on evidence, not on optimism.",
@@ -99,6 +129,7 @@ export function renderGoalStatus(state: GoalState | undefined): string {
   if (c.constraints) lines.push(`• constraints: ${c.constraints}`);
   if (c.boundaries) lines.push(`• boundaries: ${c.boundaries}`);
   if (state.subgoals.length) lines.push(`• extra criteria: ${state.subgoals.join(" · ")}`);
+  if (state.methodBlocker) lines.push(`• method blocked (${state.methodBlocker.reason}): ${state.methodBlocker.detail}`);
   if (state.lastVerdict) lines.push(`last judge: ${state.lastVerdict}${state.lastReason ? ` — ${state.lastReason}` : ""}`);
   return lines.join("\n");
 }
@@ -170,7 +201,7 @@ export function advanceGoal(state: GoalState, outcome: { verdict: GoalVerdict; r
 
 export type ContinueDecision =
   | { continue: true }
-  | { continue: false; reason: "not_active" | "budget_exhausted" | "owner_steering" | "snoozed" | "no_new_work" };
+  | { continue: false; reason: "not_active" | "budget_exhausted" | "owner_steering" | "snoozed" | "no_new_work" | "method_blocked" };
 
 /**
  * Every reason NOT to keep going: an inactive goal, snooze, or the turn budget.
@@ -185,6 +216,9 @@ export function shouldContinue(
   opts: { snoozed?: boolean; lastOwnerMessageAt?: number; lastAutoTurnAt?: number; now?: number } = {},
 ): ContinueDecision {
   if (!state || state.status !== "active") return { continue: false, reason: "not_active" };
+  // an unresolved execution method stops the loop at ONE blocker (bd pibot-0xpf.1);
+  // re-prompting would just re-spend turns on the same "undefined command"
+  if (state.methodBlocker) return { continue: false, reason: "method_blocked" };
   const now = opts.now ?? Date.now();
   // a snoozed rhythm means "don't interrupt"; the goal waits rather than dying
   if (opts.snoozed) return { continue: false, reason: "snoozed" };

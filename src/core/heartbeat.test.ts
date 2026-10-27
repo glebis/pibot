@@ -820,3 +820,141 @@ describe("passive bd-ticket pickup (bd: pibot-3w03)", () => {
     expect(host.escalateToAgent).not.toHaveBeenCalled();
   });
 });
+
+// ─── bd pibot-wr9m: the date guard is exercised at the ACTUAL delivery path ────
+// Frozen system dates + the real tick with a stubbed model/transport. The guard
+// must silence a wrong relative date BEFORE emission, never append a warning.
+describe("heartbeat speak date guard at the delivery path (bd pibot-wr9m)", () => {
+  let dir: string;
+  // 2026-10-26 08:32 Europe/Berlin (CET = UTC+1) — the exact observed moment Nov 2 was called "today"
+  const OCT26 = Date.UTC(2026, 9, 26, 7, 32);
+  const unanswered = (e: HeartbeatEngine) => (e as unknown as { unansweredSpeaks: Map<string, number> }).unansweredSpeaks;
+  const fingerprints = (e: HeartbeatEngine) => (e as unknown as { lastSpeakFingerprint: Map<string, string> }).lastSpeakFingerprint;
+
+  beforeEach(() => {
+    dir = tmpAgentDir();
+    nextActs.length = 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(OCT26));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    fs.rmSync(dir, { recursive: true, force: true });
+    nextActs.length = 0;
+    vi.mocked(PiAgent.createAgentSession).mockClear();
+    vi.mocked(PiAgent.getAgentDir).mockClear();
+  });
+
+  it("suppresses an English 'today, November 2' speak before emission and does not mark it delivered", async () => {
+    const agent = makeAgent(dir);
+    const { engine, host, events } = makeEngine(agent, dir);
+    const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+    queueActs([
+      { speak: "The deadline is today, November 2." },
+      { speak: "The November 2 deadline is in 7 days." },
+    ]);
+    await engine.tick(agent.id);
+    expect(deliver).not.toHaveBeenCalled(); // silenced, not warned
+    expect(unanswered(engine).get(agent.id)).toBeUndefined(); // a suppressed speak is NOT delivered
+    expect(fingerprints(engine).has(agent.id)).toBe(false);
+    await engine.tick(agent.id);
+    expect(deliver.mock.calls.map((c: unknown[]) => c[1])).toEqual(["The November 2 deadline is in 7 days."]);
+    expect(unanswered(engine).get(agent.id)).toBe(1);
+    const logs = (events.log as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[2]));
+    expect(logs.some((l) => l.startsWith("(suppressed, date mismatch)"))).toBe(true);
+  });
+
+  it("suppresses the Russian 'сегодня, 2 ноября' and the dotted numeric form", async () => {
+    const agent = makeAgent(dir);
+    const { engine, host } = makeEngine(agent, dir);
+    const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+    queueActs([
+      { speak: "Дедлайн — сегодня, 2 ноября." },
+      { speak: "Дедлайн — сегодня, 02.11.2026." },
+      { speak: "Дедлайн — через 7 дней, 02.11.2026." },
+    ]);
+    await engine.tick(agent.id);
+    await engine.tick(agent.id);
+    await engine.tick(agent.id);
+    expect(deliver.mock.calls.map((c: unknown[]) => c[1])).toEqual(["Дедлайн — через 7 дней, 02.11.2026."]);
+  });
+
+  it("keeps housekeeping (maintain journal + requested wakeup) while only the speak is suppressed", async () => {
+    const agent = makeAgent(dir);
+    const { engine, host } = makeEngine(agent, dir);
+    const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+    queueActs([{ maintain: "memory: rotated the journal", wakeup: "2h", speak: "The deadline is today, November 2." }]);
+    await engine.tick(agent.id);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(engine.takeNextWakeup(agent.id)).toBe(2 * 3600e3); // wakeup still applied
+    expect(fs.existsSync(path.join(dir, "memory", "maintenance.jsonl"))).toBe(true); // note still written
+  });
+
+  it("stays correct across the Europe/Berlin DST change (2026-10-25 23:30 UTC is already Oct 26 local)", async () => {
+    vi.setSystemTime(new Date(Date.UTC(2026, 9, 25, 23, 30)));
+    const agent = makeAgent(dir);
+    const { engine, host } = makeEngine(agent, dir);
+    const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+    queueActs([
+      { speak: "The deadline is today, November 2." }, // local day is Oct 26, so this is wrong
+      { speak: "The deadline is in 7 days, November 2." },
+    ]);
+    await engine.tick(agent.id);
+    await engine.tick(agent.id);
+    expect(deliver.mock.calls.map((c: unknown[]) => c[1])).toEqual(["The deadline is in 7 days, November 2."]);
+  });
+
+  it("delivers prose where 'today' merely co-occurs with a date — no false suppression (bd pibot-wr9m review)", async () => {
+    const agent = makeAgent(dir);
+    const { engine, host } = makeEngine(agent, dir);
+    const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+    queueActs([
+      { speak: "Today I checked the page for the November 2 deadline." },
+      { speak: "Сегодня проверил страницу: дедлайн 2 ноября." },
+    ]);
+    await engine.tick(agent.id);
+    await engine.tick(agent.id);
+    expect(deliver.mock.calls.map((c: unknown[]) => c[1])).toEqual([
+      "Today I checked the page for the November 2 deadline.",
+      "Сегодня проверил страницу: дедлайн 2 ноября.",
+    ]);
+  });
+});
+
+describe("buildHeartbeatDigest — computed relative wording in the named zone (bd pibot-wr9m)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = tmpAgentDir();
+    vi.useFakeTimers({ toFake: ["Date"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function digestFor(dueAt: number): string {
+    const agent = makeAgent(dir);
+    const scheduler = { list: vi.fn(() => [{ id: "1", title: "Deadline", dueAt, internal: false, wake: "important" }]) } as unknown as import("./scheduler.js").Scheduler;
+    const events = { tail: vi.fn(() => []) } as unknown as import("./events.js").EventLog;
+    return buildHeartbeatDigest(agent, scheduler, events);
+  }
+
+  it("renders the absolute date + exact Berlin clock + a computed relative phrase, never a bare 'today'", () => {
+    vi.setSystemTime(new Date(Date.UTC(2026, 9, 26, 7, 32))); // Oct 26 Berlin
+    const digest = digestFor(Date.UTC(2026, 10, 2, 9, 0)); // Nov 2 09:00 UTC = 10:00 Berlin
+    expect(digest).toContain('"Deadline" — 2026-11-02 10:00 (in 7 days) (!important)');
+    expect(digest).not.toMatch(/\btoday\b/);
+  });
+
+  it("keeps the exact Berlin due clock beside the relative wording so a same-day reminder stays actionable", () => {
+    // 2026-11-02 08:00 UTC = 09:00 Europe/Berlin; "today" alone would lose the time to act on.
+    vi.setSystemTime(new Date(Date.UTC(2026, 10, 2, 6, 0))); // 07:00 Berlin, before the due time
+    const digest = digestFor(Date.UTC(2026, 10, 2, 8, 0));
+    expect(digest).toContain("2026-11-02 09:00 (today)");
+  });
+
+  it("derives urgency in the NAMED zone, not the machine's (DST-safe)", () => {
+    vi.setSystemTime(new Date(Date.UTC(2026, 9, 25, 23, 30))); // = Oct 26 00:30 Berlin
+    expect(digestFor(Date.UTC(2026, 10, 2, 9, 0))).toContain("2026-11-02 10:00 (in 7 days)"); // 8 under a UTC machine zone
+  });
+});

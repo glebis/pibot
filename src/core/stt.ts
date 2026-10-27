@@ -4,6 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { errorMessage, truncate } from "./util.js";
+import {
+  probeDurationSecWithFfprobe,
+  runChunkedTranscription,
+  segmentAudioWithFfmpeg,
+  type ChunkedTranscriptionDeps,
+  type ChunkedTranscriptionResult,
+} from "./audio-chunks.js";
+import type { TranscriptionDurationInput } from "./transcription-policy.js";
 
 /**
  * Speech-to-Text with a configurable provider fallback chain
@@ -62,6 +70,9 @@ export interface SttDeps {
   /** precomputed availability of local CLIs (tests inject; null = absent) */
   whisperBin?: string | null;
   whisperkitBin?: string | null;
+  /** ffprobe/ffmpeg binaries for chunked long-audio work (tests inject; null = absent) */
+  ffprobeBin?: string | null;
+  ffmpegBin?: string | null;
   timeoutMs?: number;
   whisperkitTimeoutMs?: number;
 }
@@ -183,9 +194,49 @@ export class SttService {
     this.deps = deps;
   }
 
+  /** Host-enabled provider ids (for duration-aware planning, bd pibot-0xpf.4). */
+  get hostProviderIds(): SttProviderId[] {
+    return [...this.providers];
+  }
+
   /** True when at least one provider in the chain can plausibly run. */
   configured(policy: SttPolicy = {}): boolean {
     return sttProviderChain(this.providers, policy).some((p) => (p === "groq" ? !!process.env.GROQ_API_KEY : true));
+  }
+
+  /**
+   * Execute the long-audio Groq route end to end (bd pibot-0xpf.4): probe the
+   * duration when the plan cannot supply one, segment with ffmpeg, transcribe
+   * each <=15-min chunk with Groq ONLY, and join the transcripts in order.
+   *
+   * Every outside-world call — probe, segment, provider — goes through the
+   * injected deps so tests use mocks and temp fixtures (no live audio, no
+   * network). Defaults bind the real ffprobe/ffmpeg and a Groq-only `transcribe`,
+   * so a delegated long-audio run cannot quietly reach a local provider: the
+   * per-chunk policy is `{ providers: ["groq"], allowExternal: true }`.
+   */
+  async transcribeChunked(
+    filePath: string,
+    planInput: TranscriptionDurationInput,
+    deps: Partial<ChunkedTranscriptionDeps> = {},
+  ): Promise<ChunkedTranscriptionResult> {
+    const execFn = this.deps.execFileFn ?? execFile;
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-chunks-"));
+    const io: ChunkedTranscriptionDeps = {
+      probeDurationSec:
+        deps.probeDurationSec ??
+        ((file) => probeDurationSecWithFfprobe(execFn, file, "ffprobeBin" in this.deps ? this.deps.ffprobeBin ?? null : undefined)),
+      segment:
+        deps.segment ??
+        ((file, seconds) => segmentAudioWithFfmpeg(execFn, file, seconds, outDir, "ffmpegBin" in this.deps ? this.deps.ffmpegBin ?? null : undefined)),
+      transcribeChunk: deps.transcribeChunk ?? ((file) => this.transcribe(file, { providers: ["groq"], allowExternal: true })),
+      ...(deps.cleanupParts ? { cleanupParts: deps.cleanupParts } : {}),
+    };
+    try {
+      return await runChunkedTranscription(filePath, planInput, io);
+    } finally {
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
   }
 
   async transcribe(audioPath: string, policy: SttPolicy = {}, options: SttOptions = {}): Promise<SttResult> {

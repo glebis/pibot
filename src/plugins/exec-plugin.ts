@@ -7,6 +7,7 @@ import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { childEnv } from "../core/child-env.js";
 import { truncate } from "../core/util.js";
+import { appendExecTrace, searchExecTrace, readExecArtifact, type ExecTraceInput } from "./exec-trace.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -447,17 +448,51 @@ export function execPlugin(deps: ExecPluginDeps): InlineExtension {
     name: "exec",
     factory: (pi) => {
       pi.registerTool({
+        name: 'exec_audit_search', label: 'Search own execution audit',
+        description: 'Find this agent’s recent execution metadata by exact task ID, call ID or YouTube URL (query parameters are never stored). Reads only the last 2 MiB, returns at most 20 entries. New calls only; not a search of old conversations.',
+        parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: 1000 }) }),
+        async execute(_id, params) {
+          try { return { content: [{ type: 'text', text: JSON.stringify(searchExecTrace(deps.agentDir, params.query)) }], details: { ok: true } }; }
+          catch { return refuse('execution audit unavailable'); }
+        },
+      });
+      pi.registerTool({
+        name: 'exec_result_read', label: 'Read processing text artifact',
+        description: 'Read UTF-8 text outputs only from your own runtime/artifacts directory. Supply a relative filename; no symlinks or traversal. Maximum 64 KiB, text formats only. Configure processing output there using an already allowlisted command; this tool does not authorize a previously refused command.',
+        parameters: Type.Object({ path: Type.String({ minLength: 1, maxLength: 1000 }) }),
+        async execute(_id, params) {
+          try { return { content: [{ type: 'text', text: readExecArtifact(deps.agentDir, params.path) }], details: { ok: true } }; }
+          catch { return refuse('artifact unavailable or outside the permitted text artifact boundary'); }
+        },
+      });
+      pi.registerTool({
         name: "exec_run",
         label: "Run allowlisted command",
         description:
           "Run a command from this agent's vetted exec allowlist. Pass argv (array of strings, command first). NO shell: no pipes, redirections or substitutions — plain argv only. Binaries are resolved and matched against pinned entries; denied arguments (e.g. yt-dlp --exec, osascript -e) are refused. Long-running commands are capped by a timeout; output is truncated.",
         parameters: Type.Object({
           argv: Type.Array(Type.String({ description: "argument vector — command first, then arguments" }), { minItems: 1, maxItems: 64, description: "e.g. [\"yt-dlp\", \"--skip-download\", \"--list-subs\", URL]" }),
+          taskId: Type.Optional(Type.String({ pattern: '^[A-Za-z0-9_:.-]{1,160}$', description: 'Task reference for audit lookup; metadata only, not authorization.' })),
         }),
         async execute(_tcid, params): Promise<ExecToolResult> {
           const started = Date.now();
-          const resolved = await resolveExec(params.argv, deps, allowlist);
-          if (resolved.error) return refuse(resolved.error);
+          const trace = (outcome: ExecTraceInput['outcome'], reason?: string, exitCode?: number | null): boolean => {
+            try { appendExecTrace(deps.agentDir, { callId: _tcid, taskId: params.taskId, argv: params.argv, outcome, reason, exitCode }); return true; }
+            catch { return false; }
+          };
+          let resolved: Awaited<ReturnType<typeof resolveExec>>;
+          try { resolved = await resolveExec(params.argv, deps, allowlist); }
+          catch { trace('refused', 'resolution failed'); return refuse('command resolution failed'); }
+          if (resolved.error) {
+            const reason = resolved.error.includes('not found') ? 'command missing'
+              : resolved.error.includes('shell metacharacters') ? 'shell syntax denied'
+              : resolved.error.includes('denied argument') ? 'argument denied'
+              : resolved.error.includes('not on this agent') ? 'not allowlisted' : 'constraint denied';
+            const logged = trace('refused', reason);
+            return refuse(resolved.error + (logged ? '' : ' (audit unavailable)'));
+          }
+          // Fail closed before executing when durable diagnostic metadata cannot be recorded.
+          if (!trace('started')) return refuse('execution audit unavailable; command not started');
           try {
             const { stdout, stderr } = await execFileAsync(resolved.argv[0], resolved.argv.slice(1), {
               cwd: resolved.cwd,
@@ -472,10 +507,12 @@ export function execPlugin(deps: ExecPluginDeps): InlineExtension {
               stdout.trim() ? `--- stdout ---\n${truncate(stdout, maxOutput)}` : "--- (no stdout) ---",
               stderr.trim() ? `--- stderr ---\n${truncate(stderr, maxOutput)}` : "",
             ].filter(Boolean).join("\n");
-            return { content: [{ type: "text" as const, text: body }], details: { ok: true, exitCode: 0, durationMs: Date.now() - started } };
+            const recorded = trace('succeeded', undefined, 0);
+            return { content: [{ type: "text" as const, text: body + (recorded ? '' : '\nAudit completion missing; command succeeded — do not repeat.') }], details: { ok: true, exitCode: 0, durationMs: Date.now() - started } };
           } catch (e) {
             const err = e as { code?: number | string; killed?: boolean; stdout?: string; stderr?: string; message?: string };
             const secs = Math.round((Date.now() - started) / 1000);
+            trace(err.killed ? 'timed-out' : 'failed', 'execution failed', typeof err.code === 'number' ? err.code : null);
             const text = [
               err.killed ? `timed out after ${secs}s` : `exit ${err.code ?? "?"} · ${secs}s`,
               err.stdout?.trim() ? `--- stdout ---\n${truncate(err.stdout, maxOutput)}` : "",

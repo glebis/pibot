@@ -16,15 +16,32 @@ import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
 import { truncate } from "../core/util.js";
 import { scanNumericClaims } from "../core/fact-check.js";
+import { correctRelativeDateClaims } from "../core/relative-date-guard.js";
 
 export type LedgerStatus = "queued" | "running" | "done" | "partial" | "blocked" | "failed" | "cancelled";
 
-/** Evidence that a task's output was actually delivered (bd pibot-zy70). */
+/** Strongest proof of delivery obtained so far, weakest first. An API ack is NOT a same-peer
+ *  readback, and neither is a human viewing the message (bd pibot-cida). */
+export type DeliveryEvidence = "ack" | "readback" | "viewed";
+
+/** Evidence that a task's output was actually delivered (bd pibot-zy70).
+ *  A message id alone proves neither *where* the result landed nor *what* it was, so the
+ *  receipt is a tuple: account/bot + peer (destination) + message id + media type, with the
+ *  id namespace named explicitly (bd pibot-cida). */
 export interface Delivery {
-  /** id of the Telegram message that carried the result / final notice */
+  /** id of the message that carried the result / final notice — only meaningful with `peer`
+   *  and `idProtocol`, never comparable across different id namespaces */
   messageId?: number;
   /** actually delivered medium: "video_note" | "video" | "text" | … (undefined = only a text notice went out) */
   mediaType?: string;
+  /** destination the receipt attests, as "transport:chatId"; absent = the destination is unverified */
+  peer?: string;
+  /** bot/account identity that performed the send */
+  account?: string;
+  /** message-id namespace ("bot_api", "mtproto", …) — ids from different protocols are never the same message */
+  idProtocol?: string;
+  /** strongest evidence obtained: an API ack is not a readback, and neither is a human viewing */
+  evidence?: DeliveryEvidence;
   deliveredAt?: number;
 }
 
@@ -51,6 +68,14 @@ export interface LedgerTaskInput {
   /** medium the owner explicitly asked for (e.g. "video_note"); set only when delivery of that
    *  medium is part of the expected output — then `done` requires the receipt to match it. */
   expectedMedia?: string;
+  /** destination the receipt must attest, as "transport:chatId"; defaults to chatKey (the origin
+   *  chat). Set this when the owner deliberately asked for a DIFFERENT target (e.g. Saved
+   *  Messages) — the completion gate must then prove THAT destination, not the origin. */
+  expectedPeer?: string;
+  /** bot account the receipt must attest (e.g. "@pibot") — optional cross-check (bd pibot-cida) */
+  expectedAccount?: string;
+  /** message-id namespace the receipt must attest ("bot_api" | "mtproto") — optional cross-check */
+  expectedIdProtocol?: string;
   /** work lane: "dev" (pibot source work, pibot-dev's lane) vs "cross-agent" (owner-facing
    *  content/tooling tasks) — task-record-canon keeps the two from mixing (bd pibot-r47f) */
   lane?: "dev" | "cross-agent";
@@ -78,6 +103,8 @@ export interface LedgerEntry extends LedgerTaskInput {
   blocker?: string;
   /** programmatic arithmetic check of the result's numeric claims (bd pibot-wr9m) */
   factCheck?: { checked: number; inconsistent: number; failures: string[] };
+  /** date-backed correction of relative wording that contradicted the absolute date (bd pibot-wr9m) */
+  dateCheck?: { checked: number; inconsistent: number; corrected: boolean; blocked: boolean; failures: string[] };
   /** delivery receipt for the verified output (bd pibot-zy70) */
   delivery?: Delivery;
   /** pi-durable task id, kept so cancel() works after a restart */
@@ -160,6 +187,45 @@ function filterUndefined<T extends object>(o: T): T {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T;
 }
 
+/**
+ * Why an expected-medium delivery is not yet verifiable (bd pibot-cida). The receipt must name the
+ * delivered medium, a valid message id, a destination, a MEANINGFUL bot account and the id
+ * namespace — the MHT case showed a message id that actually lived in a different dialogue than the
+ * one claimed, and an agent id is not a bot identity. The expected destination is explicit
+ * (`expectedPeer`, defaulting to the origin chat), so a deliberately different target is checked
+ * against ITSELF, never hardcoded to the origin. The wording stays a gap statement ("not verified"),
+ * never an assertion that nothing arrived.
+ */
+function describeDeliveryGap(
+  delivery: Omit<Delivery, "deliveredAt"> | undefined,
+  input: Pick<LedgerTaskInput, "chatKey" | "agentId" | "expectedPeer" | "expectedAccount" | "expectedIdProtocol">,
+  expect: string,
+  validMessageId: boolean,
+): string | undefined {
+  if (!delivery) return `requested ${expect} but the delivery was not verified (no media receipt)`;
+  if (delivery.mediaType !== expect) {
+    return delivery.mediaType
+      ? `requested ${expect} but delivered ${delivery.mediaType}`
+      : `requested ${expect} but the delivery was not verified (no media type in the receipt)`;
+  }
+  if (!validMessageId) return `requested ${expect} but delivery has no valid message ID`;
+  const expectedPeer = input.expectedPeer ?? input.chatKey;
+  if (!delivery.peer) return `requested ${expect} but the receipt names no destination (destination unverified)`;
+  if (delivery.peer !== expectedPeer) return `requested ${expect} but delivered to ${delivery.peer} instead of ${expectedPeer}`;
+  if (!delivery.account) return `requested ${expect} but the receipt names no sending account (account unverified)`;
+  if (delivery.account === input.agentId) {
+    return `requested ${expect} but the receipt's account is the agent id "${input.agentId}", not a bot account (account unverified)`;
+  }
+  if (input.expectedAccount && delivery.account !== input.expectedAccount) {
+    return `requested ${expect} but sent as ${delivery.account} instead of ${input.expectedAccount}`;
+  }
+  if (!delivery.idProtocol) return `requested ${expect} but the receipt names no id namespace (id protocol unverified)`;
+  if (input.expectedIdProtocol && delivery.idProtocol !== input.expectedIdProtocol) {
+    return `requested ${expect} but the receipt used id protocol ${delivery.idProtocol} instead of ${input.expectedIdProtocol}`;
+  }
+  return undefined;
+}
+
 function prune(doc: LedgerDoc): void {
   const finished = Object.values(doc.tasks).filter((t) => !active(t.status)).sort((a, b) => b.updatedAt - a.updatedAt);
   for (const old of finished.slice(KEEP_FINISHED)) {
@@ -222,12 +288,21 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
           if (error instanceof BlockedError) final = "blocked";
         }
         const validMessageId = typeof delivery?.messageId === "number" && Number.isSafeInteger(delivery.messageId) && delivery.messageId > 0;
-        if (ok && expect && (!delivery || delivery.mediaType !== expect || !validMessageId)) {
-          // Verified-completion gate (bd pibot-zy70): when the owner asked for a specific
-          // medium, `done` requires the receipt to name that same medium.
+        const deliveryProblem = ok && expect ? describeDeliveryGap(delivery, input, expect, validMessageId) : undefined;
+        if (deliveryProblem) {
+          // Verified-completion gate (bd pibot-zy70) made destination/account-aware (bd pibot-cida):
+          // when the owner asked for a specific medium, `done` requires the receipt to name that same
+          // medium, the intended destination, a real bot account and the id namespace — a message id
+          // alone is not proof.
           final = "partial";
         }
         text = text.slice(0, RESULT_CHARS);
+        // Relative-date wording (bd pibot-wr9m): rewrite mis-stated relative words from the absolute
+        // date they sit beside rather than appending a warning to a reminder that still reads false.
+        // If the wording cannot be safely rewritten, fail safe — the result is not presented as done.
+        const dateGuard = ok ? correctRelativeDateClaims(text, { now: now() }) : undefined;
+        if (dateGuard && dateGuard.inconsistent > 0 && dateGuard.corrected) text = dateGuard.text;
+        if (dateGuard?.blocked) final = "partial";
         // Programmatic fact-check of numeric claims (bd pibot-wr9m): only mechanical
         // arithmetic, only on work results (error texts are not claim prose).
         const factCheck = ok ? scanNumericClaims(text) : { checked: 0, inconsistent: 0, failures: [] as string[] };
@@ -237,11 +312,14 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
         await rt.commit(async (tx) => {
           const entry = (await ledgerDoc(tx, rt.conversationId)).tasks[ledgerId];
           if (entry) {
-            if (factCheck.checked > 0 && factCheck !== undefined) entry.factCheck = factCheck;
+            if (factCheck.checked > 0) entry.factCheck = factCheck;
+            if (dateGuard && dateGuard.inconsistent > 0) {
+              entry.dateCheck = { checked: dateGuard.checked, inconsistent: dateGuard.inconsistent, corrected: dateGuard.corrected, blocked: dateGuard.blocked, failures: dateGuard.failures };
+            }
             if (final === "blocked") Object.assign(entry, { status: "blocked", blocker: text }, { updatedAt: now() });
             else if (final === "partial") {
-              const mismatch = expect ?
-                (delivery?.mediaType === expect && !validMessageId ? `requested ${expect} but delivery has no valid message ID` : delivery?.mediaType ? `requested ${expect} but delivered ${delivery.mediaType}` : `requested ${expect} but the delivery was not verified (no media receipt)`) : "output only partly delivered";
+              const mismatch = deliveryProblem
+                ?? (dateGuard?.blocked ? "relative date wording contradicted the absolute date and could not be corrected safely" : "output only partly delivered");
               Object.assign(entry, { status: "partial", error: mismatch, result: text, updatedAt: now() });
             } else if (ok) Object.assign(entry, { status: "done", result: text }, { updatedAt: now() });
             else Object.assign(entry, { status: "failed", error: text }, { updatedAt: now() });
@@ -273,13 +351,30 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
           const doc = await ledgerDoc(tx, rt.conversationId);
           const entry = doc.tasks[task.input.ledgerId];
           if (entry && (final === "done" || final === "partial")) {
-            // Delivery receipt (bd pibot-zy70): the result's message id comes from the runner's
-            // own receipt (the media send), falling back to the notice push id for text results;
-            // media type from the runner; keys with no evidence stay unset (strict JSON).
+            // Delivery receipt (bd pibot-zy70, destination/account-aware in bd pibot-cida): the
+            // result's message id/type/destination come from the runner's own receipt (the media
+            // send) when it exists; otherwise from the notice push. A receipt field the transport did
+            // NOT attest stays unset — a missing destination/account/namespace is recorded as
+            // unverified, never manufactured from the requested chat (bd pibot-cida review). Keys with
+            // no evidence stay unset (strict JSON).
+            const noticeReceipt = typeof receipt === "object" ? (receipt as Delivery) : undefined;
             const d: Delivery = { deliveredAt: now() };
-            if (delivery?.messageId !== undefined) d.messageId = delivery.messageId;
-            else if (typeof receipt === "object" && receipt?.messageId !== undefined) d.messageId = receipt.messageId;
-            if (delivery?.mediaType !== undefined) d.mediaType = delivery.mediaType;
+            if (delivery) {
+              if (delivery.messageId !== undefined) d.messageId = delivery.messageId;
+              if (delivery.peer !== undefined) d.peer = delivery.peer;
+              if (delivery.mediaType !== undefined) d.mediaType = delivery.mediaType;
+              if (delivery.account !== undefined) d.account = delivery.account;
+              if (delivery.idProtocol !== undefined) d.idProtocol = delivery.idProtocol;
+              if (delivery.evidence !== undefined) d.evidence = delivery.evidence;
+            } else if (noticeReceipt?.messageId !== undefined) {
+              d.messageId = noticeReceipt.messageId;
+              if (noticeReceipt.peer !== undefined) d.peer = noticeReceipt.peer;
+              if (noticeReceipt.mediaType !== undefined) d.mediaType = noticeReceipt.mediaType;
+              if (noticeReceipt.account !== undefined) d.account = noticeReceipt.account;
+              if (noticeReceipt.idProtocol !== undefined) d.idProtocol = noticeReceipt.idProtocol;
+              if (noticeReceipt.evidence !== undefined) d.evidence = noticeReceipt.evidence;
+            }
+            if (d.messageId !== undefined && d.evidence === undefined) d.evidence = "ack";
             entry.delivery = d;
           }
           prune(doc);

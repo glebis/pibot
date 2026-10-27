@@ -12,6 +12,7 @@ import type { Config } from "../config.js";
 import type { ModelCascade } from "./cascade.js";
 import type { PushOptions, ReplyContext, Schedule, Transport, IncomingMedia, DeliveryReceipt } from "./types.js";
 import { OWNER_CHAT_ID, ownerChatKey } from "../test-fixtures.js";
+import { transcriptionPolicyMarker } from "./transcription-policy.js";
 
 // The /newagent wizard runs the LLM-backed ambiguity gate before creating the
 // agent. With no modelRuntime stub the SDK falls back to the machine's real
@@ -89,14 +90,22 @@ class MockTransport implements Transport {
     this.speechSeen.push({ kind: "audio", chatId, filePath, caption });
   }
   mediaSends: Array<{ chatId: string; source: string }> = [];
+  /** override the attested destination for negative tests (bd pibot-cida) */
+  receiptPeer?: string;
+  /** the delivery tuple a real transport attests: the peer it actually posted to, the bot account and
+   *  the id namespace (bd pibot-cida). `receiptPeer` overrides the peer to simulate a response whose
+   *  chat.id disagrees with the requested chat. */
+  private receipt(chatId: string, extra: { messageId: number; mediaType: string }): DeliveryReceipt {
+    return { ...extra, account: "@mockbot", idProtocol: "bot_api", peer: this.receiptPeer ?? `${this.name}:${chatId}` };
+  }
   async sendMedia(chatId: string, source: string): Promise<DeliveryReceipt> {
     this.mediaSends.push({ chatId, source });
     const image = /\.(jpe?g|png|webp|gif|heic)$/i.test(source) || /^https?:/.test(source);
-    return { messageId: 77, mediaType: image ? "photo" : "document" };
- }
+    return this.receipt(chatId, { messageId: 77, mediaType: image ? "photo" : "document" });
+  }
   async sendVideoNote(chatId: string, filePath: string): Promise<DeliveryReceipt> {
     this.videoNoteSeen.push({ chatId, filePath });
-    return { messageId: 66, mediaType: "video_note" };
+    return this.receipt(chatId, { messageId: 66, mediaType: "video_note" });
   }
   onMessage(cb: (text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>): void {
     this.messageCb = cb;
@@ -166,6 +175,29 @@ function fakeAgentManager(promptSpy = vi.fn()) {
     ),
     list: vi.fn(() => [{ id: "assistant", dir: "/x", manifest: { name: "assistant" } }]),
     defaultAgentId: () => "assistant",
+    // Field-level, compare-and-swap manifest write — mirrors AgentManager.updateManifest
+    // (bd pibot-4wq1) so /model and the wizard exercise the real one-field patch path.
+    updateManifest: vi.fn((agentId: string, patch: Record<string, unknown>) => {
+      const agent = (agents.getAgent as (id: string) => { dir: string; manifest: Record<string, unknown> } | undefined)(agentId);
+      if (!agent) return { ok: false, error: `Unknown agent "${agentId}"` };
+      const file = path.join(agent.dir, "agent.json");
+      let current: Record<string, unknown>;
+      try {
+        current = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+      } catch {
+        current = { ...agent.manifest };
+      }
+      current.name = current.name || agentId;
+      const next: Record<string, unknown> = { ...current };
+      for (const key of Object.keys(patch)) {
+        const value = patch[key];
+        if (value === undefined) delete next[key];
+        else next[key] = value;
+      }
+      fs.mkdirSync(agent.dir, { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(next, null, 2));
+      return { ok: true, manifest: next };
+    }),
   } as unknown as AgentManager;
   return { agents, emitSessionEvent: (event: unknown) => sessionListeners.forEach((listener) => listener(event)) };
 }
@@ -1021,9 +1053,11 @@ describe("PiBot fire delivery", () => {
 
   it("sendAsAgent attributes sends on shared transports and logs them", async () => {
     const t = makeBot();
-    await t.bot.sendAsAgent("assistant", "mock:42", "hello from the tool");
+    const res = await t.bot.sendAsAgent("assistant", "mock:42", "hello from the tool");
     expect(t.transport.lastText()).toBe("**[assistant]** hello from the tool");
     expect(t.events.log).toHaveBeenCalledWith("assistant", "send", expect.stringContaining("mock:42"));
+    // the receipt names the destination even when the transport returns no message id
+    expect(res.receipts?.[0]).toMatchObject({ peer: "mock:42" });
   });
 
   it("sendAsAgent skips the prefix on the agent's own bot", async () => {
@@ -1800,6 +1834,65 @@ describe("task ack confirmations", () => {
     b.chatAgent.set(ck, agentId);
     b.agentChats.set(agentId, new Set([ck]));
   }
+});
+
+describe("session capability inventory at the acceptance path (bd pibot-4wq1)", () => {
+  function emptySession() {
+    return {
+      agent: { state: { messages: [] } },
+      prompt: vi.fn(async () => {}),
+      setModel: vi.fn(async () => {}),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+  }
+
+  it("records the delegated target's ACTUAL authorised capability set at acceptance", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(emptySession());
+    const inventory = {
+      agentId: "assistant",
+      sessionKey: "assistant::agent::assistant::from-knower",
+      chatKey: "agent::assistant::from-knower",
+      capabilities: ["memory"],
+      unavailable: ["commitments"],
+      capabilityContext: "- memory_save and memory_recall manage durable notes owned by this agent.",
+      authorisedTools: ["memory_save", "memory_recall"],
+      activeTools: ["memory_save", "memory_recall"],
+      evidence: "live-session" as const,
+      builtManifestSha: "sha-a",
+      currentManifestSha: "sha-a",
+      stale: false,
+      builtAt: 0,
+    };
+    (t.agents as unknown as { sessionInventory: unknown }).sessionInventory = vi.fn((_agentId: string, chatKey: string) =>
+      chatKey === "agent::assistant::from-knower" ? inventory : undefined
+    );
+
+    await (t.bot as unknown as { agentTurn(a: string, f: string, text: string): Promise<string> }).agentTurn(
+      "assistant", "knower", "file the Berlin takeaways"
+    );
+
+    const lines = (t.events.log as ReturnType<typeof vi.fn>).mock.calls
+      .map((call) => String(call[2]))
+      .filter((line) => line.includes("session-inventory"));
+    expect(lines.some((line) => line.includes("delegation accepted from knower"))).toBe(true);
+    expect(lines.some((line) => line.includes("live-session"))).toBe(true);
+    expect(lines.some((line) => line.includes("memory_save"))).toBe(true);
+    expect(lines.some((line) => line.includes("commitment_capture"))).toBe(false); // no unavailable grant surfaced
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("never claims a live inventory when the manager exposes none", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(emptySession());
+    await (t.bot as unknown as { agentTurn(a: string, f: string, text: string): Promise<string> }).agentTurn(
+      "assistant", "knower", "a quick inter-agent question"
+    );
+    const lines = (t.events.log as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[2]));
+    expect(lines.some((line) => line.includes("session-inventory"))).toBe(false);
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
 });
 
 describe("chat routing ownership", () => {
@@ -2732,6 +2825,77 @@ describe("task media delivery receipts (bd pibot-zy70)", () => {
     expect(t.transport.mediaSends).toEqual([]);
     expect(t.transport.videoNoteSeen).toEqual([]);
   });
+
+  it("delivers the result medium to an explicit different expectedPeer, never to the origin chat", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "MEDIA: /tmp/note-tk9.mp4\nSaved it for you." }], stopReason: "stop", timestamp: 2 });
+    });
+    const result = await t.bot.runLedgerTask(run({ expectedMedia: "video_note", expectedPeer: "mock:99" }));
+    expect(t.transport.videoNoteSeen).toEqual([{ chatId: "99", filePath: "/tmp/note-tk9.mp4" }]);
+    expect(result).toMatchObject({ delivery: { peer: "mock:99", mediaType: "video_note" } });
+  });
+
+  it("refuses with a precise blocker when the expected target has no reachable transport", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "MEDIA: /tmp/note-tk9.mp4\nSaved it." }], stopReason: "stop", timestamp: 2 });
+    });
+    await expect(t.bot.runLedgerTask(run({ expectedMedia: "video_note", expectedPeer: "nosuch:7" }))).rejects.toThrow(/no reachable transport "nosuch"/);
+    expect(t.transport.videoNoteSeen).toEqual([]); // nothing sent to the origin chat either
+  });
+});
+
+// ─── transcription exec guard wiring into the background run (bd pibot-0xpf.4 review) ───
+
+describe("background task transcription guard wiring (bd pibot-0xpf.4)", () => {
+  let t: ReturnType<typeof makeBot>;
+  const run = (instructions: string, resumed = false) =>
+    ({ agentId: "assistant", chatKey: "mock:42", taskId: "tk-guard", title: "long audio", instructions, attempt: resumed ? 2 : 1, resumed, signal: new AbortController().signal }) as never;
+
+  beforeEach(() => { t = makeBot(); });
+  afterEach(() => { fs.rmSync(t.dir, { recursive: true, force: true }); });
+
+  const lastExtras = () => (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.at(-1)![11] as unknown[];
+
+  /** Capture the tool_call handlers a host-attached guard extension registers (as pi would run them). */
+  function guardHandlers(ext: unknown): Array<(event: unknown) => { block?: boolean } | void> {
+    const handlers: Array<(event: unknown) => { block?: boolean } | void> = [];
+    const pi = { on: (name: string, h: (event: unknown) => { block?: boolean } | void) => { if (name === "tool_call") handlers.push(h); }, registerTool: vi.fn() };
+    (ext as { factory: (p: unknown) => void }).factory(pi);
+    return handlers;
+  }
+
+  it("attaches the guard to the task's own session when the durable contract declares long audio", async () => {
+    const instructions = `${transcriptionPolicyMarker("chunked-external")}\nTRANSCRIPTION POLICY (owner instruction): chunks of <=15 min via Groq.`;
+    await t.bot.runLedgerTask(run(instructions));
+    const extras = lastExtras();
+    expect(extras).toHaveLength(1);
+    expect((extras[0] as { name?: string }).name).toBe("transcription-exec-guard");
+  });
+
+  it("passes a guard whose blocked exec_run argv never reaches execution", async () => {
+    const instructions = `${transcriptionPolicyMarker("chunked-external")}\nTRANSCRIPTION POLICY (owner instruction): chunks via Groq.`;
+    await t.bot.runLedgerTask(run(instructions));
+    const handlers = guardHandlers(lastExtras()[0]);
+    const result = handlers
+      .map((h) => h({ type: "tool_call", toolCallId: "c1", toolName: "exec_run", input: { argv: ["whisperkit-cli", "x.wav"] } }))
+      .find((r) => r?.block);
+    expect(result?.block).toBe(true);
+  });
+
+  it("re-attaches the guard on a resumed attempt, from the durable contract", async () => {
+    const instructions = `${transcriptionPolicyMarker("probe-required")}\nPROBE the duration first.`;
+    await t.bot.runLedgerTask(run(instructions, true));
+    expect(lastExtras()).toHaveLength(1);
+  });
+
+  it("attaches nothing for a task with no audio contract (short/unrelated tasks unaffected)", async () => {
+    await t.bot.runLedgerTask(run("just write the summary, no audio here"));
+    expect(lastExtras()).toEqual([]);
+  });
 });
 
 // ─── delivery-proof logging: the real composition PiBot + durable ledger (bd pibot-7jqj) ───
@@ -2777,7 +2941,7 @@ describe("task ledger integration: media-type gate end to end", () => {
     await stubTaskTurn("MEDIA: /tmp/note-it1.mp4\nHere is your round note.");
     const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "video note", instructions: "make it", expectedMedia: "video_note" });
     const done = await pollUntil(() => ledger.get(task.id), (e) => e?.status === "done");
-    expect(done!.delivery).toMatchObject({ messageId: 66, mediaType: "video_note" });
+    expect(done!.delivery).toMatchObject({ messageId: 66, mediaType: "video_note", peer: "mock:42", account: "@mockbot", idProtocol: "bot_api", evidence: "ack" });
     expect(done!.delivery!.deliveredAt).toBeTruthy();
     expect(t.transport.videoNoteSeen).toEqual([{ chatId: "42", filePath: "/tmp/note-it1.mp4" }]);
     expect(notes[0]).toContain("✅ Task done");
@@ -2790,6 +2954,17 @@ describe("task ledger integration: media-type gate end to end", () => {
     const entry = await pollUntil(() => ledger.get(task.id), (e) => e?.status === "partial");
     expect(entry!.delivery).toMatchObject({ mediaType: "document" });
     expect(entry!.error).toContain("requested video_note but delivered document");
+    expect(notes[0]).toContain("🟡 Task partial");
+    expect(notes[0]).not.toContain("Task done");
+  });
+
+  it("records partial when the receipt attests a different destination than the task's chat", async () => {
+    t.transport.receiptPeer = "mock:99"; // the message id belongs to another dialogue
+    await stubTaskTurn("MEDIA: /tmp/note-it3.mp4\nHere is your round note.");
+    const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "video note", instructions: "make it", expectedMedia: "video_note" });
+    const entry = await pollUntil(() => ledger.get(task.id), (e) => e?.status === "partial");
+    expect(entry!.error).toContain("delivered to mock:99 instead of mock:42");
+    expect(entry!.delivery).toMatchObject({ messageId: 66, mediaType: "video_note", peer: "mock:99" });
     expect(notes[0]).toContain("🟡 Task partial");
     expect(notes[0]).not.toContain("Task done");
   });
@@ -2808,5 +2983,207 @@ describe("video_note_send routing", () => {
     await hooks("mock", "42", "/tmp/circle.mp4");
     expect(t.transport.videoNoteSeen).toEqual([{ chatId: "42", filePath: "/tmp/circle.mp4" }]);
     await expect(hooks("mock", "43", "/tmp/circle.mp4")).rejects.toThrow(/invoking chat/i);
+  });
+});
+
+// ─── /goal execution-method preflight (bd pibot-0xpf.1) ─────────────────────
+
+describe("/goal execution-method preflight (bd pibot-0xpf.1)", () => {
+  /** an injected, deterministic probe — production uses the bounded local PATH/docs probe */
+  const probe = (over: { which?: (c: string) => string | null; docs?: (c: string) => string[] } = {}) => ({
+    which: over.which ?? (() => null),
+    docs: over.docs ?? (() => []),
+  });
+  const stateGoals = (t: ReturnType<typeof makeBot>) => JSON.parse(fs.readFileSync(path.join(t.dir, "state.json"), "utf8")).goals;
+
+  it("parks a goal whose named method is unresolved instead of spending a turn", async () => {
+    const t = makeBot();
+    (t.bot as unknown as { deps: { methodProbe: unknown } }).deps.methodProbe = probe();
+    await t.transport.say("/goal use cmd acp to summarise the backlog");
+    expect(t.promptSpy).not.toHaveBeenCalled(); // no model spend
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal not started"))).toBe(true);
+    expect(stateGoals(t)["mock:42"].methodBlocker).toMatchObject({ reason: "unknown_method" });
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("does not treat ordinary prose ('use evidence and examples') as a required method", async () => {
+    const t = makeBot();
+    (t.bot as unknown as { deps: { methodProbe: unknown } }).deps.methodProbe = probe();
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementation(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }] });
+    });
+    await t.transport.say("/goal use evidence and examples to compare three systems");
+    expect(t.promptSpy).toHaveBeenCalled();
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal set"))).toBe(true);
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("notifies ONCE for a repeated identical blocker and clears it on explicit resume", async () => {
+    const t = makeBot();
+    const bot = t.bot as unknown as { deps: { methodProbe: unknown } };
+    bot.deps.methodProbe = probe();
+    await t.transport.say("/goal use cmd acp to do it");
+    expect(t.transport.pushed.filter((p) => p.opts.text.includes("Goal not started")).length).toBe(1);
+    // resume while still blocked: the identical blocker produces no second notice, no spend
+    await t.transport.say("/goal resume");
+    expect(t.transport.pushed.filter((p) => p.opts.text.includes("Still blocked")).length).toBe(0);
+    expect(t.promptSpy).not.toHaveBeenCalled();
+    // the owner resolves the method → explicit resume clears the blocker and activates the goal
+    bot.deps.methodProbe = probe({ which: (c) => (c === "cmd" ? "/usr/local/bin/cmd" : null), docs: () => ["/skills/herdr.md"] });
+    await t.transport.say("/goal resume");
+    const goal = stateGoals(t)["mock:42"];
+    expect(goal.methodBlocker).toBeUndefined();
+    expect(goal.status).toBe("active");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("does not spend a turn on an installed-but-unavailable method on the production default path", async () => {
+    const t = makeBot();
+    // NO injected probe: production goalMethodProbe() runs. A real `cmd` on PATH is "installed", but
+    // this agent holds no exec/herdr/bash route (DEFAULT_EXEC_ALLOWLIST has no cmd; HERDR_AGENTS
+    // excludes it), so the honest preflight blocks it rather than spending a turn.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-goalpath-"));
+    fs.writeFileSync(path.join(dir, "cmd"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${dir}${path.delimiter}${prevPath ?? ""}`;
+    try {
+      await t.transport.say("/goal use cmd acp to summarise the backlog");
+      expect(t.promptSpy).not.toHaveBeenCalled(); // no model spend
+      expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal not started"))).toBe(true);
+      expect(stateGoals(t)["mock:42"].methodBlocker).toMatchObject({ reason: "not_permitted" });
+    } finally {
+      process.env.PATH = prevPath;
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(t.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a method the agent can actually run through its shell (permission preflight)", async () => {
+    const t = makeBot();
+    // give this agent a real shell route; the binary then resolves on PATH and the goal may start
+    const base = (t.agents.getAgent as ReturnType<typeof vi.fn>).getMockImplementation() as (id: string) => unknown;
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "assistant"
+        ? { id, dir: "/tmp/fake-assistant", manifest: { name: id, description: "d", tools: ["bash"], heartbeat: { enabled: true, interval: "45m" }, evolution: { enabled: true, interval: "6h" } } }
+        : base(id),
+    );
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementation(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }] });
+    });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-goalpath-"));
+    fs.writeFileSync(path.join(dir, "pytest"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${dir}${path.delimiter}${prevPath ?? ""}`;
+    try {
+      await t.transport.say("/goal run pytest to check the suite");
+      expect(t.promptSpy).toHaveBeenCalled();
+      expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal set"))).toBe(true);
+      expect(stateGoals(t)["mock:42"].methodBlocker).toBeUndefined();
+    } finally {
+      process.env.PATH = prevPath;
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(t.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── duration-aware voice transcription (bd pibot-0xpf.4) ───────────────────
+
+describe("duration-aware voice transcription (bd pibot-0xpf.4)", () => {
+  const speechAgent = (t: ReturnType<typeof makeBot>, sttProviders: string[], allowExternalStt = false) => {
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "assistant" ? { id, dir: "/tmp/fake-assistant", manifest: { name: id, speech: { sttProviders, allowExternalStt } } } : undefined
+    );
+  };
+  const chunkedOk = (text = "chunk one chunk two") =>
+    vi.fn(async () => ({ ok: true as const, route: "chunked-external" as const, provider: "groq" as const, text, durationSec: 1200, chunks: 2, transcripts: ["chunk one", "chunk two"] }));
+
+  it("chunks known >15-min audio through Groq and shows the chunked transcript", async () => {
+    const t = makeBot();
+    speechAgent(t, ["groq"], true);
+    (t.stt as unknown as { hostProviderIds: string[] }).hostProviderIds = ["groq"];
+    const transcribeChunked = chunkedOk();
+    (t.stt as unknown as { transcribeChunked: unknown }).transcribeChunked = transcribeChunked;
+    t.audioMedia.prepare.mockResolvedValueOnce({ ok: true, filePath: "/tmp/long.ogg", durationSec: 1200, cleanup: vi.fn(async () => {}) } as never);
+    await t.transport.sayMedia({ kind: "voice", durationSec: 1200 });
+    expect(transcribeChunked).toHaveBeenCalledOnce();
+    expect(t.stt.transcribe).not.toHaveBeenCalled(); // no local fallback
+    expect(t.promptSpy.mock.calls[0][0]).toContain("chunk one chunk two");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("blocks — never substituting local WhisperKit — when the approved Groq route is unavailable", async () => {
+    const t = makeBot();
+    speechAgent(t, ["whisperkit"]);
+    (t.stt as unknown as { hostProviderIds: string[] }).hostProviderIds = ["whisperkit"];
+    (t.stt as unknown as { transcribeChunked: unknown }).transcribeChunked = vi.fn();
+    t.audioMedia.prepare.mockResolvedValueOnce({ ok: true, filePath: "/tmp/long.ogg", durationSec: 1200, cleanup: vi.fn(async () => {}) } as never);
+    await t.transport.sayMedia({ kind: "voice", durationSec: 1200 });
+    expect(t.stt.transcribe).not.toHaveBeenCalled(); // no forbidden local fallback
+    expect(t.transport.lastText()).toContain("Transcription failed");
+    expect(t.transport.lastText()).toContain("Groq");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("probes an unknown duration rather than assuming it is short or long", async () => {
+    const t = makeBot();
+    speechAgent(t, ["groq"], true);
+    (t.stt as unknown as { hostProviderIds: string[] }).hostProviderIds = ["groq"];
+    // the probe (inside transcribeChunked) finds it short → re-plans to the normal chain
+    const transcribeChunked = vi.fn(async () => ({ ok: false as const, route: "policy" as const, provider: "none" as const, text: "", durationSec: 30, chunks: 0, transcripts: [] as string[], error: "route this audio through the normal transcription path" }));
+    (t.stt as unknown as { transcribeChunked: unknown }).transcribeChunked = transcribeChunked;
+    t.audioMedia.prepare.mockResolvedValueOnce({ ok: true, filePath: "/tmp/unknown.ogg", durationSec: undefined, cleanup: vi.fn(async () => {}) } as never);
+    t.stt.transcribe.mockResolvedValueOnce({ ok: true, text: "short words", provider: "groq" });
+    await t.transport.sayMedia({ kind: "voice" });
+    expect(transcribeChunked).toHaveBeenCalledOnce(); // probed, not assumed
+    expect(t.stt.transcribe).toHaveBeenCalled();
+    expect(t.promptSpy.mock.calls[0][0]).toContain("short words");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+});
+
+// ─── heartbeat relative-date correction (bd pibot-wr9m) ─────────────────────
+
+describe("heartbeat relative-date correction (bd pibot-wr9m)", () => {
+  it("rewrites a mis-stated relative date in automated proactive output", async () => {
+    const t = makeBot();
+    await t.transport.say("remember this chat"); // bind mock:42 → assistant
+    t.transport.pushed = [];
+    const spy = vi.spyOn(Date, "now").mockReturnValue(Date.UTC(2026, 9, 26, 6, 32));
+    try {
+      await t.bot.deliverToAgent("assistant", "Дедлайн сегодня — 2 ноября.");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(t.transport.lastText()).toContain("через 7 дней");
+    expect(t.transport.lastText()).not.toContain("сегодня");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+});
+
+// ─── guarded manifest writes (bd pibot-4wq1) ────────────────────────────────
+
+describe("guarded manifest writes (bd pibot-4wq1)", () => {
+  it("/model writes only the model field, preserving unrelated manifest fields", async () => {
+    const t = makeBot();
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-model-preserve-"));
+    const manifestPath = path.join(agentDir, "agent.json");
+    fs.writeFileSync(manifestPath, JSON.stringify({ name: "assistant", description: "d", capabilities: ["speech", "tasks", "commitments"], telegram: { token: "secret" } }));
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "assistant" ? { id, dir: agentDir, manifest: JSON.parse(fs.readFileSync(manifestPath, "utf8")) } : undefined
+    );
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/a:cloud"]);
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "a" } as never);
+    await t.transport.say("/model ollama/a:cloud");
+    const written = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    expect(written.model).toBe("ollama/a:cloud");
+    expect(written.capabilities).toEqual(["speech", "tasks", "commitments"]);
+    expect(written.telegram).toEqual({ token: "secret" });
+    expect(t.agents.updateManifest).toHaveBeenCalledWith("assistant", { model: "ollama/a:cloud" });
+    fs.rmSync(agentDir, { recursive: true, force: true });
   });
 });

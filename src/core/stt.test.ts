@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SttService, sttProviderChain, sttProvidersFromEnv } from "./stt.js";
 
 const tmpDirs: string[] = [];
@@ -191,5 +191,60 @@ describe("SttService", () => {
     expect(new SttService(["groq"]).configured()).toBe(false);
     expect(new SttService(["groq"]).configured({ providers: ["groq"], allowExternal: true })).toBe(true);
     expect(new SttService(["local_whisper"]).configured()).toBe(true);
+  });
+});
+
+describe("SttService chunked long-audio path (bd pibot-0xpf.4)", () => {
+  it("exposes the host provider ids for duration-aware planning", () => {
+    expect(new SttService(["whisperkit", "groq"]).hostProviderIds).toEqual(["whisperkit", "groq"]);
+  });
+
+  it("segments, transcribes each chunk with Groq only and joins in order", async () => {
+    process.env.GROQ_API_KEY = "test-key";
+    const files = [tmpOgg("part-a"), tmpOgg("part-b")];
+    let calls = 0;
+    const fetchFn = fakeFetchJson(() => {
+      calls += 1;
+      return new Response(JSON.stringify({ text: `chunk ${calls}` }), { status: 200 });
+    });
+    const stt = new SttService(["groq"], { fetchFn });
+    const res = await stt.transcribeChunked(
+      tmpOgg("original"),
+      { durationSec: 27 * 60, policy: { providers: ["groq"], allowExternal: true }, hostProviders: ["whisperkit", "groq"] },
+      { probeDurationSec: async () => 27 * 60, segment: async () => files },
+    );
+    expect(res.ok).toBe(true);
+    expect(res.provider).toBe("groq");
+    expect(res.text).toBe("chunk 1\n\nchunk 2");
+    expect(calls).toBe(2);
+  });
+
+  it("probes an unknown duration and blocks precisely when the probe cannot supply one", async () => {
+    const stt = new SttService(["groq"], { fetchFn: fakeFetchJson(() => new Response("{}", { status: 200 })) });
+    let probed = false;
+    const res = await stt.transcribeChunked(
+      tmpOgg(),
+      { durationSec: null, policy: { providers: ["groq"], allowExternal: true }, hostProviders: ["whisperkit", "groq"] },
+      { probeDurationSec: async () => { probed = true; return null; }, segment: async () => [], transcribeChunk: async () => ({ ok: true, text: "x", provider: "groq" }) },
+    );
+    expect(probed).toBe(true);
+    expect(res.ok).toBe(false);
+    expect(res.route).toBe("probe-required");
+    expect(res.error).toMatch(/probe/i);
+  });
+
+  it("blocks long audio with no permitted Groq route and never falls back to a local provider", async () => {
+    const stt = new SttService(["whisperkit", "local_whisper"], {});
+    const chunkCall = vi.fn(async () => ({ ok: true, text: "local?", provider: "whisperkit" }));
+    const res = await stt.transcribeChunked(
+      tmpOgg(),
+      // policy permits only WhisperKit, host has no groq
+      { durationSec: 27 * 60, policy: { providers: ["whisperkit"] }, hostProviders: ["whisperkit", "local_whisper"] },
+      { probeDurationSec: async () => 27 * 60, segment: async () => ["/tmp/only.wav"], transcribeChunk: chunkCall },
+    );
+    expect(res.ok).toBe(false);
+    expect(res.route).toBe("blocked");
+    expect(res.provider).toBe("none");
+    expect(chunkCall).not.toHaveBeenCalled();
   });
 });

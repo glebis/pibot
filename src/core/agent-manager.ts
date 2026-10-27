@@ -11,6 +11,7 @@ import {
   SessionManager,
   SettingsManager,
   type AgentSession,
+  type InlineExtension,
   type ModelRuntime,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -24,6 +25,7 @@ import type { IntakeStore } from "./research-intake.js";
 import type { TaskLedger } from "../durable/task-ledger.js";
 import { childEnv } from "./child-env.js";
 import { EventLog } from "./events.js";
+import { planManifestPatch, sha256Hex, type ManifestDiff, type ManifestPatch } from "./manifest-policy.js";
 import type { Scheduler } from "./scheduler.js";
 import { DEFAULT_AGENT_TOOLS, defaultManifest, type AgentManifest, type ChatRef } from "./types.js";
 import { ensureDir, errorMessage, readJson, truncate, writeJsonAtomic } from "./util.js";
@@ -34,10 +36,97 @@ export interface LoadedAgent {
   manifest: AgentManifest;
 }
 
+/** Outcome of a field-level manifest update (bd pibot-4wq1). */
+export interface ManifestUpdateResult {
+  ok: boolean;
+  /** sha256 of the manifest bytes on disk after a successful write */
+  sha?: string;
+  manifest?: AgentManifest;
+  diff?: ManifestDiff;
+  /** precise reason when ok=false */
+  error?: string;
+}
+
+/**
+ * What a session WOULD enable for an agent's live manifest (bd pibot-4wq1).
+ *
+ * This is a would-resolve inventory, not proof of the actual running session: it
+ * re-reads the manifest from disk and resolves the registry against the caller's
+ * host context. The `session*` flags state exactly how far that is from a live
+ * session, so an accept/delegate check never claims more than it can prove.
+ */
+export interface SessionCapabilityInventory {
+  agentId: string;
+  /** always true — this is a would-resolve computation, never a live-session read */
+  resolved: true;
+  /** capability ids as requested on disk (null = the conservative default set) */
+  requested: string[] | null;
+  /** capability ids a session would actually enable on this host right now */
+  capabilities: string[];
+  /** tool names the session would load */
+  tools: string[];
+  /** requested ids this host cannot provide (missing hook, executable or policy) */
+  unavailable: string[];
+  /** true when a session has been built for this agent (a build-time fingerprint exists) */
+  sessionBuilt: boolean;
+  /** true when the on-disk manifest differs from the build-time fingerprint (session needs a rebuild) */
+  sessionStale: boolean;
+  /** true when a live session object is currently held for this agent (any chat) */
+  sessionActive: boolean;
+}
+
+/**
+ * Evidence strength of a live session-inventory reading (bd pibot-4wq1):
+ *   - `"live-session"`: the built session object exposed its own active tool names
+ *     (`getActiveToolNames`), so the reading describes the session that is actually held;
+ *   - `"unknown"`: the session object exposed no introspection, so the ACTUAL active tools
+ *     are explicitly unknown. The authorised set the build requested is still recorded — it
+ *     is never presented as a live reading.
+ */
+export type SessionInventoryEvidence = "live-session" | "unknown";
+
+/**
+ * What one BUILT session actually holds, keyed by agent + chat (bd pibot-4wq1).
+ *
+ * Unlike {@link SessionCapabilityInventory} (a would-resolve computation with no live
+ * caller), this describes a session the host created: the authorised capability ids the
+ * build resolved, the unavailable ids it had to skip, the authorised capability context it
+ * built into the system prompt, and the ACTUAL active tool names read from the live session
+ * when the SDK exposes them. Staleness is judged per session — a manifest patch leaves THIS
+ * session stale until it is rebuilt, and rebuilding one session never refreshes another.
+ */
+export interface SessionInventory {
+  agentId: string;
+  /** `${agentId}::${chatKey}` — the exact built session this snapshot describes */
+  sessionKey: string;
+  chatKey: string;
+  /** capability ids the build actually authorised (the same resolve the system prompt used) */
+  capabilities: string[];
+  /** requested ids this host could not provide at build time — recorded, never granted */
+  unavailable: string[];
+  /** the authorised capability context built into this session (preserved verbatim) */
+  capabilityContext: string;
+  /** the full tool set the build authorised */
+  authorisedTools: string[];
+  /** active tool names read from the live session, or null when introspection was unavailable */
+  activeTools: string[] | null;
+  /** how the reading was obtained — a non-live reading is never claimed as live proof */
+  evidence: SessionInventoryEvidence;
+  /** sha256 of the manifest this session was built from */
+  builtManifestSha?: string;
+  /** sha256 of the manifest on disk right now (recomputed on query) */
+  currentManifestSha?: string;
+  /** true when currentManifestSha differs from builtManifestSha (a rebuild is required) */
+  stale: boolean;
+  builtAt: number;
+}
+
 export class AgentManager {
   private agents = new Map<string, LoadedAgent>();
   private sessions = new Map<string, AgentSession>(); // `${agentId}::${chatKey}` → session
   private builtManifestShas = new Map<string, string>(); // agentId → manifest sha at session-build time
+  /** per-session capability inventory captured at build/refresh (bd pibot-4wq1) */
+  private sessionInventories = new Map<string, SessionInventory>();
   /** measurable commitment loop (proactive pilot); set by the host after wiring */
   commitments?: CommitmentPluginEngine;
   /** durable research-intake sessions (wizard persistence) */
@@ -175,6 +264,12 @@ export class AgentManager {
     /** minimal-voice shaping applied to spoken text before synthesis (bd: minimal voice).
      *  Last on purpose: the call site appends it without disturbing existing arg positions. */
     styleSpeech?: (text: string) => string,
+    /**
+     * Extra inline extensions for THIS session build only (bd pibot-0xpf.4 exec guard).
+     * The host appends a per-task policy guard here for a background task's own run;
+     * kept last so existing positional call sites are unaffected.
+     */
+    extraExtensions: InlineExtension[] = [],
   ): Promise<AgentSession> {
     const key = `${agentId}::${chatKey}`;
     const cached = this.sessions.get(key);
@@ -242,6 +337,9 @@ export class AgentManager {
       // shared plugins bound to this agent + chat
         extensionFactories: [
           ...capabilitySet.extensions,
+          // Per-task policy guard (if any) for this build only — e.g. the long-audio
+          // transcription exec guard the host attaches to a background task's own run.
+          ...extraExtensions,
           // Host-level, not a capability: every agent needs compaction, and the guard has to
           // exist for agents created before it did — without editing private manifests.
           autoCompactPlugin({
@@ -288,6 +386,9 @@ export class AgentManager {
     this.sessions.set(key, session);
     // fingerprint the manifest NOW so later on-disk grant/manifest edits flag the session stale (bd: pibot-3w03)
     this.noteSessionBuilt(agentId);
+    // capture the ACTUAL authorised capability set this build produced, keyed to this exact
+    // chat (bd pibot-4wq1) — the real host path, read back from the session object itself.
+    this.captureSessionInventory(agentId, chatKey, session, capabilitySet);
     return session;
   }
 
@@ -334,6 +435,137 @@ export class AgentManager {
     return disk !== undefined && disk !== built;
   }
 
+  /** sha256 of the manifest currently on disk (undefined when absent or unreadable). */
+  manifestSha(agentId: string): string | undefined {
+    return this.manifestShaOnDisk(agentId);
+  }
+
+  /**
+   * Read the inventory of the session actually BUILT for one agent+chat (bd pibot-4wq1).
+   *
+   * Returns the snapshot captured when the session was built: the authorised capability ids
+   * and the capability context the build produced, the unavailable ids the host had to skip,
+   * and the ACTUAL active tool names read from the live session when it exposes them
+   * (`evidence: "live-session"`; otherwise "unknown" — the active tools are then explicitly
+   * unknown, never claimed as live). `currentManifestSha`/`stale` are recomputed against the
+   * manifest on disk NOW, from the snapshot's OWN build-time hash, so a manifest patch keeps
+   * THIS session stale until it is rebuilt and rebuilding one session never marks another
+   * refreshed. Absent = no session has ever been built for this key.
+   */
+  sessionInventory(agentId: string, chatKey: string): SessionInventory | undefined {
+    const snapshot = this.sessionInventories.get(`${agentId}::${chatKey}`);
+    if (!snapshot) return undefined;
+    const current = this.manifestShaOnDisk(agentId);
+    return {
+      ...snapshot,
+      currentManifestSha: current,
+      stale: current !== undefined && snapshot.builtManifestSha !== undefined && current !== snapshot.builtManifestSha,
+    };
+  }
+
+  /** Snapshot what a just-built session actually holds — authorised ids/context plus the
+   *  session's own active tools. Read-only: it never widens or restores a grant. */
+  private captureSessionInventory(
+    agentId: string,
+    chatKey: string,
+    session: AgentSession,
+    built: { ids: string[]; unavailable: string[]; systemPrompt: string; sessionTools: string[] },
+  ): void {
+    const builtManifestSha = this.manifestShaOnDisk(agentId);
+    const activeTools = readActiveToolNames(session);
+    this.sessionInventories.set(`${agentId}::${chatKey}`, {
+      agentId,
+      sessionKey: `${agentId}::${chatKey}`,
+      chatKey,
+      capabilities: [...built.ids],
+      unavailable: [...built.unavailable],
+      capabilityContext: built.systemPrompt,
+      authorisedTools: [...built.sessionTools],
+      activeTools,
+      evidence: activeTools ? "live-session" : "unknown",
+      builtManifestSha,
+      currentManifestSha: builtManifestSha,
+      stale: false,
+      builtAt: Date.now(),
+    });
+  }
+
+  /**
+   * Field-level, compare-and-swap manifest update (bd pibot-4wq1).
+   *
+   * Only the keys present in `patch` change; every other authorised field already
+   * on disk is preserved verbatim. Removals from capability/tool/provider lists
+   * must be named in `acknowledgeRemovals`, and a concurrent edit is refused via
+   * `expectedSha` — so an "emergency replacement" can no longer drop a grant it
+   * forgot to enumerate. Nothing is restored from history or widened on its own.
+   *
+   * The write deliberately does NOT refresh the session-build fingerprint:
+   * isSessionStale() stays true so the host rebuilds against the new grants.
+   */
+  updateManifest(
+    agentId: string,
+    patch: ManifestPatch,
+    opts: { expectedSha?: string; acknowledgeRemovals?: readonly string[] } = {},
+  ): ManifestUpdateResult {
+    const agent = this.agents.get(agentId);
+    if (!agent) return { ok: false, error: `Unknown agent "${agentId}"` };
+    const file = path.join(agent.dir, "agent.json");
+    let raw: string;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      return { ok: false, error: `No manifest at ${file}` };
+    }
+    const currentSha = sha256Hex(raw);
+    let current: AgentManifest;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+      current = parsed as AgentManifest;
+    } catch {
+      return { ok: false, error: `manifest at ${file} is not a JSON object — refusing to overwrite it` };
+    }
+    current.name = current.name || agentId;
+    const plan = planManifestPatch(current, patch, { ...opts, currentSha });
+    if (!plan.ok || !plan.manifest) return { ok: false, error: plan.error, diff: plan.diff };
+    writeJsonAtomic(file, plan.manifest);
+    const fresh = this.refreshAgentFromDisk(agentId);
+    return { ok: true, sha: sha256Hex(fs.readFileSync(file, "utf8")), manifest: fresh?.manifest ?? plan.manifest, diff: plan.diff };
+  }
+
+  /**
+   * The capability inventory a session WOULD resolve for this agent's live
+   * manifest right now (bd pibot-4wq1): the manifest is re-read from disk and run
+   * through the real registry against the caller's real host context, so an
+   * accept/delegate check reports what would be enabled — and what this host
+   * cannot provide — instead of trusting the file.
+   *
+   * This is not an active-session read: `sessionBuilt`/`sessionStale`/
+   * `sessionActive` (and the always-true `resolved` marker) let the caller tell a
+   * would-resolve inventory from a live one, so it is never presented as proof
+   * that a running session actually holds these capabilities.
+   */
+  resolveAgentInventory(
+    agentId: string,
+    ctx: Omit<CapabilityContext, "agent">,
+    registry: readonly CapabilityDefinition[] = CAPABILITY_REGISTRY,
+  ): SessionCapabilityInventory | undefined {
+    const agent = this.refreshAgentFromDisk(agentId);
+    if (!agent) return undefined;
+    const set = resolveAgentCapabilitySet({ ...ctx, agent: { id: agent.id, dir: agent.dir, manifest: agent.manifest } }, registry);
+    return {
+      agentId,
+      resolved: true,
+      requested: agent.manifest.capabilities ?? null,
+      capabilities: set.ids,
+      tools: set.sessionTools,
+      unavailable: set.unavailable,
+      sessionBuilt: this.builtManifestShas.has(agentId),
+      sessionStale: this.isSessionStale(agentId),
+      sessionActive: [...this.sessions.keys()].some((key) => key.startsWith(`${agentId}::`)),
+    };
+  }
+
   async resetSession(agentId: string, chatKey: string, chat: ChatRef, scheduler: Scheduler): Promise<void> {
     const key = `${agentId}::${chatKey}`;
     const old = this.sessions.get(key);
@@ -345,6 +577,8 @@ export class AgentManager {
       }
     }
     this.sessions.delete(key);
+    // a rebuild/reset replaces this session's inventory: drop it so the next build re-captures
+    this.sessionInventories.delete(key);
     // drop the index entry so the next getOrCreateSession creates a new file
     const sessionsDir = path.join(this.agentsDir, agentId, "sessions");
     const indexPath = path.join(sessionsDir, "index.json");
@@ -366,6 +600,32 @@ export class AgentManager {
     if (!spec || spec === "same") return undefined; // fall back to agent default
     return this.resolveModel(spec);
   }
+}
+
+/**
+ * Read a session's ACTUAL active tool names through the SDK's own accessor
+ * (`getActiveToolNames`). Returns null when the session object exposes no introspection or
+ * throws — the caller must then report the active tools as "unknown", never fabricate a live
+ * reading (bd pibot-4wq1).
+ */
+function readActiveToolNames(session: AgentSession): string[] | null {
+  const fn = (session as { getActiveToolNames?: unknown }).getActiveToolNames;
+  if (typeof fn !== "function") return null;
+  try {
+    const names = (session as { getActiveToolNames: () => unknown }).getActiveToolNames.call(session);
+    if (!Array.isArray(names)) return null;
+    return names.filter((name): name is string => typeof name === "string");
+  } catch {
+    return null;
+  }
+}
+
+/** One-line, evidence-honest rendering of a built session's inventory for host diagnostics (bd pibot-4wq1). */
+export function formatSessionInventory(inv: SessionInventory): string {
+  const caps = inv.capabilities.length ? inv.capabilities.join(", ") : "(none)";
+  const missing = inv.unavailable.length ? ` unavailable=${inv.unavailable.join(", ")}` : "";
+  const tools = inv.activeTools ? `${inv.activeTools.length} active tools [${inv.activeTools.join(", ")}]` : "active tools unknown";
+  return `[session-inventory ${inv.evidence}] ${inv.sessionKey} · caps=${caps}${missing} · ${tools}${inv.stale ? " · STALE (rebuild required)" : ""}`;
 }
 
 function listTsFiles(dir: string): string[] {

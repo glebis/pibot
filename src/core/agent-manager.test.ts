@@ -289,3 +289,160 @@ describe("live capability refresh — session staleness (bd: pibot-3w03)", () =>
     fs.renameSync(file() + ".bak", file());
   });
 });
+
+describe("manifest field-level updates + real capability inventory (bd pibot-4wq1)", () => {
+  let dir: string;
+  let mgr: AgentManager;
+  const file = () => path.join(dir, "alpha", "agent.json");
+  const disk = () => JSON.parse(fs.readFileSync(file(), "utf8"));
+
+  // A scoped registry keeps the resolution deterministic: no plugin construction,
+  // and "commitments" stands in for a capability this host cannot provide.
+  const REGISTRY: readonly CapabilityDefinition[] = [
+    { id: "memory", defaultEnabled: true, tools: ["memory_save"], create: () => ({ name: "memory", factory: () => {} }) },
+    { id: "tasks", defaultEnabled: true, tools: ["start_task"], create: () => ({ name: "tasks", factory: () => {} }) },
+    { id: "commitments", defaultEnabled: true, tools: ["commitment_capture"], available: () => false, create: () => ({ name: "commitments", factory: () => {} }) },
+  ];
+
+  beforeEach(async () => {
+    dir = tmpDir();
+    mgr = new AgentManager(dir, { getModels: () => [] } as never);
+    mgr.createAgent("alpha");
+    fs.writeFileSync(
+      file(),
+      JSON.stringify(
+        {
+          name: "alpha",
+          model: "anthropic/claude-opus-4-6",
+          providers: ["anthropic"],
+          capabilities: ["memory", "tasks", "commitments"],
+          speech: { sttProviders: ["whisperkit", "groq"], allowExternalStt: true },
+          heartbeat: { enabled: true, interval: "45m" },
+        },
+        null,
+        2,
+      ),
+    );
+    await mgr.discover();
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("changes only the patched field, preserving grants, providers and policy", () => {
+    const r = mgr.updateManifest("alpha", { description: "calmer mornings" });
+    expect(r.ok).toBe(true);
+    expect(r.diff!.changed).toEqual(["description"]);
+    expect(r.diff!.added).toEqual({});
+    expect(r.diff!.removed).toEqual({});
+    const m = disk();
+    expect(m.capabilities).toEqual(["memory", "tasks", "commitments"]);
+    expect(m.providers).toEqual(["anthropic"]);
+    expect(m.speech).toEqual({ sttProviders: ["whisperkit", "groq"], allowExternalStt: true });
+    expect(m.heartbeat).toEqual({ enabled: true, interval: "45m" });
+  });
+
+  it("a nested one-field patch preserves unrelated sibling keys on disk", () => {
+    const r = mgr.updateManifest("alpha", { speech: { allowExternalStt: false } });
+    expect(r.ok).toBe(true);
+    expect(r.diff!.changed).toEqual(["speech"]);
+    const m = disk();
+    expect(m.speech).toEqual({ sttProviders: ["whisperkit", "groq"], allowExternalStt: false });
+    // the untouched nested object keeps its own siblings
+    expect(m.heartbeat).toEqual({ enabled: true, interval: "45m" });
+  });
+
+  it("refuses a capability replacement that would silently drop tasks and commitments", () => {
+    const r = mgr.updateManifest("alpha", { capabilities: ["memory"] });
+    expect(r.ok).toBe(false);
+    expect(r.diff!.removed).toEqual({ capabilities: ["tasks", "commitments"] });
+    expect(r.error).toMatch(/acknowledgement/);
+    expect(disk().capabilities).toEqual(["memory", "tasks", "commitments"]);
+  });
+
+  it("applies an acknowledged removal and reports it as an explicit diff", () => {
+    const r = mgr.updateManifest("alpha", { capabilities: ["memory", "tasks"] }, { acknowledgeRemovals: ["commitments"] });
+    expect(r.ok).toBe(true);
+    expect(r.diff!.removed).toEqual({ capabilities: ["commitments"] });
+    expect(disk().capabilities).toEqual(["memory", "tasks"]);
+  });
+
+  it("refuses a stale write (compare-and-swap) so a concurrent edit is not clobbered", () => {
+    const built = mgr.updateManifest("alpha", { description: "first" });
+    const staleSha = built.sha!;
+    const other = disk();
+    other.description = "someone else";
+    fs.writeFileSync(file(), JSON.stringify(other, null, 2));
+    const refused = mgr.updateManifest("alpha", { description: "second" }, { expectedSha: staleSha });
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toMatch(/compare-and-swap/);
+    expect(disk().description).toBe("someone else");
+    const ok = mgr.updateManifest("alpha", { description: "second" }, { expectedSha: mgr.manifestSha("alpha")! });
+    expect(ok.ok).toBe(true);
+    expect(disk().description).toBe("second");
+  });
+
+  it("leaves the live session stale after an update so the new grant is actually re-resolved", () => {
+    mgr.noteSessionBuilt("alpha");
+    expect(mgr.isSessionStale("alpha")).toBe(false);
+    const r = mgr.updateManifest("alpha", { capabilities: ["memory", "tasks", "commitments", "speech"] });
+    expect(r.ok).toBe(true);
+    expect(r.diff!.added).toEqual({ capabilities: ["speech"] });
+    expect(mgr.isSessionStale("alpha")).toBe(true);
+  });
+
+  it("refuses to overwrite a manifest that is not a JSON object", () => {
+    fs.writeFileSync(file(), "{ not json");
+    const r = mgr.updateManifest("alpha", { description: "x" });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/not a JSON object/);
+    expect(fs.readFileSync(file(), "utf8")).toBe("{ not json");
+  });
+
+  it("resolves a would-resolve inventory from the refreshed manifest, not the file text", () => {
+    const ctx = {
+      workspace: dir,
+      vaultDir: dir,
+      scheduler: {},
+      chat: { transport: "test", chatId: "1" },
+    } as unknown as Omit<CapabilityContext, "agent">;
+
+    const before = mgr.resolveAgentInventory("alpha", ctx, REGISTRY)!;
+    expect(before.requested).toEqual(["memory", "tasks", "commitments"]);
+    expect(before.capabilities).toEqual(["memory", "tasks"]); // commitments is unavailable on this host
+    expect(before.unavailable).toEqual(["commitments"]);
+    expect(before.tools).toEqual(["memory_save", "start_task"]);
+    // it is a would-resolve computation, not proof of a live session
+    expect(before.resolved).toBe(true);
+    expect(before.sessionBuilt).toBe(false);
+    expect(before.sessionStale).toBe(false);
+    expect(before.sessionActive).toBe(false);
+
+    mgr.updateManifest("alpha", { capabilities: ["memory"] }, { acknowledgeRemovals: ["tasks", "commitments"] });
+
+    const after = mgr.resolveAgentInventory("alpha", ctx, REGISTRY)!;
+    expect(after.requested).toEqual(["memory"]);
+    expect(after.capabilities).toEqual(["memory"]);
+    expect(after.unavailable).toEqual([]);
+    expect(after.tools).toEqual(["memory_save"]);
+  });
+
+  it("reports session built/stale/active state so an inventory is never mistaken for a live session", () => {
+    const ctx = { workspace: dir, vaultDir: dir, scheduler: {}, chat: { transport: "test", chatId: "1" } } as unknown as Omit<CapabilityContext, "agent">;
+    mgr.noteSessionBuilt("alpha");
+    const built = mgr.resolveAgentInventory("alpha", ctx, REGISTRY)!;
+    expect(built.sessionBuilt).toBe(true);
+    expect(built.sessionStale).toBe(false);
+
+    mgr.updateManifest("alpha", { description: "changed" });
+    const stale = mgr.resolveAgentInventory("alpha", ctx, REGISTRY)!;
+    expect(stale.sessionBuilt).toBe(true);
+    expect(stale.sessionStale).toBe(true); // a real rebuild is required before a session holds the new grants
+  });
+
+  it("reports an unknown agent rather than inventing a manifest", () => {
+    expect(mgr.updateManifest("ghost", { description: "x" })).toMatchObject({ ok: false });
+    expect(mgr.resolveAgentInventory("ghost", {} as never, REGISTRY)).toBeUndefined();
+  });
+});

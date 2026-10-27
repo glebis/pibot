@@ -92,6 +92,18 @@ describe("createAgentFromSpec", () => {
     cleanup();
   });
 
+  it("writes through the field-level manifest guard and preserves scaffolded fields", async () => {
+    const { agents, cleanup } = setup();
+    const spy = vi.spyOn(agents, "updateManifest");
+    const r = await createAgentFromSpec({ agents }, { id: "guarded", description: "Runs guarded work" });
+    expect(r.ok).toBe(true);
+    expect(spy).toHaveBeenCalled();
+    const onDisk = JSON.parse(fs.readFileSync(path.join((r as { ok: true; dir: string }).dir, "agent.json"), "utf8"));
+    expect(onDisk.name).toBe("guarded");
+    expect(onDisk.heartbeat).toMatchObject({ enabled: true, interval: "90m" });
+    cleanup();
+  });
+
   it("rejects collisions, bad ids, empty descriptions", async () => {
     const { agents, cleanup } = setup();
     agents.createAgent("taken", "seed");

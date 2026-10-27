@@ -1,9 +1,9 @@
 import { urgentSourceReceipt } from '../voice/urgent-sources.js';
 import type { UrgentSourceStore, SourceScope, BlockedDecisionProjection } from '../voice/urgent-sources.js';
 import { CanonicalTurnGate, VOICE_CALL_DIRECTIVE, type ActiveVoiceTurn, type BotVoiceInput, type BotVoiceResult, type VoiceToolGroup } from '../voice/session-control.js';
-import { CAPABILITY_REGISTRY } from './capabilities.js';
+import { CAPABILITY_REGISTRY, executableAvailable } from './capabilities.js';
 import type { VoiceOwnerCommands } from '../voice/owner-commands.js';
-import type { TaskRun, LedgerEntry } from '../durable/task-ledger.js';
+import { BlockedError, type TaskRun, type LedgerEntry, type Delivery } from '../durable/task-ledger.js';
 import { listChildProcesses, type ChildProcess, type ProcessControl } from './processes.js';
 import { beginActivity, liveActivities, trackActivity } from './activity.js';
 import { VoiceFront, type CallRecord, type TaskEvent } from '../voice/front.js';
@@ -15,7 +15,7 @@ import type { InboxControl } from "../web-inbox-routes.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildManifest, buildPersona, validateAgentName, type AgentDraft, type Proactivity } from "./agent-factory.js";
-import { listSkillDirs } from "./agent-manager.js";
+import { formatSessionInventory, listSkillDirs } from "./agent-manager.js";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { LabPublicationSync } from "./lab-publication.js";
 import { LabCompanion, labContactLinks, labMenu } from "./lab-companion.js";
@@ -23,22 +23,24 @@ import { TelegramTransport } from "../transports/telegram.js";
 import { attendCli } from "../plugins/attend-plugin.js";
 import { createCommandHandler, evolutionReviewCard, type CommandContext } from "./commands.js";
 import { classifyTaskReply, isTaskLike, taskAckLine, taskAcksEnabled } from "./task-acks.js";
-import type { AgentManager, LoadedAgent } from "./agent-manager.js";
+import type { AgentManager, LoadedAgent, SessionInventory } from "./agent-manager.js";
 import type { CommitmentEngine } from "./commitments.js";
 import { nudgeCard } from "./commitments.js";
 import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
-import type { TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
+import type { TelegramSendHooks, TelegramSendResult } from "../plugins/telegram-send-plugin.js";
 import { QuestionBus, type QuestionSpec } from "./questions.js";
 import { MessageCoalescer } from "./message-coalescer.js";
 import { ScheduleRouteError, type Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
 import type { Card, ChatRef, DeliveryReceipt, IncomingMedia, ReplyContext, Schedule, Transport } from "./types.js";
+import { DEFAULT_AGENT_TOOLS } from "./types.js";
+import type { AgentManifest } from "./types.js";
 import * as os from "node:os";
 import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBotUsername } from "./agent-factory.js";
 import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
-import { buildHandoffEnvelope, composeHandoffBrief } from "./handoff-brief.js";
+import { buildHandoffEnvelope, composeHandoffBrief, handoffNeedsLongAudioRule } from "./handoff-brief.js";
 import { SttService, type SttPolicy } from "./stt.js";
 import { applyCorrections, composeBias, loadDictionary } from "./dictionary.js";
 import { getMediaLinkKey, mediaBase, mediaLinkUrl, stashForLink } from "./media-links.js";
@@ -46,9 +48,16 @@ import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { applyVoiceStyle, isOperationalNotice, requestsFullPath, VOICE_STYLE_DIRECTIVE } from "./voice-style.js";
 import {
-  advanceGoal, goalCard, newGoal, renderGoalBlock, renderGoalStatus, shouldContinue,
+  advanceGoal, goalCard, newGoal, renderGoalBlock, renderGoalStatus, shouldContinue, withMethodBlocker,
   type GoalIO, type GoalState,
 } from "./goals.js";
+import { createLocalMethodProbe, methodBlockerSignature, validateGoalMethods, type GoalMethodBlocker, type MethodProbe } from "./method-resolution.js";
+import { formatTranscriptionPlan, planTranscription, LONG_AUDIO_THRESHOLD_SEC, LONG_AUDIO_RULE } from "./transcription-policy.js";
+import { correctRelativeDateClaims } from "./relative-date-guard.js";
+import { DISPLAY_TIME_ZONE } from "./time-zone.js";
+import { transcriptionGuardForInstructions } from "../plugins/transcription-exec-guard-plugin.js";
+import { DEFAULT_EXEC_ALLOWLIST } from "../plugins/exec-plugin.js";
+import { HERDR_AGENTS } from "../plugins/herdr-plugin.js";
 import { classifyModelError, ModelCascade, specProvider } from "./cascade.js";
 import type { ModelErrorClass } from "./cascade.js";
 import type { ConsolidationEngine } from "./consolidation.js";
@@ -584,6 +593,9 @@ export class PiBot implements HeartbeatHost {
       /** /goal's two model calls (draft a contract, judge a completed turn).
        *  Absent = goals can be set and driven manually, but never auto-judged. */
       goalIO?: GoalIO;
+      /** /goal execution-method discovery (bd pibot-0xpf.1). Defaults to the bounded read-only
+       *  local PATH + docs probe; tests inject a deterministic one. */
+      methodProbe?: MethodProbe;
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
@@ -1204,6 +1216,21 @@ export class PiBot implements HeartbeatHost {
     return session;
   }
 
+  /** Read the ACTUAL built-session capability inventory for one agent+chat (bd pibot-4wq1).
+   *  Read-only; returns undefined when the manager holds no snapshot for that session. */
+  private agentSessionInventory(agentId: string, chatKey: string): SessionInventory | undefined {
+    const fn = this.deps.agents.sessionInventory;
+    return typeof fn === "function" ? fn.call(this.deps.agents, agentId, chatKey) : undefined;
+  }
+
+  /** Safe host diagnostic at a delegation / background-acceptance point: surface the target
+   *  session's authorised capability set (bd pibot-4wq1). Read-only — it never widens or
+   *  restores a grant, and reports absent introspection as unknown rather than live. */
+  private logSessionInventory(agentId: string, chatKey: string, where: string): void {
+    const inventory = this.agentSessionInventory(agentId, chatKey);
+    if (inventory) this.deps.events.log(agentId, "system", `${where}: ${formatSessionInventory(inventory)}`);
+  }
+
   private onSessionEvent(t: Transport, chatId: string, agentId: string, ev: AgentSessionEvent): void {
     const voice=this.activeVoiceTurns.get(`${agentId}::${this.chatKey(t,chatId)}`);
     if(voice && !this.voiceBindings().some(b=>b.agentId===agentId&&b.chatKey===voice.input.chatKey)) {voice.detached=true;return;}
@@ -1509,12 +1536,51 @@ export class PiBot implements HeartbeatHost {
       // custom vocabulary: bias the decoder + correct the transcript afterwards
       const dictionary = loadDictionary(this.deps.config.dataDir);
       const bias = composeBias(dictionary);
-      const result = await stt.transcribe(prepared.filePath, policy, ...(bias ? [{ bias }] as const : [])).catch((e) => ({ ok: false as const, text: "", provider: "none", error: errorMessage(e) }));
-      if (!result.ok) {
-        await t.push(media.chatId, { text: `🎙 Transcription failed — ${truncate(result.error ?? "unknown error", 200)}` });
+      // Duration-aware route (bd pibot-0xpf.4): >15 min must be chunked through Groq, never local
+      // WhisperKit; an unknown duration is probed before any route is chosen. An unavailable approved
+      // route is reported as a blocker — there is NO silent local fallback.
+      const knownDuration = prepared.durationSec ?? media.durationSec;
+      const planInput = { durationSec: knownDuration, policy, hostProviders: stt.hostProviderIds };
+      const plan = planTranscription(planInput);
+      const transcribeOnce = () =>
+        stt.transcribe(prepared.filePath, policy, ...(bias ? [{ bias }] as const : [])).catch((e) => ({ ok: false as const, text: "", provider: "none", error: errorMessage(e) }));
+      let transcriptText = "";
+      let ok = false;
+      let failure: string | undefined;
+      let actualRoute: string = plan.route;
+      if (plan.route === "probe-required" || plan.route === "chunked-external") {
+        const chunked = stt.transcribeChunked
+          ? await stt.transcribeChunked(
+              prepared.filePath,
+              planInput,
+              // Keep the custom-vocabulary bias on EVERY chunk — the chunked host path must not lose
+              // the dictionary corrections the single-shot transcribe() receives (bd pibot-0xpf.4 review).
+              bias ? { transcribeChunk: (file) => stt.transcribe(file, { providers: ["groq"], allowExternal: true }, { bias }) } : {},
+            ).catch((e) => ({ ok: false as const, route: "blocked" as const, provider: "none" as const, text: "", durationSec: null as number | null, chunks: 0, transcripts: [] as string[], error: errorMessage(e) }))
+          : { ok: false as const, route: "blocked" as const, provider: "none" as const, text: "", durationSec: null as number | null, chunks: 0, transcripts: [] as string[], error: "chunked transcription is unavailable on this host" };
+        if (chunked.ok) {
+          ok = true; transcriptText = chunked.text; actualRoute = "chunked-external";
+        } else if (chunked.route === "policy" && chunked.durationSec != null && chunked.durationSec <= LONG_AUDIO_THRESHOLD_SEC) {
+          // the probe found it is short after all — the agent's normal chain applies
+          const r = await transcribeOnce();
+          ok = r.ok; transcriptText = r.text; failure = r.error; actualRoute = "policy";
+        } else {
+          failure = chunked.error ?? plan.blocker; actualRoute = chunked.route;
+        }
+      } else if (plan.route === "blocked") {
+        failure = plan.blocker;
+      } else {
+        const r = await transcribeOnce();
+        ok = r.ok; transcriptText = r.text; failure = r.error; actualRoute = plan.route;
+      }
+      // Record planned vs actually-achieved route truthfully: a reported success must not hide a
+      // forbidden substitution (bd pibot-0xpf.4).
+      this.deps.events.log(agentId, "system", `${formatTranscriptionPlan(plan)} → actual ${actualRoute}${ok ? " ok" : " blocked"}`);
+      if (!ok) {
+        await t.push(media.chatId, { text: `🎙 Transcription failed — ${truncate(failure ?? plan.blocker ?? "unknown error", 200)}` });
         return;
       }
-      const corrected = applyCorrections(result.text, dictionary.entries);
+      const corrected = applyCorrections(transcriptText, dictionary.entries);
       if (publicOnly) this.captureInbox(t, media.chatId, "user", `[voice transcript] ${corrected.slice(0, 4000)}`);
       if (await this.labFor(t)?.handleFeedback?.(t, media.chatId, corrected)) return;
       if (await this.enrollmentFor(t)?.handle(t, media.chatId, corrected, "voice")) return;
@@ -1525,7 +1591,7 @@ export class PiBot implements HeartbeatHost {
         await t.push(media.chatId, { text: `🎙 ${corrected}` });
       }
       // speech answers pending questions with the bare transcript, exactly like typing
-      if (!this.labFor(t)?.requiresIsolatedConversation(t, media.chatId) && this.questions.answerViaText(this.chatKey(t, media.chatId), result.text, "voice")) return;
+      if (!this.labFor(t)?.requiresIsolatedConversation(t, media.chatId) && this.questions.answerViaText(this.chatKey(t, media.chatId), transcriptText, "voice")) return;
       const body = media.caption ? `${corrected}\n\n(caption: ${media.caption})` : corrected;
       if (!body.trim()) {
         await t.push(media.chatId, { text: "🎙 Couldn't make out any words — try again a bit closer?" });
@@ -2284,6 +2350,55 @@ export class PiBot implements HeartbeatHost {
     await this.promptAgent(t, chatId, agentId, "continue", { taskAckFrom: null });
   }
 
+  /** Bounded, read-only execution-method probe for /goal (bd pibot-0xpf.1): stats PATH and greps
+   *  targeted local doc roots — the global herdr skill FIRST, then THIS agent's own skill/docs roots
+   *  (never other agents' private dirs) — and answers permission from the agent's REAL routes (the pi
+   *  shell tool, the exec allowlist, the herdr subagent set). It NEVER installs or runs the probed
+   *  command, and it does not treat "installed on PATH" as authorisation. */
+  private goalMethodProbe(agentId: string): MethodProbe {
+    if (this.deps.methodProbe) return this.deps.methodProbe;
+    const home = process.env.HOME ?? "";
+    const repo = process.cwd();
+    const agentDir = this.deps.agents.getAgent(agentId)?.dir;
+    const docRoots = [
+      path.join(home, ".agents", "skills", "herdr"), // the global herdr skill the review flagged as omitted
+      ...(agentDir ? [path.join(agentDir, "skills"), path.join(agentDir, "docs")] : []),
+      path.join(home, ".agents", "skills"),
+      path.join(repo, "docs"),
+      path.join(repo, ".agents", "skills"),
+    ];
+    return createLocalMethodProbe({ docRoots, permitted: this.goalMethodPermitted(agentId) });
+  }
+
+  /** Honest per-agent permission for a goal execution method (bd pibot-0xpf.1 review): a command is
+   *  permitted only through a route the agent actually holds — its pi shell tool, an exec allowlist
+   *  entry, or the herdr subagent set. An installed-but-unavailable command (e.g. `cmd`, absent from
+   *  DEFAULT_EXEC_ALLOWLIST and from HERDR_AGENTS) is NOT permitted, so a goal naming it is parked with
+   *  one not_permitted blocker instead of spending turns. Neither grant list is widened. */
+  private goalMethodPermitted(agentId: string): (command: string) => boolean {
+    const manifest: AgentManifest | undefined = this.deps.agents.getAgent(agentId)?.manifest;
+    const capabilities = new Set(manifest?.capabilities ?? []);
+    const tools = new Set(manifest?.tools ?? DEFAULT_AGENT_TOOLS);
+    const hasShell = tools.has("bash");
+    const execBins = capabilities.has("exec") ? DEFAULT_EXEC_ALLOWLIST.map((entry) => entry.bin) : [];
+    // herdr only counts as a route when its client is actually runnable on this host.
+    const herdrAgents = capabilities.has("herdr") && executableAvailable("herdr") ? [...HERDR_AGENTS] : [];
+    const execNames = new Set(execBins.map((bin) => goalMethodBasename(bin)));
+    const herdrNames = new Set(herdrAgents.map((a) => a.toLowerCase()));
+    return (command: string) => {
+      if (!command) return false;
+      if (hasShell) return true; // a real shell runs anything this agent is otherwise allowed to run
+      const name = goalMethodBasename(command);
+      return execNames.has(name) || herdrNames.has(name);
+    };
+  }
+
+  /** Named timezone relative dates are computed in (owner: Europe/Berlin), shared with
+   *  the heartbeat digest and the ledger date check via time-zone.ts. */
+  private ownerTimezone(): string {
+    return process.env.PIBOT_TIMEZONE || DISPLAY_TIME_ZONE;
+  }
+
   /**
    * /goal — set and drive a bounded goal loop for this chat.
    *   /goal <objective>        set it (contract optional; /goal draft writes one)
@@ -2314,6 +2429,31 @@ export class PiBot implements HeartbeatHost {
     if (lower === "pause" || lower === "resume" || lower === "done") {
       if (!current) return void (await t.push(chatId, { text: "No goal set." }));
       const status = lower === "pause" ? "paused" : lower === "resume" ? "active" : "done";
+      // /goal resume rechecks whether a blocked execution method has since been resolved — this is an
+      // explicit owner action, never a background auto-resume of an existing goal. A still-blocked
+      // method keeps the goal parked and notifies ONCE; an identical repeat stays silent.
+      if (lower === "resume") {
+        const resolution = validateGoalMethods(current.objective, current.contract, this.goalMethodProbe(agentId));
+        if (resolution.status === "blocked") {
+          const identical = Boolean(current.methodBlocker) && methodBlockerSignature(current.methodBlocker!) === methodBlockerSignature(resolution.blocker);
+          const parked = withMethodBlocker({ ...current, status: "paused" }, resolution.blocker);
+          this.goals.set(ck, parked);
+          this.persistState();
+          if (identical) {
+            await t.push(chatId, { text: renderGoalStatus(parked), card: goalCard(parked) });
+          } else {
+            this.deps.events.log(agentId, "system", `goal resume still blocked: ${resolution.blocker.detail}`.slice(0, 220));
+            await t.push(chatId, { text: `🛑 Still blocked — ${resolution.blocker.detail}\nResolve it, then /goal resume.`, card: goalCard(parked) });
+          }
+          return;
+        }
+        const cleared = withMethodBlocker({ ...current, status: "active" }, undefined);
+        this.goals.set(ck, cleared);
+        this.persistState();
+        this.deps.events.log(agentId, "system", `goal active: ${current.objective}`.slice(0, 200));
+        await t.push(chatId, { text: renderGoalStatus(cleared), card: goalCard(cleared) });
+        return;
+      }
       this.goals.set(ck, { ...current, status });
       this.persistState();
       this.deps.events.log(agentId, "system", `goal ${status}: ${current.objective}`.slice(0, 200));
@@ -2344,6 +2484,18 @@ export class PiBot implements HeartbeatHost {
     if (!objective) return void (await t.push(chatId, { text: "Usage: /goal <objective>  ·  /goal draft <objective>  ·  /goal status" }));
 
     let contract = current?.objective === objective ? current.contract : {};
+    const probe = this.goalMethodProbe(agentId);
+    // Validate the goal's execution methods BEFORE any model spend: an objective naming an
+    // unavailable method is parked with ONE blocker instead of burning a turn on "undefined command".
+    const parkBlocked = async (blocker: GoalMethodBlocker): Promise<void> => {
+      const parked = withMethodBlocker(newGoal(objective, { contract, now: Date.now() }), blocker);
+      this.goals.set(ck, parked);
+      this.persistState();
+      this.deps.events.log(agentId, "system", `goal method blocked: ${blocker.detail}`.slice(0, 220));
+      await t.push(chatId, { text: `🛑 Goal not started — ${blocker.detail}\nResolve it, then /goal resume.`, card: goalCard(parked) });
+    };
+    const preResolution = validateGoalMethods(objective, contract, probe);
+    if (preResolution.status === "blocked") return void (await parkBlocked(preResolution.blocker));
     if (drafting && this.deps.goalIO) {
       await t.setTyping?.(chatId, true);
       try {
@@ -2353,6 +2505,9 @@ export class PiBot implements HeartbeatHost {
         t.setTyping?.(chatId, false);
       }
     }
+    // A drafted contract can introduce a method the objective never named — re-validate before spend.
+    const resolution = validateGoalMethods(objective, contract, probe);
+    if (resolution.status === "blocked") return void (await parkBlocked(resolution.blocker));
     const goal = newGoal(objective, { contract, now: Date.now() });
     this.goals.set(ck, goal);
     this.persistState();
@@ -2491,7 +2646,10 @@ export class PiBot implements HeartbeatHost {
       }
       if (!cascade?.resolveModel(spec)) return `⚠︎ "${spec}" isn't in the model catalog on this machine.`;
     }
-    writeJsonAtomic(path.join(agent.dir, "agent.json"), { ...agent.manifest, model: spec || undefined });
+    // One-field patch through the guarded compare-and-swap writer (bd pibot-4wq1): an unrelated
+    // authorised field (tasks/commitments/providers/…) can never be dropped by a model switch.
+    const res = this.deps.agents.updateManifest(agentId, { model: spec || undefined });
+    if (!res.ok) return `⚠︎ Couldn't update ${agentId}'s manifest: ${res.error}`;
     await this.deps.agents.discover(); // reload manifests
     let dropped = 0;
     for (const wkey of [...this.sessionSpec.keys()]) {
@@ -2682,9 +2840,10 @@ export class PiBot implements HeartbeatHost {
       const draft: AgentDraft = { name, job: [job ?? "", ...extraAnswers].filter(Boolean).join("\n"), vibe, proactivity };
       const err = this.deps.agents.createAgent(name, buildPersona(draft));
       if (err) { await t.push(chatId, { text: `Couldn't create: ${err}` }); return; }
-      const agent = this.deps.agents.getAgent(name)!;
-      // write the wizard-built manifest (heartbeat rhythm per proactivity)
-      writeJsonAtomic(path.join(agent.dir, "agent.json"), buildManifest(draft));
+      // write the wizard-built manifest through the guarded field-level writer (bd pibot-4wq1):
+      // only the keys buildManifest sets change; everything else on disk is preserved verbatim.
+      const written = this.deps.agents.updateManifest(name, buildManifest(draft));
+      if (!written.ok) { await t.push(chatId, { text: `Couldn't write ${name}'s manifest: ${written.error}` }); return; }
       await this.deps.agents.discover();
       const fresh = this.deps.agents.getAgent(name)!;
       this.ensureHeartbeatJob(fresh);
@@ -3231,7 +3390,7 @@ export class PiBot implements HeartbeatHost {
     const targetSession = await this.sessionFor(t, chatId, toAgent, ck);
     if ((targetSession as { isStreaming?: boolean }).isStreaming) return { ok: false, error: `**${toAgent}** is mid-turn — try again in a moment.` };
     await trackActivity({ kind: "handoff", label: `handoff from ${fromAgent}${note ? `: ${note}` : ""}`, agentId: toAgent, chatKey: ck, session: targetSession },
-      () => targetSession.prompt(envelope(buildHandoffEnvelope(fromAgent, brief, note))));
+      () => targetSession.prompt(envelope(buildHandoffEnvelope(fromAgent, brief, note, { includeLongAudioRule: handoffNeedsLongAudioRule(excerpt) }))));
     const ack = extractAssistantTextFromSession(targetSession) ?? "Ready.";
     // the chat now belongs to the target — the user's next message reaches them
     this.rememberChat(toAgent, ck);
@@ -3265,8 +3424,10 @@ export class PiBot implements HeartbeatHost {
   }
 
   /** Bot-identity send from an agent tool: explicit "transport:chatId" target,
-   *  sender-attributed on shared transports, event-logged for the trail. */
-  async sendAsAgent(agentId: string, chat: string, text: string): Promise<{ sent: number; targets: string[] }> {
+   *  sender-attributed on shared transports, event-logged for the trail. Returns the
+   *  destination-aware receipt so the agent reports where the message actually landed and in
+   *  which id namespace — a message id alone is not proof of delivery (bd pibot-cida). */
+  async sendAsAgent(agentId: string, chat: string, text: string): Promise<TelegramSendResult> {
     const idx = chat.lastIndexOf(":");
     if (idx <= 0 || !chat.slice(0, idx) || !chat.slice(idx + 1)) {
       throw new Error(`chat must be "transport:chatId" — got "${chat}"`);
@@ -3276,9 +3437,18 @@ export class PiBot implements HeartbeatHost {
     const t = this.transports.get(transportName);
     if (!t) throw new Error(`no transport "${transportName}" — telegram_chats lists reachable targets`);
     const outbound = t.boundAgentId === agentId ? text : `**[${agentId}]** ${text}`;
-    await t.push(chatId, { text: outbound });
+    const receipt = await t.push(chatId, { text: outbound });
     this.deps.events.log(agentId, "send", `→ ${chat}: ${truncate(text, 80)}`);
-    return { sent: 1, targets: [chat] };
+    const r = (receipt ?? {}) as DeliveryReceipt;
+    const one: TelegramSendResult["receipts"] = [{
+      peer: r.peer ?? chat,
+      ...(r.messageId !== undefined ? { messageId: r.messageId } : {}),
+      ...(r.mediaType !== undefined ? { mediaType: r.mediaType } : {}),
+      ...(r.idProtocol !== undefined ? { idProtocol: r.idProtocol } : {}),
+      ...(r.account !== undefined ? { account: r.account } : {}),
+      ...(r.evidence !== undefined ? { evidence: r.evidence } : {}),
+    }];
+    return { sent: 1, targets: [chat], receipts: one };
   }
 
   /** Run one turn in an agent's inter-agent session and return the reply text.
@@ -3302,6 +3472,8 @@ export class PiBot implements HeartbeatHost {
       this.commsHooks()
     );
     if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("target agent is busy");
+    // delegation acceptance: record the target session's ACTUAL authorised capability set (bd pibot-4wq1)
+    this.logSessionInventory(agentId, ck, `delegation accepted from ${fromAgent}`);
     // pibot-dff: extract only assistant text PRODUCED BY THIS TURN. The old last-assistant
     // extractor made a silently-failed turn (empty model output — researcher, Oct 12–20)
     // return the PREVIOUS turn's text: every fresh ask re-delivered the stale Oct-14
@@ -3364,18 +3536,27 @@ export class PiBot implements HeartbeatHost {
    *  status and the result post; cancelling or shutting down aborts the turn.
    *  MEDIA lines in the result are delivered to the origin chat (receipts recorded) so the
    *  ledger's verified-completion gate sees the actual medium (bd pibot-zy70). */
-  async runLedgerTask(run: TaskRun): Promise<string | { text: string; delivery?: { messageId?: number; mediaType?: string } }> {
+  async runLedgerTask(run: TaskRun): Promise<string | { text: string; delivery?: Omit<Delivery, "deliveredAt"> }> {
     if (!this.deps.agents.getAgent(run.agentId)) throw new Error(`unknown agent "${run.agentId}"`);
     // A resumed task may start while the previous process's transports are still arming:
     // wait for start() so result posts and owner questions have a live delivery route.
     await this.started;
     const originChat = this.splitChatKey(run.chatKey);
     const ck = `agent::${run.agentId}::task-${run.taskId}`;
+    // The task's DURABLE instructions carry the declared transcription route; attach the matching
+    // raw-exec guard to THIS task's own session so a delegated long/unknown-duration audio run
+    // cannot reach a local WhisperKit/Whisper binary (bd pibot-0xpf.4 review). Derived from the
+    // durable contract, so a resumed attempt re-attaches it and a session reset cannot drop it.
+    const taskGuard = transcriptionGuardForInstructions(run.instructions);
     const session = await this.deps.agents.getOrCreateSession(
       run.agentId, ck, { transport: "agent", chatId: `task-${run.taskId}` }, this.deps.scheduler,
       (spec: QuestionSpec) => this.questions.ask(run.agentId, originChat, spec), this.commsHooks(),
+      undefined, undefined, undefined, undefined, undefined,
+      taskGuard ? [taskGuard] : [],
     );
     if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("task session is busy");
+    // background acceptance: record the task session's ACTUAL authorised capability set (bd pibot-4wq1)
+    this.logSessionInventory(run.agentId, ck, `background task ${run.taskId} accepted`);
     // a task started from a voice call keeps that call's tool choice
     if (run.allowedTools) { const allow = new Set(run.allowedTools); session.setActiveToolsByName(session.getActiveToolNames().filter(n => allow.has(n))); }
     const resume = run.resumed
@@ -3407,15 +3588,20 @@ export class PiBot implements HeartbeatHost {
       // text in the result post). Successful sends carry receipts; failures are logged —
       // the ledger's gate records the missing receipt as partial, never as done.
       const { text: cleanText, media } = splitMediaLines(resultText);
-      let delivery: { messageId?: number; mediaType?: string } | undefined;
-      const tr = this.transports.get(originChat.transport);
-      for (const source of media) {
-        try {
-          if (!tr) throw new Error(`no transport "${originChat.transport}"`);
-          const r = await this.sendTaskMedia(tr, originChat.chatId, run.agentId, source, run.expectedMedia);
-          if (r && (r.messageId !== undefined || r.mediaType !== undefined)) delivery = { ...r };
-        } catch (e) {
-          this.deps.events.log(run.agentId, "system", `task media send failed: ${truncate(source, 120)} — ${truncate(errorMessage(e), 160)}`);
+      let delivery: Omit<Delivery, "deliveredAt"> | undefined;
+      if (media.length) {
+        // The result MEDIUM goes to the owner's explicit expectedPeer when one was requested and it
+        // DIFFERS from the origin chat — only via an authorised reachable transport. An unreachable
+        // requested target is a precise blocker (BlockedError), never a wrong-peer send to the origin
+        // chat (bd pibot-cida review). With no explicit target the origin chat is the destination.
+        const { transport: targetTransport, chatId: targetChatId } = this.taskDeliveryTarget(run, originChat);
+        for (const source of media) {
+          try {
+            const r = await this.sendTaskMedia(targetTransport, targetChatId, run.agentId, source, run.expectedMedia);
+            if (r) delivery = r;
+          } catch (e) {
+            this.deps.events.log(run.agentId, "system", `task media send failed: ${truncate(source, 120)} — ${truncate(errorMessage(e), 160)}`);
+          }
         }
       }
       if (delivery) return { text: cleanText || "📎 (media delivered)", delivery };
@@ -3428,10 +3614,33 @@ export class PiBot implements HeartbeatHost {
     }
   }
 
+  /**
+   * Where a background task's result MEDIUM must be delivered (bd pibot-cida review): the owner's
+   * explicit `expectedPeer` when it differs from the origin chat, else the origin chat. A requested
+   * target with no reachable transport is a precise blocker — never silently redirected to the origin
+   * chat (which would post the wrong-peer output). No destination identity is ever guessed.
+   */
+  private taskDeliveryTarget(run: TaskRun, originChat: ChatRef): { transport: Transport; chatId: string } {
+    const expected = run.expectedPeer?.trim();
+    if (!expected || expected === run.chatKey) {
+      const origin = this.transports.get(originChat.transport);
+      if (!origin) throw new BlockedError(`no transport "${originChat.transport}" is available to deliver this task's result`);
+      return { transport: origin, chatId: originChat.chatId };
+    }
+    const { transport, chatId } = this.splitChatKey(expected);
+    const target = this.transports.get(transport);
+    if (!target) {
+      throw new BlockedError(
+        `this task asked to deliver its result to "${expected}", but no reachable transport "${transport}" is available — refusing to send it to the origin chat "${run.chatKey}" instead`,
+      );
+    }
+    return { transport: target, chatId };
+  }
+
   /** Deliver one background-task MEDIA attachment to the origin chat (bd pibot-zy70).
    *  MP4s route through the native round sendVideoNote only when the task's owner request
    *  asked for a video note — ordinary MP4 attachments keep the turn-path behavior (document). */
-  private async sendTaskMedia(t: Transport, chatId: string, agentId: string, source: string, expectedMedia?: string): Promise<DeliveryReceipt | void> {
+  private async sendTaskMedia(t: Transport, chatId: string, agentId: string, source: string, expectedMedia?: string): Promise<Omit<Delivery, "deliveredAt"> | void> {
     const size = localFileSize(source);
     if (size != null && size > MEDIA_MAX_BYTES) {
       // Same owner decision as the turn path (2026-09-23): oversized files get a private
@@ -3439,12 +3648,32 @@ export class PiBot implements HeartbeatHost {
       void this.deliverLargeFileLink(t, chatId, agentId, source, size).catch(() => {});
       return undefined;
     }
+    let receipt: DeliveryReceipt | void;
     if (expectedMedia === "video_note" && /\.mp4$/i.test(source)) {
       if (!t.sendVideoNote) throw new Error(`the transport "${t.name}" cannot send native video notes`);
-      return await t.sendVideoNote(chatId, source);
+      receipt = await t.sendVideoNote(chatId, source);
+    } else {
+      if (!t.sendMedia) throw new Error(`transport "${t.name}" cannot send media`);
+      receipt = await t.sendMedia(chatId, source);
     }
-    if (!t.sendMedia) throw new Error(`transport "${t.name}" cannot send media`);
-    return await t.sendMedia(chatId, source);
+    if (!receipt || (receipt.messageId === undefined && receipt.mediaType === undefined)) return undefined;
+    return this.taskReceipt(receipt);
+  }
+
+  /** Build the destination-aware delivery tuple from a transport ack (bd pibot-cida), attestation
+   *  ONLY: the peer, account and id namespace come from the transport's own receipt. Nothing is
+   *  inferred from the transport name or the requested chat — a missing peer/namespace stays unset so
+   *  the completion gate records the delivery as unverified instead of manufacturing a complete tuple
+   *  (bd pibot-cida review). `evidence` stays "ack": an API acknowledgement is not a readback. */
+  private taskReceipt(receipt: DeliveryReceipt): Omit<Delivery, "deliveredAt"> {
+    const r = receipt;
+    const d: Omit<Delivery, "deliveredAt"> = { evidence: r.evidence ?? "ack" };
+    if (r.peer !== undefined) d.peer = r.peer;
+    if (r.idProtocol !== undefined) d.idProtocol = r.idProtocol;
+    if (r.account !== undefined) d.account = r.account;
+    if (r.messageId !== undefined) d.messageId = r.messageId;
+    if (r.mediaType !== undefined) d.mediaType = r.mediaType;
+    return d;
   }
 
   /**
@@ -3535,8 +3764,12 @@ export class PiBot implements HeartbeatHost {
       modelRuntime: this.deps.modelRuntime,
       model: this.deps.agents.resolveModel(process.env.PIBOT_DEFAULT_MODEL),
     });
+    // Deterministic owner-rule carry (bd pibot-0xpf.4 review): this inline handoff envelope is not
+    // built by buildHandoffEnvelope, so attach the canonical long-audio rule here too when the
+    // handoff involves >15-min transcription, rather than hoping the model repeated it.
+    const policyBlock = handoffNeedsLongAudioRule(tail) ? `\n\n# Owner policy (verbatim)\n${LONG_AUDIO_RULE}` : "";
     return this.agentTurn(toAgent, fromAgent,
-      `[handoff from "${fromAgent}"] The user may move this thread to you.${note ? ` Note: ${note}` : ""}\n\n# Context from ${fromAgent}\n${brief}\n\nAcknowledge briefly and continue.`,
+      `[handoff from "${fromAgent}"] The user may move this thread to you.${note ? ` Note: ${note}` : ""}\n\n# Context from ${fromAgent}\n${brief}${policyBlock}\n\nAcknowledge briefly and continue.`,
       10 * 60e3,
       originChat ?? (fromCk ? this.splitChatKey(fromCk) : undefined)
     );
@@ -3646,6 +3879,18 @@ export class PiBot implements HeartbeatHost {
   ): Promise<boolean> {
     // heartbeat-originated proactive messages carry an origin tag regardless of transport
     if (opts.origin === "heartbeat") text = `[heartbeat] ${text}`;
+    // Automated, user-visible output (heartbeat speak, proactive results): REWRITE relative date
+    // wording that contradicts the absolute date beside it rather than emitting a false reminder
+    // (bd pibot-wr9m). Deterministic and timezone-aware; unambiguous prose is left untouched.
+    const dated = correctRelativeDateClaims(text, { timeZone: this.ownerTimezone() });
+    if (dated.blocked && dated.inconsistent > 0) {
+      // The wording contradicts the date and could not be safely rewritten: never emit the
+      // known-false text as if it were true — suppress it this time (bd pibot-wr9m review).
+      this.deps.events.log(agentId, "system", `proactive message suppressed — unrewritable relative date: ${truncate(text, 160)}`);
+      if (opts.origin === "heartbeat") this.deps.commitments?.deliverHeartbeatSpeak(agentId, false);
+      return false;
+    }
+    if (dated.corrected) text = dated.text;
     // deterministic nudge feedback card on every heartbeat speak (no extra message)
     let nudgeId: string | undefined;
     if (opts.origin === "heartbeat" && this.deps.commitments && !card) {
@@ -3848,6 +4093,13 @@ function safeAudioError(error: string): string {
   if (lower.includes("not installed")) return "local audio processing is unavailable";
   if (lower.includes("timeout") || lower.includes("timed out")) return "local audio processing timed out";
   return "the media is malformed or unsupported";
+}
+
+/** Basename of a command as it would appear in an allowlist (absolute paths and .exe resolved, lowercased). */
+function goalMethodBasename(command: string): string {
+  const trimmed = command.trim().replace(/[\\/]+$/, "");
+  const slash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return (slash >= 0 ? trimmed.slice(slash + 1) : trimmed).toLowerCase().replace(/\.exe$/, "");
 }
 
 /** Pull `MEDIA: <url|path>` lines out of a reply (max 3); they become sendMedia calls. */

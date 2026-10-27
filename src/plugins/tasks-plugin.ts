@@ -3,6 +3,23 @@ import { Type } from "typebox";
 import type { LedgerEntry, TaskLedger } from "../durable/task-ledger.js";
 import type { ChatRef } from "../core/types.js";
 import { fmtWhen } from "../core/util.js";
+import type { SttPolicy } from "../core/stt.js";
+import { formatTranscriptionPlan, planTranscription, transcriptionPolicyMarker } from "../core/transcription-policy.js";
+
+/** pi-durable instructions length cap; the mandatory policy head is reserved inside it. */
+const INSTRUCTIONS_MAX = 8000;
+
+/**
+ * Reserve room for a mandatory head (the transcription policy marker + constraint) and
+ * PREPEND it, so slicing to the cap can never drop it (bd pibot-0xpf.4 review: appending
+ * the constraint then slicing to 8000 dropped the entire policy at max input length).
+ */
+function withMandatoryHead(body: string, head: string): string {
+  if (!head) return body.slice(0, INSTRUCTIONS_MAX);
+  const headText = `${head}\n\n`;
+  if (headText.length >= INSTRUCTIONS_MAX) return headText.slice(0, INSTRUCTIONS_MAX);
+  return headText + body.slice(0, INSTRUCTIONS_MAX - headText.length);
+}
 
 export interface TasksPluginDeps {
   ledger: TaskLedger;
@@ -14,6 +31,12 @@ export interface TasksPluginDeps {
     check(input: { lane?: "download" | "transcribe" | "render" | "delegate" }, acquire?: boolean): Promise<{ ok: boolean; issues: string[] }>;
     release(lane: "download" | "transcribe" | "render" | "delegate"): void;
   };
+  /**
+   * The agent's speech/transcription policy (bd pibot-0xpf.4), so a task that
+   * declares audio work carries the duration-aware route in its durable
+   * contract. Absent for agents without a speech policy.
+   */
+  transcription?: { policy?: SttPolicy };
 }
 
 function line(t: LedgerEntry): string {
@@ -36,7 +59,7 @@ function line(t: LedgerEntry): string {
  * pi-durable ledger that survives restarts; the result is posted to this chat.
  */
 export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
-  const { ledger, agentId, chat, preflight } = deps;
+  const { ledger, agentId, chat, preflight, transcription } = deps;
   const chatKey = `${chat.transport}:${chat.chatId}`;
   const text = (t: string, details: Record<string, unknown> = {}) => ({ content: [{ type: "text" as const, text: t }], details });
 
@@ -52,19 +75,51 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
           instructions: Type.String({ description: "Self-contained instructions with all needed context from this conversation" }),
           timeoutMinutes: Type.Optional(Type.Number({ description: "Hard runtime cap in minutes for this task (default 30, max 480). Set higher for long local media work — a two-hour video transcription needs ~90; fetching + transcribing media counts inside the cap." })),
           expectedMedia: Type.Optional(Type.String({ description: "Set ONLY when the owner explicitly requested one specific medium for the task output (e.g. 'video_note' for a Telegram video note). Then the task completes only when the actually delivered media matches; a mismatch records 'partial', not 'done'." })),
+          expectedPeer: Type.Optional(Type.String({ description: 'Set ONLY when the owner explicitly asked the result to land somewhere OTHER than this chat: the destination as "transport:chatId" for a target this bot is already authorised to reach (e.g. "telegram:123456" for a reachable bot group/chat). The result medium is delivered THERE (never to this chat) and completion requires the receipt to attest THAT destination; an unreachable target is a precise blocker. A Saved Messages folder is NOT reachable through the Bot API — the same numeric user id there addresses a bot dialogue, not Saved Messages — so Saved Messages requires a separately authorised account/protocol route and stays unsupported here unless that route already exists.' })),
+          expectedAccount: Type.Optional(Type.String({ description: "Set ONLY when the expected sending bot identity is known (e.g. '@pibot'); completion then requires the receipt to name it, so a different bot cannot stand in." })),
+          expectedIdProtocol: Type.Optional(Type.String({ description: 'Set ONLY when the expected message-id namespace is known ("bot_api" | "mtproto"); completion then requires the receipt to name it.' })),
           lane: Type.Optional(Type.String({ description: "'dev' (pibot source work) or 'cross-agent' (owner-facing content/tooling) — keeps the two lanes separate in records" })),
           acceptanceCriteria: Type.Optional(Type.String({ description: "Verifiable criteria the task must satisfy (what 'done' means in checkable words)" })),
           outputLocation: Type.Optional(Type.String({ description: "Where artifacts live on disk (absolute paths, comma-separated if many)" })),
           linearRef: Type.Optional(Type.String({ description: "Reference-only link to the tracker (e.g. Linear id)" })),
+          audioDurationSec: Type.Optional(Type.Number({ description: "Set ONLY when this task will transcribe audio: the media duration in seconds. The duration-aware transcription policy is then attached to the task's contract (<=15 min may run locally; >15 min must be Groq chunks of <=15 min, never WhisperKit)." })),
+          audioDurationUnknown: Type.Optional(Type.Boolean({ description: "Set when the task transcribes audio whose duration could not be probed: the contract then mandates an ffprobe first, instead of assuming a duration." })),
         }),
         async execute(toolCallId, params) {
           try {
             const timeoutMinutes = params.timeoutMinutes && Number.isFinite(params.timeoutMinutes)
               ? Math.max(1, Math.min(480, Math.round(params.timeoutMinutes)))
               : undefined;
+
+            // Duration-aware transcription policy travels INSIDE the durable task
+            // contract (bd pibot-0xpf.4): the constraint is embedded in
+            // `instructions`, so it survives the background handoff and any session
+            // reset, and a blocked route refuses the task instead of starting work
+            // that would silently substitute a disallowed provider. The marker +
+            // constraint are PREPENDED and budgeted so the cap cannot drop them.
+            let instructions = params.instructions.slice(0, INSTRUCTIONS_MAX);
+            let audioRoute: string | undefined;
+            if (transcription && (params.audioDurationSec !== undefined || params.audioDurationUnknown)) {
+              const plan = planTranscription({
+                durationSec: params.audioDurationUnknown ? null : params.audioDurationSec ?? null,
+                policy: transcription.policy,
+              });
+              if (plan.route === "blocked") {
+                return text(`REFUSED: ${plan.blocker} Nothing started.`, { refused: true, route: plan.route });
+              }
+              instructions = withMandatoryHead(params.instructions, `${transcriptionPolicyMarker(plan.route)}\n${plan.constraint}`);
+              audioRoute = formatTranscriptionPlan(plan);
+            }
             // pi-durable stores strict JSON: omit the key entirely when unset
             const cap = timeoutMinutes !== undefined ? { timeoutMinutes } : {};
-            const expected = params.expectedMedia ? { expectedMedia: params.expectedMedia.slice(0, 40) } : {};
+            const expected = {
+              ...(params.expectedMedia ? { expectedMedia: params.expectedMedia.slice(0, 40) } : {}),
+              // An explicit different destination / account / id namespace is persisted with the task so
+              // the ledger's gate and the runner both check the SAME expected target (bd pibot-cida review).
+              ...(params.expectedPeer ? { expectedPeer: params.expectedPeer.slice(0, 160) } : {}),
+              ...(params.expectedAccount ? { expectedAccount: params.expectedAccount.slice(0, 80) } : {}),
+              ...(params.expectedIdProtocol ? { expectedIdProtocol: params.expectedIdProtocol.slice(0, 40) } : {}),
+            };
             const canon = {
               ...(params.lane === "dev" ? { lane: "dev" as const } : params.lane === "cross-agent" ? { lane: "cross-agent" as const } : {}),
               ...(params.acceptanceCriteria ? { acceptanceCriteria: params.acceptanceCriteria.slice(0, 500) } : {}),
@@ -81,8 +136,8 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
                   return text(`REFUSED by resource preflight: ${acq.issues.join("; ")}. Fix / wait, then retry — nothing started.`, { refused: true });
                 }
                 acquired = true;
-                const t = await ledger.start({ agentId, chatKey, title: params.title.slice(0, 120), instructions: params.instructions.slice(0, 8000), ...cap, ...expected, ...canon }, `${agentId}:${toolCallId}`);
-                return text(`Started task ${t.id} "${t.title}". It runs in the background; the result will be posted to this chat. Check it with task_status.`, { taskId: t.id });
+                const t = await ledger.start({ agentId, chatKey, title: params.title.slice(0, 120), instructions, ...cap, ...expected, ...canon }, `${agentId}:${toolCallId}`);
+                return text(`Started task ${t.id} "${t.title}". It runs in the background; the result will be posted to this chat. Check it with task_status.${audioRoute ? `\n${audioRoute}` : ""}`, { taskId: t.id, ...(audioRoute ? { transcription: audioRoute } : {}) });
               } catch (error) {
                 if (!acquired) return text(`ERROR: ${error instanceof Error ? error.message : String(error)}`);
                 throw error; // finally releases the slot; the ledger error surfaces
@@ -90,8 +145,8 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
                 if (acquired) preflight.release("delegate");
               }
             }
-            const t = await ledger.start({ agentId, chatKey, title: params.title.slice(0, 120), instructions: params.instructions.slice(0, 8000), ...cap, ...expected, ...canon }, `${agentId}:${toolCallId}`);
-            return text(`Started task ${t.id} "${t.title}". It runs in the background; the result will be posted to this chat. Check it with task_status.`, { taskId: t.id });
+            const t = await ledger.start({ agentId, chatKey, title: params.title.slice(0, 120), instructions, ...cap, ...expected, ...canon }, `${agentId}:${toolCallId}`);
+            return text(`Started task ${t.id} "${t.title}". It runs in the background; the result will be posted to this chat. Check it with task_status.${audioRoute ? `\n${audioRoute}` : ""}`, { taskId: t.id, ...(audioRoute ? { transcription: audioRoute } : {}) });
           } catch (error) {
             return text(`ERROR: ${error instanceof Error ? error.message : String(error)}`);
           }

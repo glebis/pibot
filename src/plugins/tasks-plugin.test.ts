@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { openTaskLedger } from "../durable/task-ledger.js";
+import type { SttPolicy } from "../core/stt.js";
 import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext } from "../core/capabilities.js";
 import { tasksPlugin } from "./tasks-plugin.js";
 
@@ -48,6 +49,13 @@ describe("tasks plugin", () => {
       expect(caps).toContain(480); // clamped to the hard ceiling
       expect(ids.length).toBe(2);
     } finally { await ledger.close(); }
+  });
+
+  it("the tasks capability prompt carries the long-audio owner rule", () => {
+    const tasks = CAPABILITY_REGISTRY.find((c) => c.id === "tasks")!;
+    expect(tasks.prompt).toMatch(/LONG AUDIO/);
+    expect(tasks.prompt).toMatch(/never substitute local WhisperKit/i);
+    expect(tasks.prompt).toMatch(/audioDurationSec/);
   });
 
   it("comes with the scheduler and is never offered inside agent-only sessions", () => {
@@ -103,6 +111,96 @@ describe("task-record-canon (bd pibot-r47f)", () => {
   });
 });
 
+describe("explicit expected target tuple from start_task (bd pibot-cida review)", () => {
+  it("persists expectedPeer/account/idProtocol into the task and passes them to the runner", async () => {
+    const run = vi.fn(async (_task: unknown) => "saved");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    try {
+      const t = tools(tasksPlugin({ ledger, agentId: "coach", chat: { transport: "telegram", chatId: "42" } }));
+      const r = await t.get("start_task")!.execute("e1", {
+        title: "save the note", instructions: "post the result",
+        expectedMedia: "video_note", expectedPeer: "telegram:99", expectedAccount: "@pibot", expectedIdProtocol: "bot_api",
+      });
+      const id = ((r as unknown as { details?: { taskId?: string } }).details)?.taskId ?? "";
+      const terminal = new Set(["done", "partial", "failed", "blocked", "cancelled"]);
+      for (let i = 0; i < 200 && !terminal.has((await ledger.get(id))?.status ?? ""); i++) await new Promise((x) => setTimeout(x, 10));
+      const task = await ledger.get(id);
+      expect(task).toMatchObject({ expectedPeer: "telegram:99", expectedAccount: "@pibot", expectedIdProtocol: "bot_api", expectedMedia: "video_note" });
+      expect(run.mock.calls[0][0]).toMatchObject({ expectedPeer: "telegram:99", expectedAccount: "@pibot", expectedIdProtocol: "bot_api" });
+    } finally { ledger.close(); }
+  });
+});
+
+describe("duration-aware transcription policy in the task contract (bd pibot-0xpf.4)", () => {
+  const started = (r: { details?: unknown }) => (r.details as { taskId?: string } | undefined)?.taskId ?? "";
+
+  it("writes the Groq-chunk constraint into the durable contract for known long audio", async () => {
+    const prev = process.env.STT_PROVIDERS;
+    process.env.STT_PROVIDERS = "whisperkit,groq";
+    try {
+      const run = vi.fn(async () => "done");
+      const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+      const t = tools(tasksPlugin({
+        ledger, agentId: "knower", chat: { transport: "telegram", chatId: "42" },
+        transcription: { policy: { providers: ["whisperkit", "groq"], allowExternal: true } },
+      }));
+      const r = await t.get("start_task")!.execute("c1", { title: "27-min talk", instructions: "transcribe it", audioDurationSec: 27 * 60 });
+      const taskId = started(r as { details?: unknown });
+      const task = await ledger.get(taskId);
+      expect(task?.instructions).toContain("do NOT fall back to WhisperKit");
+      expect(task?.instructions).toContain("2 chunks of <=15 min");
+      expect((r as { content: Array<{ text: string }> }).content[0].text).toContain("chunked-external");
+      ledger.close();
+    } finally {
+      if (prev === undefined) delete process.env.STT_PROVIDERS; else process.env.STT_PROVIDERS = prev;
+    }
+  });
+
+  it("refuses a known long-audio task when Groq is not permitted, instead of starting a local substitution", async () => {
+    const run = vi.fn(async () => "done");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    try {
+      const t = tools(tasksPlugin({
+        ledger, agentId: "knower", chat: { transport: "telegram", chatId: "42" },
+        transcription: { policy: { providers: ["whisperkit"] } },
+      }));
+      const r = await t.get("start_task")!.execute("c2", { title: "long talk", instructions: "transcribe", audioDurationSec: 27 * 60 });
+      expect((r as { content: Array<{ text: string }> }).content[0].text).toContain("REFUSED");
+      expect(await ledger.list({ agentId: "knower" })).toEqual([]); // nothing started
+      expect(run).not.toHaveBeenCalled();
+    } finally { ledger.close(); }
+  });
+
+  it("mandates a probe (not a duration guess) when the audio duration is declared unknown", async () => {
+    const run = vi.fn(async () => "done");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    try {
+      const t = tools(tasksPlugin({
+        ledger, agentId: "knower", chat: { transport: "telegram", chatId: "42" },
+        transcription: { policy: { providers: ["whisperkit", "groq"], allowExternal: true } },
+      }));
+      const r = await t.get("start_task")!.execute("c3", { title: "unknown length", instructions: "transcribe", audioDurationUnknown: true });
+      const task = await ledger.get(started(r as { details?: unknown }));
+      expect(task?.instructions).toMatch(/PROBE it \(ffprobe\) FIRST/);
+      expect(task?.instructions).not.toMatch(/is .* min \(>15 min\)/); // it never asserts a duration
+    } finally { ledger.close(); }
+  });
+
+  it("leaves the instructions untouched for tasks that declare no audio work", async () => {
+    const run = vi.fn(async () => "done");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    try {
+      const t = tools(tasksPlugin({
+        ledger, agentId: "knower", chat: { transport: "telegram", chatId: "42" },
+        transcription: { policy: { providers: ["whisperkit"] } },
+      }));
+      const r = await t.get("start_task")!.execute("c4", { title: "plain", instructions: "just write it" });
+      const task = await ledger.get(started(r as { details?: unknown }));
+      expect(task?.instructions).toBe("just write it");
+    } finally { ledger.close(); }
+  });
+});
+
 describe("resource preflight (bd pibot-kdpg)", () => {
   it("refuses start_task when the preflight refuses; acquires+releases when green", async () => {
     const run = vi.fn(async () => "ok");
@@ -128,6 +226,44 @@ describe("resource preflight (bd pibot-kdpg)", () => {
     expect(go.content[0].text).toContain("Started task");
     expect(releases).toContain("acquired");
     expect(releases).toContain("released:delegate");
+    ledger.close();
+  });
+});
+
+describe("mandatory transcription policy survives the instructions cap (bd pibot-0xpf.4 review)", () => {
+  const started = (r: { details?: unknown }) => (r.details as { taskId?: string } | undefined)?.taskId ?? "";
+  const long = "x".repeat(8000);
+  const policy: SttPolicy = { providers: ["whisperkit", "groq"], allowExternal: true };
+
+  it("prepends and preserves the policy when instructions fill the 8000 cap (no-preflight branch)", async () => {
+    const prev = process.env.STT_PROVIDERS;
+    process.env.STT_PROVIDERS = "whisperkit,groq"; // the host must enable Groq for the chunked route
+    try {
+      const run = vi.fn(async () => "done");
+      const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+      const t = tools(tasksPlugin({ ledger, agentId: "knower", chat: { transport: "telegram", chatId: "42" }, transcription: { policy } }));
+      const r = await t.get("start_task")!.execute("cap1", { title: "max input", instructions: long, audioDurationSec: 27 * 60 });
+      const task = await ledger.get(started(r as { details?: unknown }));
+      expect(task!.instructions.length).toBeLessThanOrEqual(8000);
+      expect(task!.instructions.startsWith("[pibot:transcription-policy] route=chunked-external")).toBe(true);
+      expect(task!.instructions).toContain("do NOT fall back to WhisperKit");
+      expect(task!.instructions).toContain("2 chunks of <=15 min");
+      ledger.close();
+    } finally {
+      if (prev === undefined) delete process.env.STT_PROVIDERS; else process.env.STT_PROVIDERS = prev;
+    }
+  });
+
+  it("prepends and preserves the policy with the preflight branch active", async () => {
+    const run = vi.fn(async () => "done");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    const preflight = { check: async () => ({ ok: true, issues: [] as string[] }), release: () => {} };
+    const t = tools(tasksPlugin({ ledger, agentId: "knower", chat: { transport: "telegram", chatId: "42" }, preflight: preflight as never, transcription: { policy } }));
+    const r = await t.get("start_task")!.execute("cap2", { title: "max input", instructions: long, audioDurationUnknown: true });
+    const task = await ledger.get(started(r as { details?: unknown }));
+    expect(task!.instructions.length).toBeLessThanOrEqual(8000);
+    expect(task!.instructions.startsWith("[pibot:transcription-policy] route=probe-required")).toBe(true);
+    expect(task!.instructions).toMatch(/PROBE it \(ffprobe\) FIRST/);
     ledger.close();
   });
 });

@@ -67,6 +67,35 @@ function messageIdOf(sent: unknown): number | undefined {
   return typeof m?.message_id === "number" ? m.message_id : undefined;
 }
 
+/** The chat a returned Bot API message actually landed in — the truth a receipt must attest. */
+function chatIdOfSent(sent: unknown): string | undefined {
+  const id = (sent as { chat?: { id?: number | string } } | undefined)?.chat?.id;
+  return id === undefined || id === null ? undefined : String(id);
+}
+
+/** The medium actually present on a returned Bot API message (fixes "assume what we asked for"). */
+function mediaKindOfSent(sent: unknown): string | undefined {
+  const m = sent as Record<string, unknown> | undefined;
+  if (!m) return undefined;
+  for (const kind of ["video_note", "video", "animation", "document", "photo", "voice", "audio"]) {
+    if (m[kind] !== undefined && m[kind] !== null) return kind;
+  }
+  return undefined;
+}
+
+/** The sender identity on a returned Bot API message — the account that ACTUALLY sent it. */
+function fromIdentityOfSent(sent: unknown): string | undefined {
+  const from = (sent as { from?: { id?: number | string; username?: string } } | undefined)?.from;
+  if (!from) return undefined;
+  if (from.username) return `@${from.username}`;
+  return from.id === undefined || from.id === null ? undefined : String(from.id);
+}
+
+/** Delivery receipt with the destination-aware tuple this transport can attest (bd pibot-cida):
+ *  the peer it actually posted to, the bot account that sent, and — because Bot API ids are not
+ *  MTProto ids — the id namespace, tagged so the two are never compared as the same message. */
+export interface TelegramReceipt extends DeliveryReceipt {}
+
 const BOT_COMMANDS = [
   { command: "call", description: "Ring my phone as this agent (confirm first)" },
   { command: "voice", description: "Talk to this agent by voice" },
@@ -579,12 +608,33 @@ export class TelegramTransport implements Transport {
     });
   }
 
+  /** The receipt tuple for a message this transport posted (bd pibot-cida), derived from the ACTUAL
+   *  Bot API response: the peer is the chat the message really landed in, the medium is the one the
+   *  response carries, and the account is the identity the RESPONSE names (the cached bot identity is
+   *  only a fallback, so a contradictory `from` is never silently replaced by ours). A response that
+   *  omits chat.id or the media leaves those fields UNSET — an unverified destination/type must not be
+   *  manufactured from what we asked for. `evidence` is "ack": an API acknowledgement is not a
+   *  same-peer readback and never a human viewing. */
+  private receiptFor(chatId: string, sent: unknown): TelegramReceipt {
+    const r: TelegramReceipt = { idProtocol: "bot_api", evidence: "ack" };
+    const actualChatId = chatIdOfSent(sent);
+    if (actualChatId !== undefined) r.peer = `${this.name}:${actualChatId}`;
+    const account =
+      fromIdentityOfSent(sent) ?? (this.me?.username ? `@${this.me.username}` : this.me ? String(this.me.id) : undefined);
+    if (account !== undefined) r.account = account;
+    const messageId = messageIdOf(sent);
+    if (messageId !== undefined) r.messageId = messageId;
+    const mediaType = mediaKindOfSent(sent);
+    if (mediaType !== undefined) r.mediaType = mediaType;
+    return r;
+  }
+
   /** Telegram requires a fresh multipart upload for every profile-photo change. */
-  async sendMedia(chatId: string, source: string): Promise<DeliveryReceipt | void> {
+  async sendMedia(chatId: string, source: string): Promise<TelegramReceipt | void> {
     // http(s) URL → Telegram fetches it; absolute local path → upload from disk.
-    return this.enqueue(chatId, async (): Promise<DeliveryReceipt | void> => {
+    return this.enqueue(chatId, async (): Promise<TelegramReceipt | void> => {
       if (/^https?:\/\//i.test(source)) {
-        return { messageId: messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, source))), mediaType: "photo" };
+        return this.receiptFor(chatId, await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, source)));
       }
       const local = path.resolve(source);
       if (!fs.existsSync(local)) throw new Error(`MEDIA file not found: ${local}`);
@@ -593,9 +643,9 @@ export class TelegramTransport implements Transport {
       const lower = local.toLowerCase();
       const isImage = /\.(jpe?g|png|webp|gif|heic)$/.test(lower);
       if (isImage) {
-        return { messageId: messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, new InputFile(local)))), mediaType: "photo" };
+        return this.receiptFor(chatId, await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, new InputFile(local))));
       }
-      return { messageId: messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendDocument(chatId, new InputFile(local)))), mediaType: "document" };
+      return this.receiptFor(chatId, await this.sendTelegram(chatId, () => this.bot.api.sendDocument(chatId, new InputFile(local))));
     });
   }
 
@@ -638,7 +688,7 @@ export class TelegramTransport implements Transport {
     });
   }
 
-    async sendVideoNote(chatId: string, filePath: string): Promise<DeliveryReceipt | void> {
+    async sendVideoNote(chatId: string, filePath: string): Promise<TelegramReceipt | void> {
     const resolved = path.resolve(filePath);
     // Sync lstat here keeps the guard simple: no symlinks, regular files only.
     const st = fs.lstatSync(resolved);
@@ -647,7 +697,7 @@ export class TelegramTransport implements Transport {
     if (path.extname(resolved).toLowerCase() !== ".mp4") throw new Error("Telegram video notes must be MP4 (H.264 up to 60s)");
     const digest = createHash("sha256").update(fs.readFileSync(resolved)).digest("hex");
     const payload = `videonote:${digest}`;
-    return this.enqueue(chatId, async (): Promise<DeliveryReceipt | void> => {
+    return this.enqueue(chatId, async (): Promise<TelegramReceipt | void> => {
       if (!this.duplicateGuard.shouldSend(chatId, payload)) {
         console.warn(`[telegram] suppressed duplicate video-note send to chat ${chatId}`);
         return;
@@ -659,9 +709,12 @@ export class TelegramTransport implements Transport {
         // video notes in the Bot API, so none is passed.
         return this.bot.api.sendVideoNote(chatId, input);
       });
+      // Real-send evidence line: agent claims of delivery must be checkable (bd pibot-3w03 ghost-claims).
       this.duplicateGuard.markSent(chatId, payload);
-      // receipt for the verified-completion gate (bd pibot-zy70): the round note's message id
-      return { messageId: messageIdOf(sent), mediaType: "video_note" };
+      // receipt for the verified-completion gate (bd pibot-zy70), destination-aware (bd pibot-cida)
+      const receipt = this.receiptFor(chatId, sent);
+      console.warn(`[telegram] ${this.name}: video-note sent — chat ${chatId} message ${receipt.messageId ?? "?"} file ${path.basename(resolved)}`);
+      return receipt;
     });
   }
 
@@ -1107,7 +1160,7 @@ export class TelegramTransport implements Transport {
     is_persistent: false,
   };
 
-  async push(chatId: string, opts: PushOptions): Promise<DeliveryReceipt | void> {
+  async push(chatId: string, opts: PushOptions): Promise<TelegramReceipt | void> {
     if (this.name === "telegram:lab" && this.boundAgentId === "lab") {
       // Origin-tagged proactive output may only reach an allowlisted owner DM.
       if (/\[heartbeat\]/i.test(opts.text) && (!/^[1-9]\d*$/.test(chatId) || !this.allowed.has(chatId))) return;
@@ -1117,7 +1170,7 @@ export class TelegramTransport implements Transport {
         opts = { ...opts, text, ...(opts.card ? { card: { ...opts.card, text: labGroupReply(opts.card.text) } } : {}) };
       }
     }
-    return this.enqueue(chatId, async (): Promise<DeliveryReceipt | void> => {
+    return this.enqueue(chatId, async (): Promise<TelegramReceipt | void> => {
       const raw = stripAcpLeak(opts.text);
       // Long texts (Bot API 10.1+): rich messages carry 32k chars — well past the
       // classic 4k, so a multi-paragraph push needs no truncation or splitting as
@@ -1137,9 +1190,11 @@ export class TelegramTransport implements Transport {
       }
       // first plain message in a chat attaches the persistent quick-action keyboard —
       // only the main bot; subbot chats keep their own clean slate
+      let sent: unknown;
       let sentId: number | undefined;
       try {
-        sentId = await this.sendPushBody(chatId, text, opts);
+        sent = await this.sendPushBody(chatId, text, opts);
+        sentId = messageIdOf(sent);
       } catch (e) {
         // The 👍 must never claim a delivery that did not happen: it is settled
         // BEFORE the send precisely so a wedged outbox cannot block it, which also
@@ -1151,14 +1206,15 @@ export class TelegramTransport implements Transport {
       this.recordCardMessage(chatId, sentId, Boolean(opts.card));
       await this.sweepStaleCards(chatId);
       this.duplicateGuard.markSent(chatId, dedupeKey);
-      // delivery receipt for task records (bd pibot-zy70); nothing observable when suppresssed
-      return sentId !== undefined ? { messageId: sentId } : undefined;
+      // delivery receipt for task records (bd pibot-zy70), destination-aware (bd pibot-cida);
+      // nothing observable when suppressed
+      return sentId !== undefined ? this.receiptFor(chatId, sent) : undefined;
     });
   }
 
-  /** Push body: rich/legacy routing, quick-action keyboard, reply threading. */
-  private async sendPushBody(chatId: string, text: string, opts: PushOptions): Promise<number | undefined> {
-      let sentId: number | undefined;
+  /** Push body: rich/legacy routing, quick-action keyboard, reply threading.
+   *  Returns the raw Bot API message so the caller can derive a receipt from the ACTUAL response. */
+  private async sendPushBody(chatId: string, text: string, opts: PushOptions): Promise<unknown> {
       // reply threading: a push can answer a specific incoming message
       const replyParams = opts.replyToMessageId
         ? { reply_parameters: { message_id: opts.replyToMessageId, allow_sending_without_reply: true } }
@@ -1169,19 +1225,18 @@ export class TelegramTransport implements Transport {
       // one classic message at all, so re-truncate to the classic limit in that branch.
       if (isRichTelegramContent(text) || text.length > TG_LIMIT) {
         try {
-          sentId = messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendRichMessage(chatId, { markdown: text }, {
+          return await this.sendTelegram(chatId, () => this.bot.api.sendRichMessage(chatId, { markdown: text }, {
             reply_markup: keyboard(opts.card),
             ...replyParams,
-          })));
+          }));
         } catch (e) {
           // 404 → legacy server (classic entities below); markup rejection → same
           // degrade as the classic path, so a formatting bug never eats a reply.
           if (!isRichUnsupported(e) && !isEntityParseError(e)) throw e;
-          const sent = await this.sendClassicMessage(chatId, text.length > TG_LIMIT ? truncate(text, TG_LIMIT) + "\n\n…(truncated)" : text, {
+          return await this.sendClassicMessage(chatId, text.length > TG_LIMIT ? truncate(text, TG_LIMIT) + "\n\n…(truncated)" : text, {
             reply_markup: keyboard(opts.card),
             ...replyParams,
           });
-          sentId = messageIdOf(sent);
         }
       } else if (!this.keyboardSent.has(chatId) && !opts.card && !this.boundAgentId && process.env.PIBOT_QUICK_KEYBOARD !== "0") {
         const sent = await this.sendClassicMessage(chatId, text, {
@@ -1189,15 +1244,13 @@ export class TelegramTransport implements Transport {
           ...replyParams,
         });
         this.keyboardSent.add(chatId);
-        sentId = messageIdOf(sent);
+        return sent;
       } else {
-        const sent = await this.sendClassicMessage(chatId, text, {
+        return await this.sendClassicMessage(chatId, text, {
           reply_markup: keyboard(opts.card),
           ...replyParams,
         });
-        sentId = messageIdOf(sent);
       }
-      return sentId;
   }
 
   /**

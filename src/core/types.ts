@@ -77,11 +77,22 @@ export interface PushOptions {
   dedupeKey?: string;
 }
 
-/** Delivery receipt from a transport push (bd pibot-zy70): id of the sent message, when observable. */
+/** Delivery receipt from a transport push (bd pibot-zy70): id of the sent message, when observable.
+ *  Destination-aware (bd pibot-cida): a message id alone proves neither WHERE the result landed nor
+ *  WHAT it was, so a transport that can observe them also attests its peer, the sending bot account
+ *  and the id namespace. An API acknowledgement is not a same-peer readback and never a human view. */
 export interface DeliveryReceipt {
   messageId?: number;
   /** actually delivered medium: "photo" | "document" | "video_note" | … (absent = plain text) */
   mediaType?: string;
+  /** destination the receipt attests, as "transport:chatId"; absent = the destination is unverified */
+  peer?: string;
+  /** bot/account identity that performed the send — NEVER an agent id */
+  account?: string;
+  /** message-id namespace ("bot_api" | "mtproto", …) — ids from other namespaces are never the same message */
+  idProtocol?: string;
+  /** strongest evidence obtained: an API ack is not a readback, and neither is a human viewing */
+  evidence?: "ack" | "readback" | "viewed";
 }
 
 /** Context about a Telegram message the user replied to (transport-supplied). */

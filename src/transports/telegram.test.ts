@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { InputFile } from "grammy";
 import type { InputProfilePhoto } from "grammy/types";
 import type { Card } from "../core/types.js";
-import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec, serviceMessageKind, toTelegramHtml, stripAcpLeak } from "./telegram.js";
+import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec, serviceMessageKind, toTelegramHtml, stripAcpLeak, type TelegramReceipt } from "./telegram.js";
 
 describe("TelegramDuplicateGuard", () => {
   it("suppresses an identical payload to the same chat inside the window", () => {
@@ -156,6 +156,90 @@ describe("Telegram profile photo adapter", () => {
     expect(first.photo.filename).toBe("coach-avatar.jpg");
     expect(second.photo).toBeInstanceOf(InputFile);
     expect(second.photo).not.toBe(first.photo);
+  });
+});
+
+describe("destination-aware delivery receipts (bd pibot-cida)", () => {
+  const ME = { id: 4242, username: "pibot", first_name: "PiBot" };
+
+  function transportWithApi(api: Record<string, unknown>, me: typeof ME | null = ME): TelegramTransport {
+    const t = new TelegramTransport("123:test", ["42"], { nameSuffix: "coach" });
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = { api };
+    (t as unknown as { me: typeof ME | undefined }).me = me ?? undefined;
+    return t;
+  }
+
+  it("stamps peer, account, id namespace and evidence on a text push", async () => {
+    const t = transportWithApi({ sendMessage: async () => ({ message_id: 7, chat: { id: 42 } }) });
+    const r = await t.push("42", { text: "hello" });
+    expect(r).toMatchObject({ messageId: 7, peer: "telegram:coach:42", account: "@pibot", idProtocol: "bot_api", evidence: "ack" });
+  });
+
+  it("tags a document send with its destination and medium", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-receipt-"));
+    const file = path.join(dir, "report.pdf");
+    fs.writeFileSync(file, "pdf", { mode: 0o600 });
+    const t = transportWithApi({ sendDocument: async () => ({ message_id: 11, chat: { id: 42 }, document: { file_id: "d" } }) });
+    const r = await t.sendMedia("42", file);
+    expect(r).toMatchObject({ messageId: 11, mediaType: "document", peer: "telegram:coach:42", idProtocol: "bot_api", evidence: "ack" });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("tags a round video note as video_note with its destination", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-receipt-"));
+    const file = path.join(dir, "circle.mp4");
+    fs.writeFileSync(file, "mp4", { mode: 0o600 });
+    const t = transportWithApi({ sendVideoNote: async () => ({ message_id: 12, chat: { id: 42 }, video_note: { file_id: "v" } }) });
+    const r = await t.sendVideoNote("42", file);
+    expect(r).toMatchObject({ messageId: 12, mediaType: "video_note", peer: "telegram:coach:42", idProtocol: "bot_api" });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("omits the account when the bot identity is not known yet", async () => {
+    const t = transportWithApi({ sendMessage: async () => ({ message_id: 8, chat: { id: 42 } }) }, null);
+    const r = await t.push("42", { text: "hello" });
+    expect(r).toMatchObject({ messageId: 8, peer: "telegram:coach:42" });
+    expect((r as TelegramReceipt).account).toBeUndefined();
+  });
+
+  it("records the ACTUAL response chat id when it contradicts the requested chat", async () => {
+    // A response whose chat.id disagrees with the chat we addressed is a contradiction the receipt
+    // must NOT paper over — the peer reports where the message really landed.
+    const t = transportWithApi({ sendMessage: async () => ({ message_id: 9, chat: { id: 99 } }) });
+    const r = await t.push("42", { text: "hello" });
+    expect(r).toMatchObject({ messageId: 9, peer: "telegram:coach:99", account: "@pibot", idProtocol: "bot_api", evidence: "ack" });
+  });
+
+  it("stamps the medium the RESPONSE carries, not the one we asked for", async () => {
+    const t = transportWithApi({ sendPhoto: async () => ({ message_id: 13, chat: { id: 42 }, animation: { file_id: "x" } }) });
+    const r = await t.sendMedia("42", "https://example.com/clip.mp4");
+    expect(r).toMatchObject({ messageId: 13, mediaType: "animation" });
+  });
+
+  // ── strict: a response field we did NOT get stays unverified (bd pibot-cida review) ──
+
+  it("leaves the peer UNSET when the response names no chat — no echo of the requested chat", async () => {
+    const t = transportWithApi({ sendMessage: async () => ({ message_id: 21 }) });
+    const r = await t.push("42", { text: "hello" });
+    expect((r as TelegramReceipt).messageId).toBe(21);
+    expect((r as TelegramReceipt).peer).toBeUndefined();
+  });
+
+  it("leaves the media type UNSET when the response carries no medium — no echo of what we asked for", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-receipt-"));
+    const file = path.join(dir, "circle.mp4");
+    fs.writeFileSync(file, "mp4", { mode: 0o600 });
+    const t = transportWithApi({ sendVideoNote: async () => ({ message_id: 22, chat: { id: 42 } }) });
+    const r = await t.sendVideoNote("42", file);
+    expect(r).toMatchObject({ messageId: 22, peer: "telegram:coach:42" });
+    expect((r as TelegramReceipt).mediaType).toBeUndefined();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("uses the account the RESPONSE names — a contradicting sender is not hidden by the cached bot identity", async () => {
+    const t = transportWithApi({ sendMessage: async () => ({ message_id: 23, chat: { id: 42 }, from: { id: 999, username: "otherbot" } }) });
+    const r = await t.push("42", { text: "hello" });
+    expect((r as TelegramReceipt).account).toBe("@otherbot"); // the ACTUAL sender, not the cached me
   });
 });
 
@@ -1043,5 +1127,31 @@ describe("Telegram video-note delivery", () => {
     const transport = new (await import("./telegram.js")).TelegramTransport("123:test", ["42"]);
     await expect(transport.sendVideoNote("42", file)).rejects.toThrow(/MP4/);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("video-note send evidence logging", () => {
+  const ME2 = { id: 4242, username: "pibot", first_name: "PiBot" };
+  function transportWithApi(api: Record<string, unknown>, me: typeof ME2 | null = ME2): TelegramTransport {
+    const t = new TelegramTransport("123:test", ["42"], { nameSuffix: "coach" });
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = { api };
+    (t as unknown as { me: typeof ME2 | undefined }).me = me ?? undefined;
+    return t;
+  }
+  it("logs a real-send line with transport name, chat and message id", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-vnlog-"));
+    try {
+      fs.writeFileSync(path.join(dir, "note.mp4"), "x");
+      const t = transportWithApi({ sendVideoNote: async () => ({ message_id: 77, chat: { id: 42 }, video_note: { file_id: "v" } }) });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      let lines: string[] = [];
+      try { await t.sendVideoNote("42", path.join(dir, "note.mp4")); lines = warn.mock.calls.map((c) => String(c[0])); }
+      finally { warn.mockRestore(); }
+      const line = lines.find((s) => s.includes("video-note sent"));
+      expect(line).toBeDefined();
+      expect(line).toContain("chat 42");
+      expect(line).toContain("message 77");
+      expect(line).toContain("note.mp4");
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

@@ -24,6 +24,9 @@ import { ensureDir, errorMessage, fmtWhen, inQuietHours, parseDuration, readJson
 import { appendBacklogItems, formatBacklogDigest } from "./backlog.js";
 import { buildResearchSignals } from "./research-signals.js";
 import { trackActivity } from "./activity.js";
+import { describeDeadlineAt } from "./deadline.js";
+import { scanRelativeDateClaims } from "./fact-check.js";
+import { DISPLAY_TIME_ZONE } from "./time-zone.js";
 
 /** Adaptive-wakeup bounds (Ouroboros set_next_wakeup pattern): the agent may
  *  compress the next gap when something is brewing, stretch it when idle.
@@ -624,6 +627,18 @@ export class HeartbeatEngine {
       }
       const speakFingerprint = fingerprint(act.speak);
       if (this.lastSpeakFingerprint.get(agent.id) === speakFingerprint) return;
+      // Relative-date guard AT the delivery path (bd pibot-wr9m): on 2026-10-26 a
+      // model-composed nudge called the November 2 deadline "today". The absolute
+      // date is the authority; a relative word that disagrees with the current
+      // calendar day (named zone) is suppressed BEFORE emission — never a warning
+      // appended below the false urgency. Housekeeping (wakeup/maintain) already
+      // ran above, and a suppressed speak is NOT recorded as delivered: no
+      // fingerprint, no backoff increment — the next tick can re-derive it.
+      const dateCheck = scanRelativeDateClaims(act.speak, { timeZone: DISPLAY_TIME_ZONE });
+      if (dateCheck.inconsistent > 0) {
+        this.deps.events.log(agent.id, "heartbeat", `(suppressed, date mismatch) ${truncate(act.speak, 160)}`);
+        return;
+      }
       // backoff: proactive speaks that go unanswered make the heartbeat quieter
       const n = (this.unansweredSpeaks.get(agent.id) ?? 0) + 1;
       await this.deps.host.deliverToAgent(agent.id, act.speak, { origin: "heartbeat" });
@@ -734,11 +749,19 @@ export function buildHeartbeatDigest(
     parts.push(`# Memory digest\n${truncate(fs.readFileSync(memoryFile, "utf8").trim(), 1200)}`);
   }
 
-  // pending schedule
+  // pending schedule — the RELATIVE wording is computed here, in the owner's named
+  // zone, from the absolute due time, WITH the exact local HH:mm so a same-day
+  // reminder stays actionable. The model never has to infer "today" from a bare clock
+  // value (which is how the Nov 2 deadline was once called "today").
   const jobs = scheduler.list(agent.id).filter((j) => !j.internal).slice(0, 6);
   if (jobs.length) {
     parts.push(
-      `# Pending scheduled items\n${jobs.map((j) => `- "${j.title}" — ${fmtWhen(j.dueAt)}${j.wake === "important" ? " (!important)" : ""}`).join("\n")}`
+      `# Pending scheduled items\n${jobs
+        .map((j) => {
+          const when = describeDeadlineAt(j.dueAt, { timeZone: DISPLAY_TIME_ZONE }) ?? fmtWhen(j.dueAt);
+          return `- "${j.title}" — ${when}${j.wake === "important" ? " (!important)" : ""}`;
+        })
+        .join("\n")}`
     );
   } else {
     parts.push("# Pending scheduled items\n(none)");

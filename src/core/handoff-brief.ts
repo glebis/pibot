@@ -14,8 +14,11 @@ import {
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { trackActivity } from "./activity.js";
+import { declaredTranscriptionRoute, LONG_AUDIO_RULE } from "./transcription-policy.js";
 
 const BRIEF_SYSTEM = `You package a conversation for handoff to another AI agent. Given the recent transcript, write a brief that lets the target agent continue — and execute the task — without asking the user to repeat anything.
+
+If the work involves transcribing audio longer than 15 minutes, record this owner rule verbatim in the Context section so it survives the handoff: "${LONG_AUDIO_RULE}".
 
 Use exactly these sections, each a short line or two; omit a section only if it truly has no content:
 - Task: what the user wants done, in one or two sentences
@@ -41,14 +44,35 @@ export function extractBriefText(raw: string): string | null {
 }
 
 /** Pure: the prompt envelope delivered to the target agent (keeps the `[handoff from` internal-prompt prefix). */
-export function buildHandoffEnvelope(fromAgent: string, brief: string, note?: string): string {
+export function buildHandoffEnvelope(
+  fromAgent: string,
+  brief: string,
+  note?: string,
+  opts: { includeLongAudioRule?: boolean } = {},
+): string {
   return [
     `[handoff from "${fromAgent}"] The user is moving this conversation to you. Continue where this left off — acknowledge in one short line, then pick up the thread.`,
     ``,
     `# Handoff brief`,
     brief,
+    // Deterministic carry (bd pibot-0xpf.4 review): when the handoff involves long-audio
+    // transcription, the canonical owner rule is attached by THIS envelope, not left to
+    // the model to reproduce from the brief.
+    ...(opts.includeLongAudioRule ? [``, `# Owner policy (verbatim)`, LONG_AUDIO_RULE] : []),
     ...(note ? [``, `# Note from ${fromAgent}`, note] : []),
   ].join("\n");
+}
+
+/**
+ * Whether a handoff source already carries the long-audio policy — either the durable
+ * task policy marker prepended to instructions, or the canonical rule wording. The host
+ * uses this to decide `includeLongAudioRule`, so the carry is deterministic rather than
+ * a hope that the model repeated the rule in its brief.
+ */
+export function handoffNeedsLongAudioRule(source: string): boolean {
+  const text = source ?? "";
+  if (declaredTranscriptionRoute(text) !== undefined) return true;
+  return text.includes("WhisperKit") && /15\s*min/i.test(text);
 }
 
 /** Distill a transcript excerpt into a handoff brief via an ephemeral cheap-model session. */
