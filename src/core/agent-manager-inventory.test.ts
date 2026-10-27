@@ -108,7 +108,7 @@ describe("built-session capability inventory (bd pibot-4wq1)", () => {
     expect(stale.capabilities).toEqual(before.capabilities); // snapshot preserved, never silently refreshed
     expect(stale.activeTools).toEqual(before.activeTools);
     expect(stale.unavailable).toEqual(before.unavailable);
-    expect(mgr.isSessionStale("alpha")).toBe(true);
+    expect(mgr.isSessionStale("alpha", "telegram:1")).toBe(true);
   });
 
   it("a rebuild yields the correct preserved authorised ids/tools and no unavailable grant", async () => {

@@ -256,22 +256,35 @@ describe("live capability refresh — session staleness (bd: pibot-3w03)", () =>
   const file = () => path.join(dir, "alpha", "agent.json");
 
   it("flags stale only when the on-disk manifest differs from the build-time fingerprint", async () => {
-    expect(mgr.isSessionStale("alpha")).toBe(false); // nothing built yet
-    mgr.noteSessionBuilt("alpha");
-    expect(mgr.isSessionStale("alpha")).toBe(false); // manifest unchanged on disk
+    expect(mgr.isSessionStale("alpha", "test:1")).toBe(false); // nothing built yet
+    mgr.noteSessionBuilt("alpha", "test:1");
+    expect(mgr.isSessionStale("alpha", "test:1")).toBe(false); // manifest unchanged on disk
     const m = JSON.parse(fs.readFileSync(file(), "utf8"));
     m.capabilities = [...(m.capabilities ?? []), "speech"];
     fs.writeFileSync(file(), JSON.stringify(m, null, 2));
-    expect(mgr.isSessionStale("alpha")).toBe(true); // capability grant landed on disk
-    mgr.noteSessionBuilt("alpha");
-    expect(mgr.isSessionStale("alpha")).toBe(false);
+    expect(mgr.isSessionStale("alpha", "test:1")).toBe(true); // capability grant landed on disk
+    mgr.noteSessionBuilt("alpha", "test:1");
+    expect(mgr.isSessionStale("alpha", "test:1")).toBe(false);
+  });
+
+  it("one chat session\ u0027s rebuild never masks another's staleness", async () => {
+    mgr.noteSessionBuilt("alpha", "test:other"); // another chat built AFTER the grant
+    expect(mgr.isSessionStale("alpha", "other:2")).toBe(false); // nothing built there yet — safe
+    mgr.noteSessionBuilt("alpha", "other:2"); // fresh chat on TODAY's manifest
+    const m = JSON.parse(fs.readFileSync(file(), "utf8"));
+    m.capabilities = [...(m.capabilities ?? []), "agent-comms"];
+    fs.writeFileSync(file(), JSON.stringify(m, null, 2));
+    // the fresh chat is current; the older chat is stale INDEPENDENTLY
+    expect(mgr.isSessionStale("alpha", "other:2")).toBe(true);
+    mgr.noteSessionBuilt("alpha", "other:2");
+    expect(mgr.isSessionStale("alpha", "other:2")).toBe(false);
   });
 
   it("an identical-byte rewrite (mtime-only refresh) never counts as stale", async () => {
-    mgr.noteSessionBuilt("alpha");
+    mgr.noteSessionBuilt("alpha", "test:1");
     const before = fs.readFileSync(file(), "utf8");
     fs.writeFileSync(file(), before); // same bytes, fresh mtime (bl_raqq2k-style refresh)
-    expect(mgr.isSessionStale("alpha")).toBe(false);
+    expect(mgr.isSessionStale("alpha", "test:1")).toBe(false);
   });
 
   it("rebuilding hydrates the manifest from disk — new caps land without a restart", async () => {
@@ -283,9 +296,9 @@ describe("live capability refresh — session staleness (bd: pibot-3w03)", () =>
   });
 
   it("a deleted or unreadable manifest never flags stale (fail-safe session keep)", () => {
-    mgr.noteSessionBuilt("alpha");
+    mgr.noteSessionBuilt("alpha", "test:1");
     fs.renameSync(file(), file() + ".bak");
-    expect(mgr.isSessionStale("alpha")).toBe(false);
+    expect(mgr.isSessionStale("alpha", "test:1")).toBe(false);
     fs.renameSync(file() + ".bak", file());
   });
 });
@@ -384,12 +397,12 @@ describe("manifest field-level updates + real capability inventory (bd pibot-4wq
   });
 
   it("leaves the live session stale after an update so the new grant is actually re-resolved", () => {
-    mgr.noteSessionBuilt("alpha");
-    expect(mgr.isSessionStale("alpha")).toBe(false);
+    mgr.noteSessionBuilt("alpha", "test:1");
+    expect(mgr.isSessionStale("alpha", "test:1")).toBe(false);
     const r = mgr.updateManifest("alpha", { capabilities: ["memory", "tasks", "commitments", "speech"] });
     expect(r.ok).toBe(true);
     expect(r.diff!.added).toEqual({ capabilities: ["speech"] });
-    expect(mgr.isSessionStale("alpha")).toBe(true);
+    expect(mgr.isSessionStale("alpha", "test:1")).toBe(true);
   });
 
   it("refuses to overwrite a manifest that is not a JSON object", () => {
@@ -430,7 +443,7 @@ describe("manifest field-level updates + real capability inventory (bd pibot-4wq
 
   it("reports session built/stale/active state so an inventory is never mistaken for a live session", () => {
     const ctx = { workspace: dir, vaultDir: dir, scheduler: {}, chat: { transport: "test", chatId: "1" } } as unknown as Omit<CapabilityContext, "agent">;
-    mgr.noteSessionBuilt("alpha");
+    mgr.noteSessionBuilt("alpha", "test:1");
     const built = mgr.resolveAgentInventory("alpha", ctx, REGISTRY)!;
     expect(built.sessionBuilt).toBe(true);
     expect(built.sessionStale).toBe(false);

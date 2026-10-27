@@ -124,7 +124,7 @@ export interface SessionInventory {
 export class AgentManager {
   private agents = new Map<string, LoadedAgent>();
   private sessions = new Map<string, AgentSession>(); // `${agentId}::${chatKey}` → session
-  private builtManifestShas = new Map<string, string>(); // agentId → manifest sha at session-build time
+  private builtManifestShas = new Map<string, string>(); // `${agentId}::${chatKey}` → manifest sha at that session's build time
   /** per-session capability inventory captured at build/refresh (bd pibot-4wq1) */
   private sessionInventories = new Map<string, SessionInventory>();
   /** measurable commitment loop (proactive pilot); set by the host after wiring */
@@ -385,7 +385,7 @@ export class AgentManager {
 
     this.sessions.set(key, session);
     // fingerprint the manifest NOW so later on-disk grant/manifest edits flag the session stale (bd: pibot-3w03)
-    this.noteSessionBuilt(agentId);
+    this.noteSessionBuilt(agentId, chatKey);
     // capture the ACTUAL authorised capability set this build produced, keyed to this exact
     // chat (bd pibot-4wq1) — the real host path, read back from the session object itself.
     this.captureSessionInventory(agentId, chatKey, session, capabilitySet);
@@ -420,19 +420,30 @@ export class AgentManager {
     }
   }
 
-  /** Record the manifest fingerprint at session-build time (getOrCreateSession calls this; tests may too). */
-  noteSessionBuilt(agentId: string): void {
+  /** Record the manifest fingerprint at session-build time (getOrCreateSession calls this; tests may too).
+   *  Keyed PER SESSION — another chat of the same agent must never mask this session's staleness (bd: pibot-3w03). */
+  noteSessionBuilt(agentId: string, chatKey: string): void {
     const sha = this.manifestShaOnDisk(agentId);
-    if (sha) this.builtManifestShas.set(agentId, sha);
+    if (sha) this.builtManifestShas.set(`${agentId}::${chatKey}`, sha);
   }
 
-  /** True when the on-disk manifest differs from the one live sessions were built with — call resetSession so
+  /** True when the on-disk manifest differs from the one THIS session was built with — call resetSession so
    *  capability grants and manifest edits reach the running session without /new or a daemon restart (bd: pibot-3w03). */
-  isSessionStale(agentId: string): boolean {
-    const built = this.builtManifestShas.get(agentId);
+  isSessionStale(agentId: string, chatKey: string): boolean {
+    const built = this.builtManifestShas.get(`${agentId}::${chatKey}`);
     if (!built) return false;
     const disk = this.manifestShaOnDisk(agentId);
     return disk !== undefined && disk !== built;
+  }
+
+  /** Agent-level view for the dashboard inventory: ANY live session still built on an older manifest. */
+  anySessionStale(agentId: string): boolean {
+    const disk = this.manifestShaOnDisk(agentId);
+    if (disk === undefined) return false;
+    for (const [key, built] of this.builtManifestShas) {
+      if (key.startsWith(`${agentId}::`) && built !== disk) return true;
+    }
+    return false;
   }
 
   /** sha256 of the manifest currently on disk (undefined when absent or unreadable). */
@@ -560,8 +571,8 @@ export class AgentManager {
       capabilities: set.ids,
       tools: set.sessionTools,
       unavailable: set.unavailable,
-      sessionBuilt: this.builtManifestShas.has(agentId),
-      sessionStale: this.isSessionStale(agentId),
+      sessionBuilt: this.builtManifestShas.has(agentId) || [...this.builtManifestShas.keys()].some((k) => k.startsWith(`${agentId}::`)),
+      sessionStale: this.anySessionStale(agentId),
       sessionActive: [...this.sessions.keys()].some((key) => key.startsWith(`${agentId}::`)),
     };
   }

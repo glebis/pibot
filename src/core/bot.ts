@@ -1157,7 +1157,7 @@ export class PiBot implements HeartbeatHost {
   }
 
   private async sessionFor(t: Transport, chatId: string, agentId: string, ck: string): Promise<AgentSession> {
-    if (this.deps.agents.isSessionStale(agentId)) {
+    if (this.deps.agents.isSessionStale(agentId, ck)) {
       // bd: pibot-3w03 — capability grants and manifest edits must reach live sessions;
       // reset (same file resumes) so tools like video_note_send appear without /new or a restart.
       this.deps.events.log(agentId, "system", `manifest changed on disk — resetting chat session to pick up current capabilities (${ck})`);
