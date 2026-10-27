@@ -17,7 +17,9 @@
     "test:coverage": "vitest run --coverage",
     "test:env": "vitest run --config vitest.env.config.ts",
     "evolve": "tsx scripts/evolve.ts",
-    "test:telegram": "tsx scripts/telegram-live-test.mts"
+    "acp": "tsx src/acp/main.ts",
+    "test:telegram": "tsx scripts/telegram-live-test.mts",
+    "test:acp": "tsx scripts/acp-smoke.mts"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^1.0.0",

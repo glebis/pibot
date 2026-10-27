@@ -12,6 +12,8 @@ import { devToolsPlugin } from "../plugins/dev-tools-plugin.js";
 import { docsPlugin } from "../plugins/docs-plugin.js";
 import { execPlugin } from "../plugins/exec-plugin.js";
 import { herdrPlugin } from "../plugins/herdr-plugin.js";
+import { acpPlugin } from "../plugins/acp-plugin.js";
+import { installedAcpAgents } from "../acp/client.js";
 import { gmailPlugin } from "../plugins/gmail-plugin.js";
 import { knowledgePlugin } from "../plugins/knowledge-plugin.js";
 import { linearPlugin } from "../plugins/linear-plugin.js";
@@ -276,6 +278,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     prompt: "herdr_dispatch spawns a subagent (claude/codex/pi/opencode) in a new tab of the owner's herdr terminal; the brief must be fully self-contained (absolute paths, do-not-touch constraints, output location) and must never contain secrets. herdr_read and herdr_wait observe a dispatched pane. Spawned subagents run with their own permissions in the owner's visible herdr UI.",
     available: () => executableAvailable("herdr"),
     create: () => herdrPlugin(),
+  },
+  {
+    id: "acp", defaultEnabled: false, tools: ["acp_run"],
+    prompt: "acp_run hands one self-contained coding task to an external Agent Client Protocol agent (Command Code, launched as `cmd acp`): it opens a fresh session in your workspace, streams that agent's tool calls, and returns its final answer. Give it absolute paths and a clear deliverable; the ACP agent works with its own model access and permissions.",
+    available: () => installedAcpAgents().length > 0,
+    create: (ctx) => acpPlugin({ allowed: installedAcpAgents(), workspace: ctx.workspace, agentId: ctx.agent.id, envPassthrough: ctx.agent.manifest.envPassthrough }),
   },
   {
     id: "developer", defaultEnabled: false, tools: DEV_TOOLS,

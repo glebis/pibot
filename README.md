@@ -31,7 +31,7 @@ The host process (`src/`) runs a **scheduler** (JSON-backed timer wheel with sno
 }
 ```
 
-Available ids are `avatar`, `speech`, `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `link-triage`, `attend`, `telegram-responder`, `delegate`, `herdr`, `developer`, and `remote-workshop`. Avatar, Calendar, and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
+Available ids are `avatar`, `speech`, `scheduler`, `memory`, `calendar-read`, `calendar-write`, `gmail-read`, `linear`, `skills`, `knowledge`, `agent-comms`, `questions`, `link-triage`, `attend`, `telegram-responder`, `delegate`, `herdr`, `acp`, `developer`, and `remote-workshop`. Avatar, Calendar, and Linear mutations require owner confirmation. Dependencies are loaded and advertised only when available. Ordinary agents receive no generic filesystem tools by default; `tools` is an explicit SDK/custom-tool allowlist and `capabilities` controls host plugins.
 
 ### Jev link triage (shadow mode)
 
@@ -50,6 +50,8 @@ The feature defaults off. Focus text is capped at 500 characters. Use only publi
 PiBot currently has no typed scraper-completion event: scraping is agent-directed and its saved materials vary in format. The tool call is therefore an explicit post-save step, not an automatic hook. A future deterministic completion event would let the same evaluator run automatically. The reusable `jev-evaluator` supports bounded Boolean, Choice, and Score questions for later experiments in routing, pre-action review, post-action verification, heartbeat novelty, skill evaluation, and context selection. Two of those hooks now ship: the advisory **skill-evolution shadow observer** (see *Self-evolution*) and the **optional `/goal` judge** (see *Goals*), both default-off, both behind a per-agent grant plus a daemon switch, and neither able to change a decision while in shadow mode.
 
 The `herdr` capability (requires the `herdr` CLI and a running herdr instance) lets an agent run subagents in new tabs of the owner's herdr UI: `herdr_dispatch` spawns claude/codex/pi/opencode in a fresh tab with a self-contained brief, waits for `done`, and returns the transcript (`--detach` returns immediately; `herdr_read` and `herdr_wait` observe the pane afterwards). The target workspace resolves from the invoking herdr pane, `$PIBOT_HERDR_WORKSPACE`, or an explicit `workspace` argument; briefs are passed as temp files and never carry secrets.
+
+The `acp` capability (requires `cmd` on PATH) drives an external **Agent Client Protocol** agent — Command Code via `cmd acp` — over stdio. `acp_run` opens a fresh session in the agent's workspace, answers the peer's permission requests and file reads (confined to that workspace, terminal capability withheld), streams its tool calls, and returns its final answer; the subprocess always gets an allowlisted environment and is always disposed. pibot can also act as an ACP agent itself: `npm run acp` serves one pibot agent over stdio to any ACP client (Zed, …), with `PIBOT_ACP_AGENT` selecting it. See [docs/acp.md](docs/acp.md).
 
 `providers` is a per-agent model-provider allowlist. Without it, only models named directly in `model`/`cascade` are used; global and authenticated-provider fallback discovery is disabled.
 
@@ -252,6 +254,13 @@ src/
     memory-plugin.ts      memory_save / memory_recall
     calendar-plugin.ts    calendar_today (icalBuddy + gws)
     skill-manage-plugin.ts agents save their own skills
+    acp-plugin.ts         acp_run — drive an external ACP agent
+  acp/                    Agent Client Protocol (both sides of the wire)
+    protocol.ts           ACP v1 types + newline-delimited JSON framing
+    client.ts             drive `cmd acp` (and any registered ACP agent)
+    agent.ts              pibot agent sessions → session/update notifications
+    server.ts             ACP server: initialize / session/new / prompt / cancel
+    main.ts               stdio entry: pibot AS an ACP agent (`npm run acp`)
   transports/
     telegram.ts           grammY, long polling, inline keyboards
     cli.ts                terminal chat with numbered cards
@@ -301,6 +310,7 @@ disables the guard entirely.
 npm test              # full Vitest suite
 npm run test:coverage
 npm run evolve -- assistant "goal text"   # CLI evolution cycle
+npm run test:acp                          # live ACP smoke vs `cmd acp`
 ```
 
 `.git/hooks/pre-commit` runs typecheck + tests before every commit (TDD gate).
