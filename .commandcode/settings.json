@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Shell(cmd:*)"
+      "Shell(cmd:*)",
+      "Shell(bd:*)"
     ],
     "deny": [],
     "defaultMode": "default"
