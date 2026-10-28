@@ -401,8 +401,14 @@ describe("PiBot commands", () => {
     const card = t.transport.lastCard();
     expect(card?.map((b) => b.label)).toEqual(["ollama/a:cloud", "ollama/b:cloud"]);
 
-    // tap a candidate → persisted to agent.json + toast confirmation
-    expect(await t.transport.act(card![0].action)).toContain("will use **ollama/a:cloud**");
+    // tap a candidate → persisted to agent.json, toast AND a persistent chat confirmation
+    let pushes = t.transport.pushed.length;
+    const switchToast = await t.transport.act(card![0].action);
+    expect(switchToast).toContain("ollama/a:cloud");
+    expect(switchToast).toContain("Current model");
+    expect(t.transport.pushed.length - pushes).toBe(1); // exactly one message — no double reply
+    expect(t.transport.lastText()).toContain("ollama/a:cloud");
+    expect(t.transport.lastText()).toContain("Current model: `ollama/a:cloud`");
     expect(JSON.parse(fs.readFileSync(manifestPath, "utf8")).model).toBe("ollama/a:cloud");
 
     // picker marks current, offers auto
@@ -410,17 +416,34 @@ describe("PiBot commands", () => {
     expect(t.transport.lastText()).toContain("`ollama/a:cloud`");
     expect(t.transport.lastCard()?.some((b) => b.label === "↺ auto")).toBe(true);
 
-    // auto reset
+    // auto reset — names auto and the head the cascade resolves after the manifest reload
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/a:cloud");
     const autoBtn = t.transport.lastCard()!.find((b) => b.label === "↺ auto")!;
-    expect(await t.transport.act(autoBtn.action)).toContain("back to **auto**");
+    pushes = t.transport.pushed.length;
+    const autoToast = await t.transport.act(autoBtn.action);
+    expect(autoToast).toContain("back to **auto**");
+    expect(autoToast).toContain("ollama/a:cloud");
+    expect(t.transport.pushed.length - pushes).toBe(1);
+    expect(t.transport.lastText()).toContain("back to **auto**");
+    expect(t.transport.lastText()).toContain("Current model: auto → `ollama/a:cloud`");
     expect(JSON.parse(fs.readFileSync(manifestPath, "utf8")).model).toBeUndefined();
 
-    // typed spec outside the permitted chain is refused
+    // typed spec still replies exactly once (switchModel itself never pushes)
+    pushes = t.transport.pushed.length;
+    await t.transport.say("/model ollama/b:cloud");
+    expect(t.transport.pushed.length - pushes).toBe(1);
+    expect(t.transport.lastText()).toContain("Current model: `ollama/b:cloud`");
+
+    // typed spec outside the permitted chain is refused — message only, no confirmation push
+    pushes = t.transport.pushed.length;
     await t.transport.say("/model openai/gpt-x");
     expect(t.transport.lastText()).toContain("not in assistant's permitted chain");
+    expect(t.transport.pushed.length - pushes).toBe(1); // just the refusal
 
-    // stale picker token → gentle expired toast
+    // stale picker token → gentle expired toast, nothing pushed
+    pushes = t.transport.pushed.length;
     expect(await t.transport.act("mdl:m_deadbeef")).toContain("expired");
+    expect(t.transport.pushed.length - pushes).toBe(0);
 
     fs.rmSync(agentDir, { recursive: true, force: true });
   });
@@ -1230,7 +1253,7 @@ describe("cascade dead-letter loop guards", () => {
     await t.transport.say("hello there");
     expect(t.promptSpy).not.toHaveBeenCalled();
     expect(t.cascade.queueDead).toHaveBeenCalledTimes(1);
-    expect(t.cascade.queueDead).toHaveBeenCalledWith(expect.objectContaining({ text: "hello there", agentId: "assistant" }));
+    expect(t.cascade.queueDead).toHaveBeenCalledWith(expect.objectContaining({ text: "hello there", agentId: "assistant", source: "user" }));
     expect(t.transport.lastText()).toContain("couldn't reach any model");
   });
 
@@ -1289,6 +1312,19 @@ describe("cascade dead-letter loop guards", () => {
         id: "dl3", agentId: "assistant", transport: "mock", chatId: "42",
         text: "[cascade] Internal: the previous attempt hit a provider error on openai-codex/gpt-5.6-terra — continue answering the user's last message with the switched model. Do not mention models, errors, or failover.",
         createdAt: Date.now(), attempts: [], lastError: "x",
+      })
+      .mockReturnValue(undefined);
+    const n = await t.bot.flushDeadLetters();
+    expect(n).toBe(0);
+    expect(t.promptSpy).not.toHaveBeenCalled();
+  });
+
+  it("flushDeadLetters drops host-sourced entries even without an internal prefix (bd pibot-c38)", async () => {
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({
+        id: "dl-host", agentId: "assistant", transport: "mock", chatId: "42",
+        text: "Confirmed the location — saved it to the vault.",
+        createdAt: Date.now(), attempts: [], lastError: "x", source: "host",
       })
       .mockReturnValue(undefined);
     const n = await t.bot.flushDeadLetters();

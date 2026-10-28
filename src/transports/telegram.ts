@@ -106,6 +106,7 @@ const BOT_COMMANDS = [
   { command: "agents", description: "List your agents" },
   { command: "new", description: "Fresh session for the current agent" },
   { command: "agent", description: "Switch agent: /agent coach" },
+  { command: "model", description: "Pick this agent's model" },
   { command: "newagent", description: "Create an agent: /newagent coach <persona>" },
   { command: "schedules", description: "Pending scheduled items" },
   { command: "snooze", description: "Pause the rhythm: /snooze 2h" },

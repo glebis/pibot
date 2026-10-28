@@ -98,6 +98,9 @@ export interface CascadeEntry {
   unavailableReason?: string;
 }
 
+/** What produced a queued prompt: a real user turn or a host-injected directive. */
+export type DeadLetterSource = "user" | "host";
+
 export interface DeadLetter {
   id: string;
   agentId: string;
@@ -109,6 +112,8 @@ export interface DeadLetter {
   lastError?: string;
   /** A replay produced partial output before failing; automatic retries risk duplicate side effects. */
   automaticReplayBlocked?: boolean;
+  /** Origin of the prompt. Host-injected text must never replay as a user turn (bd pibot-c38). */
+  source?: DeadLetterSource;
 }
 
 /** A credits failure proves the account (all models of one provider) can't pay. */
@@ -145,6 +150,7 @@ function isDeadLetter(v: unknown): v is DeadLetter {
   if (!Array.isArray(o.attempts) || !o.attempts.every((a) => typeof a === "string")) return false;
   if (o.lastError !== undefined && typeof o.lastError !== "string") return false;
   if (o.automaticReplayBlocked !== undefined && typeof o.automaticReplayBlocked !== "boolean") return false;
+  if (o.source !== undefined && o.source !== "user" && o.source !== "host") return false;
   return true;
 }
 

@@ -59,7 +59,7 @@ import { transcriptionGuardForInstructions } from "../plugins/transcription-exec
 import { DEFAULT_EXEC_ALLOWLIST } from "../plugins/exec-plugin.js";
 import { HERDR_AGENTS } from "../plugins/herdr-plugin.js";
 import { classifyModelError, ModelCascade, specProvider } from "./cascade.js";
-import type { ModelErrorClass } from "./cascade.js";
+import type { DeadLetterSource, ModelErrorClass } from "./cascade.js";
 import type { ConsolidationEngine } from "./consolidation.js";
 import { devAgentEnabled, DEV_AGENT_ID, scaffoldDevAgent } from "./dev-agent.js";
 import { execFile } from "node:child_process";
@@ -1672,7 +1672,7 @@ export class PiBot implements HeartbeatHost {
     chatId: string,
     agentId: string,
     text: string,
-    opts: { recoveringDeadLetter?: boolean; voiceTurn?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
+    opts: { recoveringDeadLetter?: boolean; source?: DeadLetterSource; voiceTurn?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
   ): Promise<void> {
     return this.canonicalTurns.run(`${agentId}::${this.chatKey(t,chatId)}`,()=>this.promptAgentUnlocked(t,chatId,agentId,text,opts));
   }
@@ -1682,7 +1682,7 @@ export class PiBot implements HeartbeatHost {
     chatId: string,
     agentId: string,
     text: string,
-    opts: { recoveringDeadLetter?: boolean; voiceTurn?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
+    opts: { recoveringDeadLetter?: boolean; source?: DeadLetterSource; voiceTurn?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
   ): Promise<void> {
     const ck = this.chatKey(t, chatId);
     if(!opts.voiceTurn) this.rememberChat(agentId, ck);
@@ -1722,7 +1722,7 @@ export class PiBot implements HeartbeatHost {
       const activeGoal = this.goals.get(ck);
       if (!opts.voiceTurn && activeGoal && activeGoal.status === "active") styled = `${styled}\n\n${renderGoalBlock(activeGoal)}`;
       // followUp: concurrent messages queue behind the running turn instead of erroring
-      await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, styled), opts.recoveringDeadLetter ?? false, opts.voiceTurn ?? false);
+      await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, styled), opts.recoveringDeadLetter ?? false, opts.voiceTurn ?? false, opts.source ?? "user");
       // The goal loop: every turn that is genuinely about this chat gets judged —
       // owner turns and the loop's own continuations, never scheduler/heartbeat/handoff
       // traffic. Recursion IS the loop and is bounded by the goal's own turn budget.
@@ -1785,6 +1785,7 @@ export class PiBot implements HeartbeatHost {
     text: string,
     recoveringDeadLetter = false,
     noReplay = false,
+    source: DeadLetterSource = "user",
   ): Promise<void> {
     const cascade = this.deps.cascade;
     const attempts: string[] = [];
@@ -1925,7 +1926,7 @@ export class PiBot implements HeartbeatHost {
       }
       throw new Error(`no permitted model available for ${agentId}`);
     }
-    const dl = cascade.queueDead({ agentId, transport: t.name, chatId, text, createdAt: Date.now(), attempts, lastError });
+    const dl = cascade.queueDead({ agentId, transport: t.name, chatId, text, createdAt: Date.now(), attempts, lastError, source });
     this.deps.events.log(agentId, "system", `cascade exhausted (${attempts.join(" → ")}) — queued ${dl.id} (${cascade.deadLetterCount()} pending)`);
     await t.notifyError(chatId, this.cascadeDownNotice(agentId, attempts, failures, cascade));
   }
@@ -2031,8 +2032,8 @@ export class PiBot implements HeartbeatHost {
       // loop guard: host-injected prompts (old recover-wrapper meta-soup, cascade retry
       // notes, scheduler/heartbeat/handoff) are dropped rather than fed back into a
       // session — a dead-lettered internal prompt must never replay as a user turn
-      if (isInternalPrompt(dl.text)) {
-        this.deps.events.log(dl.agentId, "system", "cascade recovery: dropped host-internal dead-letter entry (loop guard)");
+      if (isInternalPrompt(dl.text) || dl.source === "host") {
+        this.deps.events.log(dl.agentId, "system", "cascade recovery: dropped host-sourced dead-letter entry (loop guard)");
         continue;
       }
       const registered = [...(this.agentChats.get(dl.agentId) ?? [])];
@@ -2052,7 +2053,7 @@ export class PiBot implements HeartbeatHost {
         break;
       }
       try {
-        await this.promptAgent(t, dl.chatId, dl.agentId, dl.text, { recoveringDeadLetter: true });
+        await this.promptAgent(t, dl.chatId, dl.agentId, dl.text, { recoveringDeadLetter: true, source: dl.source ?? "user" });
         flushed++;
       } catch (e) {
         if (e instanceof AmbiguousReplayError) {
@@ -2231,7 +2232,10 @@ export class PiBot implements HeartbeatHost {
       const [, token] = action.split(":");
       const ref = this.resolveModelToken(token);
       if (!ref) return "That model picker expired — /model for the current list.";
-      return await this.switchModel(ref.agentId, ref.spec || undefined);
+      const msg = await this.switchModel(ref.agentId, ref.spec || undefined);
+      // a tap has no reply slot of its own: post the confirmation in-chat (failures stay toast-only)
+      if (!msg.startsWith("⚠︎")) await t.push(chatId, { text: msg });
+      return msg;
     }
     if (action.startsWith("evo:")) {
       const [, token, verb] = action.split(":");
@@ -2659,9 +2663,18 @@ export class PiBot implements HeartbeatHost {
       }
     }
     this.deps.events.log(agentId, "system", `model switch via /model: ${spec || "auto"}${dropped ? ` — ${dropped} live session(s) rebound` : ""}`);
-    if (!spec) return `↺ **${agentId}** back to **auto** — first healthy model in the cascade.`;
+    if (!spec) {
+      // auto: name the head the cascade will actually pick, read back after the rediscovery
+      const fresh = this.deps.agents.getAgent(agentId)?.manifest ?? agent.manifest;
+      const head = cascade?.firstHealthy(cascade.chainFor(fresh));
+      return [
+        `↺ **${agentId}** — back to **auto**.`,
+        head ? `Current model: auto → \`${head}\`` : "Current model: auto — first healthy in the cascade",
+      ].join("\n");
+    }
     return [
-      `🧠 **${agentId}** will use **${spec}** from the next message on.`,
+      `✅ **${agentId}** — model switched.`,
+      `Current model: \`${spec}\``,
       cascade?.isOpen(spec) ? "⚠️ Heads up: that model's breaker is open right now — the cascade may fail over." : "",
     ].filter(Boolean).join("\n");
   }

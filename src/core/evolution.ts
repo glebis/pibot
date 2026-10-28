@@ -19,7 +19,7 @@ import { closeBacklogItems, loadBacklogItems, topBacklogItem } from "./backlog.j
 import { readConsolidatedDigest, type ConsolidationEngine } from "./consolidation.js";
 import type { EventLog } from "./events.js";
 import { buildHeartbeatDigest } from "./heartbeat.js";
-import { errorMessage, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
+import { ensureDir, errorMessage, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
 import { JEV_RUBRIC_VERSION, type JevShadowObserver } from "./jev-shadow.js";
 import { trackActivity } from "./activity.js";
 
@@ -146,6 +146,8 @@ export interface ProposalContext {
   recentProposals?: string[];
   /** distilled event history (consolidation output) — feeds pattern-mining proposals */
   consolidatedMemory?: string;
+  /** compact history of past cycle outcomes — stops re-proposing failed or landed work */
+  capabilityDigest?: string;
 }
 
 export interface EvolutionIO {
@@ -239,8 +241,39 @@ export function extractRecentProposals(entries: Array<{ type: string; summary: s
   return [...new Set(out)];
 }
 
+// ─── append-only cycle checkpoints + solve-capability digest (bd pibot-90r) ──
+
+/** One immutable row per evolution cycle outcome. */
+export interface EvolutionCheckpoint {
+  ts: number;
+  agentId: string;
+  outcome: "promoted" | "staged" | "rejected" | "failed";
+  skill?: string;
+  goal?: string;
+  reason?: string;
+  scores?: number[];
+}
+
+/** Compact, prompt-sized view of past cycle outcomes so the proposer stops
+ *  re-proposing what already landed or already failed. */
+export function formatCapabilityDigest(rows: EvolutionCheckpoint[], limit = 12): string {
+  if (!rows.length) return "";
+  return rows
+    .slice(-limit)
+    .map((r) => {
+      const when = new Date(r.ts).toISOString().slice(0, 10);
+      const skill = r.skill ? `"${r.skill}"` : "(no skill)";
+      const goal = r.goal ? ` · goal: ${truncate(r.goal, 80)}` : "";
+      const scores = r.scores?.length ? ` · probes [${r.scores.join(", ")}]` : "";
+      const reason = r.reason ? ` · ${truncate(r.reason, 120)}` : "";
+      return `- ${when} ${r.outcome} ${skill}${goal}${scores}${reason}`;
+    })
+    .join("\n");
+}
+
 export class EvolutionEngine {
   private stateFile: string;
+  private checkpointFile: string;
 
   constructor(
     private deps: {
@@ -262,6 +295,38 @@ export class EvolutionEngine {
     }
   ) {
     this.stateFile = path.join(deps.dataDir, "evolution.json");
+    this.checkpointFile = path.join(deps.dataDir, "evolution-checkpoints.jsonl");
+  }
+
+  // ── append-only checkpoints + capability digest (bd pibot-90r) ────────────
+
+  /** Append one immutable cycle outcome. Best-effort: never breaks a cycle. */
+  private recordCheckpoint(row: Omit<EvolutionCheckpoint, "ts">): void {
+    try {
+      ensureDir(this.deps.dataDir);
+      fs.appendFileSync(this.checkpointFile, `${JSON.stringify({ ts: Date.now(), ...row })}\n`);
+    } catch (e) {
+      this.deps.events.log(row.agentId, "system", `evolution: checkpoint skipped: ${errorMessage(e)}`);
+    }
+  }
+
+  /** This agent's recent cycle outcomes as a compact prompt block. */
+  private capabilityDigest(agentId: string): string {
+    try {
+      const rows: EvolutionCheckpoint[] = [];
+      for (const line of fs.readFileSync(this.checkpointFile, "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const row = JSON.parse(line) as EvolutionCheckpoint;
+          if (row.agentId === agentId && typeof row.outcome === "string") rows.push(row);
+        } catch {
+          /* skip a malformed line */
+        }
+      }
+      return formatCapabilityDigest(rows);
+    } catch {
+      return "";
+    }
   }
 
   // ── daily budget ──────────────────────────────────────────────────────────
@@ -519,6 +584,7 @@ export class EvolutionEngine {
     const existingSkills = this.readExistingSkills(skillsDir);
     const digest = buildHeartbeatDigest(agent, { list: () => [] }, this.deps.events);
     const recentProposals = extractRecentProposals(this.deps.events.tail(agentId, 40));
+    const capabilityDigest = this.capabilityDigest(agentId);
 
     // consolidation first: distill new events into durable memory, then let the
     // proposal see the distilled view (Skill Forge pattern-mining input)
@@ -541,9 +607,10 @@ export class EvolutionEngine {
     // 2. propose
     let proposal: EvolutionProposal;
     try {
-      proposal = await this.deps.io.propose({ agent, digest, existingSkills, goal: effectiveGoal, recentProposals, consolidatedMemory });
+      proposal = await this.deps.io.propose({ agent, digest, existingSkills, goal: effectiveGoal, recentProposals, consolidatedMemory, capabilityDigest });
     } catch (e) {
       this.deps.events.log(agentId, "system", `evolution propose failed: ${errorMessage(e)}`);
+      this.recordCheckpoint({ agentId, outcome: "failed", goal: effectiveGoal, reason: `propose failed: ${errorMessage(e)}` });
       return { agentId, ok: false, summary: `propose failed: ${errorMessage(e)}`, errors: [errorMessage(e)] };
     }
 
@@ -551,6 +618,7 @@ export class EvolutionEngine {
     const gates = this.gate(agent, proposal, this.deps.events.tail(agentId, 40));
     if (!gates.ok) {
       this.deps.events.log(agentId, "system", `evolution gates rejected "${proposal.skillName}": ${gates.errors.join("; ")}`);
+      this.recordCheckpoint({ agentId, outcome: "rejected", skill: proposal.skillName, goal: effectiveGoal, reason: gates.errors.join("; ") });
       return {
         agentId,
         ok: false,
@@ -600,6 +668,14 @@ export class EvolutionEngine {
         // 6a. auto-promote with git checkpoint — close the backlog items the skill lands
         const promoted = this.promoteCandidate(agent, proposal.skillName, candidateContent, proposal.rationale);
         if (promoted) this.closeBacklogIds(agent, closesIds);
+        this.recordCheckpoint({
+          agentId,
+          outcome: promoted ? "promoted" : "staged",
+          skill: proposal.skillName,
+          goal: effectiveGoal,
+          scores,
+          reason: promoted ? undefined : "promotion failed",
+        });
         this.noteShadowDecision(shadowRunId, shadowProbeIds, promoted ? "promoted" : "staged");
         return {
           agentId,
@@ -615,6 +691,7 @@ export class EvolutionEngine {
     }
 
     // 6b. stays staged for human review
+    this.recordCheckpoint({ agentId, outcome: "staged", skill: proposal.skillName, goal: effectiveGoal, scores });
     this.noteShadowDecision(shadowRunId, shadowProbeIds, "staged");
     return {
       agentId,
@@ -869,6 +946,8 @@ export function createLlmEvolutionIO(deps: { agents: AgentManager; modelRuntime:
             ``,
             `# State digest\n${ctx.digest}`,
             ctx.consolidatedMemory ? `# Distilled memory (older, consolidated history)\n${ctx.consolidatedMemory}` : ``,
+            ctx.capabilityDigest ? `# Solve-capability history (past cycles — do NOT re-propose what already landed or was rejected)\n${ctx.capabilityDigest}` : ``,
+            ctx.recentProposals?.length ? `# Recently proposed skills (do not repeat)\n${ctx.recentProposals.map((p) => `- ${p}`).join("\n")}` : ``,
             ``,
             `# Existing skills\n${skills}`,
             ``,
@@ -960,6 +1039,7 @@ const PROPOSE_SYSTEM = `You are the evolution engine of a personal agent compani
 
 Rules:
 - Derive the proposal from the goal (if given) and from friction visible in recent events (snoozes, missed fires, repeated asks, corrections).
+- Read the "Solve-capability history": never re-propose a skill that already landed, was rejected, or scored poorly unless you are patching it with clearly different content. Repeated failed proposals waste a cycle.
 - If a "Distilled memory" section is present, mine it for durable patterns: repeated workflows, recurring frictions, and preferences are the best skill candidates.
 - Skills are markdown files with steps: name, trigger-style description ("Use when …"), concise actionable body. Max 15KB.
 - The body MUST be structured: at least one line starting with "# ", "- ", "*", or "1. " (heading, bullets, or numbered steps) — plain prose is rejected by the structure gate.

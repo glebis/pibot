@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "./agent-manager.js";
 import { appendBacklogItems, loadBacklogItems } from "./backlog.js";
-import { applyPatch, containsRiskyPattern, EvolutionEngine, extractRecentProposals, lastProbeScores, validateSkillFile, validateSkillName, type EvolutionIO, type EvolutionProposal } from "./evolution.js";
+import { applyPatch, containsRiskyPattern, EvolutionEngine, extractRecentProposals, formatCapabilityDigest, lastProbeScores, validateSkillFile, validateSkillName, type EvolutionCheckpoint, type EvolutionIO, type EvolutionProposal } from "./evolution.js";
 import { EventLog } from "./events.js";
 import { JevShadowObserver, type JevShadowRecord } from "./jev-shadow.js";
 import { writeJsonAtomic } from "./util.js";
@@ -48,6 +48,34 @@ describe("applyPatch", () => {
     expect(applyPatch("hello world", "world", "there")).toEqual({ ok: true, result: "hello there" });
     expect(applyPatch("hello", "x", "y").ok).toBe(false);
     expect(applyPatch("a a", "a", "b").ok).toBe(false);
+  });
+});
+
+describe("formatCapabilityDigest (bd pibot-90r)", () => {
+  it("renders recent cycle outcomes compactly and omits empty history", () => {
+    expect(formatCapabilityDigest([])).toBe("");
+    const rows: EvolutionCheckpoint[] = [
+      { ts: Date.UTC(2026, 0, 2), agentId: "a", outcome: "promoted", skill: "morning-brief", goal: "mornings", scores: [5] },
+      { ts: Date.UTC(2026, 0, 3), agentId: "a", outcome: "rejected", skill: "bad-skill", reason: "no eval probes" },
+    ];
+    const text = formatCapabilityDigest(rows);
+    expect(text).toContain('promoted "morning-brief"');
+    expect(text).toContain("goal: mornings");
+    expect(text).toContain("probes [5]");
+    expect(text).toContain('rejected "bad-skill"');
+    expect(text).toContain("no eval probes");
+  });
+
+  it("keeps only the most recent rows when over the limit", () => {
+    const rows: EvolutionCheckpoint[] = Array.from({ length: 20 }, (_, i) => ({
+      ts: i,
+      agentId: "a",
+      outcome: "staged" as const,
+      skill: `skill-${i}`,
+    }));
+    const text = formatCapabilityDigest(rows, 3);
+    expect(text).toContain("skill-19");
+    expect(text).not.toContain("skill-16");
   });
 });
 
@@ -139,6 +167,21 @@ describe("EvolutionEngine", () => {
     expect(engine.staged("assistant")).toEqual([]);
     expect(announced.length).toBe(1);
     expect(announced[0]).toContain("morning-brief");
+  });
+
+  it("appends a cycle checkpoint and feeds it to the next proposal (bd pibot-90r)", async () => {
+    const seen: Array<string | undefined> = [];
+    (io.propose as ReturnType<typeof vi.fn>).mockImplementation(async (ctx: { capabilityDigest?: string }) => {
+      seen.push(ctx.capabilityDigest);
+      return makeProposal();
+    });
+    await engine.evolve("assistant", "mornings"); // promoted
+    const log = path.join(dir, "evolution-checkpoints.jsonl");
+    const rows = fs.readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ agentId: "assistant", outcome: "promoted", skill: "morning-brief", goal: "mornings" });
+    await engine.evolve("assistant", "mornings"); // now rejected: skill already exists
+    expect(seen[1]).toContain('promoted "morning-brief"');
   });
 
   it("stays staged when probes score low", async () => {

@@ -27,6 +27,7 @@ import { trackActivity } from "./activity.js";
 import { describeDeadlineAt } from "./deadline.js";
 import { scanRelativeDateClaims } from "./fact-check.js";
 import { DISPLAY_TIME_ZONE } from "./time-zone.js";
+import { DRIFT_ANTI_PATTERNS, FAILURE_SIGNAL_RULE, OUTCOME_HONESTY } from "./agent-guidance.js";
 
 /** Adaptive-wakeup bounds (Ouroboros set_next_wakeup pattern): the agent may
  *  compress the next gap when something is brewing, stretch it when idle.
@@ -74,6 +75,13 @@ Maintenance rotation — keep your own house in order:
 - Your file tools can read the agent directory but write ONLY under memory/. Anything outside memory/ (persona, skills, scripts) cannot be edited from a tick: propose it with maintain "backlog: <summary>" or via speak instead.
 - If everything is fresh, record nothing and prefer a longer wakeup. Never let the same item stay stale for many cycles.
 - If the digest lists bd tickets assigned to you, service exactly ONE per tick: use escalate with "service <ticket-id>: what it needs" — your main session claims and executes it. Never a speak, never a user-facing ping about it.
+
+Work honesty and self-check:
+${OUTCOME_HONESTY}
+
+${FAILURE_SIGNAL_RULE}
+
+${DRIFT_ANTI_PATTERNS}
 
 Call the heartbeat_act tool exactly once with your decision.`;
 

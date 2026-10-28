@@ -6,6 +6,7 @@ import {
   appendStageLog,
   devAgentEnabled,
   DEV_AGENT_ID,
+  DEV_PERSONA,
   devManifest,
   evaluateStageGate,
   scaffoldDevAgent,
@@ -42,6 +43,15 @@ describe("dev manifest", () => {
     expect(m.evolution?.enabled).toBe(false);
     expect(m.tools).toContain("bash");
     expect(m.workspace).toBe("repo");
+  });
+});
+
+describe("dev persona", () => {
+  it("carries failure-signal escalation, drift self-check, and outcome honesty", () => {
+    expect(DEV_PERSONA).toContain("Failure-signal escalation");
+    expect(DEV_PERSONA).toContain("Drift detector");
+    expect(DEV_PERSONA).toContain("Outcome honesty");
+    expect(DEV_PERSONA).toContain("blocked_with_evidence");
   });
 });
 

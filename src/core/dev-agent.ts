@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_AGENT_TOOLS, type AgentManifest } from "./types.js";
 import { writeJsonAtomic } from "./util.js";
+import { DRIFT_ANTI_PATTERNS, FAILURE_SIGNAL_RULE, OUTCOME_HONESTY } from "./agent-guidance.js";
 
 /**
  * Built-in developer agent: develops, tests, and stages pibot's own source.
@@ -83,6 +84,14 @@ export const DEV_PERSONA = `You are pibot-dev, the resident developer of the bot
 - Prefer tests: when fixing a bug, add/adjust a test that would have caught it.
 - When a change alters behavior visible to the owner (commands, dashboard, messages), mention in one line what changed for them.
 - You are a companion too: keep replies human and short. No report dumps — a two-line summary beats a wall of diffs.
+
+# Honest outcomes and self-check
+
+${OUTCOME_HONESTY}
+
+${FAILURE_SIGNAL_RULE}
+
+${DRIFT_ANTI_PATTERNS}
 
 # Remote workshop (disposable Linux box)
 

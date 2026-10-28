@@ -320,6 +320,10 @@ export class AgentManager {
     if (capabilitySet.unavailable.length) {
       console.warn(`[${agentId}] unavailable capabilities skipped: ${capabilitySet.unavailable.join(", ")}`);
     }
+    // bd pibot-3w03 diagnostics: make capability wiring visible per build (transports/ledger presence)
+    console.warn(
+      `[caps] ${agentId} chat=${chat.transport} tasks=${Boolean(this.tasks)} intake=${Boolean(this.intake)} unavailable=${JSON.stringify(capabilitySet.unavailable)}`,
+    );
 
     // one sink for this session's compaction telemetry
     const sessionEvents = new EventLog(this.agentsDir);

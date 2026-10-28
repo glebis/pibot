@@ -238,6 +238,24 @@ describe("dead-letter bounded retention + take/unshift", () => {
     expect(c.deadLetters()[0].text).toBe("msg20");
   });
 
+  it("persists the prompt source and discards an unknown source value", () => {
+    const statePath = path.join(makeTempDir(), "state.json");
+    {
+      const c = makeInstance(statePath);
+      c.queueDead({ agentId: "a", transport: "t", chatId: "1", text: "hi", createdAt: 1, attempts: [], source: "host" });
+    }
+    {
+      const c = makeInstance(statePath);
+      expect(c.deadLetters()[0].source).toBe("host");
+    }
+    fs.writeFileSync(
+      statePath,
+      '{"entries":{},"deadLetters":[{"id":"x","agentId":"a","transport":"t","chatId":"1","text":"hi","createdAt":1,"attempts":[],"source":"bogus"}]}',
+      "utf8"
+    );
+    expect(makeInstance(statePath).deadLetters()).toHaveLength(0);
+  });
+
   it("preserves automaticReplayBlocked, lastError, and survives across instances", () => {
     const statePath = path.join(makeTempDir(), "state.json");
     {
