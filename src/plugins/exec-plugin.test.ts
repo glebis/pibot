@@ -512,3 +512,15 @@ describe("yt-dlp description metadata flag", () => {
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+describe("yt-dlp simulate-control flags", () => {
+  it("allowlists --no-simulate plus other benign fetch-mode flags", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yt-sim-"));
+    try {
+      const allow = DEFAULT_EXEC_ALLOWLIST.filter((e) => e.bin === "yt-dlp");
+      const r = await resolveExec(["yt-dlp", "--skip-download", "--no-simulate", "--ignore-config", "--write-subs", "--print", "title", "https://youtu.be/N8mV_E3IcZU"], { agentDir: dir, workspace: dir }, allow);
+      expect(r.error).toBeUndefined();
+      expect(r.argv).toContain("--no-simulate");
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});

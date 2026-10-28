@@ -278,6 +278,66 @@ export class ModelCascade {
     return specs.slice(0, 8); // bound the cascade walk
   }
 
+  /**
+   * Every spec the manifest's provider policy permits, in picker order: the
+   * explicit model/cascade first, then each allowed provider's catalog in the
+   * manifest's own provider order, then the global tail. Unlike `chainFor` this
+   * is not truncated to the cascade walk length — the picker must not lose a
+   * provider behind an earlier one's models. Callers bound how many they render.
+   */
+  permittedSpecs(manifest: CascadeManifestLike): string[] {
+    const specs: string[] = [];
+    const configuredProviders = manifest.providers?.map((provider) => provider.trim()).filter(Boolean);
+    const allowedProviders = new Set(configuredProviders ?? []);
+    const providerAllowed = (spec: string) => {
+      const slash = spec.indexOf("/");
+      return slash > 0 && allowedProviders.has(spec.slice(0, slash));
+    };
+    const push = (s?: string | string[], enforcePolicy = false) => {
+      for (const item of Array.isArray(s) ? s : s ? [s] : []) {
+        const v = item.trim();
+        if (!v || v === "same") continue;
+        if (enforcePolicy && !providerAllowed(v)) continue;
+        if (this.entry(v)?.unavailable) continue; // deleted from rotation
+        if (!specs.includes(v)) specs.push(v);
+      }
+    };
+    push(manifest.model, configuredProviders !== undefined);
+    push(manifest.cascade, configuredProviders !== undefined);
+    // Discovery stays opt-in through manifest.providers, exactly like chainFor; the
+    // difference is order — the manifest's provider list decides, so an agent whose
+    // providers start with ollama surfaces its cloud models before the tail can
+    // crowd them out.
+    if (configuredProviders !== undefined) {
+      let catalog: readonly { provider: string; id: string }[] = [];
+      try {
+        catalog = this.deps.modelRuntime.getModels();
+      } catch {
+        /* catalog unavailable — work with what we have */
+      }
+      const seen = new Set<string>();
+      for (const provider of configuredProviders) {
+        if (seen.has(provider)) continue;
+        seen.add(provider);
+        let authed = false;
+        try {
+          authed = this.deps.modelRuntime.hasConfiguredAuth(provider);
+        } catch {
+          authed = false;
+        }
+        if (!authed) continue;
+        for (const m of catalog) if (m.provider === provider) push(`${m.provider}/${m.id}`);
+      }
+    }
+    push(this.deps.globalTail ?? [], true);
+    return specs;
+  }
+
+  /** True when the manifest's provider policy permits switching to `spec`. */
+  isPermitted(manifest: CascadeManifestLike, spec: string): boolean {
+    return this.permittedSpecs(manifest).includes(spec.trim());
+  }
+
   /** Resolve a spec to a pi Model. Undefined when the spec isn't in the catalog. */
   resolveModel(spec: string): ResolvedModel | undefined {
     if (!spec) return undefined;

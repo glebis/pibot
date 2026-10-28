@@ -172,6 +172,11 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
     bin: "yt-dlp",
     allowFlags: [
       { flag: "--skip-download" },
+      { flag: "--no-simulate" },
+      { flag: "--simulate" },
+      { flag: "-s" },
+      { flag: "--ignore-config" },
+      { flag: "--write-info-json" },
       { flag: "--write-subs" },
       { flag: "--write-auto-subs" },
       { flag: "--write-description" },

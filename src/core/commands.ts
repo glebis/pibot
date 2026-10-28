@@ -118,7 +118,7 @@ export interface CommandContext {
   model?: {
     /** the agent's current override (undefined = auto) */
     current(agentId: string): string | undefined;
-    /** permitted candidate specs (policy-enforced cascade chain), with breaker state */
+    /** policy-permitted candidate specs (not truncated to the cascade walk), with breaker state */
     candidates(agentId: string): Array<{ spec: string; open: boolean }>;
     /** persist the override (undefined = auto) and rebind live sessions */
     switchTo(agentId: string, spec: string | undefined): Promise<string>;

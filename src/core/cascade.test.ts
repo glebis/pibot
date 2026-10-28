@@ -321,6 +321,39 @@ describe("per-agent provider routing", () => {
   });
 });
 
+describe("permittedSpecs (model picker)", () => {
+  it("lists the manifest's providers in manifest order, before the global tail", () => {
+    const c = cascade(
+      ["openai-codex/gpt-6.1-sol"],
+      [
+        { provider: "openai-codex", id: "gpt-6.1-sol" },
+        { provider: "ollama", id: "glm-5.3-flash:cloud" },
+        { provider: "ollama", id: "deepseek-v4.1-flash:cloud" },
+      ],
+    );
+    expect(c.permittedSpecs({ model: "openai-codex/gpt-6.1-sol", providers: ["ollama", "openai-codex"] })).toEqual([
+      "openai-codex/gpt-6.1-sol",
+      "ollama/local",
+      "ollama/glm-5.3-flash:cloud",
+      "ollama/deepseek-v4.1-flash:cloud",
+    ]);
+  });
+
+  it("is not truncated to the cascade walk and enforces the provider allowlist", () => {
+    const many = Array.from({ length: 10 }, (_, i) => ({ provider: "ollama", id: `m${i}` }));
+    const c = cascade([], many);
+    const manifest = { model: "ollama/m0", providers: ["ollama"] };
+    expect(c.chainFor(manifest)).toHaveLength(8);
+    expect(c.permittedSpecs(manifest)).toContain("ollama/m9");
+    expect(c.isPermitted(manifest, "ollama/m9")).toBe(true);
+    expect(c.isPermitted(manifest, "anthropic/claude")).toBe(false);
+  });
+
+  it("stays opt-in without a provider list", () => {
+    expect(cascade().permittedSpecs({ model: "ollama/primary" })).toEqual(["ollama/primary"]);
+  });
+});
+
 describe("credit-exhaustion classification", () => {
   it("classifies provider billing/credit failures as credits", () => {
     const samples = [

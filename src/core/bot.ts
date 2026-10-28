@@ -2609,6 +2609,8 @@ export class PiBot implements HeartbeatHost {
   /** Short-lived button tokens for model candidates — callback_data caps at 64 bytes. */
   private modelTokens = new Map<string, { agentId: string; spec: string; armedAt: number }>();
   private static readonly MODEL_TOKEN_TTL_MS = 24 * 3600e3;
+  /** Buttons per picker. The permitted set is unbounded (openrouter alone has hundreds). */
+  private static readonly MODEL_PICKER_MAX = 20;
 
   private mintModelToken(agentId: string, spec: string): string {
     const now = Date.now();
@@ -2644,11 +2646,12 @@ export class PiBot implements HeartbeatHost {
     if (!agent) return `No agent "${agentId}". /agents for the list.`;
     const cascade = this.deps.cascade;
     if (spec) {
-      const chain = cascade?.chainFor(agent.manifest) ?? [];
-      if (!chain.includes(spec)) {
-        return `⚠︎ "${spec}" is not in ${agentId}'s permitted chain (provider policy). /model lists what's allowed.`;
+      // Policy, not the 8-slot cascade walk: a permitted model past the walk cap must
+      // stay selectable (it becomes the head the moment the manifest names it).
+      if (!cascade || !cascade.isPermitted(agent.manifest, spec)) {
+        return `⚠︎ "${spec}" isn't permitted for ${agentId} (provider policy). /model lists what's allowed.`;
       }
-      if (!cascade?.resolveModel(spec)) return `⚠︎ "${spec}" isn't in the model catalog on this machine.`;
+      if (!cascade.resolveModel(spec)) return `⚠︎ "${spec}" isn't in the model catalog on this machine.`;
     }
     // One-field patch through the guarded compare-and-swap writer (bd pibot-4wq1): an unrelated
     // authorised field (tasks/commitments/providers/…) can never be dropped by a model switch.
@@ -2767,7 +2770,9 @@ export class PiBot implements HeartbeatHost {
           const agent = this.deps.agents.getAgent(agentId);
           const cascade = this.deps.cascade;
           if (!agent || !cascade) return [];
-          return cascade.chainFor(agent.manifest).map((spec) => ({ spec, open: cascade.isOpen(spec) }));
+          return cascade.permittedSpecs(agent.manifest)
+            .slice(0, PiBot.MODEL_PICKER_MAX)
+            .map((spec) => ({ spec, open: cascade.isOpen(spec) }));
         },
         switchTo: (agentId, spec) => this.switchModel(agentId, spec),
         token: (agentId, spec) => this.mintModelToken(agentId, spec),

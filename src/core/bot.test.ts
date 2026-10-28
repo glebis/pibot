@@ -34,6 +34,8 @@ vi.mock("./ambiguity.js", async (importOriginal) => {
 function makeCascadeStub() {
   return {
     chainFor: vi.fn(() => ["ollama/test"] as string[]),
+    permittedSpecs: vi.fn(() => ["ollama/test"] as string[]),
+    isPermitted: vi.fn((_manifest: unknown, spec: string) => spec === "ollama/test"),
     firstHealthy: vi.fn(() => "ollama/test"),
     nextCandidate: vi.fn(() => undefined),
     resolveModel: vi.fn(() => undefined),
@@ -392,6 +394,8 @@ describe("PiBot commands", () => {
       return { id, dir: agentDir, manifest };
     });
     (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/a:cloud", "ollama/b:cloud"]);
+    (t.cascade.permittedSpecs as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/a:cloud", "ollama/b:cloud"]);
+    (t.cascade.isPermitted as ReturnType<typeof vi.fn>).mockImplementation((_m: unknown, s: string) => ["ollama/a:cloud", "ollama/b:cloud"].includes(s));
     (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "a" } as never);
     (t.cascade.isOpen as ReturnType<typeof vi.fn>).mockReturnValue(false);
 
@@ -437,13 +441,49 @@ describe("PiBot commands", () => {
     // typed spec outside the permitted chain is refused — message only, no confirmation push
     pushes = t.transport.pushed.length;
     await t.transport.say("/model openai/gpt-x");
-    expect(t.transport.lastText()).toContain("not in assistant's permitted chain");
+    expect(t.transport.lastText()).toContain("isn't permitted for assistant");
     expect(t.transport.pushed.length - pushes).toBe(1); // just the refusal
 
     // stale picker token → gentle expired toast, nothing pushed
     pushes = t.transport.pushed.length;
     expect(await t.transport.act("mdl:m_deadbeef")).toContain("expired");
     expect(t.transport.pushed.length - pushes).toBe(0);
+
+    fs.rmSync(agentDir, { recursive: true, force: true });
+  });
+
+  it("/model surfaces permitted models past the cascade walk and switches to them", async () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-model-past-walk-"));
+    const manifestPath = path.join(agentDir, "agent.json");
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      if (id !== "assistant") return undefined;
+      const manifest = fs.existsSync(manifestPath)
+        ? JSON.parse(fs.readFileSync(manifestPath, "utf8"))
+        : { name: "assistant", description: "d", providers: ["ollama", "openai-codex"] };
+      return { id, dir: agentDir, manifest };
+    });
+    // the runtime walk stays short: the ollama cloud models never make it into it
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["openai-codex/gpt-6.1-sol"]);
+    const permitted = [
+      "openai-codex/gpt-6.1-sol",
+      "ollama/glm-5.3-flash:cloud",
+      "ollama/deepseek-v4.1-flash:cloud",
+      ...Array.from({ length: 25 }, (_, i) => `ollama/extra-${i}:cloud`),
+    ];
+    (t.cascade.permittedSpecs as ReturnType<typeof vi.fn>).mockReturnValue(permitted);
+    (t.cascade.isPermitted as ReturnType<typeof vi.fn>).mockImplementation((_m: unknown, s: string) => permitted.includes(s));
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "a" } as never);
+
+    await t.transport.say("/model");
+    const card = t.transport.lastCard()!;
+    expect(card.map((b) => b.label)).toContain("ollama/glm-5.3-flash:cloud");
+    expect(card.map((b) => b.label)).toContain("ollama/deepseek-v4.1-flash:cloud");
+    expect(card).toHaveLength(20); // bounded, even though the permitted set is larger
+
+    // a permitted model outside the runtime walk is switchable and becomes the head
+    const deepseek = card.find((b) => b.label === "ollama/deepseek-v4.1-flash:cloud")!;
+    expect(await t.transport.act(deepseek.action)).toContain("ollama/deepseek-v4.1-flash:cloud");
+    expect(JSON.parse(fs.readFileSync(manifestPath, "utf8")).model).toBe("ollama/deepseek-v4.1-flash:cloud");
 
     fs.rmSync(agentDir, { recursive: true, force: true });
   });
@@ -3213,6 +3253,7 @@ describe("guarded manifest writes (bd pibot-4wq1)", () => {
       id === "assistant" ? { id, dir: agentDir, manifest: JSON.parse(fs.readFileSync(manifestPath, "utf8")) } : undefined
     );
     (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/a:cloud"]);
+    (t.cascade.isPermitted as ReturnType<typeof vi.fn>).mockReturnValue(true);
     (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "a" } as never);
     await t.transport.say("/model ollama/a:cloud");
     const written = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
