@@ -25,6 +25,8 @@ describe("redactSecrets", () => {
   it("covers the key shapes a provider error can carry", () => {
     const cases = [
       "sk-abcdefghijklmnopqrstuvwx",
+      "gsk_abcdefghijklmnopqrstuvwxyz012345",
+      "lk_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       "AIzaSyA1234567890abcdefghijklmnopqrst",
       "xoxb-1234567890-abcdefghijkl",
       "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
@@ -45,6 +47,21 @@ describe("redactSecrets", () => {
     expect(redactSecrets("token=abcdef1234567890")).toContain("[REDACTED]");
     expect(redactSecrets("Authorization: Bearer abcdef1234567890")).toContain("[REDACTED]");
     expect(redactSecrets("password: hunter2hunter2")).not.toContain("hunter2hunter2");
+  });
+
+  it("keeps raw JSON valid: never consumes the string terminator or an escape", () => {
+    const cases = [
+      `{"text":"FIRECRAWL_API_KEY=abcdef123456"}`,
+      `{"text":"api_key=abcdef123456","ok":true}`,
+      `{"text":"API_KEY=abc\\"def"}`,
+      `{"url":"/api/surveys/?token=abcdef123456 /api/next"}`,
+    ];
+    for (const text of cases) {
+      const out = redactSecrets(text);
+      expect(() => JSON.parse(out), out).not.toThrow();
+      expect(out).toContain("[REDACTED]");
+      expect(out).not.toContain("abcdef123456");
+    }
   });
 
   it("leaves ordinary agent text alone (no false positives on numbers or prose)", () => {
