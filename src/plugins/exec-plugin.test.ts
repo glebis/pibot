@@ -500,3 +500,15 @@ describe('exec outcome audit', () => {
     } finally { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(other, { recursive: true, force: true }); }
   });
 });
+
+describe("yt-dlp description metadata flag", () => {
+  it("allowlists --write-description for https URLs (workspace-relative outputs)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yt-desc-"));
+    try {
+      const allow = DEFAULT_EXEC_ALLOWLIST.filter((e) => e.bin === "yt-dlp");
+      const r = await resolveExec(["yt-dlp", "--skip-download", "--write-description", "--write-subs", "https://www.youtube.com/watch?v=N8mV_E3IcZU"], { agentDir: dir, workspace: dir }, allow);
+      expect(r.error).toBeUndefined();
+      expect(r.argv).toContain("--write-description");
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});

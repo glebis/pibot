@@ -174,6 +174,7 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
       { flag: "--skip-download" },
       { flag: "--write-subs" },
       { flag: "--write-auto-subs" },
+      { flag: "--write-description" },
       { flag: "--sub-langs", takesValue: true, valueRe: SAFE_VALUE },
       { flag: "--sub-lang", takesValue: true, valueRe: SAFE_VALUE },
       { flag: "--sub-format", takesValue: true, valueRe: SAFE_VALUE },
