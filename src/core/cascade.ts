@@ -26,9 +26,13 @@ import { errorMessage, readJson, truncate, uid, writeJsonAtomic } from "./util.j
 
 // ─── error classification ───────────────────────────────────────────────────
 
-export type ModelErrorClass = "unavailable" | "auth" | "credits" | "rate-limit" | "transient" | "context" | "unknown";
+export type ModelErrorClass = "local-state" | "unavailable" | "auth" | "credits" | "rate-limit" | "transient" | "context" | "unknown";
 
 const RX = {
+  // local session state: the prompt never reached a provider (compaction mutex, busy
+  // session). Cooling a model here would poison every slot the chain walks through —
+  // the Oct 2026 arda.ai wedge cooled 9 of 18 models on one compaction error.
+  localState: /compaction is in progress|cannot submit a prompt while compaction|session (is )?busy|another (turn|request) is (already )?in progress/i,
   // permanent unavailability: the model is gone upstream or can never work with
   // the current auth. These fail identically every retry, so they are MARKED and
   // removed from rotation instead of cooling down (checked first — most specific).
@@ -49,6 +53,7 @@ export function classifyModelError(message: string): ModelErrorClass {
   // order matters: permanent-unavailability markers are the most specific and
   // win over everything; credit/billing markers beat bare status codes;
   // rate-limit mentions counting tokens; auth messages may mention quota; context is a model mismatch, not an outage
+  if (RX.localState.test(m)) return "local-state";
   if (RX.unavailable.test(m)) return "unavailable";
   if (RX.context.test(m)) return "context";
   if (RX.credits.test(m)) return "credits";
@@ -60,6 +65,7 @@ export function classifyModelError(message: string): ModelErrorClass {
 
 /** How long a failing model is skipped after an error of each class. */
 export const COOLDOWN_MS: Record<ModelErrorClass, number> = {
+  "local-state": 0, // never a model failure: nothing is cooled
   unavailable: 24 * 3600e3, // nominally long; the unavailable flag removes it from rotation outright
   auth: 4 * 3600e3, // bad keys rarely self-heal mid-session
   credits: 60 * 60e3, // exhaustion heals by top-up, not time — the recovery probe catches it early
@@ -98,6 +104,9 @@ export interface CascadeEntry {
   unavailableReason?: string;
 }
 
+/** What produced a queued prompt: a real user turn or a host-injected directive. */
+export type DeadLetterSource = "user" | "host";
+
 export interface DeadLetter {
   id: string;
   agentId: string;
@@ -109,6 +118,8 @@ export interface DeadLetter {
   lastError?: string;
   /** A replay produced partial output before failing; automatic retries risk duplicate side effects. */
   automaticReplayBlocked?: boolean;
+  /** Origin of the prompt. Host-injected text must never replay as a user turn (bd pibot-c38). */
+  source?: DeadLetterSource;
 }
 
 /** A credits failure proves the account (all models of one provider) can't pay. */
@@ -145,6 +156,7 @@ function isDeadLetter(v: unknown): v is DeadLetter {
   if (!Array.isArray(o.attempts) || !o.attempts.every((a) => typeof a === "string")) return false;
   if (o.lastError !== undefined && typeof o.lastError !== "string") return false;
   if (o.automaticReplayBlocked !== undefined && typeof o.automaticReplayBlocked !== "boolean") return false;
+  if (o.source !== undefined && o.source !== "user" && o.source !== "host") return false;
   return true;
 }
 
@@ -272,6 +284,66 @@ export class ModelCascade {
     return specs.slice(0, 8); // bound the cascade walk
   }
 
+  /**
+   * Every spec the manifest's provider policy permits, in picker order: the
+   * explicit model/cascade first, then each allowed provider's catalog in the
+   * manifest's own provider order, then the global tail. Unlike `chainFor` this
+   * is not truncated to the cascade walk length — the picker must not lose a
+   * provider behind an earlier one's models. Callers bound how many they render.
+   */
+  permittedSpecs(manifest: CascadeManifestLike): string[] {
+    const specs: string[] = [];
+    const configuredProviders = manifest.providers?.map((provider) => provider.trim()).filter(Boolean);
+    const allowedProviders = new Set(configuredProviders ?? []);
+    const providerAllowed = (spec: string) => {
+      const slash = spec.indexOf("/");
+      return slash > 0 && allowedProviders.has(spec.slice(0, slash));
+    };
+    const push = (s?: string | string[], enforcePolicy = false) => {
+      for (const item of Array.isArray(s) ? s : s ? [s] : []) {
+        const v = item.trim();
+        if (!v || v === "same") continue;
+        if (enforcePolicy && !providerAllowed(v)) continue;
+        if (this.entry(v)?.unavailable) continue; // deleted from rotation
+        if (!specs.includes(v)) specs.push(v);
+      }
+    };
+    push(manifest.model, configuredProviders !== undefined);
+    push(manifest.cascade, configuredProviders !== undefined);
+    // Discovery stays opt-in through manifest.providers, exactly like chainFor; the
+    // difference is order — the manifest's provider list decides, so an agent whose
+    // providers start with ollama surfaces its cloud models before the tail can
+    // crowd them out.
+    if (configuredProviders !== undefined) {
+      let catalog: readonly { provider: string; id: string }[] = [];
+      try {
+        catalog = this.deps.modelRuntime.getModels();
+      } catch {
+        /* catalog unavailable — work with what we have */
+      }
+      const seen = new Set<string>();
+      for (const provider of configuredProviders) {
+        if (seen.has(provider)) continue;
+        seen.add(provider);
+        let authed = false;
+        try {
+          authed = this.deps.modelRuntime.hasConfiguredAuth(provider);
+        } catch {
+          authed = false;
+        }
+        if (!authed) continue;
+        for (const m of catalog) if (m.provider === provider) push(`${m.provider}/${m.id}`);
+      }
+    }
+    push(this.deps.globalTail ?? [], true);
+    return specs;
+  }
+
+  /** True when the manifest's provider policy permits switching to `spec`. */
+  isPermitted(manifest: CascadeManifestLike, spec: string): boolean {
+    return this.permittedSpecs(manifest).includes(spec.trim());
+  }
+
   /** Resolve a spec to a pi Model. Undefined when the spec isn't in the catalog. */
   resolveModel(spec: string): ResolvedModel | undefined {
     if (!spec) return undefined;
@@ -301,6 +373,12 @@ export class ModelCascade {
    *  escalation — the model is removed from rotation outright. */
   noteFailure(spec: string, err: string, now = Date.now()): ModelErrorClass {
     const cls = classifyModelError(err);
+    // A local session state never reached this model: record nothing, open nothing.
+    // The caller stops the walk on this class instead of trying the next slot.
+    if (cls === "local-state") {
+      this.deps.log?.(`[cascade] ${spec} not attempted (local-state): ${truncate(err, 140)}`);
+      return cls;
+    }
     const key = spec.trim().toLowerCase();
     const prev = this.state.entries[key];
     const streak = (prev?.streak ?? 0) + 1;

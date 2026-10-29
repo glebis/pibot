@@ -110,6 +110,8 @@ export interface CreateAgentDeps {
     createAgent(name: string, persona?: string): string | undefined;
     getAgent(id: string): { id: string; dir: string; manifest: AgentManifest } | undefined;
     discover(): Promise<void>;
+    /** field-level patch guard (bd pibot-4wq1); absent deps fall back to a whole-file write */
+    updateManifest?(agentId: string, patch: Partial<AgentManifest>, opts?: { expectedSha?: string; acknowledgeRemovals?: readonly string[] }): { ok: boolean; error?: string; manifest?: AgentManifest };
   };
   scheduler?: { ensure(job: never): unknown };
   telegram?: { requestSubBotCreation(agentId: string): Promise<void>; managerMode(): boolean };
@@ -190,14 +192,30 @@ export async function createAgentFromSpec(deps: CreateAgentDeps, spec: CreateAge
   const agent = deps.agents.getAgent(id);
   if (!agent) return { ok: false, error: `Agent "${id}" vanished after creation` };
 
-  const manifest = buildManifest(draft);
-  if (capabilities) manifest.capabilities = capabilities;
-  if (spec.model != null && String(spec.model).trim()) manifest.model = String(spec.model).trim();
+  const desired = buildManifest(draft);
+  if (capabilities) desired.capabilities = capabilities;
+  if (spec.model != null && String(spec.model).trim()) desired.model = String(spec.model).trim();
   if (spec.providers != null) {
     const providers = (Array.isArray(spec.providers) ? spec.providers : String(spec.providers).split(",")).map((s) => String(s).trim()).filter(Boolean);
-    if (providers.length) manifest.providers = providers;
+    if (providers.length) desired.providers = providers;
   }
-  writeJsonAtomic(path.join(agent.dir, "agent.json"), manifest);
+  // Write through the field-level patch guard when the manager offers it, so the
+  // factory changes only the fields it owns and preserves everything the scaffold
+  // wrote (bd pibot-4wq1). A minimal deps object falls back to the atomic write.
+  const patch: Partial<AgentManifest> = { description: desired.description, heartbeat: desired.heartbeat };
+  if (desired.evolution) patch.evolution = desired.evolution;
+  if (desired.capabilities) patch.capabilities = desired.capabilities;
+  if (desired.model !== undefined) patch.model = desired.model;
+  if (desired.providers) patch.providers = desired.providers;
+
+  let manifest = desired;
+  if (deps.agents.updateManifest) {
+    const result = deps.agents.updateManifest(id, patch);
+    if (!result.ok) return { ok: false, error: result.error ?? "manifest write refused" };
+    manifest = result.manifest ?? desired;
+  } else {
+    writeJsonAtomic(path.join(agent.dir, "agent.json"), desired);
+  }
   await deps.agents.discover();
   const fresh = deps.agents.getAgent(id)!;
   armRhythmJobs(deps.scheduler, fresh);

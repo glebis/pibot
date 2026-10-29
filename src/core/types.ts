@@ -25,8 +25,8 @@ export interface Schedule {
   kind: ScheduleKind;
   dueAt: number;
   repeat?: ScheduleRepeat;
-  /** important items pierce snooze */
-  wake: "normal" | "important";
+  /** important items pierce snooze; notify marks an awareness-only wake (agent composes a due-notification instead of executing) */
+  wake: "normal" | "important" | "notify";
   /** direct: host formats the ping. agent: full agent session composes it */
   delivery: "direct" | "agent";
   status: "pending" | "paused" | "done" | "cancelled";
@@ -77,6 +77,24 @@ export interface PushOptions {
   dedupeKey?: string;
 }
 
+/** Delivery receipt from a transport push (bd pibot-zy70): id of the sent message, when observable.
+ *  Destination-aware (bd pibot-cida): a message id alone proves neither WHERE the result landed nor
+ *  WHAT it was, so a transport that can observe them also attests its peer, the sending bot account
+ *  and the id namespace. An API acknowledgement is not a same-peer readback and never a human view. */
+export interface DeliveryReceipt {
+  messageId?: number;
+  /** actually delivered medium: "photo" | "document" | "video_note" | … (absent = plain text) */
+  mediaType?: string;
+  /** destination the receipt attests, as "transport:chatId"; absent = the destination is unverified */
+  peer?: string;
+  /** bot/account identity that performed the send — NEVER an agent id */
+  account?: string;
+  /** message-id namespace ("bot_api" | "mtproto", …) — ids from other namespaces are never the same message */
+  idProtocol?: string;
+  /** strongest evidence obtained: an API ack is not a readback, and neither is a human viewing */
+  evidence?: "ack" | "readback" | "viewed";
+}
+
 /** Context about a Telegram message the user replied to (transport-supplied). */
 export interface ReplyContext {
   /** id of the quoted message */
@@ -110,8 +128,9 @@ export interface Transport {
   readonly boundAgentId?: string;
   start(): Promise<void>;
   stop(): Promise<void>;
-  /** Send a message (and optional button card) to a chat */
-  push(chatId: string, opts: PushOptions): Promise<void>;
+  /** Send a message (and optional button card) to a chat. May resolve with a delivery receipt
+   *  (id of the sent message) when the transport can observe it — evidence for task records. */
+  push(chatId: string, opts: PushOptions): Promise<DeliveryReceipt | void>;
   /** System-level error notice (agent crashed, bad model, …) */
   notifyError(chatId: string, message: string): Promise<void>;
   onMessage(cb: (text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>): void;
@@ -130,14 +149,17 @@ export interface Transport {
   sendPoll?(chatId: string, question: string, options: string[]): Promise<{ pollId: string }>;
   /** Poll votes (optional) */
   onPollAnswer?(cb: (pollId: string, optionIndex: number, voterId: string) => Promise<void>): void;
-  /** Send an image/document by URL (optional; Telegram only) */
-  sendMedia?(chatId: string, url: string): Promise<void>;
+  /** Send an image/document by URL (optional; Telegram only). May resolve with a
+   *  delivery receipt (message id + actual media kind) for task records (bd pibot-zy70). */
+  sendMedia?(chatId: string, url: string): Promise<DeliveryReceipt | void>;
   /** Set this bot identity's profile photo (optional; Telegram only). */
   setProfilePhoto?(filePath: string): Promise<void>;
   /** Send a local OGG/Opus voice artifact through this transport. */
   sendVoice?(chatId: string, filePath: string, caption?: string): Promise<void>;
   /** Send a local MP3/M4A music-player artifact through this transport. */
   sendAudio?(chatId: string, filePath: string, caption?: string): Promise<void>;
+  /** native round video note (Bot API sendVideoNote) — externally produced square MP4 */
+  sendVideoNote?(chatId: string, filePath: string): Promise<DeliveryReceipt | void>;
   /** Manager-mode bots receive managed-bot creation/token updates (optional) */
   onManagedBot?(cb: (info: { creatorId: string; botId: number; botUsername?: string; firstName?: string }) => Promise<void>): void;
 }

@@ -84,7 +84,7 @@ async function createBoundRuntime(c:EscalationConfig,options:BootOptions) {
   try{runtime=(options.dependencies?.runtimeFactory??(o=>new VoiceCoordinatorRuntime(o)))({
     coordinator:{inspect(){const snapshot=store?store.inspect():coordinator!.inspect();return {...snapshot,paused:snapshot.paused||!matches()};}},
     databasePath:c.databasePath,policy:{...c.policy,enabled:true,ownerId:c.ownerId,agentId:c.agentId,canonicalChatId:c.canonicalChatId,recipientRef:c.recipientRef},
-    authority:adapters.authority,sourceAuthority:adapters.sourceAuthority,phoneURL:'http://127.0.0.1:8793',phoneToken:secrets.PHONE_CONTROL_TOKEN,
+    authority:adapters.authority,sourceAuthority:adapters.sourceAuthority,phoneURL:'http://127.0.0.1:8793',phoneToken:secrets.PHONE_CONTROL_TOKEN,reconcileUsage:true,
   });}catch(error){detach?.();store?.close();throw error;}
   let timer:NodeJS.Timeout|undefined,pending:Promise<void>|undefined,closed=false,started=false;
   const poll=()=>{if(closed||pending||!store)return;pending=(async()=>{let feed:AdmittedSourceFeed;try{feed=await adapters.sources!();}catch{feed={schemaVersion:1,checkedAt:Date.now(),expiresAt:Date.now(),available:false,sources:[],blockers:['unavailable']};}if(closed)return;await store!.syncContracts(feed,source=>options.host.sendUrgentSourceMessage!({agentId:c.agentId,canonicalChatId:c.canonicalChatId,text:source.title,decisionId:source.decisionId,questionVersion:source.questionVersion,revision:source.revision,deadline:source.deadline}));})().catch(()=>{}).finally(()=>{pending=undefined;});};

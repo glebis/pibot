@@ -58,6 +58,17 @@ describe("scheduler plugin", () => {
     }
   });
 
+  it("schedule_create accepts wake:'notify' for awareness-only task wakes", async () => {
+    const { tools } = pluginFor();
+    const res = await tools.get("schedule_create")!.execute("t1", {
+      title: "proactive scorecard", when: "tomorrow 9am", kind: "task", delivery: "agent", wake: "notify",
+    });
+    expect(res.content[0].text).toContain("notify-only");
+    const job = scheduler.list().find((j) => j.title === "proactive scorecard");
+    expect(job?.wake).toBe("notify");
+    expect(job?.delivery).toBe("agent");
+  });
+
   it("shows and resumes an automatically paused schedule", async () => {
     const { tools } = pluginFor();
     const job = scheduler.create({

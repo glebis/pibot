@@ -44,6 +44,8 @@ describe("classifyModelError", () => {
     ["500 Internal server error", "transient"],
     ["timeout", "transient"],
     ["ECONNREFUSED", "transient"],
+    ["Cannot submit a prompt while compaction is in progress", "local-state"],
+    ["session busy", "local-state"],
     ["unknown error type", "unknown"],
     ["", "unknown"],
     [null as unknown as string, "unknown"],
@@ -73,6 +75,20 @@ describe("noteFailure cooldown + noteSuccess recovery", () => {
     expect(e?.lastSuccessAt).toBe(t + 1000);
     expect(c.isOpen("ollama/local", t + 1001)).toBe(false);
     expect(e?.failures).toBe(4);
+  });
+
+  it("never cools a model for a local session state, so one compaction error cannot poison the chain", () => {
+    const c = cascade();
+    const t = 1_700_000_000_000;
+    const msg = "Cannot submit a prompt while compaction is in progress";
+    expect(COOLDOWN_MS["local-state"]).toBe(0);
+    for (const spec of ["ollama/local", "anthropic/claude", "ollama/second"]) {
+      expect(c.noteFailure(spec, msg, t)).toBe("local-state");
+    }
+    expect(c.entry("ollama/local")).toBeUndefined();
+    expect(c.entry("anthropic/claude")).toBeUndefined();
+    expect(c.isOpen("ollama/local", t)).toBe(false);
+    expect(c.isOpen("anthropic/claude", t + 60_000)).toBe(false);
   });
 });
 
@@ -238,6 +254,24 @@ describe("dead-letter bounded retention + take/unshift", () => {
     expect(c.deadLetters()[0].text).toBe("msg20");
   });
 
+  it("persists the prompt source and discards an unknown source value", () => {
+    const statePath = path.join(makeTempDir(), "state.json");
+    {
+      const c = makeInstance(statePath);
+      c.queueDead({ agentId: "a", transport: "t", chatId: "1", text: "hi", createdAt: 1, attempts: [], source: "host" });
+    }
+    {
+      const c = makeInstance(statePath);
+      expect(c.deadLetters()[0].source).toBe("host");
+    }
+    fs.writeFileSync(
+      statePath,
+      '{"entries":{},"deadLetters":[{"id":"x","agentId":"a","transport":"t","chatId":"1","text":"hi","createdAt":1,"attempts":[],"source":"bogus"}]}',
+      "utf8"
+    );
+    expect(makeInstance(statePath).deadLetters()).toHaveLength(0);
+  });
+
   it("preserves automaticReplayBlocked, lastError, and survives across instances", () => {
     const statePath = path.join(makeTempDir(), "state.json");
     {
@@ -300,6 +334,39 @@ describe("per-agent provider routing", () => {
       model: "ollama/primary",
       providers: ["anthropic"],
     })).toEqual(["anthropic/claude"]);
+  });
+});
+
+describe("permittedSpecs (model picker)", () => {
+  it("lists the manifest's providers in manifest order, before the global tail", () => {
+    const c = cascade(
+      ["openai-codex/gpt-6.1-sol"],
+      [
+        { provider: "openai-codex", id: "gpt-6.1-sol" },
+        { provider: "ollama", id: "glm-5.3-flash:cloud" },
+        { provider: "ollama", id: "deepseek-v4.1-flash:cloud" },
+      ],
+    );
+    expect(c.permittedSpecs({ model: "openai-codex/gpt-6.1-sol", providers: ["ollama", "openai-codex"] })).toEqual([
+      "openai-codex/gpt-6.1-sol",
+      "ollama/local",
+      "ollama/glm-5.3-flash:cloud",
+      "ollama/deepseek-v4.1-flash:cloud",
+    ]);
+  });
+
+  it("is not truncated to the cascade walk and enforces the provider allowlist", () => {
+    const many = Array.from({ length: 10 }, (_, i) => ({ provider: "ollama", id: `m${i}` }));
+    const c = cascade([], many);
+    const manifest = { model: "ollama/m0", providers: ["ollama"] };
+    expect(c.chainFor(manifest)).toHaveLength(8);
+    expect(c.permittedSpecs(manifest)).toContain("ollama/m9");
+    expect(c.isPermitted(manifest, "ollama/m9")).toBe(true);
+    expect(c.isPermitted(manifest, "anthropic/claude")).toBe(false);
+  });
+
+  it("stays opt-in without a provider list", () => {
+    expect(cascade().permittedSpecs({ model: "ollama/primary" })).toEqual(["ollama/primary"]);
   });
 });
 

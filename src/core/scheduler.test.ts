@@ -43,6 +43,32 @@ describe("Scheduler", () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
+  it("rejects creation when the host cannot resolve a delivery route", () => {
+    const s = new Scheduler(dataDir, () => {});
+    try {
+      s.setRouteValidator(() => "No owned delivery chat; repair the destination before resuming.");
+      expect(() => s.create(makeJob())).toThrow(/repair the destination/);
+      expect(s.list()).toHaveLength(0);
+    } finally { s.stop(); }
+  });
+
+  it.each([false, true])("pauses a lost route immediately without delivering or retrying (repeat=%s)", async (repeat) => {
+    const deliver = vi.fn();
+    const notice = vi.fn();
+    const s = new Scheduler(dataDir, deliver, notice);
+    try {
+      const job = s.create(makeJob({ dueAt: Date.now() + 60000, ...(repeat ? { repeat: { everyMs: 3600000 } } : {}) }));
+      s.setRouteValidator(() => "No owned delivery chat; repair the destination before resuming.");
+      await (s as unknown as { fire: (job: Schedule) => Promise<void> }).fire(job);
+      expect(job.status).toBe("paused");
+      expect(job.deliveryAttempts).toBe(1);
+      expect(job.pauseReason).toContain("repair the destination");
+      expect(deliver).not.toHaveBeenCalled();
+      expect(notice).toHaveBeenCalledTimes(1);
+      expect(notice.mock.calls[0][1].kind).toBe("paused");
+    } finally { s.stop(); }
+  });
+
   it("fires a one-shot job and marks it done", async () => {
     const fired: string[] = [];
     const s = new Scheduler(dataDir, (job) => void fired.push(job.id));

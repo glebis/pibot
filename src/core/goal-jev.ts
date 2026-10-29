@@ -98,7 +98,7 @@ export function jevGoalPermitted(
   if (permission?.judge !== "jev") return { ok: false, reason: "not_configured" };
   if (permission.dataScope !== "redacted_approved" && permission.dataScope !== "synthetic") return { ok: false, reason: "scope_not_permitted" };
   if (!(permission.providers ?? []).some((p) => p.trim().toLowerCase() === JEV_GOAL_PROVIDER)) return { ok: false, reason: "provider_not_permitted" };
-  const key = opts.apiKey ?? process.env.AI_GATEWAY_API_KEY;
+  const key = opts.apiKey ?? (process.env.TYPESAFE_API_KEY?.trim() || process.env.AI_GATEWAY_API_KEY);
   if (!key?.trim()) return { ok: false, reason: "missing_key" };
   return { ok: true };
 }

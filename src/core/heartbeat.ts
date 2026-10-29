@@ -23,6 +23,11 @@ import type { Scheduler } from "./scheduler.js";
 import { ensureDir, errorMessage, fmtWhen, inQuietHours, parseDuration, readJson, truncate, writeJsonAtomic } from "./util.js";
 import { appendBacklogItems, formatBacklogDigest } from "./backlog.js";
 import { buildResearchSignals } from "./research-signals.js";
+import { trackActivity } from "./activity.js";
+import { describeDeadlineAt } from "./deadline.js";
+import { scanRelativeDateClaims } from "./fact-check.js";
+import { DISPLAY_TIME_ZONE } from "./time-zone.js";
+import { DRIFT_ANTI_PATTERNS, FAILURE_SIGNAL_RULE, OUTCOME_HONESTY } from "./agent-guidance.js";
 
 /** Adaptive-wakeup bounds (Ouroboros set_next_wakeup pattern): the agent may
  *  compress the next gap when something is brewing, stretch it when idle.
@@ -37,6 +42,8 @@ export interface HeartbeatHost {
   escalateToAgent(agentId: string, instruction: string): Promise<void>;
   /** timestamp (ms) of the last message the user actually sent to this agent */
   lastUserMessageAt(agentId: string): number;
+  /** optional: the loop is auto-triaged at threshold — file a dev ticket with the escalation evidence (bd: pibot-3w03) */
+  fileDevTriage?(agentId: string, signature: string): Promise<void>;
 }
 
 const BRIEF_SYSTEM_PROMPT = `You deliver the user's MORNING BRIEF. Check calendar_today, then compose a short, warm brief in the agent's voice:
@@ -67,12 +74,21 @@ Maintenance rotation — keep your own house in order:
 - Service AT MOST ONE stale item per tick, rotating across ticks — never everything at once. What you did gets recorded via heartbeat_act "maintain" (a one-line durable note into your maintenance journal).
 - Your file tools can read the agent directory but write ONLY under memory/. Anything outside memory/ (persona, skills, scripts) cannot be edited from a tick: propose it with maintain "backlog: <summary>" or via speak instead.
 - If everything is fresh, record nothing and prefer a longer wakeup. Never let the same item stay stale for many cycles.
+- If the digest lists bd tickets assigned to you, service exactly ONE per tick: use escalate with "service <ticket-id>: what it needs" — your main session claims and executes it. Never a speak, never a user-facing ping about it.
+
+Work honesty and self-check:
+${OUTCOME_HONESTY}
+
+${FAILURE_SIGNAL_RULE}
+
+${DRIFT_ANTI_PATTERNS}
 
 Call the heartbeat_act tool exactly once with your decision.`;
 
 interface HeartbeatAct {
   speak?: string;
   escalate?: string;
+
   note?: string;
   /** requested delay until this agent's next heartbeat tick (e.g. "10m", "3h") */
   wakeup?: string;
@@ -107,6 +123,62 @@ function fileAgeHours(p: string, now: number): number | null {
     return (now - fs.statSync(p).mtimeMs) / 3600e3;
   } catch {
     return null;
+  }
+}
+
+// ─── Persona staleness keyed to CONTENT, not mtime ──────────────────────────
+// bd: bl_raqq2k loop — an mtime-only staleness marker re-flags AGENTS.md every
+// ~24h even when its content is byte-identical, which forced a daily
+// timestamp-bumping ghost-write treadmill (Oct 27–28: two verified no-drift
+// ghost-writes, then the marker re-flagged exactly ~24h later — recurrence by
+// design, not noise). Key the marker to the content sha256 instead: identical
+// content self-clears until real drift appears, and a review is recorded once
+// through the gated maintain path (ticks cannot forge baselines: file tools
+// confine writes to memory/, and the baseline records the sha AT record time).
+
+const PERSONA_REVIEW_FILE = path.join("memory", "persona-review.json");
+/** A maintain note that records a persona review (e.g. "persona: reviewed — no drift"). */
+export const PERSONA_MAINTAIN_RE = /^persona\b/i;
+
+export interface PersonaReviewBaseline {
+  sha256: string;
+  reviewedAt: string;
+  note: string;
+}
+
+function fileSha256(p: string): string | null {
+  try {
+    return createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function readPersonaReview(agentDir: string): PersonaReviewBaseline | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(agentDir, PERSONA_REVIEW_FILE), "utf8")) as PersonaReviewBaseline;
+    if (raw && typeof raw.sha256 === "string" && typeof raw.reviewedAt === "string" && Number.isFinite(Date.parse(raw.reviewedAt))) return raw;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Records a persona review baseline keyed to the CURRENT AGENTS.md content sha256.
+ *  Written only by the gated maintain path (heartbeat_act), never by raw agent
+ *  file writes — so a baseline proves content was seen as of that record. */
+export function recordPersonaReview(agentDir: string, note: string): void {
+  try {
+    const sha = fileSha256(path.join(agentDir, "AGENTS.md"));
+    if (!sha) return; // nothing to baseline a record on
+    const data: PersonaReviewBaseline = {
+      sha256: sha,
+      reviewedAt: new Date().toISOString(),
+      note: truncate(note.trim(), 300),
+    };
+    writeJsonAtomic(path.join(agentDir, PERSONA_REVIEW_FILE), data);
+  } catch {
+    /* best effort — a review record must never break a tick */
   }
 }
 
@@ -198,11 +270,22 @@ export function buildMaintenancePanel(agentDir: string, now = Date.now()): strin
         : memoryHours < ROTATION_FLOOR_H
           ? `current (updated ${memoryAge}) — durable memory your digest carries; memory_save does NOT refresh this line (write with file tools)`
           : `STALE ${ageAgo(now - memoryHours * 3600e3, now)} — service this rotation (memory_save does NOT refresh this line; write with file tools)`;
+      // Persona staleness is CONTENT-keyed (see the persona-review section above):
+      // a recorded review that still matches the current sha256 reads current even
+      // with an old mtime, so zero-drift days self-clear instead of demanding daily
+      // timestamp-bumping writes. Only real content drift (or no baseline yet) falls
+      // back to the mtime floor.
+      const personaSha = fileSha256(path.join(agentDir, "AGENTS.md"));
+      const personaReview = readPersonaReview(agentDir);
       const personaLine = personaHours == null
         ? "(missing) — you cannot write AGENTS.md from a tick; record maintain \"backlog: write persona paragraph\""
-        : personaHours < ROTATION_FLOOR_H
-          ? `current (updated ${personaAge}) — read-only from ticks`
-          : `STALE ${ageAgo(now - personaHours * 3600e3, now)} — service this rotation (read-only from ticks: if it has drifted, record maintain "backlog: persona refresh — <what changed>")`;
+        : personaSha != null && personaReview && personaReview.sha256 === personaSha
+          ? `current (content-verified — sha matches the ${ageAgo(Date.parse(personaReview.reviewedAt), now)} review; no write needed unless content drifts)`
+          : personaSha != null && personaReview
+            ? `STALE (content drifted since the ${ageAgo(Date.parse(personaReview.reviewedAt), now)} review) — service this rotation (read AGENTS.md, then record maintain "persona: reviewed — <what changed or 'no drift found'>")`
+            : personaHours < ROTATION_FLOOR_H
+              ? `current (updated ${personaAge}) — read-only from ticks`
+              : `STALE ${ageAgo(now - personaHours * 3600e3, now)} — service this rotation (read-only from ticks: if it has drifted, record maintain "persona: reviewed — <what changed or 'no drift found'>")`;
       return [
         `- memory (memory/MEMORY.md): ${memLine}`,
         `- persona (AGENTS.md): ${personaLine}`,
@@ -233,6 +316,7 @@ export function buildMaintenancePanel(agentDir: string, now = Date.now()): strin
 interface PersistedHeartbeatAgentState {
   lastSpeakFingerprint?: string;
   unansweredSpeaks?: number;
+  escalationLoop?: EscalationLoopState;
 }
 
 interface PersistedHeartbeatState {
@@ -262,7 +346,89 @@ export function isValuelessHeartbeatSpeak(text: string): boolean {
   return filler.some((rx) => rx.test(t));
 }
 
+// ─── Escalation-loop triage (bd: pibot-3w03 — stuck-agent lane) ─────────────
+
+export interface EscalationLoopState {
+  /** per-signature loops (LRU-capped); each tracks its own counter and triage cooldown */
+  loops: { sig: string; count: number; triagedUntil?: number; lastTs: number }[];
+}
+
+const ESCALATION_LOOP_THRESHOLD = 3;
+const ESCALATION_LOOP_COOLDOWN_MS = 12 * 3600e3;
+const ESCALATION_LOOP_MEMORY_MS = 24 * 3600e3;
+const ESCALATION_LOOP_MAX_TRACKED = 5;
+
+function contentTokens(text: string): Set<string> {
+  // 6-char prefixes: inflection-tolerant for Russian and English plurals
+  // ("инструментов"/"инструментам" → "инстру"), digits and punctuation dropped.
+  const words = text
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .split(/\s+/)
+    .filter((w) => /\p{L}{3,}/u.test(w))
+    .map((w) => (w.length >= 7 ? w.slice(0, 6) : w));
+  return new Set(words);
+}
+
+/** Normalized content signature of an escalation — wording-shuffled repeats normalize to the same tokens. */
+export function escalationSignature(text: string): string {
+  return [...contentTokens(text)].sort().join(" ");
+}
+
+/** Deliberately loose containment match: the same stuck problem re-worded must still match (creator Oct 22–23 case),
+ *  while escalations about genuinely different matters must not. False positives only cost one suppressed duplicate ping. */
+export function escalationsSimilar(a: string, b: string): boolean {
+  const A = contentTokens(a);
+  const B = contentTokens(b);
+  if (A.size < 3 || B.size < 3) return false;
+  let inter = 0;
+  for (const w of A) if (B.has(w)) inter++;
+  return inter / Math.min(A.size, B.size) >= 0.5;
+}
+
+/** Pure state machine deciding what happens to this tick's escalation text.
+ *  Similar escalations accumulate per signature: first threshold-1 deliver; at threshold the loop
+ *  auto-triages (dev ticket filed once, owner pings suppressed for the cooldown);
+ *  after the cooldown the counter restarts and delivery resumes. Off-topic escalations never join the loop. */
+export function triageEscalationLoop(
+  prev: EscalationLoopState | undefined,
+  text: string,
+  now: number,
+  opts?: { threshold?: number; cooldownMs?: number },
+): { deliver: boolean; triageNow: boolean; matchedCount: number; next: EscalationLoopState } {
+  const threshold = opts?.threshold ?? ESCALATION_LOOP_THRESHOLD;
+  const cooldownMs = opts?.cooldownMs ?? ESCALATION_LOOP_COOLDOWN_MS;
+  const sig = escalationSignature(text);
+  const loops = (prev?.loops ?? []).filter((l) => now - l.lastTs <= ESCALATION_LOOP_MEMORY_MS);
+  const existing = loops.find((l) => escalationsSimilar(l.sig, sig));
+  let triageNow = false;
+  let deliver = true;
+  if (existing) {
+    const expired = existing.triagedUntil !== undefined && now >= existing.triagedUntil;
+    existing.count = expired ? 1 : existing.count + 1;
+    existing.triagedUntil = expired ? undefined : existing.triagedUntil;
+    existing.lastTs = now;
+    if (existing.count >= threshold) {
+      const cooling = existing.triagedUntil !== undefined && now < existing.triagedUntil;
+      if (!cooling) {
+        existing.triagedUntil = now + cooldownMs;
+        triageNow = true;
+      }
+      deliver = false;
+    }
+  } else {
+    loops.push({ sig, count: 1, lastTs: now });
+  }
+  // LRU cap — long-tail escalation topics must not grow unbounded
+  loops.sort((a, b) => b.lastTs - a.lastTs);
+  while (loops.length > ESCALATION_LOOP_MAX_TRACKED) loops.pop();
+  const matchedCount = loops.find((l) => escalationsSimilar(l.sig, sig))?.count ?? 1;
+  return { deliver, triageNow, matchedCount, next: { loops } };
+}
+
 export class HeartbeatEngine {
+  private escalationLoop = new Map<string, EscalationLoopState>();
   private inflight = new Set<string>();
   /** proactive speaks that got no user reaction — 2 in a row = back off */
   private unansweredSpeaks = new Map<string, number>();
@@ -341,6 +507,8 @@ export class HeartbeatEngine {
       statePath?: string;
       /** event-log consolidation engine — powers the "consolidate events" maintenance verb */
       consolidation?: { consolidate(agentId: string): Promise<unknown> };
+      /** optional: open bd tickets assigned to this agent — surfaced so a passive tick services one via escalate (bd: pibot-3w03) */
+      bdAssigned?: (agentId: string) => Promise<{ id: string; title: string }[]>;
     }
   ) {
     this.persistedState = deps.statePath
@@ -375,7 +543,7 @@ export class HeartbeatEngine {
   }
 
   private async tickOnce(agent: LoadedAgent, opts: { brief?: boolean } = {}): Promise<HeartbeatAct | null> {
-    const digest = this.buildDigest(agent);
+    const digest = await this.buildDigest(agent);
     const act: HeartbeatAct = {};
     let called = false;
 
@@ -447,12 +615,12 @@ export class HeartbeatEngine {
     }
 
     try {
-      await session.prompt(
+      await trackActivity({ kind: opts.brief ? "morning-brief" : "heartbeat", label: opts.brief ? "morning brief" : "heartbeat tick", agentId: agent.id, session }, () => session.prompt(
         opts.brief
           ? `MORNING BRIEF — ${new Date().toLocaleString([], { weekday: "long", hour: "2-digit", minute: "2-digit" })}\n\n${digest}\n\nCompose the user's morning brief: check calendar_today first, then cover pending items and open promises, and suggest the single most important thing today. Keep it short.`
           : `HEARTBEAT TICK — ${new Date().toLocaleString([], { weekday: "long", hour: "2-digit", minute: "2-digit" })}\n\n${digest}\n\nDecide. Call heartbeat_act exactly once.`,
         {}
-      );
+      ));
       if (choice.spec) this.deps.cascade?.noteSuccess(choice.spec);
     } catch (e) {
       if (choice.spec) this.deps.cascade?.noteFailure(choice.spec, errorMessage(e));
@@ -499,6 +667,10 @@ export class HeartbeatEngine {
         } else {
           recordMaintenanceNote(agent.dir, act.maintain);
           this.deps.events.log(agent.id, "maintenance", act.maintain);
+          // content-keyed persona staleness (see PERSONA_MAINTAIN_RE): a persona
+          // review note baselines the CURRENT AGENTS.md sha so zero-drift days
+          // self-clear without further writes.
+          if (PERSONA_MAINTAIN_RE.test(raw)) recordPersonaReview(agent.dir, act.maintain);
         }
       }
     }
@@ -507,6 +679,20 @@ export class HeartbeatEngine {
     this.deps.events.log(agent.id, "heartbeat", summary);
 
     if (act.escalate) {
+      // bd: pibot-3w03 — escalations repeating tick after tick with the same signature mean the
+      // owner pings THEMSELVES are the loop: triage instead of repeating forever.
+      const tri = triageEscalationLoop(this.escalationLoop.get(agent.id), act.escalate, Date.now());
+      this.escalationLoop.set(agent.id, tri.next);
+      this.persistAgent(agent.id);
+      if (!tri.deliver) {
+        this.deps.events.log(
+          agent.id,
+          "heartbeat",
+          `(suppressed, escalation loop ${tri.matchedCount}x, triaged=${tri.triageNow ? "now" : "earlier"}) ${truncate(act.escalate, 160)}`,
+        );
+        if (tri.triageNow) await this.deps.host.fileDevTriage?.(agent.id, act.escalate);
+        return;
+      }
       await this.deps.host.escalateToAgent(agent.id, act.escalate);
     } else if (act.speak) {
       // Valueless status reports ("no immediate action needed — let me know if…")
@@ -520,6 +706,18 @@ export class HeartbeatEngine {
       }
       const speakFingerprint = fingerprint(act.speak);
       if (this.lastSpeakFingerprint.get(agent.id) === speakFingerprint) return;
+      // Relative-date guard AT the delivery path (bd pibot-wr9m): on 2026-10-26 a
+      // model-composed nudge called the November 2 deadline "today". The absolute
+      // date is the authority; a relative word that disagrees with the current
+      // calendar day (named zone) is suppressed BEFORE emission — never a warning
+      // appended below the false urgency. Housekeeping (wakeup/maintain) already
+      // ran above, and a suppressed speak is NOT recorded as delivered: no
+      // fingerprint, no backoff increment — the next tick can re-derive it.
+      const dateCheck = scanRelativeDateClaims(act.speak, { timeZone: DISPLAY_TIME_ZONE });
+      if (dateCheck.inconsistent > 0) {
+        this.deps.events.log(agent.id, "heartbeat", `(suppressed, date mismatch) ${truncate(act.speak, 160)}`);
+        return;
+      }
       // backoff: proactive speaks that go unanswered make the heartbeat quieter
       const n = (this.unansweredSpeaks.get(agent.id) ?? 0) + 1;
       await this.deps.host.deliverToAgent(agent.id, act.speak, { origin: "heartbeat" });
@@ -557,6 +755,7 @@ export class HeartbeatEngine {
     const saved = this.persistedState.agents[fingerprint(agentId)];
     if (saved?.lastSpeakFingerprint) this.lastSpeakFingerprint.set(agentId, saved.lastSpeakFingerprint);
     if (saved?.unansweredSpeaks) this.unansweredSpeaks.set(agentId, saved.unansweredSpeaks);
+    if (saved?.escalationLoop) this.escalationLoop.set(agentId, saved.escalationLoop);
   }
 
   private persistAgent(agentId: string): void {
@@ -564,7 +763,10 @@ export class HeartbeatEngine {
     const key = fingerprint(agentId);
     const lastSpeakFingerprint = this.lastSpeakFingerprint.get(agentId);
     const unansweredSpeaks = this.unansweredSpeaks.get(agentId) ?? 0;
-    this.persistedState.agents[key] = { lastSpeakFingerprint, unansweredSpeaks };
+    const entry: PersistedHeartbeatAgentState = { lastSpeakFingerprint, unansweredSpeaks };
+    const loop = this.escalationLoop.get(agentId);
+    if (loop) entry.escalationLoop = loop;
+    this.persistedState.agents[key] = entry;
     writeJsonAtomic(this.deps.statePath, this.persistedState, 0o600);
   }
 
@@ -593,8 +795,14 @@ export class HeartbeatEngine {
     return model ? { model, spec: healthy } : {};
   }
 
-  private buildDigest(agent: LoadedAgent): string {
-    return buildHeartbeatDigest(agent, this.deps.scheduler, this.deps.events, this.deps.vaultDir);
+  private async buildDigest(agent: LoadedAgent): Promise<string> {
+    let assignedTickets: { id: string; title: string }[] | undefined;
+    try {
+      assignedTickets = await this.deps.bdAssigned?.(agent.id);
+    } catch {
+      assignedTickets = undefined; // bd absent or slow — the panel simply omits tickets
+    }
+    return buildHeartbeatDigest(agent, this.deps.scheduler, this.deps.events, this.deps.vaultDir, assignedTickets);
   }
 }
 
@@ -603,7 +811,8 @@ export function buildHeartbeatDigest(
   agent: LoadedAgent,
   scheduler: Pick<Scheduler, "list">,
   events: Pick<EventLog, "tail">,
-  vaultDir?: string
+  vaultDir?: string,
+  assignedTickets?: { id: string; title: string }[],
 ): string {
   const parts: string[] = [];
 
@@ -619,14 +828,34 @@ export function buildHeartbeatDigest(
     parts.push(`# Memory digest\n${truncate(fs.readFileSync(memoryFile, "utf8").trim(), 1200)}`);
   }
 
-  // pending schedule
+  // pending schedule — the RELATIVE wording is computed here, in the owner's named
+  // zone, from the absolute due time, WITH the exact local HH:mm so a same-day
+  // reminder stays actionable. The model never has to infer "today" from a bare clock
+  // value (which is how the Nov 2 deadline was once called "today").
   const jobs = scheduler.list(agent.id).filter((j) => !j.internal).slice(0, 6);
   if (jobs.length) {
     parts.push(
-      `# Pending scheduled items\n${jobs.map((j) => `- "${j.title}" — ${fmtWhen(j.dueAt)}${j.wake === "important" ? " (!important)" : ""}`).join("\n")}`
+      `# Pending scheduled items\n${jobs
+        .map((j) => {
+          const when = describeDeadlineAt(j.dueAt, { timeZone: DISPLAY_TIME_ZONE }) ?? fmtWhen(j.dueAt);
+          return `- "${j.title}" — ${when}${j.wake === "important" ? " (!important)" : ""}`;
+        })
+        .join("\n")}`
     );
   } else {
     parts.push("# Pending scheduled items\n(none)");
+  }
+
+  // assigned bd tickets — passive pickup: one serviced per tick via escalate (bd: pibot-3w03)
+  if (assignedTickets?.length) {
+    parts.push(
+      `# Bd tickets assigned to you
+${assignedTickets
+        .slice(0, 3)
+        .map((t) => `- ${t.id}: ${truncate(t.title, 90)}`)
+        .join("\n")}
+Service exactly ONE per tick: escalate \`service <ticket-id>\` — your main session claims and executes it.`,
+    );
   }
 
   // recent events

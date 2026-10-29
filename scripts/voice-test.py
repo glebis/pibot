@@ -85,8 +85,20 @@ def main():
     parser.add_argument('--no-open', action='store_true', help='Do not open the private browser link')
     parser.add_argument('--new-token', action='store_true', help='Issue a fresh page key (old links and remembered keys stop working)')
     parser.add_argument('--isolated', action='store_true', help='Use an isolated persona copy instead of the bot\'s shared Telegram session')
+    parser.add_argument('--hermes-repo', type=Path, help='Opt in to live Hermes sessions from this trusted absolute checkout (or PIBOT_HERMES_REPO)')
+    parser.add_argument('--hermes-profiles', help='Comma-separated Hermes profile allowlist; default: default,content,ops,researcher')
     parser.add_argument('--check', action='store_true', help='Check dependencies, credential presence and free ports without starting services')
     args = parser.parse_args()
+    if args.hermes_repo:
+        os.environ['PIBOT_HERMES_REPO'] = str(args.hermes_repo)
+    if args.hermes_profiles is not None:
+        os.environ['PIBOT_HERMES_PROFILES'] = args.hermes_profiles
+    if os.environ.get('PIBOT_HERMES_REPO'):
+        if args.isolated:
+            parser.error('Hermes requires canonical mode, not --isolated')
+        sys.path.insert(0, str(ROOT / 'voice'))
+        from hermes_bridge import HermesTransport
+        HermesTransport(os.environ['PIBOT_HERMES_REPO'], os.environ.get('PIBOT_HERMES_PROFILES'))
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     from dotenv import dotenv_values
     import importlib.metadata

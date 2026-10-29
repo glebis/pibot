@@ -2,7 +2,7 @@ import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
-import { VoiceCoordinatorRuntime, localPhoneDispatcher, type CoordinatorVoiceSnapshot, type VoiceCoordinatorOptions } from './coordinator-runtime.js';
+import { VoiceCoordinatorRuntime, localPhoneUsage, localPhoneDispatcher, type CoordinatorVoiceSnapshot, type VoiceCoordinatorOptions } from './coordinator-runtime.js';
 import type { CallConsent, CallDispatchInput, CallPolicy } from './escalation.js';
 function fixture(){
  let now=Date.parse('2026-10-14T12:00:00Z');
@@ -24,4 +24,18 @@ describe('voice coordinator adapter',()=>{
  it('stop prevents subsequent dispatch and closes cleanly',async()=>{const f=fixture(),r=new VoiceCoordinatorRuntime(f.opts);await r.stop();await r.tick();expect(f.http).not.toHaveBeenCalled();r.close();});
  it('rejects nonliteral, remote and credential-bearing control URLs',()=>{const f=fixture();for(const phoneURL of ['http://localhost:8793','http://127.0.0.1:80','https://127.0.0.1:8793','http://evil.example:8793','http://x:y@127.0.0.1:8793','http://127.0.0.1:8793/path'])expect(()=>localPhoneDispatcher({...f.opts,phoneURL})).toThrow();});
  it('rejects incorrect recipient binding before making a request',async()=>{const f=fixture();const sender=localPhoneDispatcher(f.opts);expect(await sender.dispatch({ownerId:'other',recipientRef:'owner-phone',attemptId:'x',maxDurationSeconds:180} as CallDispatchInput)).toEqual({status:'rejected_preflight'});expect(f.http).not.toHaveBeenCalled();});
+});
+
+
+describe('read-only phone usage client',()=>{
+ it('reads usage from the exact private origin without a call request',async()=>{
+  const f=fixture();f.http.mockImplementation(async()=>new Response(JSON.stringify({schemaVersion:1,attemptId:'attempt',providerCallId:'CA'+'a'.repeat(32),currency:'EUR',checkedAt:f.now,terminal:true,confirmedTwilioMinor:0,remainingExposureMinor:0})));
+  const result=await localPhoneUsage(f.opts).check({attemptId:'attempt'} as any);
+  expect(result?.confirmedTwilioMinor).toBe(0);
+  const [url,init]=f.http.mock.calls[0]!;expect(String(url)).toBe('http://127.0.0.1:8793/control/calls/attempt/usage');expect(init?.method).toBe('GET');expect(init?.body).toBeUndefined();expect(init?.redirect).toBe('error');
+ });
+ it('retains unknown usage on unavailable or oversized replies',async()=>{
+  const f=fixture(),reader=localPhoneUsage(f.opts);f.http.mockImplementation(async()=>new Response('',{status:503}));expect(await reader.check({attemptId:'attempt'} as any)).toBeNull();
+  f.http.mockImplementation(async()=>new Response('x'.repeat(17000)));expect(await reader.check({attemptId:'attempt'} as any)).toBeNull();
+ });
 });

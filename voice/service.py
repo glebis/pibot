@@ -76,12 +76,14 @@ class Ledger:
         self.db.execute('CREATE TABLE IF NOT EXISTS calls (id TEXT PRIMARY KEY, agent TEXT, chat TEXT, state TEXT, sid TEXT UNIQUE, created REAL, auth_started REAL, tries INTEGER DEFAULT 0)')
         if 'max_duration' not in {r[1] for r in self.db.execute('PRAGMA table_info(calls)')}:
             self.db.execute('ALTER TABLE calls ADD COLUMN max_duration INTEGER NOT NULL DEFAULT 180')
+        if 'usage_evidence_version' not in {r[1] for r in self.db.execute('PRAGMA table_info(calls)')}:
+            self.db.execute('ALTER TABLE calls ADD COLUMN usage_evidence_version INTEGER')
         self.db.execute("UPDATE calls SET state='unknown' WHERE state IN ('dispatching','accepted','authenticated','streaming')")
     def close(self):
         self.db.close();os.close(self.lock_fd)
     def get(self,id):
-        row=self.db.execute('SELECT id,agent,chat,state,sid,created,auth_started,tries,max_duration FROM calls WHERE id=?',(id,)).fetchone()
-        return dict(zip(('id','agent','chat','state','sid','created','auth_started','tries','max_duration'),row)) if row else None
+        row=self.db.execute('SELECT id,agent,chat,state,sid,created,auth_started,tries,max_duration,usage_evidence_version FROM calls WHERE id=?',(id,)).fetchone()
+        return dict(zip(('id','agent','chat','state','sid','created','auth_started','tries','max_duration','usage_evidence_version'),row)) if row else None
     def reserve(self,id,agent,chat,duration=180):
         self.db.execute('BEGIN IMMEDIATE')
         try:
@@ -90,7 +92,7 @@ class Ledger:
                 if old['agent']!=agent or old['chat']!=chat or old['max_duration']!=duration:raise ValueError('Attempt identity conflict')
                 self.db.execute('COMMIT');return old,False
             if self.db.execute("SELECT 1 FROM calls WHERE state IN ('dispatching','accepted','authenticated','streaming','unknown','denied') LIMIT 1").fetchone():raise RuntimeError('Existing call needs completion or reconciliation')
-            self.db.execute("INSERT INTO calls(id,agent,chat,state,created,max_duration) VALUES(?,?,?,'dispatching',?,?)",(id,agent,chat,time.time(),duration))
+            self.db.execute("INSERT INTO calls(id,agent,chat,state,created,max_duration,usage_evidence_version) VALUES(?,?,?,'dispatching',?,?,1)",(id,agent,chat,time.time(),duration))
             self.db.execute('COMMIT');return self.get(id),True
         except BaseException:self.db.execute('ROLLBACK');raise
     def bind(self,id,sid):
@@ -125,6 +127,13 @@ class Network:
                 sid=body.get('sid')
                 if not isinstance(sid,str) or not re.fullmatch(r'CA[0-9a-fA-F]{32}',sid):raise ValueError('Unknown call outcome')
                 return {'sid':sid}
+    async def usage(self,sid):
+        async with aiohttp.ClientSession() as client:
+            async with client.get(f'https://api.twilio.com/2010-04-01/Accounts/{self.c.account_sid}/Calls/{sid}.json',
+                auth=aiohttp.BasicAuth(self.c.api_key_sid,self.c.api_key_secret),
+                timeout=aiohttp.ClientTimeout(total=10),allow_redirects=False) as response:
+                if response.status!=200:raise ValueError('Usage unavailable')
+                return await bounded_json(response)
     async def bridge(self,method,path,body=None):
         async with aiohttp.ClientSession() as client:
             async with client.request(method,self.c.bridge_url+path,json=body,
@@ -145,6 +154,8 @@ def create_apps(c:Config,*,network=None,runner=run_phone):
     ledger=Ledger(c.ledger_path);network=network or Network(c)
     from costs import CostEvidence
     cost_evidence=CostEvidence(c)
+    from usage import UsageEvidence
+    usage_evidence=UsageEvidence(c,network.usage) if hasattr(network,'usage') else None
     public=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
     control=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
     public.state.ledger=control.state.ledger=ledger
@@ -185,6 +196,14 @@ def create_apps(c:Config,*,network=None,runner=run_phone):
         row=ledger.get(id)
         if not row:raise HTTPException(404)
         return {'attemptId':id,'state':row['state'],'providerCallId':row['sid']}
+    @control.get('/control/calls/{id}/usage')
+    async def inspect_usage(id:str,request:Request):
+        control_auth(request)
+        if not IDENT.fullmatch(id):raise HTTPException(400)
+        row=ledger.get(id)
+        if not row:raise HTTPException(404)
+        if usage_evidence is None:raise HTTPException(503)
+        return await usage_evidence.check(row)
     @control.post('/control/calls')
     async def dial(request:Request):
         control_auth(request)

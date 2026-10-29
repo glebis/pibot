@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { delegatePlugin, resolveDelegateCwd } from "./delegate-plugin.js";
+import { delegateCommand, delegatePlugin, resolveDelegateCwd } from "./delegate-plugin.js";
 
 describe("delegate cwd + env", () => {
   let root: string;
@@ -18,6 +18,8 @@ describe("delegate cwd + env", () => {
     fs.rmSync(outside, { recursive: true, force: true });
     delete process.env.FAKE_API_KEY;
     delete process.env.GEMINI_API_KEY;
+    delete process.env.PIBOT_OFFICE_CLI;
+    delete process.env.PAPERINSTRUMENTS_API_KEY;
   });
 
   it("allows inside, refuses outside / traversal / symlink escape", () => {
@@ -30,8 +32,8 @@ describe("delegate cwd + env", () => {
   });
 
   async function exec(cli: string, cwd?: string) {
-    const calls: { env: NodeJS.ProcessEnv; cwd?: string }[] = [];
-    const ext = delegatePlugin({ cwd: root, run: async (_c, _a, o) => (calls.push({ env: o.env, cwd: o.cwd }), { stdout: "ok" }) });
+    const calls: { cmd: string; args: string[]; timeout: number; env: NodeJS.ProcessEnv; cwd?: string }[] = [];
+    const ext = delegatePlugin({ cwd: root, run: async (c, a, o) => (calls.push({ cmd: c, args: a, timeout: o.timeout, env: o.env, cwd: o.cwd }), { stdout: "ok" }) });
     let tool: any;
     (typeof ext === "function" ? ext : ext.factory)({ registerTool: (t: unknown) => (tool = t) } as never);
     const r = await tool.execute("id", { cli, prompt: "p", cwd });
@@ -53,5 +55,30 @@ describe("delegate cwd + env", () => {
     const g = await exec("gemini");
     expect(g.calls[0].env.GEMINI_API_KEY).toBe("g");
     expect(g.calls[0].env.FAKE_API_KEY).toBeUndefined();
+  });
+
+  it("refuses an unconfigured or relative office executable without spawning", async () => {
+    for (const command of [undefined, "relative-office"]) {
+      if (command) process.env.PIBOT_OFFICE_CLI = command;
+      else delete process.env.PIBOT_OFFICE_CLI;
+      expect(delegateCommand("office")).toBeUndefined();
+      const result = await exec("office");
+      expect(result.calls).toHaveLength(0);
+      expect(result.text).toMatch(/not configured/);
+    }
+  });
+
+  it("office resolves its executable from PIBOT_OFFICE_CLI and passes no secrets", async () => {
+    expect(delegateCommand("office")).toBeUndefined();
+    expect(delegateCommand("claude")).toBe("claude");
+    expect(delegateCommand("nope")).toBeUndefined();
+    process.env.PIBOT_OFFICE_CLI = "/opt/office/bin/pi-office";
+    process.env.PAPERINSTRUMENTS_API_KEY = "secret";
+    expect(delegateCommand("office")).toBe("/opt/office/bin/pi-office");
+    const o = await exec("office");
+    expect(o.calls[0].cmd).toBe("/opt/office/bin/pi-office");
+    expect(o.calls[0].args).toEqual(["p"]);
+    expect(o.calls[0].timeout).toBe(30 * 60_000);
+    expect(o.calls[0].env.PAPERINSTRUMENTS_API_KEY).toBeUndefined();
   });
 });

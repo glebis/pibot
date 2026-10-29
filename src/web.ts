@@ -12,12 +12,18 @@ import type { Commitment, ProactiveLoop, ProactiveStore } from "./core/proactive
 import { summarize } from "./core/proactive-store.js";
 import type { Scheduler } from "./core/scheduler.js";
 import type { AgentManifest, Schedule } from "./core/types.js";
+import type { ManifestPatch } from "./core/manifest-policy.js";
 import { buildManifest, buildPersona, createAgentFromSpec, PROACTIVITY_OPTIONS, suggestedSubBotUsername, validateAgentName, type Proactivity } from "./core/agent-factory.js";
 import { taskAcksEnabled } from "./core/task-acks.js";
 import { CAPABILITY_REGISTRY } from "./core/capabilities.js";
-import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate, writeJsonAtomic } from "./core/util.js";
+import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate } from "./core/util.js";
 import { providerRowHtml } from "./core/providers.js";
 import { getMediaLinkKey, mediaDirFor, verifyMediaToken } from "./core/media-links.js";
+import { registerInboxRoutes, type InboxControl } from "./web-inbox-routes.js";
+import { renderProcesses } from "./web-processes.js";
+import { registerEnrollmentRoutes, type EnrollmentControl } from "./web-enrollment.js";
+import { mountLabPaymentRoutes } from "./web-payments.js";
+import { registerReviewRoutes } from "./web-review-routes.js";
 import { WebAuthStore } from "./web-auth.js";
 import {
   generateRegistrationOptions,
@@ -47,6 +53,10 @@ export interface TelegramControl {
 
 export interface WebDeps {
   coordinator?: CoordinatorControl;
+  inbox?: InboxControl;
+  /** live turns, durable tasks, goal loops, voice calls and child OS processes */
+  processes?: import("./core/processes.js").ProcessControl;
+  enrollment?: EnrollmentControl;
   agents: AgentManager;
   scheduler: Scheduler;
   events: EventLog;
@@ -96,6 +106,7 @@ function page(title: string, body: string, flash?: string): string {
 <title>${esc(title)} · pibot</title>
 <style>
   :root { color-scheme: dark; }
+  [hidden]{display:none!important} :focus-visible{outline:3px solid #9fe0b5;outline-offset:3px} nav{margin-bottom:20px} .admin-search{margin:12px 0} .admin-search input{max-width:420px}
   * { box-sizing: border-box; }
   body { margin: 0; background: #0d0f12; color: #d7dce2; font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
   a { color: #8ab4ff; text-decoration: none; } a:hover { text-decoration: underline; }
@@ -130,14 +141,31 @@ function page(title: string, body: string, flash?: string): string {
   code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
   .pill { display: inline-block; border: 1px solid #2b313b; border-radius: 999px; padding: 1px 10px; font-size: 12px; color: #aab3bf; margin-right: 6px; }
   .pill.on { border-color: #1d5c33; color: #9fe0b5; }
+  .pill.bad { border-color: #7f1d1d; color: #f2a7a7; }
   form.inline { display: inline; }
   pre.events { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #9aa4b1; max-height: 260px; overflow: auto; margin: 0; white-space: pre-wrap; }
 </style></head><body><main>
+<nav aria-label="Admin navigation"><a href="/">Overview</a> · <a href="/processes">Processes</a> · <a href="/review">Review changes</a> · <a href="/inbox">Lab inbox</a> · <a href="/lab-payments">Course payments</a> · <a href="/enrollments">Course access</a></nav>
 <h1>🤖 pibot config</h1>
 <p class="sub">agents · rhythm · schedules · evolution${flash ? "" : ""}</p>
 ${flash ? `<div class="flash" id="page-flash">${esc(flash)}</div>` : ""}
 ${body}
 </main>
+<script>
+(function(){
+function setup(){document.querySelectorAll('table,[data-admin-list]').forEach((list,i)=>{
+if(list.dataset.searchReady)return;list.dataset.searchReady='1';
+const params=new URLSearchParams(location.search),key='list'+i, label=list.dataset.adminList||list.closest('.card')?.previousElementSibling?.textContent?.trim()||'table';
+const previous=list.previousElementSibling;
+const controls=previous?.classList.contains('admin-search')?previous:document.createElement('div');controls.className='admin-search';
+let input=controls.querySelector('input'),count=controls.querySelector('span');
+if(!input){input=document.createElement('input');input.type='search';input.placeholder='Search '+label;input.setAttribute('aria-label','Search '+label);input.value=params.get(key)||'';count=document.createElement('span');count.className='muted';count.setAttribute('aria-live','polite');controls.append(input,count);list.before(controls);}
+const items=list.matches('table')?[...list.querySelectorAll('tr')].filter(r=>r.querySelector('td')&&!r.querySelector('td[colspan]')):[...list.children].filter(item=>!item.matches('.muted'));
+function filter(){let n=0;items.forEach(item=>{item.hidden=!item.textContent.toLowerCase().includes(input.value.trim().toLowerCase());if(!item.hidden)n++;});count.textContent=' '+n+' of '+items.length+' results';}
+input.oninput=()=>{filter();const url=new URL(location.href);if(input.value)url.searchParams.set(key,input.value);else url.searchParams.delete(key);history.replaceState(null,'',url);};filter();
+});}window.pibotInitListSearch=setup;setup();
+})();
+</script>
 <script>
 (function () {
   "use strict";
@@ -253,6 +281,7 @@ ${body}
       if (target && freshSwap) {
         var imp2 = document.importNode(freshSwap, true);
         target.replaceWith(imp2);
+        window.pibotInitListSearch?.();
         if (flash) showFlash(imp2, flash.cls, flash.text); else showFlash(imp2, "flash", "\u2713 applied");
         refreshStagedBanner(doc);
         return;
@@ -315,7 +344,7 @@ ${body}
 </body></html>`;
 }
 
-function manifestForm(agent: LoadedAgent, csrf: string): string {
+function manifestForm(agent: LoadedAgent, csrf: string, manifestSha?: string): string {
   const m = agent.manifest;
   const hb = m.heartbeat ?? { enabled: false, interval: "45m", model: "same" };
   const ev = m.evolution ?? { enabled: false, interval: "6h", model: "same" };
@@ -323,6 +352,8 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
   return `
 <form method="post" action="/agents/${esc(agent.id)}/manifest" class="card">
   <input type="hidden" name="_csrf" value="${esc(csrf)}">
+  <input type="hidden" name="_form" value="manifest">
+  ${manifestSha ? `<input type="hidden" name="_sha" value="${esc(manifestSha)}">` : ""}
   <div class="row">
     <div><label>Description</label><input type="text" name="description" value="${esc(m.description ?? "")}"></div>
     <div><label>Model (pi shorthand, empty = auto)</label><input type="text" name="model" value="${esc(m.model ?? "")}" placeholder="sonnet:medium"></div>
@@ -373,8 +404,19 @@ function manifestForm(agent: LoadedAgent, csrf: string): string {
     <div><label>Interval</label><input type="text" name="ev_interval" value="${esc(ev.interval ?? "6h")}"></div>
     <div><label>Model</label><input type="text" name="ev_model" value="${esc(ev.model ?? "same")}"></div>
   </div>
+  <div class="row">
+    <div><label class="mono">acknowledge capability/tool/provider removals <input type="checkbox" name="ack_removals" style="width:auto"></label>
+      <div class="muted">A save only changes the fields above and never drops an unlisted grant. If a list would lose entries (e.g. clearing capabilities, or a removal made here), the save is refused and the removals are named until this box is checked.</div></div>
+  </div>
   <button type="submit">Save manifest</button>
 </form>`;
+}
+
+/** Constant-time string comparison for secrets (length leak is acceptable). */
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
 }
 
 // ─── app factory ────────────────────────────────────────────────────────────
@@ -426,7 +468,7 @@ export function createWebApp(deps: WebDeps): Hono {
 
   function isAuthenticated(c: any): boolean {
     const auth = c.req.header("authorization") ?? "";
-    if (webToken && auth === `Bearer ${webToken}`) return true;
+    if (webToken && safeEqual(auth, `Bearer ${webToken}`)) return true;
     const cookie = authStore.parseCookie(c.req.header("cookie"));
     if (cookie) {
       const tok = authStore.verifySignedToken(cookie);
@@ -605,7 +647,7 @@ ${hasToken ? `<div class="card">
     const body = await c.req.parseBody() as Record<string,string>;
     if (!checkCsrf(body as any)) return c.text("CSRF failed", 403);
     if (!webToken) return c.redirect("/auth?msg=" + encodeURIComponent("No PIBOT_WEB_TOKEN configured"));
-    if (String(body.token ?? "").trim() === webToken) {
+    if (safeEqual(String(body.token ?? "").trim(), webToken)) {
       invalidTokenAttempts = [];
       const tok = authStore.createSession();
       c.header("Set-Cookie", authStore.makeCookie(tok));
@@ -783,6 +825,40 @@ ${hasToken ? `<div class="card">
   });
 
   registerCoordinatorRoutes(app, deps, csrfToken, expectedOrigins());
+  registerInboxRoutes(app, deps, csrfToken, expectedOrigins());
+
+  // ─── /processes: everything the daemon is running right now ──────────────
+  app.get("/processes", async (c) => {
+    if (!deps.processes) return c.text("Process view is not wired in this build", 404);
+    c.header("Cache-Control", "no-store");
+    const snap = await deps.processes.snapshot();
+    return c.html(page("processes", renderProcesses(snap, esc, csrfField), c.req.query("msg")));
+  });
+  app.get("/api/processes", async (c) => {
+    if (!deps.processes) return c.json({ error: "Process view is not wired." }, 503);
+    c.header("Cache-Control", "no-store");
+    return c.json(await deps.processes.snapshot());
+  });
+  app.post("/processes/tasks/:id/cancel", async (c) => {
+    const b = await c.req.parseBody().catch(() => ({})) as Record<string, string>;
+    if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
+    if (!deps.processes) return c.redirect("/processes");
+    const ok = await deps.processes.cancelTask(c.req.param("id"));
+    return c.redirect(`/processes?msg=${encodeURIComponent(ok ? "Cancel requested — the task stops at its next step." : "That task is no longer running.")}`);
+  });
+  registerEnrollmentRoutes(app, deps, csrfToken, expectedOrigins());
+  registerReviewRoutes(app, deps, csrfToken, expectedOrigins());
+  mountLabPaymentRoutes(app, {
+    getKey: () => deps.secrets?.get().labPayments?.stripeKey,
+    saveKey: async (stripeKey) => {
+      if (!deps.secrets) throw new Error("Encrypted settings unavailable");
+      await deps.secrets.save({ labPayments: { stripeKey } });
+    },
+    root: () => {
+      const agent = deps.agents.getAgent("lab");
+      return agent ? path.join(agent.dir, "private", "lab-recommendations") : undefined;
+    },
+  }, csrfToken, expectedOrigins());
 
   const agentOr404 = (id: string): LoadedAgent | null => {
     const a = deps.agents.getAgent(id);
@@ -798,7 +874,6 @@ ${hasToken ? `<div class="card">
         const sn = deps.scheduler.snoozeState(a.id);
         const staged = deps.evolution.staged(a.id);
         const skills = listSkillDirs(path.join(a.dir, "skills"));
-        const stagedDetail = deps.evolution.stagedDetail(a.id);
         return `<div class="card">
   <a href="/agents/${esc(a.id)}"><strong>${esc(a.id)}</strong></a>
   <span class="muted">${esc(a.manifest.description ?? "")}</span><br>
@@ -809,10 +884,7 @@ ${hasToken ? `<div class="card">
   ${skills.length ? `<span class="pill">${skills.length} skills</span>` : ""}
   ${staged.length ? `<span class="pill on">🧬 ${staged.length} staged</span>` : ""}
   ${sn ? `<span class="pill">😴 until ${esc(fmtWhen(sn.until))}</span>` : ""}
-  ${stagedDetail.length ? `<div style="margin-top:10px">${stagedDetail.map((s2) => {
-    const stagePath = `/agents/${esc(a.id)}/staged/${esc(s2.name)}`;
-    return `<a href="${stagePath}"><span class="pill on">${esc(s2.name)}</span></a> <a href="${stagePath}" class="mini">view</a> <form class="inline" method="post" action="${stagePath}/promote">${csrfField()}<button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="${stagePath}/reject">${csrfField()}<button class="mini danger" type="submit">reject</button></form>`;
-  }).join(" · ")}</div>` : ""}
+  ${staged.length ? `<p><a class="btn ghost" href="/review?agent=${encodeURIComponent(a.id)}">Review ${staged.length} proposed changes</a></p>` : ""}
 </div>`;
       })
       .join("\n");
@@ -829,7 +901,7 @@ ${hasToken ? `<div class="card">
     <form class="inline" method="post" action="/cascade/clear" data-swap="#cascade-card">${csrfField()}<button class="mini danger" type="submit">clear breakers</button></form>
   </div>
 </div>` : "";
-    return c.html(page("overview", `${deps.proactiveStore ? `<div class="card"><a href="/analytics">📊 Proactive analytics →</a> <span class="muted">commitment follow-through pilot</span></div>` : ""}${authBanner}${cascadeCard}${cards || '<p class="muted">No agents yet.</p>'}
+    return c.html(page("overview", `${deps.proactiveStore ? `<div class="card"><a href="/analytics">📊 Proactive analytics →</a> <span class="muted">commitment follow-through pilot</span></div>` : ""}<div class="card"><a href="/inbox">Lab inbox →</a> <span class="muted">Conversations, replies and runtime logs</span></div>${authBanner}${cascadeCard}<div data-admin-list="Agents">${cards || '<p class="muted">No agents yet.</p>'}</div>
 <h2>Telegram</h2>
 <div class="card">
   ${deps.telegram?.hasTransport("telegram")
@@ -918,7 +990,13 @@ ${hasToken ? `<div class="card">
     const err = deps.agents.createAgent(name, buildPersona(draft));
     if (err) return c.redirect(`/agents/new?msg=${encodeURIComponent(err)}`);
     const agent = deps.agents.getAgent(name)!;
-    writeJsonAtomic(path.join(agent.dir, "agent.json"), buildManifest(draft));
+    // Field-level write (bd pibot-4wq1) so the scaffolded manifest keeps every
+    // field the creation form does not own instead of being replaced wholesale.
+    const built = buildManifest(draft);
+    const creationPatch: Partial<AgentManifest> = { description: built.description, heartbeat: built.heartbeat };
+    if (built.evolution) creationPatch.evolution = built.evolution;
+    const created = deps.agents.updateManifest(name, creationPatch);
+    if (!created.ok) return c.redirect(`/agents/new?msg=${encodeURIComponent(created.error ?? "Manifest write refused")}`);
     await deps.agents.discover();
     const fresh = deps.agents.getAgent(name)!;
     const hb = fresh.manifest.heartbeat;
@@ -1113,7 +1191,7 @@ ${hasToken ? `<div class="card">
       .join("\n") || `<tr><td colspan="4" class="muted">Nothing pending.</td></tr>`;
 
     const body = `
-${staged.length ? `<div class="flash warn" id="staged-banner">🧬 Staged for review: ${staged.map((s) => `<strong>${esc(s)}</strong>`).join(", ")}</div>` : ""}
+${staged.length ? `<div class="flash warn" id="staged-banner"><a href="/review?agent=${encodeURIComponent(agent.id)}">Review ${staged.length} proposed changes for ${esc(agent.id)}</a></div>` : ""}
 <div class="row">
   <div class="card"><span class="pill ${m.heartbeat?.enabled ? "on" : ""}">heartbeat ${esc(m.heartbeat?.interval ?? "off")}</span>
   <span class="pill ${m.evolution?.enabled ? "on" : ""}">evolution ${esc(m.evolution?.interval ?? "off")}</span>
@@ -1122,7 +1200,7 @@ ${staged.length ? `<div class="flash warn" id="staged-banner">🧬 Staged for re
 </div>
 
 <h2>Rhythm & model</h2>
-${manifestForm(agent, csrfToken)}
+${manifestForm(agent, csrfToken, deps.agents.manifestSha(agent.id))}
 
 <h2>Persona <span class="muted">(AGENTS.md)</span></h2>
 <form method="post" action="/agents/${esc(agent.id)}/persona" class="card">
@@ -1156,9 +1234,9 @@ ${manifestForm(agent, csrfToken)}
 </div>
 
 <h2>Skills</h2>
-<div class="card" id="skills-card">
+<div class="card" id="skills-card"><div data-admin-list="Installed skills">
   ${skills.length ? skills.map((s) => `<div><strong>${esc(s.name)}</strong> <span class="muted">${esc(s.description)}</span></div>`).join("") : '<span class="muted">No skills yet.</span>'}
-  ${staged.length ? `<div style="margin-top:12px"><strong>Staged:</strong> ${staged.map((s) => `<a href="/agents/${esc(agent.id)}/staged/${esc(s)}"><span class="pill on">${esc(s)}</span></a> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/promote" data-swap="#skills-card">${csrfField()}<button class="mini" type="submit">promote</button></form> <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(s)}/reject" data-swap="#skills-card">${csrfField()}<button class="mini danger" type="submit">reject</button></form>`).join(" · ")}</div>` : ""}
+  </div>${staged.length ? `<p><a href="/review?agent=${encodeURIComponent(agent.id)}">Review ${staged.length} proposed changes</a></p>` : ""}
 </div>
 
 <h2>Telegram sub-bot <span class="muted">(its own @identity)</span></h2>
@@ -1187,7 +1265,7 @@ ${manifestForm(agent, csrfToken)}
 </form>
 
 <h2>Capabilities <span class="muted">(what tools this agent may use)</span></h2>
-<div class="card" id="capabilities-card">
+<div class="card" id="capabilities-card" data-admin-list="Capabilities">
   ${CAPABILITY_REGISTRY.map((cap) => {
     const on = (agent.manifest.capabilities ?? []).includes(cap.id) || (cap.defaultEnabled && !agent.manifest.capabilities);
     const note = cap.prompt ?? "";
@@ -1227,46 +1305,90 @@ ${manifestForm(agent, csrfToken)}
     const str = (k: string) => String(b[k] ?? "").trim();
     const on = (k: string) => b[k] === "on";
 
-    const hbInterval = str("hb_interval") || "45m";
-    const hbMin = str("hb_min") || "5m";
-    const hbMax = str("hb_max") || "12h";
-    const evInterval = str("ev_interval") || "6h";
-    if (!parseDuration(hbInterval) || !parseDuration(evInterval) || !parseDuration(hbMin) || !parseDuration(hbMax)) {
+    // Explicit form intent (bd pibot-4wq1 review): the full manifest form submits
+    // `_form=manifest`, so an ABSENT control there means "intended false" (an unticked
+    // checkbox). A partial POST without the sentinel only changes the keys it actually
+    // carries — an omitted field is preserved, never reset. Without this, a
+    // description-only POST reset model/thinking/speech/heartbeat/proactive/etc.
+    const fullForm = str("_form") === "manifest";
+    const has = (k: string) => Object.prototype.hasOwnProperty.call(b, k);
+    const write = (k: string) => fullForm || has(k);
+
+    const HB_KEYS = ["hb_enabled", "hb_interval", "hb_model", "hb_from", "hb_to", "hb_morning_brief", "hb_min", "hb_max"];
+    const EV_KEYS = ["ev_enabled", "ev_interval", "ev_model"];
+    const list = (k: string): string[] | undefined =>
+      str(k) ? str(k).split(",").map((value) => value.trim()).filter(Boolean) : undefined;
+
+    // Field-level, compare-and-swap patch (bd pibot-4wq1): only the fields the submission
+    // owns change; every other authorised field (including `capabilities` entries the form
+    // does not carry) is preserved verbatim. Nested objects are MERGED by the manifest
+    // planner, so a one-field save cannot drop a sibling key. Removals from
+    // capability/tool/provider lists are refused and named unless acknowledged explicitly.
+    const patch: ManifestPatch = {};
+    if (write("thinking")) patch.thinking = (str("thinking") as AgentManifest["thinking"]) || "off";
+    if (write("model")) patch.model = str("model") || undefined;
+    if (write("description")) patch.description = str("description") || undefined;
+    if (write("tools")) patch.tools = list("tools");
+    if (write("providers")) patch.providers = list("providers");
+    if (write("capabilities")) patch.capabilities = list("capabilities");
+    if (write("task_acks")) patch.comms = { taskAcks: on("task_acks") };
+    if (write("pilot_enabled") || write("pilot_budget")) {
+      patch.proactive = {
+        ...(write("pilot_enabled") ? { pilot: on("pilot_enabled") } : {}),
+        ...(write("pilot_budget") ? { dailyBudget: Math.max(1, parseInt(str("pilot_budget"), 10) || 6) } : {}),
+      };
+    }
+    if (write("stt_providers") || write("allow_external_stt")) {
+      patch.speech = {
+        ...(write("stt_providers")
+          ? { sttProviders: list("stt_providers") as Array<"whisperkit" | "local_whisper" | "groq"> | undefined }
+          : {}),
+        ...(write("allow_external_stt") ? { allowExternalStt: on("allow_external_stt") } : {}),
+      };
+    }
+    if (fullForm || HB_KEYS.some(has)) {
+      patch.heartbeat = {
+        ...(write("hb_enabled") ? { enabled: on("hb_enabled") } : {}),
+        ...(write("hb_interval") ? { interval: str("hb_interval") || "45m" } : {}),
+        ...(write("hb_model") ? { model: str("hb_model") || "same" } : {}),
+        ...(write("hb_from") || write("hb_to") ? { quietHours: { from: str("hb_from") || "23:00", to: str("hb_to") || "08:00" } } : {}),
+        ...(write("hb_morning_brief") ? { morningBrief: on("hb_morning_brief") || undefined } : {}),
+        ...(write("hb_min") ? { minInterval: str("hb_min") || "5m" } : {}),
+        ...(write("hb_max") ? { maxInterval: str("hb_max") || "12h" } : {}),
+      };
+    }
+    if (fullForm || EV_KEYS.some(has)) {
+      patch.evolution = {
+        ...(write("ev_enabled") ? { enabled: on("ev_enabled") } : {}),
+        ...(write("ev_interval") ? { interval: str("ev_interval") || "6h" } : {}),
+        ...(write("ev_model") ? { model: str("ev_model") || "same" } : {}),
+      };
+    }
+
+    // Validate only the intervals this submission actually writes.
+    const intervals: string[] = [];
+    if (write("hb_interval")) intervals.push(str("hb_interval") || "45m");
+    if (write("hb_min")) intervals.push(str("hb_min") || "5m");
+    if (write("hb_max")) intervals.push(str("hb_max") || "12h");
+    if (write("ev_interval")) intervals.push(str("ev_interval") || "6h");
+    if (intervals.some((value) => !parseDuration(value))) {
       return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Invalid interval (try 45m, 2h, 6h)")}`);
     }
 
-    const manifest: AgentManifest = {
-      ...agent.manifest,
-      description: str("description") || agent.manifest.description,
-      model: str("model") || undefined,
-      thinking: (str("thinking") as AgentManifest["thinking"]) || "off",
-      tools: str("tools") ? str("tools").split(",").map((t) => t.trim()).filter(Boolean) : undefined,
-      providers: str("providers") ? str("providers").split(",").map((provider) => provider.trim()).filter(Boolean) : undefined,
-      capabilities: str("capabilities") ? str("capabilities").split(",").map((v) => v.trim()).filter(Boolean) : undefined,
-      comms: { ...agent.manifest.comms, taskAcks: on("task_acks") },
-      proactive: { pilot: on("pilot_enabled"), dailyBudget: Math.max(1, parseInt(str("pilot_budget"), 10) || 6) },
-      speech: {
-        sttProviders: str("stt_providers")
-          ? (str("stt_providers").split(",").map((v) => v.trim()).filter(Boolean) as Array<"whisperkit" | "local_whisper" | "groq">)
-          : undefined,
-        allowExternalStt: on("allow_external_stt"),
-      },
-      heartbeat: {
-        enabled: on("hb_enabled"),
-        interval: hbInterval,
-        model: str("hb_model") || "same",
-        morningBrief: on("hb_morning_brief") || undefined,
-        quietHours: { from: str("hb_from") || "23:00", to: str("hb_to") || "08:00" },
-        minInterval: hbMin,
-        maxInterval: hbMax,
-      },
-      evolution: {
-        enabled: on("ev_enabled"),
-        interval: evInterval,
-        model: str("ev_model") || "same",
-      },
-    };
-    writeJsonAtomic(path.join(agent.dir, "agent.json"), manifest);
+    const expectedSha = str("_sha") || undefined;
+    let result = deps.agents.updateManifest(agent.id, patch, { expectedSha });
+    // An unacknowledged list removal is refused (not applied). When the operator
+    // ticked the acknowledgement, re-run naming the exact ids so the removal is
+    // explicit and auditable; a compare-and-swap refusal is never auto-retried.
+    if (!result.ok && result.diff && Object.keys(result.diff.removed).length && !result.error?.includes("compare-and-swap") && on("ack_removals")) {
+      result = deps.agents.updateManifest(agent.id, patch, {
+        expectedSha,
+        acknowledgeRemovals: [...new Set(Object.values(result.diff.removed).flat())],
+      });
+    }
+    if (!result.ok) {
+      return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent(result.error ?? "Manifest update refused")}`);
+    }
     await deps.agents.discover(); // reload manifests
     deps.commitments?.syncGovernance(agent.id); // scorecard job follows the pilot toggle
     return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Manifest saved — rhythm changes apply on next restart of jobs (or via chat)")}`);
@@ -1361,29 +1483,11 @@ ${manifestForm(agent, csrfToken)}
     const b = await c.req.parseBody().catch(()=>({})) as Record<string,string>;
     if (!checkCsrf(b as any)) return c.text("CSRF failed", 403);
     deps.evolution.reject(c.req.param("id"), c.req.param("name"));
-    return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Rejected 🗑")}`);
+    return c.redirect(`/agents/${encodeURIComponent(c.req.param("id"))}?msg=${encodeURIComponent("Archived — recover it in Review changes")}`);
   });
 
-  app.get("/agents/:id/staged/:name", async (c) => {
-    const agent = agentOr404(c.req.param("id"));
-    if (!agent) return c.notFound();
-    const name = c.req.param("name");
-    const content = deps.evolution.stagedContent(agent.id, name);
-    if (content === undefined) return c.redirect(`/agents/${encodeURIComponent(agent.id)}?msg=${encodeURIComponent("Nothing staged under that name")}`);
-    const cand = deps.evolution.stagedDetail(agent.id).find((s2) => s2.name === name);
-    const meta = [
-      cand?.scores?.length ? `probes ${cand.scores.join(", ")}` : "",
-      cand?.closesBacklog?.length ? `closes ${cand.closesBacklog.join(", ")}` : "",
-    ].filter(Boolean).join(" · ");
-    const body = `<h2>Staged: <strong>${esc(name)}</strong> <span class="muted">${esc(cand?.mode ?? "create")}${meta ? ` · ${esc(meta)}` : ""}</span></h2>
-<div class="card"><pre class="events" style="max-height:520px">${esc(content)}</pre></div>
-<div class="card">
-  <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(name)}/promote">${csrfField()}<button class="mini" type="submit">✅ Promote</button></form>
-  <form class="inline" method="post" action="/agents/${esc(agent.id)}/staged/${esc(name)}/reject">${csrfField()}<button class="mini danger" type="submit">✖ Reject</button></form>
-  <a href="/agents/${esc(agent.id)}" style="margin-left:8px">← Back</a>
-</div>`;
-    return c.html(page(`${agent.id} · staged ${name}`, body, c.req.query("msg")));
-  });
+  // Old bookmarks land on the same review screen as the queue.
+  app.get("/agents/:id/staged/:name", c => c.redirect(`/review?${new URLSearchParams({agent:c.req.param("id"),id:`${c.req.param("id")}/${c.req.param("name")}`})}`));
 
   app.post("/agents/:id/rebind", async (c) => {
     const b = await c.req.parseBody() as Record<string,string>;

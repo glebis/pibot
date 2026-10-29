@@ -10,6 +10,29 @@ export interface TelegramSendTarget {
   owned: boolean;
 }
 
+/** Destination-aware delivery receipt returned by a send (bd pibot-cida). */
+export interface TelegramSendReceipt {
+  /** destination the receipt attests, as "transport:chatId" */
+  peer: string;
+  /** message id the API returned; only meaningful together with `idProtocol` */
+  messageId?: number;
+  /** delivered medium ("photo" | "document" | "video_note" | …) */
+  mediaType?: string;
+  /** id namespace ("bot_api" | "mtproto" | …) — ids from different protocols are never the same message */
+  idProtocol?: string;
+  /** bot/account identity that performed the send — never an agent id */
+  account?: string;
+  /** strongest evidence obtained: an API ack is not a readback, and neither is a human viewing */
+  evidence?: "ack" | "readback" | "viewed";
+}
+
+export interface TelegramSendResult {
+  sent: number;
+  targets: string[];
+  /** per-target receipts; absent/partial when the host has no message id to attest */
+  receipts?: TelegramSendReceipt[];
+}
+
 export interface TelegramSendHooks {
   /**
    * Send a message as the agent's bot identity to an explicit
@@ -17,7 +40,7 @@ export interface TelegramSendHooks {
    * enforces access). Shared (non-dedicated) transports get a `[agentId]`
    * sender prefix, mirroring the host's proactive-delivery attribution.
    */
-  send(agentId: string, chat: string, text: string): Promise<{ sent: number; targets: string[] }>;
+  send(agentId: string, chat: string, text: string): Promise<TelegramSendResult>;
   /** Chats this agent can currently reach, with ownership info. */
   chats(agentId: string): Array<{ chat: string; dedicated: boolean; owned: boolean }>;
 }
@@ -27,6 +50,35 @@ export interface TelegramSendPluginDeps {
   /** the chat this session is bound to — default send target */
   chat: ChatRef;
   hooks: TelegramSendHooks;
+}
+
+/**
+ * Human/agent-facing summary of a send that never overclaims (bd pibot-cida): it reports the
+ * destination, medium and id namespace, and keeps an API acknowledgement distinct from a
+ * same-peer readback or a human viewing. An id-less ack is explicitly "unverified", not "sent".
+ */
+function describeSend(r: TelegramSendResult): string {
+  if (r.sent <= 0) return "Nothing sent — no reachable chat for that target.";
+  const receipts = r.receipts ?? [];
+  const withId = receipts.filter((x) => x.messageId !== undefined);
+  const destinations = receipts.map((x) => x.peer).join(", ") || r.targets.join(", ");
+  if (!withId.length) {
+    return `Accepted by Telegram for ${destinations} but no message id came back — destination unverified, this is not proof of delivery.`;
+  }
+  const parts = withId.map((x) => {
+    const bits = [`→ ${x.peer}`, `message ${x.messageId}`];
+    if (x.mediaType) bits.push(x.mediaType);
+    if (x.idProtocol) bits.push(`${x.idProtocol} id`);
+    if (x.account) bits.push(`as ${x.account}`);
+    // A receipt missing the account or the id namespace cannot prove which bot sent it or which
+    // protocol the id belongs to — say so instead of implying a complete, verified delivery.
+    const missing: string[] = [];
+    if (!x.account) missing.push("account");
+    if (!x.idProtocol) missing.push("id protocol");
+    if (missing.length) bits.push(`incomplete (no ${missing.join("/")})`);
+    return bits.join(" · ");
+  });
+  return `Sent ✅ ${parts.join("; ")} — API acknowledgement only, not a read or a human view.`;
 }
 
 /**
@@ -56,11 +108,11 @@ export function telegramSendPlugin(deps: TelegramSendPluginDeps): InlineExtensio
           try {
             const r = await hooks.send(agentId, target, params.text);
             return {
-              content: [{ type: "text", text: r.sent > 0 ? `Sent ✅ → ${r.targets.join(", ")}` : "Nothing sent — no reachable chat for that target." }],
-              details: { sent: r.sent, targets: r.targets },
+              content: [{ type: "text", text: describeSend(r) }],
+              details: { sent: r.sent, targets: r.targets, receipts: r.receipts ?? [] },
             };
           } catch (e) {
-            return { content: [{ type: "text", text: `ERROR: ${e instanceof Error ? e.message : String(e)}` }], details: { sent: 0, targets: [] } };
+            return { content: [{ type: "text", text: `ERROR: ${e instanceof Error ? e.message : String(e)}` }], details: { sent: 0, targets: [], receipts: [] } };
           }
         },
       });

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { nextActs } = vi.hoisted(() => ({ nextActs: [] as Array<null | { speak?: string; escalate?: string; note?: string; wakeup?: string; maintain?: string }> }));
@@ -43,7 +44,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   };
 });
 
-import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine, recordMaintenanceNote, verifyMemoryClaim } from "./heartbeat.js";
+import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine, recordMaintenanceNote, recordPersonaReview, verifyMemoryClaim, triageEscalationLoop, escalationsSimilar, type EscalationLoopState } from "./heartbeat.js";
 import { appendBacklogItems, loadBacklogItems } from "./backlog.js";
 import { clearSignalsCache } from "./research-signals.js";
 import type { LoadedAgent } from "./agent-manager.js";
@@ -443,6 +444,23 @@ describe("HeartbeatEngine backoff", () => {
       expect(calls.some((c) => c[1] === "maintenance" && c[2].includes("voice notes"))).toBe(true);
     });
 
+    it("heartbeat_act persona maintain records a content-sha review baseline", async () => {
+      const agent = makeAgent(dir);
+      const { engine } = makeEngine(agent, dir);
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "persona content v1");
+      queueActs([{ maintain: "persona: reviewed — no drift" }]);
+      await engine.tick(agent.id);
+      const sidecar = JSON.parse(
+        fs.readFileSync(path.join(dir, "memory", "persona-review.json"), "utf8"),
+      ) as { sha256: string; reviewedAt: string; note: string };
+      expect(sidecar.sha256).toBe(createHash("sha256").update("persona content v1").digest("hex"));
+      expect(sidecar.reviewedAt).toBeTruthy();
+      expect(sidecar.note).toContain("reviewed");
+      // the durable journal still gets the persona note (both books, one write path)
+      const journal = fs.readFileSync(path.join(dir, "memory", "maintenance.jsonl"), "utf8").trim();
+      expect(JSON.parse(journal).note).toContain("reviewed");
+    });
+
     it("services a stale-events item by running the consolidation engine", async () => {
       const agent = makeAgent(dir);
       const consolidation = { consolidate: vi.fn(async () => ({ agentId: agent.id, ok: true, summary: "ok" })) };
@@ -528,6 +546,32 @@ describe("HeartbeatEngine backoff", () => {
       expect(panel).toContain("current (updated 21h ago)");
       expect(panel).toContain("STALE 26h ago");
       expect(panel).not.toContain("STALE 22h");
+    });
+
+    it("persona staleness is content-keyed: a matching sha baseline reads current despite old mtime", () => {
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "persona content v1");
+      utime(path.join(dir, "AGENTS.md"), 3); // 72h — legacy mtime logic would flag STALE
+      recordPersonaReview(dir, "persona: reviewed — no drift");
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toMatch(/persona \(AGENTS\.md\): current \(content-verified/);
+      expect(panel).not.toContain("content drifted");
+      expect(panel).not.toMatch(/persona \(AGENTS\.md\): STALE/);
+    });
+
+    it("persona content drift after a review baseline flags STALE with content wording", () => {
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "persona content v1");
+      recordPersonaReview(dir, "persona: reviewed");
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "persona content v2");
+      utime(path.join(dir, "AGENTS.md"), 0.5); // fresh mtime — the marker keys to CONTENT, not age
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toMatch(/persona \(AGENTS\.md\): STALE \(content drifted since the .* review\)/);
+    });
+
+    it("no review baseline keeps the legacy 24h mtime behavior for persona", () => {
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "persona content");
+      utime(path.join(dir, "AGENTS.md"), 2); // 48h — past the rotation floor, no baseline
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toMatch(/persona \(AGENTS\.md\): STALE 2d ago/);
     });
 
     it("marks missing files and shows the last maintenance entry", () => {
@@ -638,5 +682,323 @@ describe("nudge-rating governor", () => {
       expect(engine.unansweredFor(agent.id)).toBe(0);
       expect(engine.takeNextWakeup(agent.id)).toBeNull();
     });
+  });
+});
+
+describe("HeartbeatEngine escalation-loop triage (bd: pibot-3w03)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = tmpAgentDir();
+    nextActs.length = 0;
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    nextActs.length = 0;
+    vi.mocked(PiAgent.createAgentSession).mockClear();
+    vi.mocked(PiAgent.getAgentDir).mockClear();
+  });
+
+  const t = (e: HeartbeatEngine) => e as unknown as { tickInner: (a: LoadedAgent, o?: { brief?: boolean }) => Promise<void> };
+
+  it("delivers similar escalations until threshold, then suppresses and files dev triage once", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const { engine, host, events } = makeEngine(agent, dir);
+    const fileDevTriage = vi.fn(async (_agentId: string, _signature: string) => {});
+    (host as HeartbeatHost).fileDevTriage = fileDevTriage;
+    // creator Oct 22-23 wording variants — inflected, re-worded, numbered
+    queueActs([
+      null,
+      { escalate: "Тик снова без инструментов (3-й подряд) — рендер от 16:15 ждёт проверки" },
+      { escalate: "Тик снова мёртв по инструментам: task_status, agent_message все not found уже 4-й раз подряд" },
+      { escalate: "Кратко: тик снова без инструментов (6-й подряд) — рендер и AGENTS.md всё ещё ждут рабочего тика" },
+      { escalate: "Кратко: тик снова без инструментов (7-й подряд) — рендер и AGENTS.md всё ещё ждут рабочего тика" },
+    ]);
+    const tick = () => t(engine).tickInner(agent, {});
+    await tick();
+    await tick();
+    await tick();
+    await tick();
+    await tick();
+    expect(host.escalateToAgent).toHaveBeenCalledTimes(2);
+    expect(fileDevTriage).toHaveBeenCalledTimes(1);
+    expect(fileDevTriage.mock.calls[0][0]).toBe("assistant");
+    expect(String(fileDevTriage.mock.calls[0][1])).toContain("инструмент");
+    const logs = (events.log as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[2]));
+    expect(logs.some((l) => l.includes("(suppressed, escalation loop 3x, triaged=now)"))).toBe(true);
+    expect(logs.some((l) => l.includes("triaged=earlier"))).toBe(true);
+  });
+
+  it("a genuinely different escalation escapes the loop and delivers", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const { engine, host, events } = makeEngine(agent, dir);
+    const fileDevTriage = vi.fn(async (_agentId: string, _signature: string) => {});
+    (host as HeartbeatHost).fileDevTriage = fileDevTriage;
+    queueActs([
+      { escalate: "Тик без инструментов: рендер ждёт проверки, исполнители недоступны" },
+      { escalate: "Тик без инструментов: рендер ждёт проверки, исполнители недоступны, 2-й раз" },
+      { escalate: "Утренний брифинг не уехал из-за сбоя календаря — проверить подключение" },
+      { escalate: "Тик без инструментов: рендер ждёт проверки, исполнители недоступны, 3-й раз" },
+    ]);
+    const tick = () => t(engine).tickInner(agent, {});
+    await tick();
+    await tick();
+    await tick();
+    await tick();
+    expect(host.escalateToAgent).toHaveBeenCalledTimes(3);
+    // the off-topic escalation resets the tool loop: threshold not yet reached after it
+    expect(fileDevTriage).toHaveBeenCalledTimes(1);
+    const logs = (events.log as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[2]));
+    expect(logs.some((l) => l.includes("(suppressed, escalation loop 3x, triaged=now)"))).toBe(true);
+  });
+
+  it("after the cooldown the same escalation starts a fresh loop that delivers again", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const { engine, host } = makeEngine(agent, dir);
+    queueActs([
+      { escalate: "Тик без инструментов: рендер ждёт проверки" },
+      { escalate: "Тик без инструментов: рендер ждёт проверки, повтор" },
+      { escalate: "Тик без инструментов: рендер ждёт проверки, третий тик" },
+    ]);
+    const tick = () => t(engine).tickInner(agent, {});
+    await tick();
+    await tick();
+    await tick();
+    expect(host.escalateToAgent).toHaveBeenCalledTimes(2);
+    // simulate cooldown expiry on the persisted/loop state
+    const engineState = (engine as unknown as { escalationLoop: Map<string, EscalationLoopState> }).escalationLoop.get(agent.id);
+    expect(engineState?.loops[0]?.count).toBe(3);
+    (engine as unknown as { escalationLoop: Map<string, EscalationLoopState> }).escalationLoop.set(agent.id, {
+      loops: engineState!.loops.map((l) => ({ ...l, triagedUntil: Date.now() - 1 })),
+    });
+    queueActs([{ escalate: "Тик без инструментов: рендер ждёт проверки, снова" }]);
+    await tick();
+    expect(host.escalateToAgent).toHaveBeenCalledTimes(3);
+  });
+
+  it("escalation fingerprints tolerate inflection but separate different topics (pure fns)", () => {
+    const a = "Тик без инструментов (6-й подряд) — рендер ждёт";
+    const b = "тики без инструментов подряд — рендер ждёт рабочего тика";
+    const c = "деньги пришли на счёт: счёт-фактура 2026 от клиента";
+    expect(triageEscalationLoop(undefined, a, 1).matchedCount).toBe(1);
+    const st = triageEscalationLoop(triageEscalationLoop(undefined, a, 1).next, b, 2);
+    expect(st.matchedCount).toBe(2);
+    expect(escalationsSimilar(a, b)).toBe(true);
+    expect(escalationsSimilar(a, c)).toBe(false);
+  });
+});
+
+describe("passive bd-ticket pickup (bd: pibot-3w03)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = tmpAgentDir();
+    nextActs.length = 0;
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    nextActs.length = 0;
+    vi.mocked(PiAgent.createAgentSession).mockClear();
+    vi.mocked(PiAgent.getAgentDir).mockClear();
+  });
+
+  it("digest shows the assigned-tickets panel only when tickets exist", () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const scheduler = { list: vi.fn(() => []) } as unknown as import("./scheduler.js").Scheduler;
+    const events = { tail: vi.fn(() => []) } as unknown as import("./events.js").EventLog;
+    const without = buildHeartbeatDigest(agent, scheduler, events);
+    expect(without).not.toContain("Bd tickets assigned to you");
+    const withTickets = buildHeartbeatDigest(agent, scheduler, events, undefined, [
+      { id: "pibot-3w03", title: "triage lane for stuck agents" },
+      { id: "pibot-gahj", title: "another open ticket" },
+    ]);
+    expect(withTickets).toContain("# Bd tickets assigned to you");
+    expect(withTickets).toContain("- pibot-3w03: triage lane for stuck agents");
+    expect(withTickets).toContain("service <ticket-id>");
+  });
+
+  it("a passive tick with an assigned ticket escalates service into the main session", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const seen: string[] = [];
+    const acts = [
+      { escalate: "service pibot-3w03: verify capability-refresh wiring and close the ticket" },
+    ];
+    nextActs.length = 0;
+    nextActs.push(...(acts as never[]));
+    const { engine, host } = makeEngine(agent, dir, {}, undefined, undefined, undefined);
+    // bdAssigned feeds the digest
+    (engine as unknown as { deps: { bdAssigned: (id: string) => Promise<{ id: string; title: string }[]> } }).deps.bdAssigned =
+      vi.fn(async () => [{ id: "pibot-3w03", title: "triage lane for stuck agents" }]);
+    const t = (e: HeartbeatEngine) => e as unknown as { tickInner: (a: LoadedAgent, o?: { brief?: boolean }) => Promise<void> };
+    // capture the prompt text the tick sends
+    vi.mocked(PiAgent.createAgentSession).mockImplementationOnce(async (opts: unknown) => {
+      const o = opts as { customTools?: Array<{ name: string; execute: (id: string, params: unknown) => Promise<unknown> }> };
+      const actTool = o.customTools?.find((t) => t.name === "heartbeat_act");
+      const payload = nextActs.shift();
+      return {
+        session: {
+          prompt: async (text?: string) => {
+            seen.push(String(text));
+            if (actTool && payload) await actTool.execute("test-id", payload as never);
+          },
+          dispose() {},
+          agent: { state: { messages: [] } },
+        },
+        modelFallbackMessage: undefined,
+      } as never;
+    });
+    await t(engine).tickInner(agent, {});
+    expect(seen[0]).toContain("# Bd tickets assigned to you");
+    expect(seen[0]).toContain("- pibot-3w03: triage lane for stuck agents");
+    expect(host.escalateToAgent).toHaveBeenCalledTimes(1);
+    expect(String((host.escalateToAgent as ReturnType<typeof vi.fn>).mock.calls[0][1])).toContain("service pibot-3w03");
+  });
+
+  it("bd lookup failure never breaks a tick (panel simply omitted)", async () => {
+    const agent = makeAgent(dir, { model: "anthropic/claude-opus-4-6", providers: ["anthropic"] });
+    const { engine, host } = makeEngine(agent, dir);
+    const t = (e: HeartbeatEngine) => e as unknown as { tickInner: (a: LoadedAgent, o?: { brief?: boolean }) => Promise<void> };
+    (engine as unknown as { deps: { bdAssigned: (id: string) => Promise<never> } }).deps.bdAssigned = vi.fn(async () => {
+      throw new Error("bd missing");
+    });
+    queueActs([{ note: "calm tick" }]);
+    await t(engine).tickInner(agent, {});
+    expect(host.escalateToAgent).not.toHaveBeenCalled();
+  });
+});
+
+// ─── bd pibot-wr9m: the date guard is exercised at the ACTUAL delivery path ────
+// Frozen system dates + the real tick with a stubbed model/transport. The guard
+// must silence a wrong relative date BEFORE emission, never append a warning.
+describe("heartbeat speak date guard at the delivery path (bd pibot-wr9m)", () => {
+  let dir: string;
+  // 2026-10-26 08:32 Europe/Berlin (CET = UTC+1) — the exact observed moment Nov 2 was called "today"
+  const OCT26 = Date.UTC(2026, 9, 26, 7, 32);
+  const unanswered = (e: HeartbeatEngine) => (e as unknown as { unansweredSpeaks: Map<string, number> }).unansweredSpeaks;
+  const fingerprints = (e: HeartbeatEngine) => (e as unknown as { lastSpeakFingerprint: Map<string, string> }).lastSpeakFingerprint;
+
+  beforeEach(() => {
+    dir = tmpAgentDir();
+    nextActs.length = 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(OCT26));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    fs.rmSync(dir, { recursive: true, force: true });
+    nextActs.length = 0;
+    vi.mocked(PiAgent.createAgentSession).mockClear();
+    vi.mocked(PiAgent.getAgentDir).mockClear();
+  });
+
+  it("suppresses an English 'today, November 2' speak before emission and does not mark it delivered", async () => {
+    const agent = makeAgent(dir);
+    const { engine, host, events } = makeEngine(agent, dir);
+    const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+    queueActs([
+      { speak: "The deadline is today, November 2." },
+      { speak: "The November 2 deadline is in 7 days." },
+    ]);
+    await engine.tick(agent.id);
+    expect(deliver).not.toHaveBeenCalled(); // silenced, not warned
+    expect(unanswered(engine).get(agent.id)).toBeUndefined(); // a suppressed speak is NOT delivered
+    expect(fingerprints(engine).has(agent.id)).toBe(false);
+    await engine.tick(agent.id);
+    expect(deliver.mock.calls.map((c: unknown[]) => c[1])).toEqual(["The November 2 deadline is in 7 days."]);
+    expect(unanswered(engine).get(agent.id)).toBe(1);
+    const logs = (events.log as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[2]));
+    expect(logs.some((l) => l.startsWith("(suppressed, date mismatch)"))).toBe(true);
+  });
+
+  it("suppresses the Russian 'сегодня, 2 ноября' and the dotted numeric form", async () => {
+    const agent = makeAgent(dir);
+    const { engine, host } = makeEngine(agent, dir);
+    const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+    queueActs([
+      { speak: "Дедлайн — сегодня, 2 ноября." },
+      { speak: "Дедлайн — сегодня, 02.11.2026." },
+      { speak: "Дедлайн — через 7 дней, 02.11.2026." },
+    ]);
+    await engine.tick(agent.id);
+    await engine.tick(agent.id);
+    await engine.tick(agent.id);
+    expect(deliver.mock.calls.map((c: unknown[]) => c[1])).toEqual(["Дедлайн — через 7 дней, 02.11.2026."]);
+  });
+
+  it("keeps housekeeping (maintain journal + requested wakeup) while only the speak is suppressed", async () => {
+    const agent = makeAgent(dir);
+    const { engine, host } = makeEngine(agent, dir);
+    const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+    queueActs([{ maintain: "memory: rotated the journal", wakeup: "2h", speak: "The deadline is today, November 2." }]);
+    await engine.tick(agent.id);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(engine.takeNextWakeup(agent.id)).toBe(2 * 3600e3); // wakeup still applied
+    expect(fs.existsSync(path.join(dir, "memory", "maintenance.jsonl"))).toBe(true); // note still written
+  });
+
+  it("stays correct across the Europe/Berlin DST change (2026-10-25 23:30 UTC is already Oct 26 local)", async () => {
+    vi.setSystemTime(new Date(Date.UTC(2026, 9, 25, 23, 30)));
+    const agent = makeAgent(dir);
+    const { engine, host } = makeEngine(agent, dir);
+    const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+    queueActs([
+      { speak: "The deadline is today, November 2." }, // local day is Oct 26, so this is wrong
+      { speak: "The deadline is in 7 days, November 2." },
+    ]);
+    await engine.tick(agent.id);
+    await engine.tick(agent.id);
+    expect(deliver.mock.calls.map((c: unknown[]) => c[1])).toEqual(["The deadline is in 7 days, November 2."]);
+  });
+
+  it("delivers prose where 'today' merely co-occurs with a date — no false suppression (bd pibot-wr9m review)", async () => {
+    const agent = makeAgent(dir);
+    const { engine, host } = makeEngine(agent, dir);
+    const deliver = host.deliverToAgent as ReturnType<typeof vi.fn>;
+    queueActs([
+      { speak: "Today I checked the page for the November 2 deadline." },
+      { speak: "Сегодня проверил страницу: дедлайн 2 ноября." },
+    ]);
+    await engine.tick(agent.id);
+    await engine.tick(agent.id);
+    expect(deliver.mock.calls.map((c: unknown[]) => c[1])).toEqual([
+      "Today I checked the page for the November 2 deadline.",
+      "Сегодня проверил страницу: дедлайн 2 ноября.",
+    ]);
+  });
+});
+
+describe("buildHeartbeatDigest — computed relative wording in the named zone (bd pibot-wr9m)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = tmpAgentDir();
+    vi.useFakeTimers({ toFake: ["Date"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function digestFor(dueAt: number): string {
+    const agent = makeAgent(dir);
+    const scheduler = { list: vi.fn(() => [{ id: "1", title: "Deadline", dueAt, internal: false, wake: "important" }]) } as unknown as import("./scheduler.js").Scheduler;
+    const events = { tail: vi.fn(() => []) } as unknown as import("./events.js").EventLog;
+    return buildHeartbeatDigest(agent, scheduler, events);
+  }
+
+  it("renders the absolute date + exact Berlin clock + a computed relative phrase, never a bare 'today'", () => {
+    vi.setSystemTime(new Date(Date.UTC(2026, 9, 26, 7, 32))); // Oct 26 Berlin
+    const digest = digestFor(Date.UTC(2026, 10, 2, 9, 0)); // Nov 2 09:00 UTC = 10:00 Berlin
+    expect(digest).toContain('"Deadline" — 2026-11-02 10:00 (in 7 days) (!important)');
+    expect(digest).not.toMatch(/\btoday\b/);
+  });
+
+  it("keeps the exact Berlin due clock beside the relative wording so a same-day reminder stays actionable", () => {
+    // 2026-11-02 08:00 UTC = 09:00 Europe/Berlin; "today" alone would lose the time to act on.
+    vi.setSystemTime(new Date(Date.UTC(2026, 10, 2, 6, 0))); // 07:00 Berlin, before the due time
+    const digest = digestFor(Date.UTC(2026, 10, 2, 8, 0));
+    expect(digest).toContain("2026-11-02 09:00 (today)");
+  });
+
+  it("derives urgency in the NAMED zone, not the machine's (DST-safe)", () => {
+    vi.setSystemTime(new Date(Date.UTC(2026, 9, 25, 23, 30))); // = Oct 26 00:30 Berlin
+    expect(digestFor(Date.UTC(2026, 10, 2, 9, 0))).toContain("2026-11-02 10:00 (in 7 days)"); // 8 under a UTC machine zone
   });
 });

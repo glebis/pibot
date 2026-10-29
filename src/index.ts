@@ -88,8 +88,11 @@ async function main(): Promise<void> {
   });
 
   const modelRuntime = await ModelRuntime.create();
+  const stt = new SttService();
   const agents = new AgentManager(config.agentsDir, modelRuntime, config.vaultDir, process.cwd(), config.dataDir);
   agents.docsDir = config.docsDir;
+  // Host STT enablement for route diagnosis (bd pibot-hn90): metadata only, no credential value.
+  agents.stt = { hostProviderIds: stt.hostProviderIds, groqCredentialPresent: stt.groqCredentialPresent };
   const events = new EventLog(config.agentsDir);
 
   // model cascade: primary → manifest fallbacks → PIBOT_MODEL_CASCADE → authenticated models → queue
@@ -165,7 +168,9 @@ async function main(): Promise<void> {
       deliverToAgent: (agentId, text, opts) => bot.deliverToAgent(agentId, text, opts),
       escalateToAgent: (agentId, instruction) => bot.escalateToAgent(agentId, instruction),
       lastUserMessageAt: (agentId) => bot.lastUserMessageAt(agentId),
+      fileDevTriage: (agentId, signature) => bot.fileDevTriage(agentId, signature),
     },
+    bdAssigned: (agentId) => bot.assignedTicketsFor(agentId),
     cascade,
     statePath: path.join(config.dataDir, "heartbeat-state.json"),
     consolidation,
@@ -250,15 +255,15 @@ async function main(): Promise<void> {
   };
 
   const providerManager = new ProviderManager(modelRuntime);
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, commitments, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir), goalIO });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, commitments, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt, audioMedia: new AudioMediaProcessor(mediaDir), goalIO });
   diskGuard?.setNotify((text) => void bot.notifyOwnerEvent(text));
 
-  await bot.start();
-  await coordinator?.start();
-  scheduler.rearm();
-
-  // Durable background tasks (pi-durable ledger, bead pibot-e9t). Opened after the bot is up:
-  // tasks left unfinished by the last process resume at once and post their results.
+  // Durable background tasks (pi-durable ledger, bead pibot-e9t). Wired BEFORE bot.start():
+  // any session created by transports/heartbeat/scheduler delivery after that sees the tasks
+  // capability — a session built before the wiring was cached for the whole process lifetime
+  // with no task tools (creator/knower/worker tools-not-found, Oct 21). Tasks left unfinished
+  // by the last process resume here; runLedgerTask waits for the started gate, so their result
+  // posts and owner questions always have a live delivery route.
   const taskDir = path.join(config.dataDir, "durable", "tasks");
   fs.mkdirSync(taskDir, { recursive: true, mode: 0o700 });
   const taskLedger = await (await import("./durable/task-ledger.js")).openTaskLedger({
@@ -267,6 +272,9 @@ async function main(): Promise<void> {
   }).catch((e) => { console.error("[pibot] task ledger unavailable:", e instanceof Error ? e.message : e); return undefined; });
   agents.tasks = taskLedger;
 
+  await bot.start();
+  await coordinator?.start();
+  scheduler.rearm();
   // pilot governance on boot: weekly scorecard jobs follow the manifest flags
   for (const a of agents.list()) commitments.syncPilotGovernance(a.id);
 
@@ -278,7 +286,10 @@ async function main(): Promise<void> {
     const webApp = createWebApp({
       agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
       proactiveStore,
+      inbox: bot.labInboxControl(),
+      processes: bot.processControl(),
       coordinator,
+      enrollment: bot.labEnrollmentControl(),
       commitments: { syncGovernance: (agentId) => commitments.syncPilotGovernance(agentId) },
       webToken, webRpId: config.webRpId, webPort,
       providers: providerManager,
@@ -328,15 +339,26 @@ async function main(): Promise<void> {
       await voiceEscalation?.close();
       await coordinator?.stopDispatch();
       await voiceRuntime?.close();
+      await taskLedger?.close(); // a running task stays pending and resumes (once) after restart
       await bot.stop();
       coordinator?.close();
-      await taskLedger?.close(); // a running task stays pending and resumes (once) after restart
     })()
       .catch(() => {})
       .finally(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  // One process hosts every bot: a stray rejected promise in one feature must not take the
+  // others down (Node's default is to exit). Log it loudly and keep serving.
+  process.on("unhandledRejection", (reason) => {
+    console.error("[pibot] unhandled rejection (kept running):", reason instanceof Error ? reason.stack ?? reason.message : reason);
+  });
+  // A synchronous throw that escaped every handler may have left state half-updated: exit and let
+  // launchd (KeepAlive) restart from durable state rather than limp on.
+  process.on("uncaughtException", (err) => {
+    console.error("[pibot] uncaught exception — exiting for a clean restart:", err.stack ?? err.message);
+    process.exit(1);
+  });
 }
 
 main().catch((e) => {

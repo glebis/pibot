@@ -26,6 +26,7 @@ export interface VoiceHost {
   voiceFrontNote?(callId:string,role:'owner'|'agent',text:string):void;
   voiceFrontClose?(callId:string):Promise<unknown>;
   voiceTasks?(agentId:string,chatKey:string):Promise<LedgerEntry[]|undefined>;
+  voiceCancelTask?(agentId:string,chatKey:string,taskId:string):Promise<boolean|undefined>;
   blockedDecisionProjection?(scope:SourceScope):BlockedDecisionProjection|undefined;
 }
 interface Session { agentId:string;chatKey:string;callSid:string;tools?:string[];front?:boolean;expires:number;controller:AbortController;requests:Map<string,{text:string;reply?:string}>;busy:boolean }
@@ -110,6 +111,13 @@ export function createCanonicalVoiceBridge(host:VoiceHost,token:string,clock=Dat
     let b:any;try{b=await body(c);}catch{return c.json({error:'invalid_body'},400);}
     if(!b||!['owner','agent'].includes(b.role)||typeof b.text!=='string'||b.text.length>4000)return c.json({error:'invalid_note'},400);
     host.voiceFrontNote?.(c.req.param('id'),b.role,b.text);return c.json({ok:true});
+  });
+  app.post('/voice/tasks/:id/cancel',async c=>{
+    let b:any;try{b=await body(c);}catch{return c.json({error:'invalid_body'},400);}
+    if(!b||typeof b.agentId!=='string'||typeof b.chatKey!=='string'||!allowed(b))return c.json({error:'binding_denied'},403);
+    const taskId=c.req.param('id');if(!/^[A-Za-z0-9_-]{1,64}$/.test(taskId))return c.json({error:'invalid_task'},400);
+    const cancelled=await host.voiceCancelTask?.(b.agentId,b.chatKey,taskId);
+    return cancelled===undefined?c.json({error:'tasks_unavailable'},503):c.json({cancelled});
   });
   app.get('/voice/tasks',async c=>{
     const agentId=c.req.query('agentId')??'',chatKey=c.req.query('chatKey')??'';

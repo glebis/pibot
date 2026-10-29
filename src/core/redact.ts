@@ -17,6 +17,9 @@ const PATTERNS: Array<[RegExp, string]> = [
   [/(?<!\d)(\d{5,12}):[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, "$1:[TELEGRAM_BOT_TOKEN_REDACTED]"],
   // Provider / platform key shapes that are unambiguous by prefix.
   [/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[REDACTED]"],
+  // Groq (gsk_) and Lyceum (lk_) keys configured in ~/.pi/agent/models.json.
+  [/\bgsk_[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]"],
+  [/\blk_[A-Za-z0-9]{20,}\b/g, "[REDACTED]"],
   [/\bAIza[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]"],
   [/\bxox[abpsr]-[A-Za-z0-9-]{10,}\b/g, "[REDACTED]"],
   [/\b(?:ghp|gho|ghs|ghu)_[A-Za-z0-9]{20,}\b/g, "[REDACTED]"],
@@ -29,8 +32,12 @@ const PATTERNS: Array<[RegExp, string]> = [
     /("(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|private[_-]?key|signing[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|authorization|credentials?|password|passwd|passphrase|secret|token)"\s*:\s*)(?:"(?:\\.|[^"\\])*"|null|true|false|-?\d+(?:\.\d+)?)/gi,
     `$1"${REDACTED}"`,
   ],
+  // The bare-value branch must stop at a quote or backslash: these patterns also
+  // run over raw JSON, and consuming the terminator would leave invalid JSON
+  // behind (three session lines were damaged this way in the Oct 28 log scrub).
+  // A backslash is kept so an escaped `\"` inside a JSON string stays escaped.
   [
-    /(\b(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|private[_-]?key|signing[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|authorization|credentials?|password|passwd|passphrase|secret|token)\b\s*(?:=|:)\s*)(?:Bearer\s+[^\s,;}\]]+|"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\]]+)/gi,
+    /(\b(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|private[_-]?key|signing[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|authorization|credentials?|password|passwd|passphrase|secret|token)\b\s*(?:=|:)\s*)(?:Bearer\s+[^\s,;}\]]+|"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\]"'\\]+)/gi,
     `$1${REDACTED}`,
   ],
   [/\bBearer\s+[^\s,;}\]]+/gi, `Bearer ${REDACTED}`],

@@ -9,7 +9,7 @@ function harness() {
  const pushed: string[]=[];const subscribers: Array<(e:any)=>void>=[];
  const t={name:'telegram',push:vi.fn(async (_chat:string,p:any)=>{pushed.push(p.text);}),notifyError:vi.fn(async()=>{}),setTyping:vi.fn(),onMessage:vi.fn(),onAction:vi.fn(),start:vi.fn(),stop:vi.fn()};
  const session={isStreaming:false,subscribe:vi.fn((f:any)=>{subscribers.push(f);}),setModel:vi.fn(async()=>{}),prompt:vi.fn(async()=>{subscribers.forEach(f=>f({type:'agent_end',messages:[{role:'assistant',content:[{type:'text',text:'Here is the answer.'}],stopReason:'stop'}]}));})};
- const agents={getAgent:vi.fn((id:string)=>id==='assistant'?{id,manifest:{name:id}}:undefined),getOrCreateSession:vi.fn(async()=>session)};
+ const agents={isSessionStale:vi.fn(()=>false),resetSession:vi.fn(async()=>{}),getAgent:vi.fn((id:string)=>id==='assistant'?{id,manifest:{name:id}}:undefined),getOrCreateSession:vi.fn(async()=>session)};
  const bot=new PiBot({config:{dataDir:'/tmp/voice-test-unused',allowedChats:['42']},transports:[t],agents,heartbeat:{noteUserMessage:vi.fn()},events:{log:vi.fn()},scheduler:{},secrets:{}} as any);
  const b=bot as any;b.chatAgent.set('telegram:42','assistant');b.agentChats.set('assistant',new Set(['telegram:42']));
  // No test writes to runtime state or invokes unrelated plugin services.
@@ -131,6 +131,26 @@ describe('voice front in the bot',()=>{
   await h.bot.voiceFrontClose('call-1');
   expect(h.pushed.at(-1)).toContain('📞 Voice call');expect(h.pushed.at(-1)).toContain('You: Are you there?');
   expect(custom).toHaveBeenCalledWith(expect.objectContaining({customType:'voice-call'}),{deliverAs:'nextTurn'});
+ });
+});
+describe('task steps for the page and the front',()=>{
+ it('summarises a task session as readable steps: short paths, the command itself, notes as text',()=>{
+  const h=harness();const home=process.env.HOME!;
+  const messages=[{role:'assistant',content:[{type:'toolCall',name:'read',arguments:{path:`${home}/.local/share/pibot/agents/mentalhealthtech/drafts/character-ai.md`}},{type:'toolCall',name:'bash',arguments:{command:`cat ${home}/.local/share/pibot/agents/mentalhealthtech/drafts/character-ai.md | wc -l`}},{type:'text',text:'Reviewing the draft now.'}]}];
+  (h.agents as any).sessions=new Map([['assistant::agent::assistant::task-t1',{agent:{state:{messages}}}]]);
+  expect(h.bot.taskSteps('assistant','t1')).toEqual([{tool:'read',detail:'~/…/drafts/character-ai.md'},{tool:'bash',detail:'cat ~/…/drafts/character-ai.md | wc -l'},{detail:'Reviewing the draft now.'}]);
+  expect(h.bot.taskActivity('assistant','t1')[0]).toBe('read ~/…/drafts/character-ai.md');
+  expect(h.bot.taskSteps('assistant','missing')).toEqual([]);
+ });
+});
+describe('cancelling a task from the page',()=>{
+ it('cancels only this chat\'s own tasks',async()=>{
+  const h=harness();const cancel=vi.fn(async()=>true);
+  (h.agents as any).tasks={get:vi.fn(async(id:string)=>id==='mine'?{id,agentId:'assistant',chatKey:'telegram:42',status:'running'}:id==='other'?{id,agentId:'assistant',chatKey:'telegram:99',status:'running'}:undefined),cancel};
+  expect(await h.bot.voiceCancelTask('assistant','telegram:99','mine')).toBeUndefined();
+  expect(await h.bot.voiceCancelTask('assistant','telegram:42','other')).toBe(false);
+  expect(await h.bot.voiceCancelTask('assistant','telegram:42','mine')).toBe(true);
+  expect(cancel).toHaveBeenCalledOnce();
  });
 });
 describe('canonical turn gate',()=>{

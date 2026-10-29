@@ -109,7 +109,7 @@ describe("membership gate (memberGroups)", () => {
   });
 
   it("administrator and creator statuses count as members", async () => {
-    for (const status of ["administrator", "creator", "restricted"]) {
+    for (const status of ["administrator", "creator"]) {
       const t = memberBot(async () => ({ status }));
       const g = t as unknown as { check: (c: Context) => Promise<boolean>; membershipCache: Map<string, { ok: boolean; until: number }> };
       expect(await g.check(fakeGateCtx({ chatType: "private", chatId: 5, fromId: 5, text: "hi" }))).toBe(true);
@@ -123,13 +123,27 @@ describe("membership gate (memberGroups)", () => {
     expect(await g.check(fakeGateCtx({ chatType: "private", chatId: 5, fromId: 5, text: "hi" }))).toBe(false);
   });
 
-  it("API failure fails open with a short cache entry (never locks participants out)", async () => {
+  it("API failure for an unseen sender denies without caching a negative and flags them for a retry note", async () => {
     const t = memberBot(async () => { throw new Error("telegram down"); });
+    const g = t as unknown as { check: (c: Context) => Promise<boolean>; membershipCache: Map<string, { ok: boolean; until: number }>; membershipUnverified: Set<string> };
+    expect(await g.check(fakeGateCtx({ chatType: "private", chatId: 5, fromId: 5, text: "hi" }))).toBe(false);
+    expect(g.membershipCache.has("5")).toBe(false);
+    expect(g.membershipUnverified.has("5")).toBe(true);
+  });
+
+  it("API failure keeps a known member on their last verified status (even if expired)", async () => {
+    let down = false;
+    const t = memberBot(async () => { if (down) throw new Error("telegram down"); return { status: "member" }; });
     const g = t as unknown as { check: (c: Context) => Promise<boolean>; membershipCache: Map<string, { ok: boolean; until: number }> };
     expect(await g.check(fakeGateCtx({ chatType: "private", chatId: 5, fromId: 5, text: "hi" }))).toBe(true);
-    const entry = g.membershipCache.get("5");
-    expect(entry?.ok).toBe(true);
-    expect(entry!.until - Date.now()).toBeLessThanOrEqual(60_000);
+    g.membershipCache.get("5")!.until = Date.now() - 1; // expired
+    down = true;
+    expect(await g.check(fakeGateCtx({ chatType: "private", chatId: 5, fromId: 5, text: "hi again" }))).toBe(true);
+  });
+
+  it("proactive delivery stays fail-closed on API failure", async () => {
+    const t = memberBot(async () => { throw new Error("telegram down"); });
+    expect(await t.canDeliverToMember("5")).toBe(false);
   });
 
   it("group messages skip the membership lookup entirely", async () => {
@@ -187,3 +201,21 @@ describe("denied-path responses", () => {
     expect(sentCount).toBe(0);
   });
 });
+ describe("fresh proactive delivery membership", () => {
+  it("requires restricted.is_member and denies unknown statuses", async () => {
+    const t = new TelegramTransport("123:test", [], { memberGroups: ["-100123"] });
+    for (const [member, expected] of [[{ status: "restricted", is_member: false }, false], [{ status: "restricted", is_member: true }, true], [{ status: "new-status" }, false]] as const) {
+      fakeApi(t, { getChatMember: async () => member });
+      expect(await t.canDeliverToMember("5")).toBe(expected);
+    }
+  });
+  it("checks afresh after membership loss and allows the owner during API failure", async () => {
+    const t = new TelegramTransport("123:test", ["42"], { memberGroups: ["-100123"] });
+    fakeApi(t, { getChatMember: async () => ({ status: "member" }) });
+    expect(await t.canDeliverToMember("5")).toBe(true);
+    fakeApi(t, { getChatMember: async () => { throw new Error("offline"); } });
+    expect(await t.canDeliverToMember("5")).toBe(false);
+    expect(await t.canDeliverToMember("42")).toBe(true);
+    expect(await t.canDeliverToMember("-100123")).toBe(false);
+  });
+ });

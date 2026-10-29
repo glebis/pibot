@@ -10,8 +10,9 @@ import type { HeartbeatEngine } from "./heartbeat.js";
 import type { Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
 import type { ModelCascade } from "./cascade.js";
-import type { PushOptions, ReplyContext, Schedule, Transport, IncomingMedia } from "./types.js";
+import type { PushOptions, ReplyContext, Schedule, Transport, IncomingMedia, DeliveryReceipt } from "./types.js";
 import { OWNER_CHAT_ID, ownerChatKey } from "../test-fixtures.js";
+import { transcriptionPolicyMarker } from "./transcription-policy.js";
 
 // The /newagent wizard runs the LLM-backed ambiguity gate before creating the
 // agent. With no modelRuntime stub the SDK falls back to the machine's real
@@ -33,6 +34,8 @@ vi.mock("./ambiguity.js", async (importOriginal) => {
 function makeCascadeStub() {
   return {
     chainFor: vi.fn(() => ["ollama/test"] as string[]),
+    permittedSpecs: vi.fn(() => ["ollama/test"] as string[]),
+    isPermitted: vi.fn((_manifest: unknown, spec: string) => spec === "ollama/test"),
     firstHealthy: vi.fn(() => "ollama/test"),
     nextCandidate: vi.fn(() => undefined),
     resolveModel: vi.fn(() => undefined),
@@ -67,6 +70,7 @@ class MockTransport implements Transport {
   mediaCb: ((media: import("./types.js").IncomingMedia) => Promise<void>) | null = null;
   mediaSeen: import("./types.js").IncomingMedia[] = [];
   speechSeen: Array<{ kind: "voice" | "audio"; chatId: string; filePath: string; caption?: string }> = [];
+  videoNoteSeen: Array<{ chatId: string; filePath: string }> = [];
 
   constructor(name = "mock", boundAgentId?: string) {
     this.name = name;
@@ -86,6 +90,24 @@ class MockTransport implements Transport {
   }
   async sendAudio(chatId: string, filePath: string, caption?: string): Promise<void> {
     this.speechSeen.push({ kind: "audio", chatId, filePath, caption });
+  }
+  mediaSends: Array<{ chatId: string; source: string }> = [];
+  /** override the attested destination for negative tests (bd pibot-cida) */
+  receiptPeer?: string;
+  /** the delivery tuple a real transport attests: the peer it actually posted to, the bot account and
+   *  the id namespace (bd pibot-cida). `receiptPeer` overrides the peer to simulate a response whose
+   *  chat.id disagrees with the requested chat. */
+  private receipt(chatId: string, extra: { messageId: number; mediaType: string }): DeliveryReceipt {
+    return { ...extra, account: "@mockbot", idProtocol: "bot_api", peer: this.receiptPeer ?? `${this.name}:${chatId}` };
+  }
+  async sendMedia(chatId: string, source: string): Promise<DeliveryReceipt> {
+    this.mediaSends.push({ chatId, source });
+    const image = /\.(jpe?g|png|webp|gif|heic)$/i.test(source) || /^https?:/.test(source);
+    return this.receipt(chatId, { messageId: 77, mediaType: image ? "photo" : "document" });
+  }
+  async sendVideoNote(chatId: string, filePath: string): Promise<DeliveryReceipt> {
+    this.videoNoteSeen.push({ chatId, filePath });
+    return this.receipt(chatId, { messageId: 66, mediaType: "video_note" });
   }
   onMessage(cb: (text: string, chatId: string, reply?: ReplyContext, messageId?: number) => Promise<void>): void {
     this.messageCb = cb;
@@ -143,6 +165,7 @@ function fakeAgentManager(promptSpy = vi.fn()) {
     createAgent: vi.fn(() => undefined),
     resetSession: vi.fn(async () => {}),
     discover: vi.fn(async () => {}),
+    isSessionStale: vi.fn(() => false),
     getOrCreateSession: vi.fn(async (..._args: unknown[]) => fakeSession),
     resolveModel: vi.fn(() => undefined),
     getAgent: vi.fn((id: string) =>
@@ -154,6 +177,29 @@ function fakeAgentManager(promptSpy = vi.fn()) {
     ),
     list: vi.fn(() => [{ id: "assistant", dir: "/x", manifest: { name: "assistant" } }]),
     defaultAgentId: () => "assistant",
+    // Field-level, compare-and-swap manifest write — mirrors AgentManager.updateManifest
+    // (bd pibot-4wq1) so /model and the wizard exercise the real one-field patch path.
+    updateManifest: vi.fn((agentId: string, patch: Record<string, unknown>) => {
+      const agent = (agents.getAgent as (id: string) => { dir: string; manifest: Record<string, unknown> } | undefined)(agentId);
+      if (!agent) return { ok: false, error: `Unknown agent "${agentId}"` };
+      const file = path.join(agent.dir, "agent.json");
+      let current: Record<string, unknown>;
+      try {
+        current = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+      } catch {
+        current = { ...agent.manifest };
+      }
+      current.name = current.name || agentId;
+      const next: Record<string, unknown> = { ...current };
+      for (const key of Object.keys(patch)) {
+        const value = patch[key];
+        if (value === undefined) delete next[key];
+        else next[key] = value;
+      }
+      fs.mkdirSync(agent.dir, { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(next, null, 2));
+      return { ok: true, manifest: next };
+    }),
   } as unknown as AgentManager;
   return { agents, emitSessionEvent: (event: unknown) => sessionListeners.forEach((listener) => listener(event)) };
 }
@@ -199,6 +245,8 @@ export function makeBot(evolution?: unknown, configPatch?: Partial<Config>) {
   };
   const runBd = vi.fn(async () => "✓ Created issue: pibot-test (P2)");
   const bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports: [transport], secrets: { get: () => ({}), save: async () => {} } as never, cascade, stt: stt as never, audioMedia: audioMedia as never, runBd: runBd as never, evolution: evolution as never });
+  // tests never call bot.start(); durable-task runners gate on it — arm the gate as production would
+  (bot as unknown as { resolveStarted?: () => void }).resolveStarted?.();
   return { bot, transport, agents, scheduler, heartbeat, events, promptSpy, cascade, dir, stt, audioMedia, emitSessionEvent, resetSession: agents.resetSession, runBd };
 }
 
@@ -346,6 +394,8 @@ describe("PiBot commands", () => {
       return { id, dir: agentDir, manifest };
     });
     (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/a:cloud", "ollama/b:cloud"]);
+    (t.cascade.permittedSpecs as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/a:cloud", "ollama/b:cloud"]);
+    (t.cascade.isPermitted as ReturnType<typeof vi.fn>).mockImplementation((_m: unknown, s: string) => ["ollama/a:cloud", "ollama/b:cloud"].includes(s));
     (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "a" } as never);
     (t.cascade.isOpen as ReturnType<typeof vi.fn>).mockReturnValue(false);
 
@@ -355,8 +405,14 @@ describe("PiBot commands", () => {
     const card = t.transport.lastCard();
     expect(card?.map((b) => b.label)).toEqual(["ollama/a:cloud", "ollama/b:cloud"]);
 
-    // tap a candidate → persisted to agent.json + toast confirmation
-    expect(await t.transport.act(card![0].action)).toContain("will use **ollama/a:cloud**");
+    // tap a candidate → persisted to agent.json, toast AND a persistent chat confirmation
+    let pushes = t.transport.pushed.length;
+    const switchToast = await t.transport.act(card![0].action);
+    expect(switchToast).toContain("ollama/a:cloud");
+    expect(switchToast).toContain("Current model");
+    expect(t.transport.pushed.length - pushes).toBe(1); // exactly one message — no double reply
+    expect(t.transport.lastText()).toContain("ollama/a:cloud");
+    expect(t.transport.lastText()).toContain("Current model: `ollama/a:cloud`");
     expect(JSON.parse(fs.readFileSync(manifestPath, "utf8")).model).toBe("ollama/a:cloud");
 
     // picker marks current, offers auto
@@ -364,17 +420,70 @@ describe("PiBot commands", () => {
     expect(t.transport.lastText()).toContain("`ollama/a:cloud`");
     expect(t.transport.lastCard()?.some((b) => b.label === "↺ auto")).toBe(true);
 
-    // auto reset
+    // auto reset — names auto and the head the cascade resolves after the manifest reload
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/a:cloud");
     const autoBtn = t.transport.lastCard()!.find((b) => b.label === "↺ auto")!;
-    expect(await t.transport.act(autoBtn.action)).toContain("back to **auto**");
+    pushes = t.transport.pushed.length;
+    const autoToast = await t.transport.act(autoBtn.action);
+    expect(autoToast).toContain("back to **auto**");
+    expect(autoToast).toContain("ollama/a:cloud");
+    expect(t.transport.pushed.length - pushes).toBe(1);
+    expect(t.transport.lastText()).toContain("back to **auto**");
+    expect(t.transport.lastText()).toContain("Current model: auto → `ollama/a:cloud`");
     expect(JSON.parse(fs.readFileSync(manifestPath, "utf8")).model).toBeUndefined();
 
-    // typed spec outside the permitted chain is refused
-    await t.transport.say("/model openai/gpt-x");
-    expect(t.transport.lastText()).toContain("not in assistant's permitted chain");
+    // typed spec still replies exactly once (switchModel itself never pushes)
+    pushes = t.transport.pushed.length;
+    await t.transport.say("/model ollama/b:cloud");
+    expect(t.transport.pushed.length - pushes).toBe(1);
+    expect(t.transport.lastText()).toContain("Current model: `ollama/b:cloud`");
 
-    // stale picker token → gentle expired toast
+    // typed spec outside the permitted chain is refused — message only, no confirmation push
+    pushes = t.transport.pushed.length;
+    await t.transport.say("/model openai/gpt-x");
+    expect(t.transport.lastText()).toContain("isn't permitted for assistant");
+    expect(t.transport.pushed.length - pushes).toBe(1); // just the refusal
+
+    // stale picker token → gentle expired toast, nothing pushed
+    pushes = t.transport.pushed.length;
     expect(await t.transport.act("mdl:m_deadbeef")).toContain("expired");
+    expect(t.transport.pushed.length - pushes).toBe(0);
+
+    fs.rmSync(agentDir, { recursive: true, force: true });
+  });
+
+  it("/model surfaces permitted models past the cascade walk and switches to them", async () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-model-past-walk-"));
+    const manifestPath = path.join(agentDir, "agent.json");
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      if (id !== "assistant") return undefined;
+      const manifest = fs.existsSync(manifestPath)
+        ? JSON.parse(fs.readFileSync(manifestPath, "utf8"))
+        : { name: "assistant", description: "d", providers: ["ollama", "openai-codex"] };
+      return { id, dir: agentDir, manifest };
+    });
+    // the runtime walk stays short: the ollama cloud models never make it into it
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["openai-codex/gpt-6.1-sol"]);
+    const permitted = [
+      "openai-codex/gpt-6.1-sol",
+      "ollama/glm-5.3-flash:cloud",
+      "ollama/deepseek-v4.1-flash:cloud",
+      ...Array.from({ length: 25 }, (_, i) => `ollama/extra-${i}:cloud`),
+    ];
+    (t.cascade.permittedSpecs as ReturnType<typeof vi.fn>).mockReturnValue(permitted);
+    (t.cascade.isPermitted as ReturnType<typeof vi.fn>).mockImplementation((_m: unknown, s: string) => permitted.includes(s));
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "a" } as never);
+
+    await t.transport.say("/model");
+    const card = t.transport.lastCard()!;
+    expect(card.map((b) => b.label)).toContain("ollama/glm-5.3-flash:cloud");
+    expect(card.map((b) => b.label)).toContain("ollama/deepseek-v4.1-flash:cloud");
+    expect(card).toHaveLength(20); // bounded, even though the permitted set is larger
+
+    // a permitted model outside the runtime walk is switchable and becomes the head
+    const deepseek = card.find((b) => b.label === "ollama/deepseek-v4.1-flash:cloud")!;
+    expect(await t.transport.act(deepseek.action)).toContain("ollama/deepseek-v4.1-flash:cloud");
+    expect(JSON.parse(fs.readFileSync(manifestPath, "utf8")).model).toBe("ollama/deepseek-v4.1-flash:cloud");
 
     fs.rmSync(agentDir, { recursive: true, force: true });
   });
@@ -484,6 +593,22 @@ describe("PiBot commands", () => {
     expect(arg).not.toContain("transcribed via");
   });
 
+  it.each([true, false])("retains the original video only after successful transcription (%s)", async (success) => {
+    const retainVideo = vi.fn(() => "/private/media/original.mp4");
+    const cleanup = vi.fn(async () => {});
+    t.audioMedia.prepare.mockResolvedValueOnce({ ok: true, filePath: "/private/media/audio.wav", durationSec: 9, retainVideo, cleanup } as never);
+    if (!success) t.stt.transcribe.mockRejectedValueOnce(new Error("failed"));
+    await t.transport.sayMedia({ kind: "video_note", durationSec: 9, filePath: "/private/media/original.mp4" });
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(retainVideo).toHaveBeenCalledTimes(success ? 1 : 0);
+    if (success) {
+      expect(t.promptSpy.mock.calls[0][0]).toContain("spoken words");
+      expect(t.promptSpy.mock.calls[0][0]).toContain("/private/media/original.mp4");
+      expect(t.promptSpy.mock.calls[0][0]).toContain("only when requested");
+      expect(t.transport.pushed.some((p) => p.opts.text.includes("/private/media/"))).toBe(false);
+    }
+  });
+
   it("uses the resolved agent speech policy for video-note transcription", async () => {
     (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => id === "assistant"
       ? { id, dir: "/tmp/fake-assistant", manifest: { name: id, speech: { sttProviders: ["whisperkit", "groq"], allowExternalStt: true } } }
@@ -521,7 +646,8 @@ describe("PiBot commands", () => {
   it("references photo files with caption in the prompt", async () => {
     await t.transport.sayMedia({ kind: "photo", filePath: "/tmp/42-7-photo.jpg", caption: "the whiteboard" });
     const arg = t.promptSpy.mock.calls[0][0] as string;
-    expect(arg).toContain("📎 photo attached — file: /tmp/42-7-photo.jpg");
+    expect(arg).toContain("📎 photo: 42-7-photo.jpg attached");
+    expect(arg).toContain("[file stored at /tmp/42-7-photo.jpg — read tool]");
     expect(arg).toContain("caption: the whiteboard");
     expect(arg).toContain("read tool");
   });
@@ -562,6 +688,18 @@ describe("PiBot commands", () => {
   it("rejects switching to unknown agents", async () => {
     await t.transport.say("/agent ghost");
     expect(t.transport.lastText()).toContain("No agent");
+  });
+
+  it("/agent switch wins over a dedicated sub-bot's binding (pibot-z09)", async () => {
+    const t = makeBot(undefined, { allowedChats: ["42"] }); // owner chat passes the dedicated-bot gate
+    const subBot = new MockTransport("telegram:fitness", "fitness");
+    t.bot.addTransport(subBot);
+    await subBot.say("hi"); // registers the chat with the bound agent
+    await subBot.say("/agent assistant");
+    expect(subBot.lastText()).toContain("Switched to");
+    await subBot.say("who am I talking to");
+    expect((t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0]).toBe("assistant");
+    fs.rmSync(t.dir, { recursive: true, force: true });
   });
 
   it("hands the conversation to another agent with /handoff", async () => {
@@ -756,6 +894,99 @@ describe("PiBot fire delivery", () => {
     expect(arg).toContain("compose me");
   });
 
+  it("work-item wakes lead with EXECUTE and demand an outcome; reminders keep the compose wake", async () => {
+    const t = makeBot();
+    await t.transport.say("remember this chat");
+    t.promptSpy.mockClear();
+    // workflow task: EXECUTE directive, no announce-only imperative
+    await t.bot.deliverFire(
+      {
+        id: "sc20", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+        title: "research digest", detail: "TOKEN-SMALL. delegate scoped search, max 5 links",
+        kind: "task", dueAt: Date.now(), wake: "normal",
+        delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    const workArg = t.promptSpy.mock.calls[0][0] as string;
+    expect(workArg).toContain("[scheduler] EXECUTE now:");
+    expect(workArg).toContain("research digest");
+    expect(workArg).toContain("Do NOT merely announce that the item is due");
+    expect(workArg).toContain("completed / blocked / failed");
+    expect(workArg).not.toContain("Compose a short, natural message");
+    // reminder kind: compose-a-message wake preserved
+    t.promptSpy.mockClear();
+    await t.bot.deliverFire(
+      {
+        id: "sc21", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+        title: "stretch", kind: "reminder", dueAt: Date.now(), wake: "normal",
+        delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    expect(t.promptSpy.mock.calls[0][0] as string).toContain("Compose a short, natural message telling the user this is due now");
+    // explicit wake:"notify" on a task kind forces the compose wake
+    t.promptSpy.mockClear();
+    await t.bot.deliverFire(
+      {
+        id: "sc22", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+        title: "scorecard", detail: "proactive scorecard stats", kind: "task",
+        dueAt: Date.now(), wake: "notify", delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    expect(t.promptSpy.mock.calls[0][0] as string).toContain("Compose a short, natural message telling the user this is due now");
+  });
+
+  it("scheduled wake with an empty model output emits a missed-run receipt", async () => {
+    const t = makeBot();
+    await t.transport.say("remember this chat");
+    t.promptSpy.mockClear();
+    const agents = t.agents as unknown as { getOrCreateSession: (...a: unknown[]) => Promise<unknown> };
+    const session = (await agents.getOrCreateSession()) as { agent: { state: { messages: unknown[] } } };
+    session.agent.state.messages = []; // no assistant output at all
+    await t.bot.deliverFire(
+      {
+        id: "sc23", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+        title: "wedge probe", kind: "task", dueAt: Date.now(), wake: "normal",
+        delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    expect(t.transport.lastText()).toContain("produced no model output");
+    expect(t.transport.lastText()).toContain("wedge probe");
+    expect(vi.mocked(t.events.log).mock.calls.some(([, kind, msg]) => kind === "system" && String(msg).includes("wedge probe"))).toBe(true);
+  });
+
+  it("scheduled wake with real agent output does NOT emit the missed-run receipt", async () => {
+    const t = makeBot();
+    await t.transport.say("remember this chat");
+    t.promptSpy.mockClear();
+    const agents = t.agents as unknown as { getOrCreateSession: (...a: unknown[]) => Promise<unknown> };
+    const session = (await agents.getOrCreateSession()) as { agent: { state: { messages: unknown[] } } };
+    session.agent.state.messages = [{ role: "assistant", content: [{ type: "text", text: "Ran the digest — 3 links saved to vault." }] }];
+    await t.bot.deliverFire(
+      {
+        id: "sc24", agentId: "assistant", chat: { transport: "mock", chatId: "42" },
+        title: "healthy probe", kind: "task", dueAt: Date.now(), wake: "normal",
+        delivery: "agent", status: "pending", createdAt: 0, firedCount: 1,
+      },
+      false
+    );
+    expect(t.transport.lastText()).not.toContain("produced no model output");
+  });
+
+  it("rejects an unresolved synthetic schedule without delivering anywhere", async () => {
+    const t = makeBot();
+    await expect(t.bot.deliverFire({
+      id: "lost", agentId: "pibot-dev", chat: { transport: "agent", chatId: "sender" },
+      title: "lost route", kind: "task", dueAt: Date.now(), wake: "normal",
+      delivery: "agent", status: "pending", createdAt: 0, firedCount: 0,
+    }, false)).rejects.toThrow(/No usable owned chat.*Repair the destination/);
+    expect(t.promptSpy).not.toHaveBeenCalled();
+    expect(t.transport.pushed).toHaveLength(0);
+  });
+
   it("agent delivery with the synthetic 'agent' transport resolves the agent's remembered chat", async () => {
     const t = makeBot();
     // agent→chat bindings persist in state.json; simulate a restored binding (both maps)
@@ -885,9 +1116,11 @@ describe("PiBot fire delivery", () => {
 
   it("sendAsAgent attributes sends on shared transports and logs them", async () => {
     const t = makeBot();
-    await t.bot.sendAsAgent("assistant", "mock:42", "hello from the tool");
+    const res = await t.bot.sendAsAgent("assistant", "mock:42", "hello from the tool");
     expect(t.transport.lastText()).toBe("**[assistant]** hello from the tool");
     expect(t.events.log).toHaveBeenCalledWith("assistant", "send", expect.stringContaining("mock:42"));
+    // the receipt names the destination even when the transport returns no message id
+    expect(res.receipts?.[0]).toMatchObject({ peer: "mock:42" });
   });
 
   it("sendAsAgent skips the prefix on the agent's own bot", async () => {
@@ -1060,7 +1293,7 @@ describe("cascade dead-letter loop guards", () => {
     await t.transport.say("hello there");
     expect(t.promptSpy).not.toHaveBeenCalled();
     expect(t.cascade.queueDead).toHaveBeenCalledTimes(1);
-    expect(t.cascade.queueDead).toHaveBeenCalledWith(expect.objectContaining({ text: "hello there", agentId: "assistant" }));
+    expect(t.cascade.queueDead).toHaveBeenCalledWith(expect.objectContaining({ text: "hello there", agentId: "assistant", source: "user" }));
     expect(t.transport.lastText()).toContain("couldn't reach any model");
   });
 
@@ -1119,6 +1352,19 @@ describe("cascade dead-letter loop guards", () => {
         id: "dl3", agentId: "assistant", transport: "mock", chatId: "42",
         text: "[cascade] Internal: the previous attempt hit a provider error on openai-codex/gpt-5.6-terra — continue answering the user's last message with the switched model. Do not mention models, errors, or failover.",
         createdAt: Date.now(), attempts: [], lastError: "x",
+      })
+      .mockReturnValue(undefined);
+    const n = await t.bot.flushDeadLetters();
+    expect(n).toBe(0);
+    expect(t.promptSpy).not.toHaveBeenCalled();
+  });
+
+  it("flushDeadLetters drops host-sourced entries even without an internal prefix (bd pibot-c38)", async () => {
+    (t.cascade.takeOneDead as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({
+        id: "dl-host", agentId: "assistant", transport: "mock", chatId: "42",
+        text: "Confirmed the location — saved it to the vault.",
+        createdAt: Date.now(), attempts: [], lastError: "x", source: "host",
       })
       .mockReturnValue(undefined);
     const n = await t.bot.flushDeadLetters();
@@ -1280,6 +1526,17 @@ describe("cascade dead-letter loop guards", () => {
     expect(notices).toHaveLength(1);
   });
 
+  it("does not repeat fallback notices after recovery or a different fallback", async () => {
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["primary/m", "fallback/m", "other/m"]);
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "model" } as never);
+    t.promptSpy.mockResolvedValue(undefined);
+    for (const model of ["fallback/m", "primary/m", "fallback/m", "other/m"]) {
+      await (t.bot as unknown as { maybeNotifyFallback: (...args: unknown[]) => Promise<void> })
+        .maybeNotifyFallback(t.transport, "42", "mock::42", "assistant", model, "primary/m", "hello");
+    }
+    expect(t.transport.pushed.filter((p) => p.opts.text.includes("answering on fallback model"))).toHaveLength(1);
+  });
+
   it("does not mistake historical assistant text for partial output on a terminal error", async () => {
     const original = {
       id: "dl-history", agentId: "assistant", transport: "mock", chatId: "42",
@@ -1436,6 +1693,7 @@ describe("MEDIA delivery observability", () => {
 
   it("records a dropped-media event when the transport cannot send media", async () => {
     const t = makeBot();
+    (t.transport as { sendMedia?: unknown }).sendMedia = undefined; // exercise the no-capability path (the mock now defaults to sending)
     primeTurn(t);
     await t.transport.say("attach test");
     expect(t.transport.pushed.map((p) => p.opts.text)).toEqual(["Files attached."]);
@@ -1483,9 +1741,12 @@ describe("voice transcript echo", () => {
 
 describe("task ack confirmations", () => {
   function sessionWithReply(text: string) {
+    const messages: unknown[] = []; // prompt() appends the reply — fresh-only extraction reads this turn's own output
     return {
-      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text }] }] } },
-      prompt: vi.fn(async () => {}),
+      agent: { state: { messages } },
+      prompt: vi.fn(async () => {
+        messages.push({ role: "assistant", content: [{ type: "text", text }] });
+      }),
       subscribe: vi.fn(() => () => {}),
       isStreaming: false,
     };
@@ -1505,8 +1766,10 @@ describe("task ack confirmations", () => {
   it("origin-chat routing: delegated work reports back to the chat the owner typed in", async () => {
     const t = makeBot();
     const sess = {
-      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] }] } },
-      prompt: vi.fn(async () => {}),
+      agent: { state: { messages: [] as unknown[] } },
+      prompt: vi.fn(async () => {
+        sess.agent.state.messages.push({ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] });
+      }),
       subscribe: vi.fn(() => () => {}),
       isStreaming: false,
     };
@@ -1647,6 +1910,65 @@ describe("task ack confirmations", () => {
     b.chatAgent.set(ck, agentId);
     b.agentChats.set(agentId, new Set([ck]));
   }
+});
+
+describe("session capability inventory at the acceptance path (bd pibot-4wq1)", () => {
+  function emptySession() {
+    return {
+      agent: { state: { messages: [] } },
+      prompt: vi.fn(async () => {}),
+      setModel: vi.fn(async () => {}),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+  }
+
+  it("records the delegated target's ACTUAL authorised capability set at acceptance", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(emptySession());
+    const inventory = {
+      agentId: "assistant",
+      sessionKey: "assistant::agent::assistant::from-knower",
+      chatKey: "agent::assistant::from-knower",
+      capabilities: ["memory"],
+      unavailable: ["commitments"],
+      capabilityContext: "- memory_save and memory_recall manage durable notes owned by this agent.",
+      authorisedTools: ["memory_save", "memory_recall"],
+      activeTools: ["memory_save", "memory_recall"],
+      evidence: "live-session" as const,
+      builtManifestSha: "sha-a",
+      currentManifestSha: "sha-a",
+      stale: false,
+      builtAt: 0,
+    };
+    (t.agents as unknown as { sessionInventory: unknown }).sessionInventory = vi.fn((_agentId: string, chatKey: string) =>
+      chatKey === "agent::assistant::from-knower" ? inventory : undefined
+    );
+
+    await (t.bot as unknown as { agentTurn(a: string, f: string, text: string): Promise<string> }).agentTurn(
+      "assistant", "knower", "file the Berlin takeaways"
+    );
+
+    const lines = (t.events.log as ReturnType<typeof vi.fn>).mock.calls
+      .map((call) => String(call[2]))
+      .filter((line) => line.includes("session-inventory"));
+    expect(lines.some((line) => line.includes("delegation accepted from knower"))).toBe(true);
+    expect(lines.some((line) => line.includes("live-session"))).toBe(true);
+    expect(lines.some((line) => line.includes("memory_save"))).toBe(true);
+    expect(lines.some((line) => line.includes("commitment_capture"))).toBe(false); // no unavailable grant surfaced
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("never claims a live inventory when the manager exposes none", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(emptySession());
+    await (t.bot as unknown as { agentTurn(a: string, f: string, text: string): Promise<string> }).agentTurn(
+      "assistant", "knower", "a quick inter-agent question"
+    );
+    const lines = (t.events.log as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[2]));
+    expect(lines.some((line) => line.includes("session-inventory"))).toBe(false);
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
 });
 
 describe("chat routing ownership", () => {
@@ -2031,8 +2353,10 @@ describe("acceptance acks for delegated work", () => {
   it("origin chat sees an immediate accepted-ack before the final result", async () => {
     const t = makeBot();
     const sess = {
-      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] }] } },
-      prompt: vi.fn(async () => {}),
+      agent: { state: { messages: [] as unknown[] } },
+      prompt: vi.fn(async () => {
+        sess.agent.state.messages.push({ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] });
+      }),
       subscribe: vi.fn(() => () => {}),
       isStreaming: false,
     };
@@ -2040,7 +2364,7 @@ describe("acceptance acks for delegated work", () => {
     // release the session prompt only after a tick so the ack has time to land first
     let release: () => void = () => {};
     const gate = new Promise<void>((r) => (release = r));
-    sess.prompt = vi.fn(async () => { await gate; });
+    sess.prompt = vi.fn(async () => { await gate; sess.agent.state.messages.push({ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] }); });
     setTimeout(release, 20);
     await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
       "fitness", "assistant", "implement the dashboard", undefined, { transport: "mock", chatId: "42" }
@@ -2051,6 +2375,43 @@ describe("acceptance acks for delegated work", () => {
     expect(ackIdx).toBeGreaterThanOrEqual(0);
     expect(ackIdx).toBeLessThan(doneIdx); // ack precedes the result
     expect(texts[ackIdx]).toContain("[assistant]");
+  });
+
+  it("agentAsk never replays prior-turn assistant text when this turn produced none (pibot-dff)", async () => {
+    const t = makeBot();
+    const sess = {
+      agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: "1. https://sierra.ai/blog/introducing-personal-agent-protocol — the stale Oct-14 digest" }] }] } },
+      prompt: vi.fn(async () => {
+        // wedged session: the model appends an EMPTY assistant message, nothing else
+        (sess.agent.state.messages as unknown[]).push({ role: "assistant", content: [] });
+      }),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
+    const reply = await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
+      "fitness", "assistant", "fresh digest, do NOT list any sources"
+    );
+    expect(reply).toBe("(no reply)"); // NOT the stale Sierra digest — replay is dead
+  });
+
+  it("agentAsk surfaces an explicit model error instead of stale content (pibot-dff)", async () => {
+    const t = makeBot();
+    const sess = {
+      agent: { state: { messages: [] as unknown[] } },
+      prompt: vi.fn(async () => {
+        // provider failure: prompt() resolves, the error lands on the assistant message
+        (sess.agent.state.messages as unknown[]).push({ role: "assistant", errorMessage: "HTTP 502 from ollama gateway", content: [] });
+      }),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
+    await expect(
+      (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
+        "fitness", "assistant", "anything"
+      )
+    ).rejects.toThrow(/HTTP 502 from ollama gateway/);
   });
 });
 
@@ -2463,5 +2824,443 @@ describe("PiBot host routing", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("background task model failover", () => {
+  let t: ReturnType<typeof makeBot>;
+  const run = () => ({ agentId: "assistant", chatKey: "mock:42", taskId: "tk1", title: "research", instructions: "find it", attempt: 1, resumed: false, signal: new AbortController().signal }) as never;
+  const failed = { role: "assistant", content: [], stopReason: "error", errorMessage: "429: weekly usage limit", timestamp: 1 };
+  const answered = { role: "assistant", content: [{ type: "text", text: "Found it: the answer." }], stopReason: "stop", timestamp: 2 };
+
+  beforeEach(() => { t = makeBot(); });
+  afterEach(() => { fs.rmSync(t.dir, { recursive: true, force: true }); });
+
+  it("switches to the next model when the primary errors instead of finishing with no summary", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["primary/m", "fallback/m"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("primary/m");
+    (t.cascade.nextCandidate as ReturnType<typeof vi.fn>).mockReturnValue("fallback/m");
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "m" } as never);
+    t.promptSpy.mockImplementationOnce(async () => { messages.push(failed); }).mockImplementationOnce(async () => { messages.push(answered); });
+
+    await expect(t.bot.runLedgerTask(run())).resolves.toBe("Found it: the answer.");
+    expect(t.cascade.noteFailure).toHaveBeenCalledWith("primary/m", "429: weekly usage limit");
+    expect(t.cascade.noteSuccess).toHaveBeenCalledWith("fallback/m");
+    expect(t.promptSpy.mock.calls[1][0]).toContain("[cascade] Internal");
+  });
+
+  it("fails the task with the provider error when every model is down", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementation(async () => { messages.push(failed); });
+
+    await expect(t.bot.runLedgerTask(run())).rejects.toThrow(/every model failed \(ollama\/test\): 429: weekly usage limit/);
+  });
+});
+
+describe("task media delivery receipts (bd pibot-zy70)", () => {
+  let t: ReturnType<typeof makeBot>;
+  const run = (extra: Record<string, unknown> = {}) =>
+    ({ agentId: "assistant", chatKey: "mock:42", taskId: "tk9", title: "make the circle", instructions: "send the video note", attempt: 1, resumed: false, signal: new AbortController().signal, ...extra }) as never;
+
+  beforeEach(() => { t = makeBot(); });
+  afterEach(() => { fs.rmSync(t.dir, { recursive: true, force: true }); });
+
+  it("delivers a MEDIA mp4 as a native video note when that was expected, with the receipt", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "MEDIA: /tmp/note-tk9.mp4\nHere is your round note." }], stopReason: "stop", timestamp: 2 });
+    });
+    const result = await t.bot.runLedgerTask(run({ expectedMedia: "video_note" }));
+    expect(t.transport.videoNoteSeen).toEqual([{ chatId: "42", filePath: "/tmp/note-tk9.mp4" }]);
+    expect(result).toMatchObject({ text: "Here is your round note.", delivery: { messageId: 66, mediaType: "video_note" } });
+  });
+
+  it("sends an ordinary non-mp4 attachment via sendMedia and stamps the actual media kind", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "MEDIA: /tmp/report-tk9.pdf\nThe report is attached." }], stopReason: "stop", timestamp: 2 });
+    });
+    const result = await t.bot.runLedgerTask(run());
+    expect(t.transport.videoNoteSeen).toEqual([]);
+    expect(t.transport.mediaSends).toEqual([{ chatId: "42", source: "/tmp/report-tk9.pdf" }]);
+    expect(result).toMatchObject({ text: "The report is attached.", delivery: { messageId: 77, mediaType: "document" } });
+  });
+
+  it("delivers text-only results unchanged, with no delivery field", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "Found it: the answer." }], stopReason: "stop", timestamp: 2 });
+    });
+    await expect(t.bot.runLedgerTask(run())).resolves.toBe("Found it: the answer.");
+    expect(t.transport.mediaSends).toEqual([]);
+    expect(t.transport.videoNoteSeen).toEqual([]);
+  });
+
+  it("delivers the result medium to an explicit different expectedPeer, never to the origin chat", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "MEDIA: /tmp/note-tk9.mp4\nSaved it for you." }], stopReason: "stop", timestamp: 2 });
+    });
+    const result = await t.bot.runLedgerTask(run({ expectedMedia: "video_note", expectedPeer: "mock:99" }));
+    expect(t.transport.videoNoteSeen).toEqual([{ chatId: "99", filePath: "/tmp/note-tk9.mp4" }]);
+    expect(result).toMatchObject({ delivery: { peer: "mock:99", mediaType: "video_note" } });
+  });
+
+  it("refuses with a precise blocker when the expected target has no reachable transport", async () => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "MEDIA: /tmp/note-tk9.mp4\nSaved it." }], stopReason: "stop", timestamp: 2 });
+    });
+    await expect(t.bot.runLedgerTask(run({ expectedMedia: "video_note", expectedPeer: "nosuch:7" }))).rejects.toThrow(/no reachable transport "nosuch"/);
+    expect(t.transport.videoNoteSeen).toEqual([]); // nothing sent to the origin chat either
+  });
+});
+
+// ─── transcription exec guard wiring into the background run (bd pibot-0xpf.4 review) ───
+
+describe("background task transcription guard wiring (bd pibot-0xpf.4)", () => {
+  let t: ReturnType<typeof makeBot>;
+  const run = (instructions: string, resumed = false) =>
+    ({ agentId: "assistant", chatKey: "mock:42", taskId: "tk-guard", title: "long audio", instructions, attempt: resumed ? 2 : 1, resumed, signal: new AbortController().signal }) as never;
+
+  beforeEach(() => { t = makeBot(); });
+  afterEach(() => { fs.rmSync(t.dir, { recursive: true, force: true }); });
+
+  const lastExtras = () => (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.at(-1)![11] as unknown[];
+
+  /** Capture the tool_call handlers a host-attached guard extension registers (as pi would run them). */
+  function guardHandlers(ext: unknown): Array<(event: unknown) => { block?: boolean } | void> {
+    const handlers: Array<(event: unknown) => { block?: boolean } | void> = [];
+    const pi = { on: (name: string, h: (event: unknown) => { block?: boolean } | void) => { if (name === "tool_call") handlers.push(h); }, registerTool: vi.fn() };
+    (ext as { factory: (p: unknown) => void }).factory(pi);
+    return handlers;
+  }
+
+  it("attaches the guard to the task's own session when the durable contract declares long audio", async () => {
+    const instructions = `${transcriptionPolicyMarker("chunked-external")}\nTRANSCRIPTION POLICY (owner instruction): chunks of <=15 min via Groq.`;
+    await t.bot.runLedgerTask(run(instructions));
+    const extras = lastExtras();
+    expect(extras).toHaveLength(1);
+    expect((extras[0] as { name?: string }).name).toBe("transcription-exec-guard");
+  });
+
+  it("passes a guard whose blocked exec_run argv never reaches execution", async () => {
+    const instructions = `${transcriptionPolicyMarker("chunked-external")}\nTRANSCRIPTION POLICY (owner instruction): chunks via Groq.`;
+    await t.bot.runLedgerTask(run(instructions));
+    const handlers = guardHandlers(lastExtras()[0]);
+    const result = handlers
+      .map((h) => h({ type: "tool_call", toolCallId: "c1", toolName: "exec_run", input: { argv: ["whisperkit-cli", "x.wav"] } }))
+      .find((r) => r?.block);
+    expect(result?.block).toBe(true);
+  });
+
+  it("re-attaches the guard on a resumed attempt, from the durable contract", async () => {
+    const instructions = `${transcriptionPolicyMarker("probe-required")}\nPROBE the duration first.`;
+    await t.bot.runLedgerTask(run(instructions, true));
+    expect(lastExtras()).toHaveLength(1);
+  });
+
+  it("attaches nothing for a task with no audio contract (short/unrelated tasks unaffected)", async () => {
+    await t.bot.runLedgerTask(run("just write the summary, no audio here"));
+    expect(lastExtras()).toEqual([]);
+  });
+});
+
+// ─── delivery-proof logging: the real composition PiBot + durable ledger (bd pibot-7jqj) ───
+const pollUntil = async <T>(read: () => Promise<T>, ok: (v: T) => boolean, ms = 3000): Promise<T> => {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = await read();
+    if (ok(v)) return v;
+    if (Date.now() > end) throw new Error("poll timed out");
+    await new Promise((res) => setTimeout(res, 10));
+  }
+};
+
+describe("task ledger integration: media-type gate end to end", () => {
+  let t: ReturnType<typeof makeBot>;
+  let ledger: import("../durable/task-ledger.js").TaskLedger;
+  let notes: string[];
+
+  beforeEach(async () => {
+    t = makeBot();
+    notes = [];
+    const { openTaskLedger } = await import("../durable/task-ledger.js");
+    ledger = await openTaskLedger({
+      // the exact composition the daemon runs (src/index.ts): runner through the bot
+      runner: { run: (task) => t.bot.runLedgerTask(task), notify: async (ck, text) => { notes.push(text); await t.bot.notifyChat(ck, text); } },
+    });
+  });
+  afterEach(async () => {
+    await ledger.close();
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  async function stubTaskTurn(text: string) {
+    // the fake sessions are promptSpy-driven; the mock fires on the next prompt() — the task turn
+    const session = await t.agents.getOrCreateSession("assistant", "probe", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: 2 });
+    });
+  }
+
+  it("records done with a video_note receipt when the task really delivered a round note", async () => {
+    await stubTaskTurn("MEDIA: /tmp/note-it1.mp4\nHere is your round note.");
+    const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "video note", instructions: "make it", expectedMedia: "video_note" });
+    const done = await pollUntil(() => ledger.get(task.id), (e) => e?.status === "done");
+    expect(done!.delivery).toMatchObject({ messageId: 66, mediaType: "video_note", peer: "mock:42", account: "@mockbot", idProtocol: "bot_api", evidence: "ack" });
+    expect(done!.delivery!.deliveredAt).toBeTruthy();
+    expect(t.transport.videoNoteSeen).toEqual([{ chatId: "42", filePath: "/tmp/note-it1.mp4" }]);
+    expect(notes[0]).toContain("✅ Task done");
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Task done"))).toBe(true);
+  });
+
+  it("records partial with evidence when the delivered medium is not the requested kind", async () => {
+    await stubTaskTurn("MEDIA: /tmp/report-it2.pdf\nHere is the pdf.");
+    const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "video note", instructions: "make it", expectedMedia: "video_note" });
+    const entry = await pollUntil(() => ledger.get(task.id), (e) => e?.status === "partial");
+    expect(entry!.delivery).toMatchObject({ mediaType: "document" });
+    expect(entry!.error).toContain("requested video_note but delivered document");
+    expect(notes[0]).toContain("🟡 Task partial");
+    expect(notes[0]).not.toContain("Task done");
+  });
+
+  it("records partial when the receipt attests a different destination than the task's chat", async () => {
+    t.transport.receiptPeer = "mock:99"; // the message id belongs to another dialogue
+    await stubTaskTurn("MEDIA: /tmp/note-it3.mp4\nHere is your round note.");
+    const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "video note", instructions: "make it", expectedMedia: "video_note" });
+    const entry = await pollUntil(() => ledger.get(task.id), (e) => e?.status === "partial");
+    expect(entry!.error).toContain("delivered to mock:99 instead of mock:42");
+    expect(entry!.delivery).toMatchObject({ messageId: 66, mediaType: "video_note", peer: "mock:99" });
+    expect(notes[0]).toContain("🟡 Task partial");
+    expect(notes[0]).not.toContain("Task done");
+  });
+});
+
+describe("video_note_send routing", () => {
+  it("routes to the invoking transport and chat, rejects other targets", async () => {
+    const t = makeBot();
+    await t.transport.say("hello"); // binds mock:42 → assistant session
+    const hooks = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls[0][8] as (
+      transport: string,
+      chatId: string,
+      filePath: string,
+    ) => Promise<void>;
+    expect(hooks).toBeTypeOf("function");
+    await hooks("mock", "42", "/tmp/circle.mp4");
+    expect(t.transport.videoNoteSeen).toEqual([{ chatId: "42", filePath: "/tmp/circle.mp4" }]);
+    await expect(hooks("mock", "43", "/tmp/circle.mp4")).rejects.toThrow(/invoking chat/i);
+  });
+});
+
+// ─── /goal execution-method preflight (bd pibot-0xpf.1) ─────────────────────
+
+describe("/goal execution-method preflight (bd pibot-0xpf.1)", () => {
+  /** an injected, deterministic probe — production uses the bounded local PATH/docs probe */
+  const probe = (over: { which?: (c: string) => string | null; docs?: (c: string) => string[] } = {}) => ({
+    which: over.which ?? (() => null),
+    docs: over.docs ?? (() => []),
+  });
+  const stateGoals = (t: ReturnType<typeof makeBot>) => JSON.parse(fs.readFileSync(path.join(t.dir, "state.json"), "utf8")).goals;
+
+  it("parks a goal whose named method is unresolved instead of spending a turn", async () => {
+    const t = makeBot();
+    (t.bot as unknown as { deps: { methodProbe: unknown } }).deps.methodProbe = probe();
+    await t.transport.say("/goal use cmd acp to summarise the backlog");
+    expect(t.promptSpy).not.toHaveBeenCalled(); // no model spend
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal not started"))).toBe(true);
+    expect(stateGoals(t)["mock:42"].methodBlocker).toMatchObject({ reason: "unknown_method" });
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("does not treat ordinary prose ('use evidence and examples') as a required method", async () => {
+    const t = makeBot();
+    (t.bot as unknown as { deps: { methodProbe: unknown } }).deps.methodProbe = probe();
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementation(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }] });
+    });
+    await t.transport.say("/goal use evidence and examples to compare three systems");
+    expect(t.promptSpy).toHaveBeenCalled();
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal set"))).toBe(true);
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("notifies ONCE for a repeated identical blocker and clears it on explicit resume", async () => {
+    const t = makeBot();
+    const bot = t.bot as unknown as { deps: { methodProbe: unknown } };
+    bot.deps.methodProbe = probe();
+    await t.transport.say("/goal use cmd acp to do it");
+    expect(t.transport.pushed.filter((p) => p.opts.text.includes("Goal not started")).length).toBe(1);
+    // resume while still blocked: the identical blocker produces no second notice, no spend
+    await t.transport.say("/goal resume");
+    expect(t.transport.pushed.filter((p) => p.opts.text.includes("Still blocked")).length).toBe(0);
+    expect(t.promptSpy).not.toHaveBeenCalled();
+    // the owner resolves the method → explicit resume clears the blocker and activates the goal
+    bot.deps.methodProbe = probe({ which: (c) => (c === "cmd" ? "/usr/local/bin/cmd" : null), docs: () => ["/skills/herdr.md"] });
+    await t.transport.say("/goal resume");
+    const goal = stateGoals(t)["mock:42"];
+    expect(goal.methodBlocker).toBeUndefined();
+    expect(goal.status).toBe("active");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("does not spend a turn on an installed-but-unavailable method on the production default path", async () => {
+    const t = makeBot();
+    // NO injected probe: production goalMethodProbe() runs. A real `cmd` on PATH is "installed", but
+    // this agent holds no exec/herdr/bash route (DEFAULT_EXEC_ALLOWLIST has no cmd; HERDR_AGENTS
+    // excludes it), so the honest preflight blocks it rather than spending a turn.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-goalpath-"));
+    fs.writeFileSync(path.join(dir, "cmd"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${dir}${path.delimiter}${prevPath ?? ""}`;
+    try {
+      await t.transport.say("/goal use cmd acp to summarise the backlog");
+      expect(t.promptSpy).not.toHaveBeenCalled(); // no model spend
+      expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal not started"))).toBe(true);
+      expect(stateGoals(t)["mock:42"].methodBlocker).toMatchObject({ reason: "not_permitted" });
+    } finally {
+      process.env.PATH = prevPath;
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(t.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a method the agent can actually run through its shell (permission preflight)", async () => {
+    const t = makeBot();
+    // give this agent a real shell route; the binary then resolves on PATH and the goal may start
+    const base = (t.agents.getAgent as ReturnType<typeof vi.fn>).getMockImplementation() as (id: string) => unknown;
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "assistant"
+        ? { id, dir: "/tmp/fake-assistant", manifest: { name: id, description: "d", tools: ["bash"], heartbeat: { enabled: true, interval: "45m" }, evolution: { enabled: true, interval: "6h" } } }
+        : base(id),
+    );
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/test"]);
+    (t.cascade.firstHealthy as ReturnType<typeof vi.fn>).mockReturnValue("ollama/test");
+    t.promptSpy.mockImplementation(async () => {
+      t.emitSessionEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }] });
+    });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-goalpath-"));
+    fs.writeFileSync(path.join(dir, "pytest"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${dir}${path.delimiter}${prevPath ?? ""}`;
+    try {
+      await t.transport.say("/goal run pytest to check the suite");
+      expect(t.promptSpy).toHaveBeenCalled();
+      expect(t.transport.pushed.some((p) => p.opts.text.includes("Goal set"))).toBe(true);
+      expect(stateGoals(t)["mock:42"].methodBlocker).toBeUndefined();
+    } finally {
+      process.env.PATH = prevPath;
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(t.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── duration-aware voice transcription (bd pibot-0xpf.4) ───────────────────
+
+describe("duration-aware voice transcription (bd pibot-0xpf.4)", () => {
+  const speechAgent = (t: ReturnType<typeof makeBot>, sttProviders: string[], allowExternalStt = false) => {
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "assistant" ? { id, dir: "/tmp/fake-assistant", manifest: { name: id, speech: { sttProviders, allowExternalStt } } } : undefined
+    );
+  };
+  const chunkedOk = (text = "chunk one chunk two") =>
+    vi.fn(async () => ({ ok: true as const, route: "chunked-external" as const, provider: "groq" as const, text, durationSec: 1200, chunks: 2, transcripts: ["chunk one", "chunk two"] }));
+
+  it("chunks known >15-min audio through Groq and shows the chunked transcript", async () => {
+    const t = makeBot();
+    speechAgent(t, ["groq"], true);
+    (t.stt as unknown as { hostProviderIds: string[] }).hostProviderIds = ["groq"];
+    const transcribeChunked = chunkedOk();
+    (t.stt as unknown as { transcribeChunked: unknown }).transcribeChunked = transcribeChunked;
+    t.audioMedia.prepare.mockResolvedValueOnce({ ok: true, filePath: "/tmp/long.ogg", durationSec: 1200, cleanup: vi.fn(async () => {}) } as never);
+    await t.transport.sayMedia({ kind: "voice", durationSec: 1200 });
+    expect(transcribeChunked).toHaveBeenCalledOnce();
+    expect(t.stt.transcribe).not.toHaveBeenCalled(); // no local fallback
+    expect(t.promptSpy.mock.calls[0][0]).toContain("chunk one chunk two");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("blocks — never substituting local WhisperKit — when the approved Groq route is unavailable", async () => {
+    const t = makeBot();
+    speechAgent(t, ["whisperkit"]);
+    (t.stt as unknown as { hostProviderIds: string[] }).hostProviderIds = ["whisperkit"];
+    (t.stt as unknown as { transcribeChunked: unknown }).transcribeChunked = vi.fn();
+    t.audioMedia.prepare.mockResolvedValueOnce({ ok: true, filePath: "/tmp/long.ogg", durationSec: 1200, cleanup: vi.fn(async () => {}) } as never);
+    await t.transport.sayMedia({ kind: "voice", durationSec: 1200 });
+    expect(t.stt.transcribe).not.toHaveBeenCalled(); // no forbidden local fallback
+    expect(t.transport.lastText()).toContain("Transcription failed");
+    expect(t.transport.lastText()).toContain("Groq");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("probes an unknown duration rather than assuming it is short or long", async () => {
+    const t = makeBot();
+    speechAgent(t, ["groq"], true);
+    (t.stt as unknown as { hostProviderIds: string[] }).hostProviderIds = ["groq"];
+    // the probe (inside transcribeChunked) finds it short → re-plans to the normal chain
+    const transcribeChunked = vi.fn(async () => ({ ok: false as const, route: "policy" as const, provider: "none" as const, text: "", durationSec: 30, chunks: 0, transcripts: [] as string[], error: "route this audio through the normal transcription path" }));
+    (t.stt as unknown as { transcribeChunked: unknown }).transcribeChunked = transcribeChunked;
+    t.audioMedia.prepare.mockResolvedValueOnce({ ok: true, filePath: "/tmp/unknown.ogg", durationSec: undefined, cleanup: vi.fn(async () => {}) } as never);
+    t.stt.transcribe.mockResolvedValueOnce({ ok: true, text: "short words", provider: "groq" });
+    await t.transport.sayMedia({ kind: "voice" });
+    expect(transcribeChunked).toHaveBeenCalledOnce(); // probed, not assumed
+    expect(t.stt.transcribe).toHaveBeenCalled();
+    expect(t.promptSpy.mock.calls[0][0]).toContain("short words");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+});
+
+// ─── heartbeat relative-date correction (bd pibot-wr9m) ─────────────────────
+
+describe("heartbeat relative-date correction (bd pibot-wr9m)", () => {
+  it("rewrites a mis-stated relative date in automated proactive output", async () => {
+    const t = makeBot();
+    await t.transport.say("remember this chat"); // bind mock:42 → assistant
+    t.transport.pushed = [];
+    const spy = vi.spyOn(Date, "now").mockReturnValue(Date.UTC(2026, 9, 26, 6, 32));
+    try {
+      await t.bot.deliverToAgent("assistant", "Дедлайн сегодня — 2 ноября.");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(t.transport.lastText()).toContain("через 7 дней");
+    expect(t.transport.lastText()).not.toContain("сегодня");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+});
+
+// ─── guarded manifest writes (bd pibot-4wq1) ────────────────────────────────
+
+describe("guarded manifest writes (bd pibot-4wq1)", () => {
+  it("/model writes only the model field, preserving unrelated manifest fields", async () => {
+    const t = makeBot();
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-model-preserve-"));
+    const manifestPath = path.join(agentDir, "agent.json");
+    fs.writeFileSync(manifestPath, JSON.stringify({ name: "assistant", description: "d", capabilities: ["speech", "tasks", "commitments"], telegram: { token: "secret" } }));
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "assistant" ? { id, dir: agentDir, manifest: JSON.parse(fs.readFileSync(manifestPath, "utf8")) } : undefined
+    );
+    (t.cascade.chainFor as ReturnType<typeof vi.fn>).mockReturnValue(["ollama/a:cloud"]);
+    (t.cascade.isPermitted as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    (t.cascade.resolveModel as ReturnType<typeof vi.fn>).mockReturnValue({ id: "a" } as never);
+    await t.transport.say("/model ollama/a:cloud");
+    const written = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    expect(written.model).toBe("ollama/a:cloud");
+    expect(written.capabilities).toEqual(["speech", "tasks", "commitments"]);
+    expect(written.telegram).toEqual({ token: "secret" });
+    expect(t.agents.updateManifest).toHaveBeenCalledWith("assistant", { model: "ollama/a:cloud" });
+    fs.rmSync(agentDir, { recursive: true, force: true });
   });
 });

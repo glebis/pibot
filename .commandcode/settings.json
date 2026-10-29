@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(cmd:*)",
+      "Shell(bd:*)",
+      "Shell(python3 -c import json,sys; d=json.load(sys.stdin); print(len(d)); [print(f\"{i['id']} P{i['priority']} {i['title']}\") for i in sorted(d,key=lambda x:x['priority'])])"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

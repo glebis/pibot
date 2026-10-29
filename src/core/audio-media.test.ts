@@ -50,7 +50,7 @@ describe("AudioMediaProcessor", () => {
     expect(fs.existsSync(file)).toBe(false);
   });
 
-  it("extracts only the bounded audio track from a video note into a private safe file", async () => {
+  it.each([false, true])("extracts video-note audio with optional original retention (%s)", async (retain) => {
     const { root, file } = fixture("private-chat-77-video_note.mp4");
     const execFileMock = vi.fn((
       bin: string,
@@ -83,8 +83,12 @@ describe("AudioMediaProcessor", () => {
     const ffmpegCall = execFileMock.mock.calls.find((call) => String(call[0]).endsWith("ffmpeg"));
     expect(ffmpegCall?.[1]).toEqual(expect.arrayContaining(["-vn", "-ac", "1", "-ar", "16000"]));
 
+    if (retain) {
+      expect(result.retainVideo?.()).toBe(fs.realpathSync(file));
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    }
     await result.cleanup();
-    expect(fs.existsSync(file)).toBe(false);
+    expect(fs.existsSync(file)).toBe(retain);
     expect(fs.existsSync(result.filePath)).toBe(false);
   });
 

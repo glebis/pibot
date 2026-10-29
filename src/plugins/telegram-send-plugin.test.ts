@@ -55,6 +55,49 @@ describe("telegram-send plugin", () => {
     expect(r.content[0].text).toContain("Nothing sent");
   });
 
+  it("reports the destination-aware receipt tuple without overclaiming delivery", async () => {
+    const send = vi.fn(async () => ({
+      sent: 1,
+      targets: ["telegram:42"],
+      receipts: [{ peer: "telegram:42", messageId: 7, mediaType: "video_note", idProtocol: "bot_api", evidence: "ack" as const }],
+    }));
+    const { tools } = pluginFor({ send, chats: () => [] });
+    const r = await tools.get("telegram_send")!.execute("t1", { text: "round note" });
+    expect(r.content[0].text).toContain("telegram:42");
+    expect(r.content[0].text).toContain("message 7");
+    expect(r.content[0].text).toContain("video_note");
+    expect(r.content[0].text).toContain("bot_api id");
+    // an API ack is not a readback or a view — the report must say so
+    expect(r.content[0].text).toContain("API acknowledgement");
+    expect(r.details.receipts).toHaveLength(1);
+  });
+
+  it("treats an id-less ack as unverified instead of claiming the message was delivered", async () => {
+    const send = vi.fn(async () => ({ sent: 1, targets: ["telegram:42"], receipts: [{ peer: "telegram:42" }] }));
+    const { tools } = pluginFor({ send, chats: () => [] });
+    const r = await tools.get("telegram_send")!.execute("t1", { text: "hi" });
+    expect(r.content[0].text).toContain("telegram:42");
+    expect(r.content[0].text).toContain("no message id came back");
+    expect(r.content[0].text).not.toContain("Sent ✅");
+  });
+
+  it("persists the bot account and calls a receipt without one incomplete", async () => {
+    const send = vi.fn(async () => ({
+      sent: 2,
+      targets: ["telegram:42", "telegram:43"],
+      receipts: [
+        { peer: "telegram:42", messageId: 7, mediaType: "video_note", idProtocol: "bot_api", account: "@pibot", evidence: "ack" as const },
+        { peer: "telegram:43", messageId: 8, mediaType: "text" },
+      ],
+    }));
+    const { tools } = pluginFor({ send, chats: () => [] });
+    const r = await tools.get("telegram_send")!.execute("t1", { text: "x" });
+    expect(r.content[0].text).toContain("as @pibot");
+    // a receipt missing the account and the id namespace must not read as a complete delivery
+    expect(r.content[0].text).toContain("incomplete (no account/id protocol)");
+    expect(r.details.receipts).toHaveLength(2);
+  });
+
   it("telegram_chats lists reachable chats and explains empty state", async () => {
     const chats = vi.fn(() => [{ chat: "telegram:42", dedicated: false, owned: false }]);
     let { tools } = pluginFor({ send: vi.fn(), chats });

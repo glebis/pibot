@@ -1,4 +1,4 @@
-import { UrgentCallEscalation, type CallDecision, type CallDispatchInput, type CallDispatcher, type CallPolicy, type EscalationDependencies } from './escalation.js';
+import { UrgentCallEscalation, type CallDecision, type CallDispatchInput, type CallDispatcher, type CallPolicy, type CallAttempt, type CallUsageEvidence, type EscalationDependencies } from './escalation.js';
 
 export interface CoordinatorVoiceSnapshot {
   paused: boolean; workerHealthy?: boolean;
@@ -8,7 +8,7 @@ export interface CoordinatorVoiceSnapshot {
 export interface VoiceCoordinatorOptions {
   coordinator:{inspect():CoordinatorVoiceSnapshot}; databasePath:string; policy:CallPolicy;
   authority:EscalationDependencies['authority']; sourceAuthority:EscalationDependencies['sourceAuthority'];
-  phoneURL:string; phoneToken:string; fetch?:typeof fetch; clock?:()=>number; timeoutMs?:number;
+  phoneURL:string; phoneToken:string; reconcileUsage?:boolean; fetch?:typeof fetch; clock?:()=>number; timeoutMs?:number;
 }
 
 /** One local request; any uncertainty remains charged and cannot initiate a retry. */
@@ -32,6 +32,25 @@ export function localPhoneDispatcher(options:Pick<VoiceCoordinatorOptions,'polic
   }};
 }
 
+/** Read-only billing lookup. Evidence validation and budget changes belong to the gate. */
+export function localPhoneUsage(options:Pick<VoiceCoordinatorOptions,'phoneURL'|'phoneToken'|'fetch'|'timeoutMs'>) {
+  // Reuse the exact loopback origin and credential validation of call control.
+  localPhoneDispatcher({...options,policy:{} as CallPolicy});
+  const request=options.fetch??fetch;
+  return {async check(attempt:CallAttempt):Promise<CallUsageEvidence|null>{
+    if(!/^[A-Za-z0-9_-]{1,128}$/.test(attempt.attemptId))return null;
+    const response=await request(new URL(`/control/calls/${encodeURIComponent(attempt.attemptId)}/usage`,options.phoneURL),{
+      method:'GET',redirect:'error',signal:AbortSignal.timeout(options.timeoutMs??10000),
+      headers:{authorization:`Bearer ${options.phoneToken}`},
+    });
+    if(!response.ok)return null;
+    const reader=response.body?.getReader();if(!reader)return null;
+    const chunks:Uint8Array[]=[];let size=0;
+    for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>16384){await reader.cancel();return null;}chunks.push(value);}
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  }};
+}
+
 /** Adapter only: consent and source authority are supplied by their trusted owners. */
 export class VoiceCoordinatorRuntime {
   private gate:UrgentCallEscalation;
@@ -43,7 +62,7 @@ export class VoiceCoordinatorRuntime {
   constructor(private options:VoiceCoordinatorOptions){
     this.policy={...options.policy};
     if(!/^telegram(?::[a-zA-Z0-9_-]+)?:[1-9]\d{0,19}$/.test(this.policy.canonicalChatId))throw new Error('Voice coordinator requires a canonical private Telegram chat');
-    this.gate=new UrgentCallEscalation({databasePath:options.databasePath,policy:this.policy,authority:options.authority,sourceAuthority:options.sourceAuthority,dispatcher:localPhoneDispatcher({...options,policy:this.policy}),clock:options.clock,decisions:()=>this.decisions()});
+    this.gate=new UrgentCallEscalation({databasePath:options.databasePath,policy:this.policy,authority:options.authority,sourceAuthority:options.sourceAuthority,dispatcher:localPhoneDispatcher({...options,policy:this.policy}),...(options.reconcileUsage?{usageReconciler:localPhoneUsage(options)}:{}),clock:options.clock,decisions:()=>this.decisions()});
   }
   private decisions():CallDecision[]{
     const snapshot=this.options.coordinator.inspect();

@@ -75,6 +75,18 @@ describe("exec plugin allowlist resolution", () => {
     expect(r.error).toMatch(/shell metacharacters/);
   });
 
+  it("allows space-bounded '|' as plain data but refuses pipe-shaped args", async () => {
+    const plain = path.join(agentDir, "bin/fake-plain");
+    for (const arg of ["%(title)s | %(channel)s", "a | b", "a |", "A | B | C"]) {
+      const r = await resolveExec([plain, arg], { workspace: agentDir, agentDir }, allow);
+      expect(r.error, arg).toBeUndefined();
+    }
+    for (const arg of ["a |b", "a| b", "a|b", "| b", "  | b", "a > b", "a ; b", "$(id)", "a && b", "a || b", "`id`"]) {
+      const r = await resolveExec([plain, arg], { workspace: agentDir, agentDir }, allow);
+      expect(r.error, arg).toMatch(/shell metacharacters/);
+    }
+  });
+
   it("enforces pin: python3-style pinned script must match exactly", async () => {
     const py = path.join(agentDir, "bin/fake-py");
     const ok = await resolveExec([py, "/tmp/fake/pinned.py", "--flag", "x"], { workspace: agentDir, agentDir }, allow);
@@ -83,6 +95,24 @@ describe("exec plugin allowlist resolution", () => {
     expect(bad.error).toMatch(/pinned/);
     const missing = await resolveExec([py], { workspace: agentDir, agentDir }, allow);
     expect(missing.error).toMatch(/pinned/);
+  });
+
+  it("browserbase-fetch pin: exactly one https positional, no flags (free-tier wrapper)", async () => {
+    const py = path.join(agentDir, "bin/fake-py");
+    const pin = path.join(os.homedir(), ".agents/skills/browserbase-fetch/scripts/bb_fetch.py");
+    const allowBB: ExecAllowEntry[] = [
+      { bin: py, pin: [pin], allowPositionalRe: /^https:\/\//, positionals: { min: 1, max: 1 } },
+    ];
+    const deps = { workspace: agentDir, agentDir };
+    const ok = await resolveExec([py, pin, "https://www.ai-first.company/"], deps, allowBB);
+    expect(ok.error).toBeUndefined();
+    expect((await resolveExec([py, pin, "http://insecure.example/"], deps, allowBB)).error).toMatch(/not allowed/);
+    const twoPos = await resolveExec([py, pin, "https://a.test/x", "https://b.test/y"], deps, allowBB);
+    expect(twoPos.error).toMatch(/positional/);
+    const flagRider = await resolveExec([py, pin, "https://a.test/x", "--header", "Cookie: x"], deps, allowBB);
+    expect(flagRider.error).toMatch(/positional|not allowed/);
+    const wrongPin = await resolveExec([py, "/tmp/fake/other.py", "https://a.test/x"], deps, allowBB);
+    expect(wrongPin.error).toMatch(/pinned/);
   });
 
   it("enforces requireScriptUnder: script files must live under the agent dir", async () => {
@@ -216,16 +246,29 @@ describe("default allowlist hardening (bypass regressions)", () => {
       }
     });
 
-    it("-o/--output must stay workspace-relative", async () => {
-      for (const o of ["/etc/x", "../../x", "a/../../x", "~/x", "~"]) {
+    it("resolves the argvs from knower's blocked sessions (2026-10-19 regressions)", async () => {
+      // 17:54 session: the runner refused this for the pipe in --print; -o is now allowed under the agent dir
+      expect((await yt("--skip-download", "--write-auto-subs", "--write-subs", "--sub-langs", "en.*", "--sub-format", "vtt",
+        "-o", path.join(agentDir, "7T-gldvgfpo.%(ext)s"), "--print", "%(title)s | %(channel)s | %(upload_date)s", URL)).error).toBeUndefined();
+      // 16:22 session: multi-line --print + absolute -o under the agent dir
+      expect((await yt("--skip-download", "--print", "%(title)s\n%(channel)s\n%(description)s\n%(subtitles)j",
+        "--write-auto-subs", "--write-subs", "--sub-langs", "en.*", "--sub-format", "vtt",
+        "-o", path.join(agentDir, "70fH1KGSlOo.%(ext)s"), URL)).error).toBeUndefined();
+    });
+
+    it("-o/--output must stay under the agent's workspace or agent dir", async () => {
+      fs.symlinkSync("/tmp", path.join(agentDir, "outdir-link"));
+      for (const o of ["/etc/x", "../../x", "a/../../x", "~/x", "~", "outdir-link/x.mp3", path.join(agentDir, "scripts/x.scpt")]) {
         expect((await yt("-o", o, URL)).error, o).toMatch(/not allowed/);
         expect((await yt(`--output=${o}`, URL)).error, o).toMatch(/not allowed/);
       }
       expect((await yt("-o", "out/%(id)s.%(ext)s", URL)).error).toBeUndefined();
+      expect((await yt("-o", path.join(agentDir, "out.%(ext)s"), URL)).error).toBeUndefined();
+      expect((await yt("-o", path.join(agentDir, "media/x.%(ext)s"), URL)).error).toBeUndefined();
     });
 
     it("-o refuses type prefixes (their template may be absolute)", async () => {
-      for (const o of ["subtitle:/Users/x/.zshrc", "infojson:/tmp/x", "pl_thumbnail:x", "SUBTITLE:x"]) {
+      for (const o of ["subtitle:/Users/x/.zshrc", "infojson:/tmp/x", "pl_thumbnail:x", "SUBTITLE:x", "subtitle:~/x"]) {
         expect((await yt("-o", o, URL)).error, o).toMatch(/not allowed/);
         expect((await yt(`--output=${o}`, URL)).error, o).toMatch(/not allowed/);
       }
@@ -236,6 +279,11 @@ describe("default allowlist hardening (bypass regressions)", () => {
         expect((await yt("-o", o, URL)).error, o).toMatch(/not allowed/);
       }
       expect((await yt("-o", "materials/scripts-notes.%(ext)s", URL)).error).toBeUndefined();
+    });
+
+    it("--print template values stay plain data space-bounded pipe ok, shell shapes refused", async () => {
+      expect((await yt("--print", "%(title)s | %(channel)s", URL)).error).toBeUndefined();
+      expect((await yt("--print", "%(title)s > %(channel)s", URL)).error).toMatch(/shell metacharacters/);
     });
 
     it("positionals must be https URLs; value flags need a safe value", async () => {
@@ -325,6 +373,14 @@ describe("default allowlist hardening (bypass regressions)", () => {
       expect((await curl("-sL", "--max-time", "15", "--next", "https://evil.example/y")).error).toMatch(/exactly one/);
       expect((await curl("-sL", "https://api.github.com/x")).error).toMatch(/pinned/);
     });
+
+    it("arbitrary-https entry permits exactly one https URL GET, no extra flags, sibling of the github pin (pibot fleet Oct 20)", async () => {
+      const curl20 = (...args: string[]) => run("curl:-sL --max-time 20", ...args);
+      expect((await curl20("-sL", "--max-time", "20", "https://www.ai-first.company/")).error).toBeUndefined();
+      expect((await curl20("-sL", "--max-time", "20", "http://insecure.example/x")).error).toMatch(/exactly one/);
+      expect((await curl20("-sL", "--max-time", "20", "https://a.example/x", "-H", "Cookie: x")).error).toMatch(/exactly one/);
+      expect((await curl20("-sL", "-o", "/tmp/x", "https://a.example/x")).error).toMatch(/pinned|exactly one/);
+    });
   });
 });
 
@@ -355,5 +411,122 @@ describe("exec plugin tool", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+  it("groq-parts pin: pin-only wrapper takes exactly one existing-file positional; dash args refused", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-groq-"));
+    const py = path.join(dir, "fake-py");
+    fs.writeFileSync(py, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(py, 0o755);
+    const pin = path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_parts.py");
+    const allowBB: ExecAllowEntry[] = [
+      { bin: py, pin: [pin], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
+    ];
+    const deps = { workspace: dir, agentDir: dir };
+    const ok = await resolveExec([py, pin, "/Users/x/chalmers.m4a"], deps, allowBB);
+    expect(ok.error).toBeUndefined();
+    const dash = await resolveExec([py, pin, "x.m4a", "--model", "whisper-large-v3-turbo"], deps, allowBB);
+    expect(dash.error).toMatch(/flag-like/);
+    const twoPos = await resolveExec([py, pin, "a.m4a", "b.m4a"], deps, allowBB);
+    expect(twoPos.error).toMatch(/positional/);
+  });
+
+
+  it("groq key setup: pin-only intake takes no positionals (dialog-driven, zero argv surface)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-groqsetup-"));
+    const py = path.join(dir, "fake-py");
+    fs.writeFileSync(py, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(py, 0o755);
+    const pin = path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_key_setup.py");
+    const allowBB: ExecAllowEntry[] = [{ bin: py, pin: [pin], allowPositionalRe: /^[^-]/, positionals: { max: 2 } }];
+    const deps = { workspace: dir, agentDir: dir };
+    const ok = await resolveExec([py, pin, "keychain"], deps, allowBB);
+    expect(ok.error).toBeUndefined();
+    const ok2 = await resolveExec([py, pin, "sops"], deps, allowBB);
+    expect(ok2.error).toBeUndefined();
+    const dash = await resolveExec([py, pin, "--env-file", "x"], deps, allowBB);
+    expect(dash.error).toMatch(/flag-like|not allowed/);
+    const three = await resolveExec([py, pin, "keychain", "sops", "extra"], deps, allowBB);
+    expect(three.error).toBeTruthy();
+  });
+
+describe('exec trace tools', () => {
+  it('registers private audit search and confined output reader, and traces refusals', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-audit-tools-'));
+    try {
+      const { pi, tools } = captureTools();
+      factoryOf(execPlugin({ agentDir: dir, workspace: dir, allowlist: [] }))(pi);
+      expect(tools.has('exec_audit_search')).toBe(true);
+      expect(tools.has('exec_result_read')).toBe(true);
+      await tools.get('exec_run')!.execute('call-youtube', { argv: ['/bin/echo', 'https://youtube.com/shorts/N8mV_E3IcZU?token=SECRET'], taskId: 'task-short' });
+      const rows = await tools.get('exec_audit_search')!.execute('search', { query: 'task-short' });
+      expect(rows.content[0].text).toContain('refused');
+      expect(rows.content[0].text).toContain('call-youtube');
+      expect(rows.content[0].text).not.toContain('SECRET');
+      const denied = await tools.get('exec_result_read')!.execute('read', { path: '../../agent.json' });
+      expect(denied.details.ok).toBe(false);
+      fs.mkdirSync(path.join(dir, 'runtime', 'artifacts'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'runtime', 'artifacts', 'captions.txt'), 'x'.repeat(100));
+      const page = await tools.get('exec_result_read')!.execute('read', { path: 'captions.txt', offset: 40, limit: 20 });
+      const extract = JSON.parse(page.content[0].text);
+      expect(extract).toMatchObject({ path: 'captions.txt', totalBytes: 100, offset: 40, bytes: 20, truncated: true, nextOffset: 60 });
+      expect(extract.content).toBe('x'.repeat(20));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('exec outcome audit', () => {
+  it('records actual success and failure while keeping stdout out of the audit', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-outcomes-'));
+    try {
+      const script = path.join(dir, 'exit-two'); fs.writeFileSync(script, '#!/bin/sh\nexit 2\n'); fs.chmodSync(script, 0o700);
+      const { pi, tools } = captureTools();
+      factoryOf(execPlugin({ agentDir: dir, workspace: dir, allowlist: [{ bin: '/bin/echo' }, { bin: script }] }))(pi);
+      await tools.get('exec_run')!.execute('ok', { argv: ['/bin/echo', 'PRIVATE_STDOUT'], taskId: 'outcome' });
+      await tools.get('exec_run')!.execute('bad', { argv: [script], taskId: 'outcome' });
+      const raw = fs.readFileSync(path.join(dir, 'runtime', 'exec-audit.jsonl'), 'utf8');
+      expect(raw).not.toContain('PRIVATE_STDOUT');
+      const rows = raw.trim().split('\n').map((s) => JSON.parse(s));
+      expect(rows.map((r) => r.outcome)).toEqual(['started', 'succeeded', 'started', 'failed']);
+      expect(rows[3].exitCode).toBe(2);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('never starts a command when the audit boundary is unsafe', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-fail-closed-'));
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-symlink-'));
+    try {
+      fs.symlinkSync(other, path.join(dir, 'runtime'));
+      const marker = path.join(dir, 'should-not-exist');
+      const script = path.join(dir, 'marker-script'); fs.writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\n`); fs.chmodSync(script, 0o700);
+      const { pi, tools } = captureTools();
+      factoryOf(execPlugin({ agentDir: dir, workspace: dir, allowlist: [{ bin: script }] }))(pi);
+      const result = await tools.get('exec_run')!.execute('unsafe', { argv: [script] });
+      expect(result.details.ok).toBe(false); expect(fs.existsSync(marker)).toBe(false);
+      expect(fs.readdirSync(other)).toEqual([]);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(other, { recursive: true, force: true }); }
+  });
+});
+
+describe("yt-dlp description metadata flag", () => {
+  it("allowlists --write-description for https URLs (workspace-relative outputs)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yt-desc-"));
+    try {
+      const allow = DEFAULT_EXEC_ALLOWLIST.filter((e) => e.bin === "yt-dlp");
+      const r = await resolveExec(["yt-dlp", "--skip-download", "--write-description", "--write-subs", "https://www.youtube.com/watch?v=N8mV_E3IcZU"], { agentDir: dir, workspace: dir }, allow);
+      expect(r.error).toBeUndefined();
+      expect(r.argv).toContain("--write-description");
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe("yt-dlp simulate-control flags", () => {
+  it("allowlists --no-simulate plus other benign fetch-mode flags", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yt-sim-"));
+    try {
+      const allow = DEFAULT_EXEC_ALLOWLIST.filter((e) => e.bin === "yt-dlp");
+      const r = await resolveExec(["yt-dlp", "--skip-download", "--no-simulate", "--ignore-config", "--write-subs", "--print", "title", "https://youtu.be/N8mV_E3IcZU"], { agentDir: dir, workspace: dir }, allow);
+      expect(r.error).toBeUndefined();
+      expect(r.argv).toContain("--no-simulate");
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

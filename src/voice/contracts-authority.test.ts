@@ -10,12 +10,12 @@ const consent={kind:'owner_call',status:'active',id:'mandate',lineageId:'lineage
 const source={verified:true,checkedAt:now,expiresAt:now+30000,sourceContractId:'contract',ownerId:'owner',decisionId:'decision',questionVersion:1,revision:'revision',actionable:true,urgent:true,usefulUntil:decision.deadline};
 const servers:net.Server[]=[];
 afterEach(async()=>{await Promise.all(servers.splice(0).map(server=>new Promise<void>(resolve=>server.close(()=>resolve()))));});
-async function fixture(){
+async function fixture(timeoutMs=2000){
  const directory=fs.mkdtempSync(path.join(fs.realpathSync('/tmp'),'voice-authority-'));fs.chmodSync(directory,0o700);const tokenFile=path.join(directory,'token'),socketPath=path.join(directory,'rpc');fs.writeFileSync(tokenFile,'b'.repeat(64),{mode:0o600});
  const state:{result:any;envelope?:(r:any)=>any;requests:any[];raw?:string;silent?:boolean}={result:{schemaVersion:1,allowed:true,reason:'ok',checkedAt:now,consent:{...consent}},requests:[]};
  const server=net.createServer(client=>{let data='';client.on('error',()=>{});client.on('data',chunk=>{data+=chunk;if(!data.includes('\n'))return;const request=JSON.parse(data.split('\n')[0]);state.requests.push(request);if(state.silent)return;const envelope={schemaVersion:1,requestId:request.requestId,ok:true,result:state.result};client.end(state.raw??JSON.stringify(state.envelope?.(envelope)??envelope)+'\n');});});servers.push(server);
  await new Promise<void>(resolve=>server.listen(socketPath,resolve));fs.chmodSync(socketPath,0o600);
- const authority=new ContractsVoiceAuthority({socketPath,tokenFile,ownerId:'owner',coordinatorId:'coordinator',mandateId:'mandate',agentId:'assistant',canonicalChatId:'telegram:42',recipientRef:'owner-phone',clock:()=>now,timeoutMs:40});
+ const authority=new ContractsVoiceAuthority({socketPath,tokenFile,ownerId:'owner',coordinatorId:'coordinator',mandateId:'mandate',agentId:'assistant',canonicalChatId:'telegram:42',recipientRef:'owner-phone',clock:()=>now,timeoutMs});
  return {authority,state,directory,tokenFile,socketPath};
 }
 describe('Contracts voice authority client',()=>{
@@ -34,7 +34,7 @@ describe('Contracts voice authority client',()=>{
   for(const patch of [{checkedAt:now-30001},{checkedAt:now+1},{expiresAt:now},{expiresAt:now+30001},{ownerId:'other'},{sourceContractId:'other'},{decisionId:'other'},{questionVersion:2},{revision:''},{urgent:false},{actionable:false},{usefulUntil:decision.deadline+1}]){f.state.result={...source,...patch};expect((await f.authority.project(decision)).verified,JSON.stringify(patch)).toBe(false);}
  });
  it('rejects wrong envelopes, malformed data, oversized replies and timeout without leaking server errors',async()=>{
-  const f=await fixture();for(const patch of [{requestId:'other'},{schemaVersion:2},{ok:false,result:{error:'SECRET'}}]){f.state.envelope=r=>({...r,...patch});expect(await f.authority.check(decision)).toEqual({allowed:false,checkedAt:now});}
+  const f=await fixture(80);for(const patch of [{requestId:'other'},{schemaVersion:2},{ok:false,result:{error:'SECRET'}}]){f.state.envelope=r=>({...r,...patch});expect(await f.authority.check(decision)).toEqual({allowed:false,checkedAt:now});}
   f.state.envelope=undefined;for(const raw of ['not-json\n','x'.repeat(65537)+'\n']){f.state.raw=raw;expect((await f.authority.check(decision)).allowed).toBe(false);}
   f.state.raw=undefined;f.state.silent=true;expect((await f.authority.check(decision)).allowed).toBe(false);
  });

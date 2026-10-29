@@ -110,6 +110,7 @@ function fakeAgentManager() {
   const agents = {
     createAgent: vi.fn(() => undefined),
     discover: vi.fn(async () => {}),
+    isSessionStale: vi.fn(() => false),
     getOrCreateSession: vi.fn(async () => ({}) as AgentSession),
     getAgent: vi.fn((id: string): LoadedAgent | undefined =>
       id === "assistant" ? { id, dir: "/tmp/fake-assistant", manifest: { name: "assistant", heartbeat: { enabled: true, interval: "45m" } } } : undefined

@@ -3,10 +3,11 @@ import * as path from "node:path";
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { agentCommsPlugin, type CommsHooks } from "../plugins/agent-comms-plugin.js";
 import { telegramSendPlugin, type TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
+import { resourcePreflight } from "./preflight.js";
 import { avatarPlugin } from "../plugins/avatar-plugin.js";
 import { attendPlugin, ATTEND_CLI } from "../plugins/attend-plugin.js";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
-import { delegatePlugin, DELEGATE_CLIS } from "../plugins/delegate-plugin.js";
+import { delegateCommand, delegatePlugin, DELEGATE_CLIS } from "../plugins/delegate-plugin.js";
 import { devToolsPlugin } from "../plugins/dev-tools-plugin.js";
 import { docsPlugin } from "../plugins/docs-plugin.js";
 import { execPlugin } from "../plugins/exec-plugin.js";
@@ -38,6 +39,7 @@ import { researchIntakePlugin } from "../plugins/research-intake-plugin.js";
 import { linkTriageConfig, linkTriagePlugin } from "../plugins/link-triage-plugin.js";
 import { EventLog } from "./events.js";
 import type { IntakeStore } from "./research-intake.js";
+import { LONG_AUDIO_RULE } from "./transcription-policy.js";
 
 export interface CapabilityAgent { id: string; dir: string; manifest: AgentManifest }
 export interface CapabilityContext {
@@ -61,6 +63,8 @@ export interface CapabilityContext {
     providers: SpeechProviderRegistry;
     store: SpeechArtifactStore;
     send: (transport: string, chatId: string, kind: SpeechKind, filePath: string, caption?: string) => Promise<void>;
+    /** native round video note (Bot API sendVideoNote) — externally produced MP4 */
+    sendVideoNote?: (transport: string, chatId: string, filePath: string) => Promise<void | import("../core/types.js").DeliveryReceipt>;
   };
   /** global STT custom-vocabulary store (bot-wide data dir) */
   dictionary?: {
@@ -72,6 +76,8 @@ export interface CapabilityContext {
   intake?: IntakeStore;
   /** durable background-task ledger (pi-durable); absent when not wired */
   tasks?: TaskLedger;
+  /** host STT enablement for route diagnosis (bd pibot-hn90); metadata only */
+  stt?: { hostProviderIds: readonly string[]; groqCredentialPresent: boolean };
 }
 
 export type { CommitmentPluginEngine };
@@ -101,7 +107,10 @@ export function executableAvailable(command: string): boolean {
   });
 }
 
-const installedDelegateClis = () => Object.keys(DELEGATE_CLIS).filter(executableAvailable);
+const installedDelegateClis = () => Object.keys(DELEGATE_CLIS).filter((cli) => {
+  const command = delegateCommand(cli);
+  return command !== undefined && executableAvailable(command);
+});
 
 const confirmMutation = (ctx: CapabilityContext) => async (description: string): Promise<boolean> => {
   if (!ctx.ask) return false;
@@ -130,6 +139,7 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
       providers: ctx.speech!.providers,
       store: ctx.speech!.store,
       send: ctx.speech!.send,
+      sendVideoNote: ctx.speech!.sendVideoNote,
     }),
   },
   {
@@ -160,10 +170,19 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
   {
     id: "tasks", defaultEnabled: true,
     tools: ["start_task", "task_status", "list_tasks", "cancel_task"],
-    prompt: "start_task hands longer work (research, drafting, multi-step tool work) to a durable background run of you that survives restarts and posts its result to this chat; give it self-contained instructions. When the owner asks how a task is going or what came back, use list_tasks / task_status rather than guessing. cancel_task stops one. In a voice conversation, prefer start_task over long work inside the turn, and say the result will arrive in the chat.",
+    prompt: `start_task hands longer work (research, drafting, multi-step tool work) to a durable background run of you that survives restarts and posts its result to this chat; give it self-contained instructions. For heavier work pass timeoutMinutes (default 30, max 480): downloading + transcribing long media with yt-dlp needs ~90 minutes for a two-hour talk; fetch video audio with yt-dlp by default instead of relying on caption APIs (they rate-limit with 429s). When the owner asks how a task is going or what came back, use list_tasks / task_status rather than guessing. cancel_task stops one. In a voice conversation, prefer start_task over long work inside the turn, and say the result will arrive in the chat. LONG AUDIO (owner instruction, bd pibot-0xpf.4): ${LONG_AUDIO_RULE}. When a task will transcribe audio, declare its duration with audioDurationSec (or audioDurationUnknown) so this rule is written into the task contract and cannot be substituted inside the background run.`,
     // never inside agent-only sessions (a task's own run, agent-to-agent): no tasks spawning tasks
     available: (ctx) => Boolean(ctx.tasks) && ctx.chat.transport !== "agent",
-    create: (ctx) => tasksPlugin({ ledger: ctx.tasks!, agentId: ctx.agent.id, chat: ctx.chat }),
+    create: (ctx) => tasksPlugin({
+      ledger: ctx.tasks!,
+      agentId: ctx.agent.id,
+      chat: ctx.chat,
+      preflight: ctx.dictionary ? resourcePreflight(ctx.dictionary.dataDir) : undefined,
+      transcription: {
+        policy: { providers: ctx.agent.manifest.speech?.sttProviders, allowExternal: ctx.agent.manifest.speech?.allowExternalStt === true },
+        ...(ctx.stt ? { hostProviders: ctx.stt.hostProviderIds, groqCredentialPresent: ctx.stt.groqCredentialPresent } : {}),
+      },
+    }),
   },
   {
     id: "commitments", defaultEnabled: true,

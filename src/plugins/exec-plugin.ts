@@ -7,6 +7,7 @@ import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { childEnv } from "../core/child-env.js";
 import { truncate } from "../core/util.js";
+import { appendExecTrace, searchExecTrace, readExecArtifactExtract, ARTIFACT_MAX_PAGE_BYTES, ARTIFACT_PAGE_BYTES, type ExecTraceInput } from "./exec-trace.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -53,21 +54,68 @@ export interface ExecAllowEntry {
 
 const SAFE_VALUE = /^[A-Za-z0-9,._*-]+$/;
 const YT_FORMAT = /^[A-Za-z0-9+,\/\[\]=!*^.:()_@-]+$/;
-const YT_PRINT = /^[A-Za-z0-9_%().:,\s-]+$/;
+const YT_PRINT = /^[A-Za-z0-9_%().:|,\s-]+$/; // "|" allowed: plain separator data in --print templates ("A | B")
 /** yt-dlp `-o [TYPES:]TEMPLATE` type prefixes (subtitle:, infojson:, pl_thumbnail:, …) — the template after them may be absolute. */
 const YT_TYPE_PREFIX = /^[a-z_]+:/i;
 /** Workspace dirs whose contents another tool trusts as code: osascript runs scripts/, the daemon loads extensions/. */
 const YT_PROTECTED_DIRS = new Set(["scripts", "extensions", "skills"]);
+/** Static shape gate for -o/--output values (full path policy is enforced per-agent in validateYtDlp). */
+const YT_TEMPLATE_SHAPE = (v: string): boolean => v.length > 0 && !v.includes("\0") && !v.startsWith("-");
+
+/** realpath the deepest existing ancestor of `p` and rejoin the (possibly nonexistent) tail — symlink-safe canonicalization. */
+function canonicalize(p: string): string | null {
+  let probe = path.resolve(p);
+  let tail = "";
+  for (;;) {
+    try {
+      return tail ? path.join(fs.realpathSync(probe), tail) : fs.realpathSync(probe);
+    } catch {
+      /* does not exist (yet) — climb to the nearest existing ancestor */
+    }
+    tail = path.join(path.basename(probe), tail);
+    const parent = path.dirname(probe);
+    if (parent === probe) return null;
+    probe = parent;
+  }
+}
+
 /**
- * yt-dlp -o: relative to the workspace (cwd), no "..", not absolute, not home-relative, no type prefix,
- * and never into a directory whose files are later executed (yt-dlp can download arbitrary bytes there).
+ * yt-dlp -o/--output: the resolved path must land under the agent's workspace or agent dir
+ * (canonical, symlinks followed — the intended "download into my working dir" use). No type
+ * prefixes (subtitle:, … — their template may be absolute), nothing into dirs trusted as code
+ * (scripts/, extensions/, skills/).
  */
-const YT_OUTPUT = (v: string): boolean => {
-  if (!v.length || v.startsWith("/") || v.startsWith("~") || v.startsWith("-") || v.includes("..") || v.includes("\0")) return false;
+function ytOutputOk(v: string, deps: ExecPluginDeps): boolean {
+  if (!YT_TEMPLATE_SHAPE(v)) return false;
   if (YT_TYPE_PREFIX.test(v)) return false;
-  const first = path.normalize(v).split(path.sep).find((s) => s && s !== ".") ?? "";
+  const resolved = canonicalize(path.resolve(deps.workspace, resolveTilde(v)));
+  if (!resolved) return false;
+  const roots = [deps.workspace, deps.agentDir].map((r) => {
+    try {
+      return fs.realpathSync(path.resolve(r));
+    } catch {
+      return path.resolve(r);
+    }
+  });
+  const root = roots.find((r) => resolved === r || resolved.startsWith(r + path.sep));
+  if (!root) return false;
+  const first = path.relative(root, resolved).split(path.sep)[0] ?? "";
   return !YT_PROTECTED_DIRS.has(first.toLowerCase());
-};
+}
+
+/** yt-dlp path policy for -o/--output (both "-o V" and "--output=V" forms). */
+function validateYtDlp(rest: string[], deps: ExecPluginDeps): ExecValidateResult {
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    const eq = arg.startsWith("--output=") ? arg.indexOf("=") : -1;
+    const value = eq > 0 ? arg.slice(eq + 1) : arg === "-o" || arg === "--output" ? rest[++i] : undefined;
+    if (value === undefined) continue;
+    if (!ytOutputOk(value, deps)) {
+      return { error: "refused: yt-dlp -o/--output must write under the agent's workspace or agent dir (no type prefixes, not into scripts/extensions/skills) — this value is not allowed" };
+    }
+  }
+  return { args: rest };
+}
 const GH_JQ = /^[A-Za-z0-9_.\[\]-]+$/;
 const GH_ENDPOINT = /^repos\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(\/[A-Za-z0-9._\/-]*)?(\?[A-Za-z0-9=&_.-]*)?$/;
 const GH_REPO = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
@@ -114,7 +162,8 @@ function validateOsascript(rest: string[], deps: ExecPluginDeps): ExecValidateRe
  * yt-dlp allowed set (https URL positional(s) required): --skip-download, --write-subs, --write-auto-subs,
  *   --sub-langs/--sub-lang, --sub-format, --convert-subs (srt|vtt|ass|lrc), --list-subs, --dump-json/-j,
  *   --dump-single-json/-J, --print/-O (plain field/template), --no-playlist, --playlist-items, -f/--format,
- *   -x/--extract-audio, --audio-format, --no-warnings, -q/--quiet, --no-progress, -o/--output (workspace-relative).
+ *   -x/--extract-audio, --audio-format, --no-warnings, -q/--quiet, --no-progress, -o/--output
+ *   (paths under the agent's workspace or agent dir — see validateYtDlp).
  * gh: `gh api repos/<o>/<r>[/...]` with only --jq/-q, --paginate, -H "Accept: ..."; `gh repo view <o>/<r>` with
  *   only --json / --jq. No methods, fields, --input, --web.
  */
@@ -123,8 +172,14 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
     bin: "yt-dlp",
     allowFlags: [
       { flag: "--skip-download" },
+      { flag: "--no-simulate" },
+      { flag: "--simulate" },
+      { flag: "-s" },
+      { flag: "--ignore-config" },
+      { flag: "--write-info-json" },
       { flag: "--write-subs" },
       { flag: "--write-auto-subs" },
+      { flag: "--write-description" },
       { flag: "--sub-langs", takesValue: true, valueRe: SAFE_VALUE },
       { flag: "--sub-lang", takesValue: true, valueRe: SAFE_VALUE },
       { flag: "--sub-format", takesValue: true, valueRe: SAFE_VALUE },
@@ -147,17 +202,31 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
       { flag: "-q" },
       { flag: "--quiet" },
       { flag: "--no-progress" },
-      { flag: "-o", takesValue: true, valueRe: predicateRe(YT_OUTPUT) },
-      { flag: "--output", takesValue: true, valueRe: predicateRe(YT_OUTPUT) },
+      { flag: "-o", takesValue: true, valueRe: predicateRe(YT_TEMPLATE_SHAPE) },
+      { flag: "--output", takesValue: true, valueRe: predicateRe(YT_TEMPLATE_SHAPE) },
     ],
     allowPositionalRe: /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?(\/\S*)?$/,
     positionals: { min: 1 },
+    validate: (rest, deps) => validateYtDlp(rest, deps),
   },
   { bin: "whisperkit-cli" },
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/youtube-transcript/scripts/extract_transcript.py")] },
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/fathom/scripts/fetch.py")] },
+  // Browserbase Fetch-API fallback (read-only browser-grade retrieval): pinned wrapper reads the
+  // API key from Keychain itself (never argv/logs) and enforces free-tier caps locally
+  // (1 concurrent, 40/day + 300/month counters, refuses if project usage can't be verified).
+  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/browserbase-fetch/scripts/bb_fetch.py")], allowPositionalRe: /^https:\/\//, positionals: { min: 1, max: 1 } },
+  // Groq parts-transcription wrapper (free-tier pinned: key from 0600 file/Keychain at runtime,
+  // 1 concurrent + 8 calls/day local caps, <=15-min owner rule, adaptive 22MB part sizing):
+  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_parts.py")], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
+  // Groq key intake (native hidden dialog; stores to 0600 file / Keychain / sops-encrypted copy),
+  // and a no-arg config-setter entry so the sops key path can be registered without shell:
+  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_key_setup.py")] },
   // read-only GitHub fetches for link-saves (host-pinned curl; exactly one URL, so no extra flags like -o can ride along)
   { bin: "curl", pin: ["-sL", "--max-time", "15"], urlsUnder: ["https://api.github.com/", "https://github.com/", "https://raw.githubusercontent.com/"] },
+  // arbitrary-https READ-ONLY GET (link-saves/fetches): pinned flags cap runtime, exactly one URL
+  // positional so no -o/-K/-H/--data/--next can ride along and no body can be sent. GET only.
+  { bin: "curl", pin: ["-sL", "--max-time", "20"], urlsUnder: ["https://"] },
   {
     bin: "gh",
     pin: ["repo", "view"],
@@ -191,6 +260,7 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
 
 
 /** Strict flag/positional check. Returns an error string or undefined. */
+/** Strict flag/positional check (single pass: flag values are consumed, never counted as positionals). */
 function checkAllowFlags(entry: ExecAllowEntry, rest: string[]): string | undefined {
   const flags = entry.allowFlags ?? [];
   let positionals = 0;
@@ -221,6 +291,20 @@ function checkAllowFlags(entry: ExecAllowEntry, rest: string[]): string | undefi
   return undefined;
 }
 
+/** Pin-only entries (no allowFlags): every arg must be bare and positional-shaped — flag-like args are refused outright. */
+function checkBarePositionals(entry: ExecAllowEntry, rest: string[]): string | undefined {
+  let positionals = 0;
+  for (const arg of rest) {
+    if (arg.startsWith("-")) return `refused: ${entry.bin} flag-like argument "${arg}" is not allowed`;
+    positionals++;
+    if (!entry.allowPositionalRe || !entry.allowPositionalRe.test(arg)) return `refused: ${entry.bin} argument "${arg}" is not allowed`;
+  }
+  const min = entry.positionals?.min ?? 0;
+  const max = entry.positionals?.max ?? Infinity;
+  if (positionals < min || positionals > max) return `refused: ${entry.bin} expects ${min === max ? min : `${min}-${max === Infinity ? "n" : max}`} positional argument(s)`;
+  return undefined;
+}
+
 export interface ExecPluginDeps {
   /** env var names (beyond the child-env base) passed to commands — manifest.envPassthrough */
   envPassthrough?: string[];
@@ -242,9 +326,24 @@ function resolveTilde(p: string): string {
   return p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p;
 }
 
-/** Refuse anything that smells like it expects a shell to interpret it. */
+/**
+ * Refuse args that read like shell syntax. execFile runs plain argv — metacharacters cannot
+ * execute anything — but they usually mean the caller wrote a shell command line instead of an
+ * argv, which silently does the wrong thing. Carve-out: a "|" sitting between spaces with a word
+ * before it is plain template data in yt-dlp --print values ("%(title)s | %(channel)s") and is
+ * allowed; pipes glued to words, pipes opening an element, and everything else (&&, ||, ;, `,$(
+ * and any ">") are refused.
+ */
 function looksLikeShell(arg: string): boolean {
-  return /(^|\s)(&&|\|\||;|`|\$\(|>\s*|\|\s)/.test(arg);
+  if (/(^|\s)(&&|\|\||;|`|\$(?=\())/.test(arg)) return true;
+  if (arg.includes(">")) return true;
+  for (let i = 0; i < arg.length; i++) {
+    if (arg[i] !== "|") continue;
+    const prevSpace = i >= 2 && /\s/.test(arg[i - 1]) && !/\s/.test(arg[i - 2]);
+    const nextSpace = i + 1 === arg.length || /\s/.test(arg[i + 1]);
+    if (!(prevSpace && nextSpace)) return true;
+  }
+  return false;
 }
 
 export async function resolveExec(argv: string[], deps: ExecPluginDeps, allowlist: ExecAllowEntry[]): Promise<{ argv: string[]; cwd: string; error?: string }> {
@@ -321,6 +420,13 @@ export async function resolveExec(argv: string[], deps: ExecPluginDeps, allowlis
         constraintFailure = bad;
         continue;
       }
+    } else if (entry.allowPositionalRe || entry.positionals) {
+      // pin-style entries without a flag allowlist still enforce positional shape/count
+      const bad = checkBarePositionals(entry, rest);
+      if (bad) {
+        constraintFailure = bad;
+        continue;
+      }
     }
     let finalRest = rest;
     if (entry.validate) {
@@ -348,17 +454,57 @@ export function execPlugin(deps: ExecPluginDeps): InlineExtension {
     name: "exec",
     factory: (pi) => {
       pi.registerTool({
+        name: 'exec_audit_search', label: 'Search own execution audit',
+        description: 'Find this agent’s recent execution metadata by exact task ID, call ID or YouTube URL (query parameters are never stored). Reads only the last 2 MiB, returns at most 20 entries. New calls only; not a search of old conversations.',
+        parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: 1000 }) }),
+        async execute(_id, params) {
+          try { return { content: [{ type: 'text', text: JSON.stringify(searchExecTrace(deps.agentDir, params.query)) }], details: { ok: true } }; }
+          catch { return refuse('execution audit unavailable'); }
+        },
+      });
+      pi.registerTool({
+        name: 'exec_result_read', label: 'Read processing text artifact range',
+        description: `Read a UTF-8 text output only from your own runtime/artifacts directory. Returns JSON with path, totalBytes, offset, bytes, truncated and nextOffset (pass nextOffset as offset to continue); nextOffset null means the end was reached. Supply a relative filename; no symlinks or traversal. Up to ${ARTIFACT_MAX_PAGE_BYTES} bytes per call (default ${ARTIFACT_PAGE_BYTES}), text formats only. Configure processing output there using an already allowlisted command; this tool does not authorize a previously refused command.`,
+        parameters: Type.Object({
+          path: Type.String({ minLength: 1, maxLength: 1000 }),
+          offset: Type.Optional(Type.Integer({ minimum: 0, description: 'Byte offset to start at; use the previous nextOffset.' })),
+          limit: Type.Optional(Type.Integer({ minimum: 1, maximum: ARTIFACT_MAX_PAGE_BYTES, description: 'Bytes to return in this extract.' })),
+        }),
+        async execute(_id, params) {
+          try {
+            const extract = readExecArtifactExtract(deps.agentDir, params.path, { offset: params.offset, limit: params.limit });
+            return { content: [{ type: 'text', text: JSON.stringify(extract) }], details: { ok: true } };
+          } catch { return refuse('artifact unavailable or outside the permitted text artifact boundary'); }
+        },
+      });
+      pi.registerTool({
         name: "exec_run",
         label: "Run allowlisted command",
         description:
           "Run a command from this agent's vetted exec allowlist. Pass argv (array of strings, command first). NO shell: no pipes, redirections or substitutions — plain argv only. Binaries are resolved and matched against pinned entries; denied arguments (e.g. yt-dlp --exec, osascript -e) are refused. Long-running commands are capped by a timeout; output is truncated.",
         parameters: Type.Object({
           argv: Type.Array(Type.String({ description: "argument vector — command first, then arguments" }), { minItems: 1, maxItems: 64, description: "e.g. [\"yt-dlp\", \"--skip-download\", \"--list-subs\", URL]" }),
+          taskId: Type.Optional(Type.String({ pattern: '^[A-Za-z0-9_:.-]{1,160}$', description: 'Task reference for audit lookup; metadata only, not authorization.' })),
         }),
         async execute(_tcid, params): Promise<ExecToolResult> {
           const started = Date.now();
-          const resolved = await resolveExec(params.argv, deps, allowlist);
-          if (resolved.error) return refuse(resolved.error);
+          const trace = (outcome: ExecTraceInput['outcome'], reason?: string, exitCode?: number | null): boolean => {
+            try { appendExecTrace(deps.agentDir, { callId: _tcid, taskId: params.taskId, argv: params.argv, outcome, reason, exitCode }); return true; }
+            catch { return false; }
+          };
+          let resolved: Awaited<ReturnType<typeof resolveExec>>;
+          try { resolved = await resolveExec(params.argv, deps, allowlist); }
+          catch { trace('refused', 'resolution failed'); return refuse('command resolution failed'); }
+          if (resolved.error) {
+            const reason = resolved.error.includes('not found') ? 'command missing'
+              : resolved.error.includes('shell metacharacters') ? 'shell syntax denied'
+              : resolved.error.includes('denied argument') ? 'argument denied'
+              : resolved.error.includes('not on this agent') ? 'not allowlisted' : 'constraint denied';
+            const logged = trace('refused', reason);
+            return refuse(resolved.error + (logged ? '' : ' (audit unavailable)'));
+          }
+          // Fail closed before executing when durable diagnostic metadata cannot be recorded.
+          if (!trace('started')) return refuse('execution audit unavailable; command not started');
           try {
             const { stdout, stderr } = await execFileAsync(resolved.argv[0], resolved.argv.slice(1), {
               cwd: resolved.cwd,
@@ -373,10 +519,12 @@ export function execPlugin(deps: ExecPluginDeps): InlineExtension {
               stdout.trim() ? `--- stdout ---\n${truncate(stdout, maxOutput)}` : "--- (no stdout) ---",
               stderr.trim() ? `--- stderr ---\n${truncate(stderr, maxOutput)}` : "",
             ].filter(Boolean).join("\n");
-            return { content: [{ type: "text" as const, text: body }], details: { ok: true, exitCode: 0, durationMs: Date.now() - started } };
+            const recorded = trace('succeeded', undefined, 0);
+            return { content: [{ type: "text" as const, text: body + (recorded ? '' : '\nAudit completion missing; command succeeded — do not repeat.') }], details: { ok: true, exitCode: 0, durationMs: Date.now() - started } };
           } catch (e) {
             const err = e as { code?: number | string; killed?: boolean; stdout?: string; stderr?: string; message?: string };
             const secs = Math.round((Date.now() - started) / 1000);
+            trace(err.killed ? 'timed-out' : 'failed', 'execution failed', typeof err.code === 'number' ? err.code : null);
             const text = [
               err.killed ? `timed out after ${secs}s` : `exit ${err.code ?? "?"} · ${secs}s`,
               err.stdout?.trim() ? `--- stdout ---\n${truncate(err.stdout, maxOutput)}` : "",

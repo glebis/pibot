@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { Bot, InputFile, type Context } from "grammy";
 import type { InlineKeyboardButton } from "grammy/types";
-import type { Card, IncomingMedia, PushOptions, ReplyContext, Transport } from "../core/types.js";
+import type { Card, DeliveryReceipt, IncomingMedia, PushOptions, ReplyContext, Transport } from "../core/types.js";
 import { truncate } from "../core/util.js";
 
 const TG_LIMIT = 4000;
@@ -67,6 +67,35 @@ function messageIdOf(sent: unknown): number | undefined {
   return typeof m?.message_id === "number" ? m.message_id : undefined;
 }
 
+/** The chat a returned Bot API message actually landed in — the truth a receipt must attest. */
+function chatIdOfSent(sent: unknown): string | undefined {
+  const id = (sent as { chat?: { id?: number | string } } | undefined)?.chat?.id;
+  return id === undefined || id === null ? undefined : String(id);
+}
+
+/** The medium actually present on a returned Bot API message (fixes "assume what we asked for"). */
+function mediaKindOfSent(sent: unknown): string | undefined {
+  const m = sent as Record<string, unknown> | undefined;
+  if (!m) return undefined;
+  for (const kind of ["video_note", "video", "animation", "document", "photo", "voice", "audio"]) {
+    if (m[kind] !== undefined && m[kind] !== null) return kind;
+  }
+  return undefined;
+}
+
+/** The sender identity on a returned Bot API message — the account that ACTUALLY sent it. */
+function fromIdentityOfSent(sent: unknown): string | undefined {
+  const from = (sent as { from?: { id?: number | string; username?: string } } | undefined)?.from;
+  if (!from) return undefined;
+  if (from.username) return `@${from.username}`;
+  return from.id === undefined || from.id === null ? undefined : String(from.id);
+}
+
+/** Delivery receipt with the destination-aware tuple this transport can attest (bd pibot-cida):
+ *  the peer it actually posted to, the bot account that sent, and — because Bot API ids are not
+ *  MTProto ids — the id namespace, tagged so the two are never compared as the same message. */
+export interface TelegramReceipt extends DeliveryReceipt {}
+
 const BOT_COMMANDS = [
   { command: "call", description: "Ring my phone as this agent (confirm first)" },
   { command: "voice", description: "Talk to this agent by voice" },
@@ -77,6 +106,7 @@ const BOT_COMMANDS = [
   { command: "agents", description: "List your agents" },
   { command: "new", description: "Fresh session for the current agent" },
   { command: "agent", description: "Switch agent: /agent coach" },
+  { command: "model", description: "Pick this agent's model" },
   { command: "newagent", description: "Create an agent: /newagent coach <persona>" },
   { command: "schedules", description: "Pending scheduled items" },
   { command: "snooze", description: "Pause the rhythm: /snooze 2h" },
@@ -84,6 +114,20 @@ const BOT_COMMANDS = [
   { command: "skills", description: "Agent's skills" },
   { command: "evolve", description: "Run a skill-evolution cycle" },
   { command: "promises", description: "Open promises" },
+];
+
+const LAB_COMMANDS = [
+  { command: "start", description: "Открыть меню лаборатории" },
+  { command: "menu", description: "Меню лаборатории" },
+  { command: "recommendations", description: "Мои рекомендации" },
+  { command: "homework", description: "Моя практика" },
+  { command: "prompt", description: "Мой промпт" },
+  { command: "skills", description: "Мои навыки" },
+  { command: "install", description: "Установка плагина" },
+  { command: "models", description: "Помощь с бесплатными и открытыми моделями" },
+  { command: "subscribe", description: "Включить рекомендации после занятий" },
+  { command: "unsubscribe", description: "Отключить уведомления" },
+  { command: "help", description: "Помощь по лаборатории" },
 ];
 
 // ACP context-manager bookkeeping must never reach user-visible rendering —
@@ -392,9 +436,10 @@ export function assertCallbackData(action: string): string {
 function keyboard(card: Card | undefined) {
   if (!card?.buttons.length) return undefined;
   const rows: InlineKeyboardButton[][] = [];
-  for (let i = 0; i < card.buttons.length; i += 2) {
+  const columns = card.columns === 1 ? 1 : 2;
+  for (let i = 0; i < card.buttons.length; i += columns) {
     rows.push(
-      card.buttons.slice(i, i + 2).map((b): InlineKeyboardButton =>
+      card.buttons.slice(i, i + columns).map((b): InlineKeyboardButton =>
         b.url
           ? { text: b.label, url: b.url }
           : { text: b.label, callback_data: assertCallbackData(b.action) }
@@ -410,6 +455,17 @@ function keyboard(card: Card | undefined) {
  * set PIBOT_TELEGRAM_OPEN=1 to restore open behavior (opt-in).
  * Each chat picks its agent with /agent.
  */
+/** Last-mile guard: operational notices never become participant group replies.
+ * Sentence-level filtering also catches notices appended inside an answer.
+ * Owner DMs bypass this guard; ordinary course words like “status” stay intact.
+ */
+function labGroupReply(text: string): string {
+  const operational = /fallback(?: model)?|answering on (?:a )?(?:backup|fallback)|primary.{0,100}unavailable|the reply above was produced|\/cascade\b|couldn['’]t reach any model|removed from rotation|circuit.breaker|^\s*(?:[⚠︎️🔀🪫]+\s*)?status:\s*(?:provider|model|retry)|резервн.{0,30}модел|служебн.{0,20}уведомлен/iu;
+  return text.split(/((?<=[.!?])\s+|\n+)/u)
+    .filter((part) => !operational.test(part))
+    .join("").trim();
+}
+
 export class TelegramTransport implements Transport {
   readonly name: string;
   readonly boundAgentId?: string;
@@ -435,7 +491,6 @@ export class TelegramTransport implements Transport {
 
   private publicMediaAllowedCb?: (chatId: string, kind: IncomingMedia["kind"]) => boolean;
   onPublicMediaAllowed(cb: (chatId: string, kind: IncomingMedia["kind"]) => boolean): void { this.publicMediaAllowedCb = cb; }
-
   private onMediaCb: ((media: IncomingMedia) => Promise<void>) | null = null;
   private mediaDir: string;
   private reactions: boolean;
@@ -518,7 +573,7 @@ export class TelegramTransport implements Transport {
     this.bot.on("callback_query:data", async (ctx) => {
       console.log(`[telegram] callback received: ${ctx.callbackQuery?.data?.slice(0, 40)} at ${new Date().toISOString().slice(11, 19)}`);
       this.lastCallbackQuery = ctx.callbackQuery ?? undefined;
-      if (!(await this.check(ctx))) { void this.handleDenied(ctx); await ctx.answerCallbackQuery().catch(() => {}); return; }
+      if (!(await this.check(ctx))) { await ctx.answerCallbackQuery().catch(() => {}); await this.handleDenied(ctx); return; }
       const action = ctx.callbackQuery?.data;
       if (!action || !this.onActionCb) { await ctx.answerCallbackQuery().catch(() => {}); return; }
       // remove the buttons from the tapped message first — no double-taps, no stale clicks
@@ -554,13 +609,33 @@ export class TelegramTransport implements Transport {
     });
   }
 
+  /** The receipt tuple for a message this transport posted (bd pibot-cida), derived from the ACTUAL
+   *  Bot API response: the peer is the chat the message really landed in, the medium is the one the
+   *  response carries, and the account is the identity the RESPONSE names (the cached bot identity is
+   *  only a fallback, so a contradictory `from` is never silently replaced by ours). A response that
+   *  omits chat.id or the media leaves those fields UNSET — an unverified destination/type must not be
+   *  manufactured from what we asked for. `evidence` is "ack": an API acknowledgement is not a
+   *  same-peer readback and never a human viewing. */
+  private receiptFor(chatId: string, sent: unknown): TelegramReceipt {
+    const r: TelegramReceipt = { idProtocol: "bot_api", evidence: "ack" };
+    const actualChatId = chatIdOfSent(sent);
+    if (actualChatId !== undefined) r.peer = `${this.name}:${actualChatId}`;
+    const account =
+      fromIdentityOfSent(sent) ?? (this.me?.username ? `@${this.me.username}` : this.me ? String(this.me.id) : undefined);
+    if (account !== undefined) r.account = account;
+    const messageId = messageIdOf(sent);
+    if (messageId !== undefined) r.messageId = messageId;
+    const mediaType = mediaKindOfSent(sent);
+    if (mediaType !== undefined) r.mediaType = mediaType;
+    return r;
+  }
+
   /** Telegram requires a fresh multipart upload for every profile-photo change. */
-  async sendMedia(chatId: string, source: string): Promise<void> {
+  async sendMedia(chatId: string, source: string): Promise<TelegramReceipt | void> {
     // http(s) URL → Telegram fetches it; absolute local path → upload from disk.
-    return this.enqueue(chatId, async () => {
+    return this.enqueue(chatId, async (): Promise<TelegramReceipt | void> => {
       if (/^https?:\/\//i.test(source)) {
-        await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, source));
-        return;
+        return this.receiptFor(chatId, await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, source)));
       }
       const local = path.resolve(source);
       if (!fs.existsSync(local)) throw new Error(`MEDIA file not found: ${local}`);
@@ -569,10 +644,9 @@ export class TelegramTransport implements Transport {
       const lower = local.toLowerCase();
       const isImage = /\.(jpe?g|png|webp|gif|heic)$/.test(lower);
       if (isImage) {
-        await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, new InputFile(local)));
-      } else {
-        await this.sendTelegram(chatId, () => this.bot.api.sendDocument(chatId, new InputFile(local)));
+        return this.receiptFor(chatId, await this.sendTelegram(chatId, () => this.bot.api.sendPhoto(chatId, new InputFile(local))));
       }
+      return this.receiptFor(chatId, await this.sendTelegram(chatId, () => this.bot.api.sendDocument(chatId, new InputFile(local))));
     });
   }
 
@@ -612,6 +686,36 @@ export class TelegramTransport implements Transport {
           : this.bot.api.sendAudio(chatId, input, { caption: safeCaption });
       });
       this.duplicateGuard.markSent(chatId, payload);
+    });
+  }
+
+    async sendVideoNote(chatId: string, filePath: string): Promise<TelegramReceipt | void> {
+    const resolved = path.resolve(filePath);
+    // Sync lstat here keeps the guard simple: no symlinks, regular files only.
+    const st = fs.lstatSync(resolved);
+    if (!st.isFile() || st.isSymbolicLink()) throw new Error("Invalid video note artifact file");
+    if (st.size <= 0 || st.size > 50 * 1024 * 1024) throw new Error("Video note artifact must be between 1 byte and 50MB");
+    if (path.extname(resolved).toLowerCase() !== ".mp4") throw new Error("Telegram video notes must be MP4 (H.264 up to 60s)");
+    const digest = createHash("sha256").update(fs.readFileSync(resolved)).digest("hex");
+    const payload = `videonote:${digest}`;
+    return this.enqueue(chatId, async (): Promise<TelegramReceipt | void> => {
+      if (!this.duplicateGuard.shouldSend(chatId, payload)) {
+        console.warn(`[telegram] suppressed duplicate video-note send to chat ${chatId}`);
+        return;
+      }
+      const sent = await this.sendTelegram(chatId, () => {
+        const input = new InputFile(resolved, path.basename(resolved));
+        // Native round note: sendVideoNote — never ordinary video (sendVideo would
+        // deliver a rectangular clip, not a circle). No caption field exists for
+        // video notes in the Bot API, so none is passed.
+        return this.bot.api.sendVideoNote(chatId, input);
+      });
+      // Real-send evidence line: agent claims of delivery must be checkable (bd pibot-3w03 ghost-claims).
+      this.duplicateGuard.markSent(chatId, payload);
+      // receipt for the verified-completion gate (bd pibot-zy70), destination-aware (bd pibot-cida)
+      const receipt = this.receiptFor(chatId, sent);
+      console.warn(`[telegram] ${this.name}: video-note sent — chat ${chatId} message ${receipt.messageId ?? "?"} file ${path.basename(resolved)}`);
+      return receipt;
     });
   }
 
@@ -728,36 +832,53 @@ export class TelegramTransport implements Transport {
 
   /** DMs for participant bots (memberGroups set): the sender must be a member of
    *  the configured group. Owner allowlist chats always pass. Membership is cached
-   *  (positive 10m / negative 60s) so a burst of DMs makes one API call at most. */
-  private async dmAllowedByMembership(ctx: Context): Promise<boolean> {
-    if (!this.memberGroups.size) return true;
-    const type = ctx.chat?.type;
-    if (type === "private") {
-      const userId = String(ctx.from?.id ?? "");
-      if (!userId) return false;
-      const now = Date.now();
-      const cached = this.membershipCache.get(userId);
-      if (cached && cached.until > now) return cached.ok;
-      let ok = false;
-      for (const groupId of this.memberGroups) {
-        try {
-          const member = await this.bot.api.getChatMember(Number(groupId), Number(userId));
-          const status = (member as { status?: string }).status;
-          if (status && status !== "left" && status !== "kicked") {
-            ok = true;
-            break;
-          }
-        } catch {
-          // API failure here must not lock participants out: fail open, short TTL
-          this.membershipCache.set(userId, { ok: true, until: now + 60_000 });
-          return true;
-        }
+   *  (positive 10m / negative 60s); proactive delivery always checks afresh. */
+  /** Fresh eligibility check for proactive personal delivery. Errors deny access. */
+  async canDeliverToMember(chatId: string): Promise<boolean> {
+    return (await this.membershipLookup(chatId)) === "member";
+  }
+
+  /** "unknown" = every group lookup failed (network, 429): neither proof of membership nor of its absence. */
+  private async membershipLookup(chatId: string): Promise<"member" | "not-member" | "unknown"> {
+    if (!/^[1-9]\d*$/.test(chatId)) return "not-member";
+    if (this.allowed.has(chatId)) return "member";
+    if (!this.memberGroups.size) return "not-member";
+    let answered = false;
+    for (const groupId of this.memberGroups) {
+      try {
+        const member = await this.bot.api.getChatMember(Number(groupId), Number(chatId));
+        answered = true;
+        if (member.status === "creator" || member.status === "administrator" || member.status === "member" ||
+            (member.status === "restricted" && member.is_member === true)) return "member";
+      } catch {
+        // A failed lookup is never proof of membership; another configured group may succeed.
       }
-      this.membershipCache.set(userId, { ok, until: now + (ok ? 10 * 60_000 : 60_000) });
-      return ok;
     }
-    // group chats themselves pass the normal allowlist (mention-only governs noise)
-    return true;
+    return answered ? "not-member" : "unknown";
+  }
+
+  /** DMs whose sender could not be verified this time; handleDenied asks them to retry instead of selling to them. */
+  private membershipUnverified = new Set<string>();
+
+  private async dmAllowedByMembership(ctx: Context): Promise<boolean> {
+    if (!this.memberGroups.size || ctx.chat?.type !== "private") return true;
+    const userId = String(ctx.from?.id ?? "");
+    if (!userId) return false;
+    if (this.allowed.has(userId)) return true;
+    const now = Date.now();
+    const cached = this.membershipCache.get(userId);
+    if (cached && cached.until > now) return cached.ok;
+    const result = await this.membershipLookup(userId);
+    if (result === "unknown") {
+      // Telegram is flaky: keep serving a known member on their last verified status, and never
+      // cache a negative or route an unverified sender into the public sales flow.
+      if (cached) return cached.ok;
+      this.membershipUnverified.add(userId);
+      return false;
+    }
+    const ok = result === "member";
+    this.membershipCache.set(userId, { ok, until: now + (ok ? 10 * 60_000 : 60_000) });
+    return ok;
   }
 
   private async check(ctx: Context): Promise<boolean> {
@@ -789,6 +910,10 @@ export class TelegramTransport implements Transport {
     // pairing help — that exposes owner configuration to strangers)
     if (this.memberGroups.size && ctx.chat?.type === "private") {
       const userId = String(ctx.from?.id ?? "");
+      if (this.membershipUnverified.delete(userId)) {
+        await this.push(chatId, { text: "⚠️ Не удалось проверить участие в группе — Telegram временно недоступен. Повторите сообщение через минуту." }).catch(() => {});
+        return;
+      }
       if (this.name === "telegram:lab" && this.boundAgentId === "lab" && this.publicRequestCb && /^[1-9]\d*$/.test(chatId) && chatId === userId) {
         const request = ctx.callbackQuery?.data ?? ctx.message?.text ?? "/start";
         try {
@@ -963,11 +1088,35 @@ export class TelegramTransport implements Transport {
     return this.me?.username;
   }
 
+  /** Participant menus never advertise operational commands. Telegram's more
+   * specific private/group scopes override old broad menus from earlier versions. */
+  private async registerCommandMenus(): Promise<void> {
+    if (!this.memberGroups.size) {
+      await this.bot.api.setMyCommands(BOT_COMMANDS);
+      return;
+    }
+    for (const type of ["default", "all_private_chats", "all_group_chats"] as const) {
+      await this.bot.api.setMyCommands(LAB_COMMANDS, { scope: { type } });
+    }
+    const adminCommands = [
+      ...BOT_COMMANDS.filter(({ command }) => !LAB_COMMANDS.some((lab) => lab.command === command)),
+      ...LAB_COMMANDS,
+      { command: "labtest", description: "Preview a participant's lab content (admin)" },
+      { command: "userview", description: "View the bot as a selected participant (admin)" },
+      { command: "courseoffer", description: "Preview course payment offer (admin)" },
+      { command: "lessonpreview", description: "Preview selected participant publication message (admin)" },
+    ];
+    for (const chatId of this.allowed) {
+      // Group allowlist entries grant group access, never an administrator menu.
+      if (!/^[1-9]\d*$/.test(chatId) || !Number.isSafeInteger(Number(chatId))) continue;
+      await this.bot.api.setMyCommands(adminCommands, { scope: { type: "chat", chat_id: Number(chatId) } });
+    }
+  }
+
   async start(): Promise<void> {
     await this.bot.init();
     this.me = this.bot.botInfo;
-    void this.bot.api
-      .setMyCommands(BOT_COMMANDS)
+    await this.registerCommandMenus()
       .then(() => console.log("[telegram] command menu registered"))
       .catch((e) => console.error("[telegram] setMyCommands failed:", e.message));
     if (!this.allowed.size && !this.openWhenEmpty) {
@@ -1012,13 +1161,22 @@ export class TelegramTransport implements Transport {
     is_persistent: false,
   };
 
-  async push(chatId: string, opts: PushOptions): Promise<void> {
-    return this.enqueue(chatId, async () => {
+  async push(chatId: string, opts: PushOptions): Promise<TelegramReceipt | void> {
+    if (this.name === "telegram:lab" && this.boundAgentId === "lab") {
+      // Origin-tagged proactive output may only reach an allowlisted owner DM.
+      if (/\[heartbeat\]/i.test(opts.text) && (!/^[1-9]\d*$/.test(chatId) || !this.allowed.has(chatId))) return;
+      if (chatId.startsWith("-")) {
+        const text = labGroupReply(opts.text);
+        if (!text) return;
+        opts = { ...opts, text, ...(opts.card ? { card: { ...opts.card, text: labGroupReply(opts.card.text) } } : {}) };
+      }
+    }
+    return this.enqueue(chatId, async (): Promise<TelegramReceipt | void> => {
       const raw = stripAcpLeak(opts.text);
       // Long texts (Bot API 10.1+): rich messages carry 32k chars — well past the
       // classic 4k, so a multi-paragraph push needs no truncation or splitting as
       // long as it fits the rich limit and we can route it through sendRichMessage.
-      const longFit = raw.length > TG_LIMIT && raw.length <= RICH_TEXT_LIMIT && !opts.card && !opts.replyToMessageId;
+      const longFit = raw.length > TG_LIMIT;
       const text = truncate(raw, longFit ? RICH_TEXT_LIMIT : TG_LIMIT) + (raw.length > (longFit ? RICH_TEXT_LIMIT : TG_LIMIT) ? "\n\n…(truncated)" : "");
       const payload = JSON.stringify({ text, card: opts.card ?? null });
       // Dedupe key: a reply to a user turn carries its turn identity, so two identical
@@ -1033,9 +1191,11 @@ export class TelegramTransport implements Transport {
       }
       // first plain message in a chat attaches the persistent quick-action keyboard —
       // only the main bot; subbot chats keep their own clean slate
+      let sent: unknown;
       let sentId: number | undefined;
       try {
-        sentId = await this.sendPushBody(chatId, text, opts);
+        sent = await this.sendPushBody(chatId, text, opts);
+        sentId = messageIdOf(sent);
       } catch (e) {
         // The 👍 must never claim a delivery that did not happen: it is settled
         // BEFORE the send precisely so a wedged outbox cannot block it, which also
@@ -1047,12 +1207,15 @@ export class TelegramTransport implements Transport {
       this.recordCardMessage(chatId, sentId, Boolean(opts.card));
       await this.sweepStaleCards(chatId);
       this.duplicateGuard.markSent(chatId, dedupeKey);
+      // delivery receipt for task records (bd pibot-zy70), destination-aware (bd pibot-cida);
+      // nothing observable when suppressed
+      return sentId !== undefined ? this.receiptFor(chatId, sent) : undefined;
     });
   }
 
-  /** Push body: rich/legacy routing, quick-action keyboard, reply threading. */
-  private async sendPushBody(chatId: string, text: string, opts: PushOptions): Promise<number | undefined> {
-      let sentId: number | undefined;
+  /** Push body: rich/legacy routing, quick-action keyboard, reply threading.
+   *  Returns the raw Bot API message so the caller can derive a receipt from the ACTUAL response. */
+  private async sendPushBody(chatId: string, text: string, opts: PushOptions): Promise<unknown> {
       // reply threading: a push can answer a specific incoming message
       const replyParams = opts.replyToMessageId
         ? { reply_parameters: { message_id: opts.replyToMessageId, allow_sending_without_reply: true } }
@@ -1061,18 +1224,20 @@ export class TelegramTransport implements Transport {
       // sendRichMessage (Bot API 10.1+). Legacy/self-hosted servers that 404 the
       // method fall back to classic entities — but a >4k body then cannot travel as
       // one classic message at all, so re-truncate to the classic limit in that branch.
-      if (!opts.card && !opts.replyToMessageId && (isRichTelegramContent(text) || text.length > TG_LIMIT)) {
+      if (isRichTelegramContent(text) || text.length > TG_LIMIT) {
         try {
-          sentId = messageIdOf(await this.sendTelegram(chatId, () => this.bot.api.sendRichMessage(chatId, { markdown: text })));
+          return await this.sendTelegram(chatId, () => this.bot.api.sendRichMessage(chatId, { markdown: text }, {
+            reply_markup: keyboard(opts.card),
+            ...replyParams,
+          }));
         } catch (e) {
           // 404 → legacy server (classic entities below); markup rejection → same
           // degrade as the classic path, so a formatting bug never eats a reply.
           if (!isRichUnsupported(e) && !isEntityParseError(e)) throw e;
-          const sent = await this.sendClassicMessage(chatId, text.length > TG_LIMIT ? truncate(text, TG_LIMIT) + "\n\n…(truncated)" : text, {
+          return await this.sendClassicMessage(chatId, text.length > TG_LIMIT ? truncate(text, TG_LIMIT) + "\n\n…(truncated)" : text, {
             reply_markup: keyboard(opts.card),
             ...replyParams,
           });
-          sentId = messageIdOf(sent);
         }
       } else if (!this.keyboardSent.has(chatId) && !opts.card && !this.boundAgentId && process.env.PIBOT_QUICK_KEYBOARD !== "0") {
         const sent = await this.sendClassicMessage(chatId, text, {
@@ -1080,15 +1245,13 @@ export class TelegramTransport implements Transport {
           ...replyParams,
         });
         this.keyboardSent.add(chatId);
-        sentId = messageIdOf(sent);
+        return sent;
       } else {
-        const sent = await this.sendClassicMessage(chatId, text, {
+        return await this.sendClassicMessage(chatId, text, {
           reply_markup: keyboard(opts.card),
           ...replyParams,
         });
-        sentId = messageIdOf(sent);
       }
-      return sentId;
   }
 
   /**

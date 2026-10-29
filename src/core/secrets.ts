@@ -180,11 +180,13 @@ export async function encryptJsonWithSops(value: unknown, dataDir: string, encPa
 
 /** Fields that must never sit in plaintext */
 export function isSecretSettings(s: Settings): boolean {
-  return Boolean(s.telegram?.token || (s.telegram?.subBots && Object.values(s.telegram.subBots).some((b) => b.token)));
+  return Boolean(s.labEnrollment?.signingSecret || s.labPayments?.stripeKey || s.telegram?.token || (s.telegram?.subBots && Object.values(s.telegram.subBots).some((b) => b.token)));
 }
 
 export function stripSecrets(s: Settings): Settings {
   const out: Settings = JSON.parse(JSON.stringify(s));
+  if (out.labPayments) delete out.labPayments.stripeKey;
+  if (out.labEnrollment) delete out.labEnrollment.signingSecret;
   if (out.telegram) {
     const tg = out.telegram as Record<string, unknown>;
     delete tg.token;

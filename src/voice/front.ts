@@ -213,6 +213,13 @@ export class VoiceFront {
       if (name === "start_task") {
         const title = str(args.title, 120), instructions = str(args.instructions, 8000);
         if (!title || !instructions) return "ERROR: title and instructions are required";
+        // A voice turn may be replayed after the front has already issued its tool call.
+        // Reuse the current scrape/research job rather than surfacing or launching a second one.
+        const duplicate = await ledger.latestActive(call.agentId, call.chatKey);
+        if (duplicate && /scrap|research|fetch|web|source/i.test(`${duplicate.title}\n${duplicate.instructions}`) && /scrap|research|fetch|web|source/i.test(`${title}\n${instructions}`)) {
+          if (!call.started.includes(duplicate.id)) call.started.push(duplicate.id);
+          return `Already running ${duplicate.id} "${duplicate.title}". I will use the latest result.`;
+        }
         const t = await ledger.start({ agentId: call.agentId, chatKey: call.chatKey, title, instructions, ...(call.allowedTools ? { allowedTools: call.allowedTools } : {}) }, `voice:${callId}:${toolCallId}`);
         if (!call.started.includes(t.id)) call.started.push(t.id);
         return `Started ${t.id} "${t.title}". It runs in the background; the result goes to the chat and is announced here.`;

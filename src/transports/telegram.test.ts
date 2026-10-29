@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { InputFile } from "grammy";
 import type { InputProfilePhoto } from "grammy/types";
-import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec, serviceMessageKind, toTelegramHtml, stripAcpLeak } from "./telegram.js";
+import type { Card } from "../core/types.js";
+import { TelegramDuplicateGuard, TelegramTransport, telegramRetryAfterMs, replyContextFrom, extFromMime, telegramMediaSpec, serviceMessageKind, toTelegramHtml, stripAcpLeak, type TelegramReceipt } from "./telegram.js";
 
 describe("TelegramDuplicateGuard", () => {
   it("suppresses an identical payload to the same chat inside the window", () => {
@@ -158,6 +159,90 @@ describe("Telegram profile photo adapter", () => {
   });
 });
 
+describe("destination-aware delivery receipts (bd pibot-cida)", () => {
+  const ME = { id: 4242, username: "pibot", first_name: "PiBot" };
+
+  function transportWithApi(api: Record<string, unknown>, me: typeof ME | null = ME): TelegramTransport {
+    const t = new TelegramTransport("123:test", ["42"], { nameSuffix: "coach" });
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = { api };
+    (t as unknown as { me: typeof ME | undefined }).me = me ?? undefined;
+    return t;
+  }
+
+  it("stamps peer, account, id namespace and evidence on a text push", async () => {
+    const t = transportWithApi({ sendMessage: async () => ({ message_id: 7, chat: { id: 42 } }) });
+    const r = await t.push("42", { text: "hello" });
+    expect(r).toMatchObject({ messageId: 7, peer: "telegram:coach:42", account: "@pibot", idProtocol: "bot_api", evidence: "ack" });
+  });
+
+  it("tags a document send with its destination and medium", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-receipt-"));
+    const file = path.join(dir, "report.pdf");
+    fs.writeFileSync(file, "pdf", { mode: 0o600 });
+    const t = transportWithApi({ sendDocument: async () => ({ message_id: 11, chat: { id: 42 }, document: { file_id: "d" } }) });
+    const r = await t.sendMedia("42", file);
+    expect(r).toMatchObject({ messageId: 11, mediaType: "document", peer: "telegram:coach:42", idProtocol: "bot_api", evidence: "ack" });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("tags a round video note as video_note with its destination", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-receipt-"));
+    const file = path.join(dir, "circle.mp4");
+    fs.writeFileSync(file, "mp4", { mode: 0o600 });
+    const t = transportWithApi({ sendVideoNote: async () => ({ message_id: 12, chat: { id: 42 }, video_note: { file_id: "v" } }) });
+    const r = await t.sendVideoNote("42", file);
+    expect(r).toMatchObject({ messageId: 12, mediaType: "video_note", peer: "telegram:coach:42", idProtocol: "bot_api" });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("omits the account when the bot identity is not known yet", async () => {
+    const t = transportWithApi({ sendMessage: async () => ({ message_id: 8, chat: { id: 42 } }) }, null);
+    const r = await t.push("42", { text: "hello" });
+    expect(r).toMatchObject({ messageId: 8, peer: "telegram:coach:42" });
+    expect((r as TelegramReceipt).account).toBeUndefined();
+  });
+
+  it("records the ACTUAL response chat id when it contradicts the requested chat", async () => {
+    // A response whose chat.id disagrees with the chat we addressed is a contradiction the receipt
+    // must NOT paper over — the peer reports where the message really landed.
+    const t = transportWithApi({ sendMessage: async () => ({ message_id: 9, chat: { id: 99 } }) });
+    const r = await t.push("42", { text: "hello" });
+    expect(r).toMatchObject({ messageId: 9, peer: "telegram:coach:99", account: "@pibot", idProtocol: "bot_api", evidence: "ack" });
+  });
+
+  it("stamps the medium the RESPONSE carries, not the one we asked for", async () => {
+    const t = transportWithApi({ sendPhoto: async () => ({ message_id: 13, chat: { id: 42 }, animation: { file_id: "x" } }) });
+    const r = await t.sendMedia("42", "https://example.com/clip.mp4");
+    expect(r).toMatchObject({ messageId: 13, mediaType: "animation" });
+  });
+
+  // ── strict: a response field we did NOT get stays unverified (bd pibot-cida review) ──
+
+  it("leaves the peer UNSET when the response names no chat — no echo of the requested chat", async () => {
+    const t = transportWithApi({ sendMessage: async () => ({ message_id: 21 }) });
+    const r = await t.push("42", { text: "hello" });
+    expect((r as TelegramReceipt).messageId).toBe(21);
+    expect((r as TelegramReceipt).peer).toBeUndefined();
+  });
+
+  it("leaves the media type UNSET when the response carries no medium — no echo of what we asked for", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-receipt-"));
+    const file = path.join(dir, "circle.mp4");
+    fs.writeFileSync(file, "mp4", { mode: 0o600 });
+    const t = transportWithApi({ sendVideoNote: async () => ({ message_id: 22, chat: { id: 42 } }) });
+    const r = await t.sendVideoNote("42", file);
+    expect(r).toMatchObject({ messageId: 22, peer: "telegram:coach:42" });
+    expect((r as TelegramReceipt).mediaType).toBeUndefined();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("uses the account the RESPONSE names — a contradicting sender is not hidden by the cached bot identity", async () => {
+    const t = transportWithApi({ sendMessage: async () => ({ message_id: 23, chat: { id: 42 }, from: { id: 999, username: "otherbot" } }) });
+    const r = await t.push("42", { text: "hello" });
+    expect((r as TelegramReceipt).account).toBe("@otherbot"); // the ACTUAL sender, not the cached me
+  });
+});
+
 describe("Telegram speech delivery", () => {
   it("sends voice through the guarded per-chat outbox and suppresses an immediate duplicate", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-voice-"));
@@ -213,15 +298,17 @@ describe("Telegram speech delivery", () => {
 });
 
 describe("rich message auto-routing (Bot API 10.1+)", () => {
-  function richTransport(): { t: TelegramTransport; calls: string[]; richPayloads: Array<{ markdown: string }> } {
+  function richTransport(): { t: TelegramTransport; calls: string[]; richPayloads: Array<{ markdown: string }>; richOptions: Array<unknown> } {
     const t = new TelegramTransport("123:test", ["42"]);
     const calls: string[] = [];
     const richPayloads: Array<{ markdown: string }> = [];
+    const richOptions: Array<unknown> = [];
     (t as unknown as { bot: { api: Record<string, unknown> } }).bot = {
       api: {
-        sendRichMessage: async (_cid: string, payload: { markdown: string }) => {
+        sendRichMessage: async (_cid: string, payload: { markdown: string }, options: unknown) => {
           calls.push("sendRichMessage");
           richPayloads.push(payload);
+          richOptions.push(options);
           return { message_id: 5 };
         },
         sendMessage: async () => {
@@ -230,7 +317,7 @@ describe("rich message auto-routing (Bot API 10.1+)", () => {
         },
       },
     };
-    return { t, calls, richPayloads };
+    return { t, calls, richPayloads, richOptions };
   }
 
   it("headings route through sendRichMessage with the raw markdown", async () => {
@@ -297,10 +384,49 @@ describe("rich message auto-routing (Bot API 10.1+)", () => {
     expect(sentText).not.toBe("html-mode-truncated-placeholder"); // smoke: no crash on the long path
   });
 
-  it("card pushes stay classic even when the text looks rich", async () => {
-    const { t, calls } = richTransport();
-    await t.push("42", { text: "## pick one", card: { text: "", buttons: [{ label: "go", action: "agt:x" }] } });
-    expect(calls).toEqual(["sendMessage"]);
+  it("respects full-width card actions while retaining default paired rows", async () => {
+    const { t, richOptions } = richTransport();
+    const buttons = [{ label: "Recording", action: "recording", url: "https://youtube.com/watch?v=known" }, { label: "Materials", action: "materials", url: "https://example.com/materials" }];
+    await t.push("42", { text: "## Recordings", card: { text: "", columns: 1, buttons } });
+    expect(richOptions[0]).toMatchObject({ reply_markup: { inline_keyboard: [[{ text: "Recording", url: buttons[0].url }], [{ text: "Materials", url: buttons[1].url }]] } });
+    await t.push("42", { text: "## Other actions", card: { text: "", buttons } });
+    expect(richOptions[1]).toMatchObject({ reply_markup: { inline_keyboard: [[{ text: "Recording", url: buttons[0].url }, { text: "Materials", url: buttons[1].url }]] } });
+  });
+
+  it("headed cards use native rich formatting with their inline keyboard and reply", async () => {
+    const { t, calls, richOptions } = richTransport();
+    await t.push("42", { text: "## pick one", replyToMessageId: 12, card: { text: "", buttons: [{ label: "go", action: "agt:x" }] } });
+    expect(calls).toEqual(["sendRichMessage"]);
+    expect(richOptions[0]).toMatchObject({
+      reply_markup: { inline_keyboard: [[{ text: "go", callback_data: "agt:x" }]] },
+      reply_parameters: { message_id: 12, allow_sending_without_reply: true },
+    });
+  });
+
+  it("long cards keep the rich limit", async () => {
+    const { t, calls, richPayloads } = richTransport();
+    await t.push("42", { text: "## Guide\n\n" + "a".repeat(6000), card: { text: "", buttons: [{ label: "go", action: "agt:x" }] } });
+    expect(calls).toEqual(["sendRichMessage"]);
+    expect(richPayloads[0]?.markdown.length).toBeGreaterThan(6000);
+  });
+
+  it("legacy fallback keeps a card keyboard and reply parameters", async () => {
+    const { t } = richTransport();
+    const api = (t as unknown as { bot: { api: Record<string, unknown> } }).bot.api;
+    api.sendRichMessage = async () => { throw Object.assign(new Error("Not Found"), { error_code: 404 }); };
+    let fallbackOptions: unknown;
+    let fallbackText = "";
+    api.sendMessage = async (_cid: string, body: string, options: unknown) => {
+      fallbackText = body;
+      fallbackOptions = options;
+      return { message_id: 8 };
+    };
+    await t.push("42", { text: "## Guide\n\n" + "a".repeat(6000), replyToMessageId: 12, card: { text: "", buttons: [{ label: "go", action: "agt:x" }] } });
+    expect(fallbackText.length).toBeLessThan(4200);
+    expect(fallbackOptions).toMatchObject({
+      reply_markup: { inline_keyboard: [[{ text: "go", callback_data: "agt:x" }]] },
+      reply_parameters: { message_id: 12, allow_sending_without_reply: true },
+    });
   });
 
   it("404 from a legacy server falls back to classic entities", async () => {
@@ -806,5 +932,226 @@ describe("media download retry (transient network)", () => {
     } finally {
       globalThis.fetch = origFetch;
     }
+  });
+});
+
+describe("TelegramTransport outbound push path", () => {
+  function makeTransport(allowed: string[] = ["42", "84"]) {
+    const T = new TelegramTransport("123:test", allowed, { nameSuffix: "x" });
+    return T as unknown as {
+      push(chatId: string, opts: { text: string; card?: Card }): Promise<void>;
+      bot: { api: { [method: string]: (...args: unknown[]) => Promise<unknown> } };
+    };
+  }
+
+  it("sends the payload through Telegram sendMessage with HTML parse mode", async () => {
+    const transport = makeTransport();
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown) => ({ message_id: 1 }));
+    transport.bot.api.sendMessage = send as never;
+
+    await transport.push("42", { text: "hello **world**" });
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toBe("42");
+    expect(send.mock.calls[0][1]).toBe("hello <b>world</b>");
+    expect(send.mock.calls[0][2]).toMatchObject({ parse_mode: "HTML" });
+  });
+
+  it("keeps a failed push retry-eligible and delivers on explicit retry", async () => {
+    const transport = makeTransport();
+    let attempts = 0;
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown) => {
+      attempts++;
+      if (attempts === 1) throw new Error("transient");
+      return { message_id: 1 };
+    });
+    transport.bot.api.sendMessage = send as never;
+
+    await expect(transport.push("42", { text: "retry me" })).rejects.toThrow("transient");
+    expect(send).toHaveBeenCalledTimes(1);
+
+    // failed attempt was not marked sent — the identical payload is not suppressed
+    await transport.push("42", { text: "retry me" });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it("serializes pushes to the same chat and enforces the minimum send gap", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = makeTransport();
+      const sendTimes: number[] = [];
+      const send = vi.fn(async (chatId: string, text: string, options?: unknown) => {
+        sendTimes.push(Date.now());
+        return { message_id: 1 };
+      });
+      transport.bot.api.sendMessage = send as never;
+
+      const p1 = transport.push("42", { text: "first" });
+      const p2 = transport.push("42", { text: "second" });
+      await vi.runAllTimersAsync();
+      await Promise.all([p1, p2]);
+
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send.mock.calls[0][1]).toBe("first");
+      expect(send.mock.calls[1][1]).toBe("second");
+      expect(sendTimes[1] - sendTimes[0]).toBeGreaterThanOrEqual(1000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("honors Telegram 429 retry_after and retries once", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = makeTransport();
+      let attempts = 0;
+      const sendTimes: number[] = [];
+      const send = vi.fn(async (chatId: string, text: string, options?: unknown) => {
+        sendTimes.push(Date.now());
+        attempts++;
+        if (attempts === 1) throw { error_code: 429, parameters: { retry_after: 2 } };
+        return { message_id: 1 };
+      });
+      transport.bot.api.sendMessage = send as never;
+
+      const p = transport.push("42", { text: "throttled" });
+      await vi.runAllTimersAsync();
+      await p;
+
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(sendTimes[1] - sendTimes[0]).toBe(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry on non-429 errors and leaves the chat retry-eligible", async () => {
+    const transport = makeTransport();
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown): Promise<unknown> => {
+      throw { error_code: 500, parameters: { retry_after: 99 } };
+    });
+    transport.bot.api.sendMessage = send as never;
+
+    await expect(transport.push("42", { text: "fail" })).rejects.toMatchObject({ error_code: 500 });
+    expect(send).toHaveBeenCalledTimes(1);
+
+    // a different, non-throttled error still blocks until the caller retries
+    send.mockResolvedValueOnce({ message_id: 1 });
+    await transport.push("42", { text: "fail" });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it("delivers to each chat independently with no cross-chat coupling or serialization", async () => {
+    const transport = makeTransport();
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown) => ({ message_id: 1 }));
+    transport.bot.api.sendMessage = send as never;
+
+    await Promise.all([
+      transport.push("42", { text: "hello" }),
+      transport.push("84", { text: "world" }),
+    ]);
+
+    expect(send).toHaveBeenCalledTimes(2);
+    const byChat = Object.fromEntries(send.mock.calls.map((c) => [c[0], c[1]]));
+    expect(byChat).toEqual({ "42": "hello", "84": "world" });
+  });
+
+  it("isolates a slow chat so a fast chat is not held up", async () => {
+    const transport = makeTransport();
+    let releaseSlow: () => void = () => {};
+    const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+    const order: string[] = [];
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown) => {
+      order.push(`start:${chatId}`);
+      if (chatId === "84") await slowGate;
+      order.push(`done:${chatId}`);
+      return { message_id: 1 };
+    });
+    transport.bot.api.sendMessage = send as never;
+
+    // slow chat enqueued first
+    const p84 = transport.push("84", { text: "slow" });
+
+    // wait until slow chat's send has started (entered the mock)
+    await vi.waitFor(() => expect(order).toEqual(["start:84"]));
+
+    // now enqueue fast chat on a different chat
+    const p42 = transport.push("42", { text: "fast" });
+    await p42;
+
+    // fast chat completed while slow chat is still gated
+    expect(order).toEqual(["start:84", "start:42", "done:42"]);
+
+    releaseSlow();
+    await p84;
+
+    // slow chat completes after release
+    expect(order).toEqual(["start:84", "start:42", "done:42", "done:84"]);
+  });
+
+  it("suppresses an identical push within the duplicate window after a successful send", async () => {
+    const transport = makeTransport();
+    const send = vi.fn(async (chatId: string, text: string, options?: unknown) => ({ message_id: 1 }));
+    transport.bot.api.sendMessage = send as never;
+
+    await transport.push("42", { text: "once" });
+    await transport.push("42", { text: "once" });
+
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Telegram video-note delivery", () => {
+  it("sends native round notes via sendVideoNote (no caption) and suppresses an immediate duplicate", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-videofnote-"));
+    const file = path.join(dir, "circle.mp4");
+    fs.writeFileSync(file, "ftyp-circle-note", { mode: 0o600 });
+    const transport = new (await import("./telegram.js")).TelegramTransport("123:test", ["42"]);
+    const sendVideoNote = vi.fn(async (_chatId: string, _note: unknown, _options?: unknown) => ({ message_id: 2 }));
+    (transport as unknown as { bot: { api: { sendVideoNote: typeof sendVideoNote } } }).bot.api.sendVideoNote = sendVideoNote;
+
+    await transport.sendVideoNote("42", file);
+    await transport.sendVideoNote("42", file);
+
+    expect(sendVideoNote).toHaveBeenCalledTimes(1); // duplicate suppressed
+    expect(sendVideoNote.mock.calls[0][0]).toBe("42");
+    // no caption/other params: video notes have no caption field in the Bot API
+    expect(sendVideoNote.mock.calls[0][2]).toBeUndefined();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("rejects non-MP4 artifacts", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-videofnote-"));
+    const file = path.join(dir, "circle.webm");
+    fs.writeFileSync(file, "webm", { mode: 0o600 });
+    const transport = new (await import("./telegram.js")).TelegramTransport("123:test", ["42"]);
+    await expect(transport.sendVideoNote("42", file)).rejects.toThrow(/MP4/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("video-note send evidence logging", () => {
+  const ME2 = { id: 4242, username: "pibot", first_name: "PiBot" };
+  function transportWithApi(api: Record<string, unknown>, me: typeof ME2 | null = ME2): TelegramTransport {
+    const t = new TelegramTransport("123:test", ["42"], { nameSuffix: "coach" });
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot = { api };
+    (t as unknown as { me: typeof ME2 | undefined }).me = me ?? undefined;
+    return t;
+  }
+  it("logs a real-send line with transport name, chat and message id", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-tg-vnlog-"));
+    try {
+      fs.writeFileSync(path.join(dir, "note.mp4"), "x");
+      const t = transportWithApi({ sendVideoNote: async () => ({ message_id: 77, chat: { id: 42 }, video_note: { file_id: "v" } }) });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      let lines: string[] = [];
+      try { await t.sendVideoNote("42", path.join(dir, "note.mp4")); lines = warn.mock.calls.map((c) => String(c[0])); }
+      finally { warn.mockRestore(); }
+      const line = lines.find((s) => s.includes("video-note sent"));
+      expect(line).toBeDefined();
+      expect(line).toContain("chat 42");
+      expect(line).toContain("message 77");
+      expect(line).toContain("note.mp4");
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

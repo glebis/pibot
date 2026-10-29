@@ -20,9 +20,10 @@ import { ensureDir } from "../core/util.js";
 import { createPibotAcpPrompt } from "./agent.js";
 import { AcpServer } from "./server.js";
 
-/** Every diagnostic goes to stderr; stdout is reserved for the protocol. */
+/** Every diagnostic goes to stderr; stdout is reserved for the protocol.
+ *  Routed through console.error so installLogRedaction() scrubs it too. */
 function log(message: string): void {
-  process.stderr.write(`[acp] ${message}\n`);
+  console.error(`[acp] ${message}`);
 }
 
 async function main(): Promise<void> {

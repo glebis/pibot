@@ -14,8 +14,45 @@ import { createModels } from "@earendil-works/pi-ai";
 import { Harness, createRegistry, defineDoc, defineExtension, defineTask, type JsonObject } from "@earendil-works/pi-durable";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
+import { truncate } from "../core/util.js";
+import { scanNumericClaims } from "../core/fact-check.js";
+import { correctRelativeDateClaims } from "../core/relative-date-guard.js";
 
-export type LedgerStatus = "queued" | "running" | "done" | "failed" | "cancelled";
+export type LedgerStatus = "queued" | "running" | "done" | "partial" | "blocked" | "failed" | "cancelled";
+
+/** Strongest proof of delivery obtained so far, weakest first. An API ack is NOT a same-peer
+ *  readback, and neither is a human viewing the message (bd pibot-cida). */
+export type DeliveryEvidence = "ack" | "readback" | "viewed";
+
+/** Evidence that a task's output was actually delivered (bd pibot-zy70).
+ *  A message id alone proves neither *where* the result landed nor *what* it was, so the
+ *  receipt is a tuple: account/bot + peer (destination) + message id + media type, with the
+ *  id namespace named explicitly (bd pibot-cida). */
+export interface Delivery {
+  /** id of the message that carried the result / final notice — only meaningful with `peer`
+   *  and `idProtocol`, never comparable across different id namespaces */
+  messageId?: number;
+  /** actually delivered medium: "video_note" | "video" | "text" | … (undefined = only a text notice went out) */
+  mediaType?: string;
+  /** destination the receipt attests, as "transport:chatId"; absent = the destination is unverified */
+  peer?: string;
+  /** bot/account identity that performed the send */
+  account?: string;
+  /** message-id namespace ("bot_api", "mtproto", …) — ids from different protocols are never the same message */
+  idProtocol?: string;
+  /** strongest evidence obtained: an API ack is not a readback, and neither is a human viewing */
+  evidence?: DeliveryEvidence;
+  deliveredAt?: number;
+}
+
+/** A runner could not proceed because a prerequisite is missing (tool, credential, provider) —
+ *  distinct from a plain failure so the ledger can record a blocker instead of a bogus retry loop. */
+export class BlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BlockedError";
+  }
+}
 
 export interface LedgerTaskInput {
   agentId: string;
@@ -25,6 +62,33 @@ export interface LedgerTaskInput {
   instructions: string;
   /** owner-chosen tool names for the run (from a voice call); omitted = the agent's full set */
   allowedTools?: string[];
+  /** per-task hard stop in minutes; omitted = config default. Persisted with the task so
+   *  retries/resumes keep the same ceiling. Clamped in runLedgerTask: ≥1min, ≤8h ceiling. */
+  timeoutMinutes?: number;
+  /** medium the owner explicitly asked for (e.g. "video_note"); set only when delivery of that
+   *  medium is part of the expected output — then `done` requires the receipt to match it. */
+  expectedMedia?: string;
+  /** destination the receipt must attest, as "transport:chatId"; defaults to chatKey (the origin
+   *  chat). Set this when the owner deliberately asked for a DIFFERENT target (e.g. Saved
+   *  Messages) — the completion gate must then prove THAT destination, not the origin. */
+  expectedPeer?: string;
+  /** bot account the receipt must attest (e.g. "@pibot") — optional cross-check (bd pibot-cida) */
+  expectedAccount?: string;
+  /** message-id namespace the receipt must attest ("bot_api" | "mtproto") — optional cross-check */
+  expectedIdProtocol?: string;
+  /** work lane: "dev" (pibot source work, pibot-dev's lane) vs "cross-agent" (owner-facing
+   *  content/tooling tasks) — task-record-canon keeps the two from mixing (bd pibot-r47f) */
+  lane?: "dev" | "cross-agent";
+  /** id of the owner/source message that requested this task, when the caller knows it */
+  sourceMessageId?: number;
+  /** verifiable acceptance criteria — the gate a completed task must satisfy */
+  acceptanceCriteria?: string;
+  /** what would unblock/advance this task next (task-record-canon) */
+  nextAction?: string;
+  /** where the task's artifacts live on disk (absolute paths) */
+  outputLocation?: string;
+  /** reference-only link to the tracker (Linear/beads) — the ledger stays authoritative */
+  linearRef?: string;
 }
 
 export interface LedgerEntry extends LedgerTaskInput {
@@ -35,6 +99,14 @@ export interface LedgerEntry extends LedgerTaskInput {
   attempts: number;
   result?: string;
   error?: string;
+  /** set when the runner asked for a specific medium but the delivered one differed/unverified */
+  blocker?: string;
+  /** programmatic arithmetic check of the result's numeric claims (bd pibot-wr9m) */
+  factCheck?: { checked: number; inconsistent: number; failures: string[] };
+  /** date-backed correction of relative wording that contradicted the absolute date (bd pibot-wr9m) */
+  dateCheck?: { checked: number; inconsistent: number; corrected: boolean; blocked: boolean; failures: string[] };
+  /** delivery receipt for the verified output (bd pibot-zy70) */
+  delivery?: Delivery;
   /** pi-durable task id, kept so cancel() works after a restart */
   durableId?: number;
 }
@@ -48,14 +120,24 @@ export interface TaskRun extends LedgerTaskInput {
 }
 
 export interface TaskRunner {
-  /** do the work; resolves with the owner-facing result text */
-  run(task: TaskRun): Promise<string>;
-  /** post a message to the owner chat (at-least-once: a crash right after posting may repeat it) */
-  notify(chatKey: string, text: string): Promise<void>;
+  /** do the work; resolves with the owner-facing result text — or a result plus a delivery receipt
+   *  (message id and actual media type) so completion can be verified against expected output */
+  run(task: TaskRun): Promise<string | { text: string; delivery?: Omit<Delivery, "deliveredAt"> }>;
+  /** post a message to the owner chat (at-least-once: a crash right after posting may repeat it;
+   *  may return a receipt with the sent message id) */
+  notify(chatKey: string, text: string): Promise<Delivery | void>;
 }
 
 export interface TaskLedger {
   start(input: LedgerTaskInput, requestId?: string): Promise<LedgerEntry>;
+  /** Return the newest active task for an agent/chat, if any. */
+  latestActive(agentId: string, chatKey: string): Promise<LedgerEntry | undefined>;
+  /**
+   * Update a task's canonical record fields (task-record-canon, bd pibot-r47f):
+   * nextAction / outputLocation. scoped to the owning agent; only pending/running
+   * (and blocked) tasks accept record updates — finished tasks are history.
+   */
+  updateRecord(id: string, agentId: string, patch: { nextAction?: string; outputLocation?: string }): Promise<LedgerEntry | undefined>;
   get(id: string): Promise<LedgerEntry | undefined>;
   list(filter: { agentId: string; chatKey?: string }): Promise<LedgerEntry[]>;
   /** true when an abort was requested for a live task */
@@ -90,9 +172,59 @@ const ledgerDoc = async (tx: unknown, conversationId: unknown) =>
 type Checkpoint =
   | { phase: "run"; attempts: number }
   | { phase: "work"; attempt: number }
-  | { phase: "notify"; ok: boolean; text: string };
+  | { phase: "notify"; ok: boolean; text: string;
+      /** post-work verdict carried into the notice. Older checkpoints predate `final`
+       *  (treated from `ok`); the `partial` verdict is always an explicit newer commit. */
+      final?: "done" | "partial" | "failed" | "blocked";
+      /** delivery receipt returned by run(), kept for the notify-phase entry update */
+      delivery?: Omit<Delivery, "deliveredAt">;
+};
 
 const active = (s: LedgerStatus) => s === "queued" || s === "running";
+
+/** drop keys with undefined values — pi-durable stores strict JSON (bd pibot-zy70) */
+function filterUndefined<T extends object>(o: T): T {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T;
+}
+
+/**
+ * Why an expected-medium delivery is not yet verifiable (bd pibot-cida). The receipt must name the
+ * delivered medium, a valid message id, a destination, a MEANINGFUL bot account and the id
+ * namespace — the MHT case showed a message id that actually lived in a different dialogue than the
+ * one claimed, and an agent id is not a bot identity. The expected destination is explicit
+ * (`expectedPeer`, defaulting to the origin chat), so a deliberately different target is checked
+ * against ITSELF, never hardcoded to the origin. The wording stays a gap statement ("not verified"),
+ * never an assertion that nothing arrived.
+ */
+function describeDeliveryGap(
+  delivery: Omit<Delivery, "deliveredAt"> | undefined,
+  input: Pick<LedgerTaskInput, "chatKey" | "agentId" | "expectedPeer" | "expectedAccount" | "expectedIdProtocol">,
+  expect: string,
+  validMessageId: boolean,
+): string | undefined {
+  if (!delivery) return `requested ${expect} but the delivery was not verified (no media receipt)`;
+  if (delivery.mediaType !== expect) {
+    return delivery.mediaType
+      ? `requested ${expect} but delivered ${delivery.mediaType}`
+      : `requested ${expect} but the delivery was not verified (no media type in the receipt)`;
+  }
+  if (!validMessageId) return `requested ${expect} but delivery has no valid message ID`;
+  const expectedPeer = input.expectedPeer ?? input.chatKey;
+  if (!delivery.peer) return `requested ${expect} but the receipt names no destination (destination unverified)`;
+  if (delivery.peer !== expectedPeer) return `requested ${expect} but delivered to ${delivery.peer} instead of ${expectedPeer}`;
+  if (!delivery.account) return `requested ${expect} but the receipt names no sending account (account unverified)`;
+  if (delivery.account === input.agentId) {
+    return `requested ${expect} but the receipt's account is the agent id "${input.agentId}", not a bot account (account unverified)`;
+  }
+  if (input.expectedAccount && delivery.account !== input.expectedAccount) {
+    return `requested ${expect} but sent as ${delivery.account} instead of ${input.expectedAccount}`;
+  }
+  if (!delivery.idProtocol) return `requested ${expect} but the receipt names no id namespace (id protocol unverified)`;
+  if (input.expectedIdProtocol && delivery.idProtocol !== input.expectedIdProtocol) {
+    return `requested ${expect} but the receipt used id protocol ${delivery.idProtocol} instead of ${input.expectedIdProtocol}`;
+  }
+  return undefined;
+}
 
 function prune(doc: LedgerDoc): void {
   const finished = Object.values(doc.tasks).filter((t) => !active(t.status)).sort((a, b) => b.updatedAt - a.updatedAt);
@@ -136,28 +268,122 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
         // shutting down or cancelled before the work began: never hand a dead signal to the runner
         if (rt.signal.aborted) throw new Error("task invocation ended before it started");
         const { ledgerId, ...input } = task.input;
+        const expect = task.input.expectedMedia?.trim() || undefined;
         let ok = true;
         let text: string;
+        let final: "done" | "partial" | "failed" | "blocked" = "done";
+        let delivery: Omit<Delivery, "deliveredAt"> | undefined;
         try {
-          text = (await runner.run({ ...input, taskId: ledgerId, attempt, resumed: attempt > 1, signal: rt.signal })).trim() || "(finished without a summary)";
+          const raw = await runner.run({ ...input, taskId: ledgerId, attempt, resumed: attempt > 1, signal: rt.signal });
+          // A runner may return a bare string or a { text, delivery } receipt
+          text = (typeof raw === "string" ? raw : raw.text).trim();
+          delivery = typeof raw === "string" ? undefined : raw.delivery;
+          // Empty output is not a successful result: record an explicit failure
+          // rather than delivering a fabricated success summary.
+          if (!text) throw new Error("Task finished without a result summary");
         } catch (error) {
           if (rt.signal.aborted) throw error; // cancelled or shutting down: the abort protocol / resume owns the outcome
           ok = false;
           text = error instanceof Error ? error.message : String(error);
+          if (error instanceof BlockedError) final = "blocked";
         }
+        const validMessageId = typeof delivery?.messageId === "number" && Number.isSafeInteger(delivery.messageId) && delivery.messageId > 0;
+        const deliveryProblem = ok && expect ? describeDeliveryGap(delivery, input, expect, validMessageId) : undefined;
+        if (deliveryProblem) {
+          // Verified-completion gate (bd pibot-zy70) made destination/account-aware (bd pibot-cida):
+          // when the owner asked for a specific medium, `done` requires the receipt to name that same
+          // medium, the intended destination, a real bot account and the id namespace — a message id
+          // alone is not proof.
+          final = "partial";
+        }
+        const resultChars = text.length;
         text = text.slice(0, RESULT_CHARS);
+        // Relative-date wording (bd pibot-wr9m): rewrite mis-stated relative words from the absolute
+        // date they sit beside rather than appending a warning to a reminder that still reads false.
+        // If the wording cannot be safely rewritten, fail safe — the result is not presented as done.
+        const dateGuard = ok ? correctRelativeDateClaims(text, { now: now() }) : undefined;
+        if (dateGuard && dateGuard.inconsistent > 0 && dateGuard.corrected) text = dateGuard.text;
+        if (dateGuard?.blocked) final = "partial";
+        // Programmatic fact-check of numeric claims (bd pibot-wr9m): only mechanical
+        // arithmetic, only on work results (error texts are not claim prose).
+        const factCheck = ok ? scanNumericClaims(text) : { checked: 0, inconsistent: 0, failures: [] as string[] };
+        if (factCheck.inconsistent > 0) {
+          text += `\n\n⚠️ fact-check: ${factCheck.inconsistent} of ${factCheck.checked} numeric claim(s) inconsistent — e.g. "${truncate(factCheck.failures[0], 80)}"`;
+        }
+        // Disclose the cap instead of silently cutting a long result (bd pibot-wcp0): a
+        // consumer that cannot see truncation asks for ad hoc remainder slices.
+        if (resultChars > RESULT_CHARS) {
+          text += `\n\n[truncated: showing the first ${RESULT_CHARS} of ${resultChars} characters — request the remaining range from this task's output artifact]`;
+        }
         await rt.commit(async (tx) => {
           const entry = (await ledgerDoc(tx, rt.conversationId)).tasks[ledgerId];
-          if (entry) Object.assign(entry, ok ? { status: "done", result: text } : { status: "failed", error: text }, { updatedAt: now() });
-          return { status: "running", checkpoint: { phase: "notify", ok, text } };
+          if (entry) {
+            if (factCheck.checked > 0) entry.factCheck = factCheck;
+            if (dateGuard && dateGuard.inconsistent > 0) {
+              entry.dateCheck = { checked: dateGuard.checked, inconsistent: dateGuard.inconsistent, corrected: dateGuard.corrected, blocked: dateGuard.blocked, failures: dateGuard.failures };
+            }
+            if (final === "blocked") Object.assign(entry, { status: "blocked", blocker: text }, { updatedAt: now() });
+            else if (final === "partial") {
+              const mismatch = deliveryProblem
+                ?? (dateGuard?.blocked ? "relative date wording contradicted the absolute date and could not be corrected safely" : "output only partly delivered");
+              Object.assign(entry, { status: "partial", error: mismatch, result: text, updatedAt: now() });
+            } else if (ok) Object.assign(entry, { status: "done", result: text }, { updatedAt: now() });
+            else Object.assign(entry, { status: "failed", error: text }, { updatedAt: now() });
+          }
+          return { status: "running", checkpoint: { phase: "notify", ok, text, final, ...(delivery !== undefined && Object.entries(delivery).some(([, v]) => v !== undefined) ? { delivery: filterUndefined(delivery) } : {}) } };
         }, ctx);
       },
       notify: async (task, rt, ctx) => {
-        const { ok, text } = task.state.checkpoint;
-        const head = ok ? `✅ Task done: **${task.input.title}**` : `⚠️ Task failed: **${task.input.title}**`;
-        await runner.notify(task.input.chatKey, `${head}\n\n${text}`).catch((e) => rt.report(e));
+        const { ok, text, final = ok ? "done" : "failed", delivery } = task.state.checkpoint;
+        const head = final === "blocked" ? `🛑 Task blocked: **${task.input.title}**`
+          : final === "partial" ? `🟡 Task partial: **${task.input.title}**`
+          : ok ? `✅ Task done: **${task.input.title}**`
+          : `⚠️ Task failed: **${task.input.title}**`;
+        let receipt: Delivery | void;
+        try {
+          receipt = await runner.notify(task.input.chatKey, `${head}\n\n${text}`);
+        } catch (e) {
+          // The owner never saw the result, so the ledger must not claim done (bd pibot-zy70).
+          // rt.report keeps the harness retry semantics; the entry stops saying ✅.
+          await rt.commit(async (tx) => {
+            const entry = (await ledgerDoc(tx, rt.conversationId)).tasks[task.input.ledgerId];
+            if (entry && entry.status === "done") Object.assign(entry, { status: "partial", blocker: `delivery failed: ${truncate(e instanceof Error ? e.message : String(e), 200)}`, updatedAt: now() });
+            return { status: "running", checkpoint: task.state.checkpoint };
+          }, ctx);
+          rt.report(e);
+          return;
+        }
         await rt.commit(async (tx) => {
-          prune(await ledgerDoc(tx, rt.conversationId));
+          const doc = await ledgerDoc(tx, rt.conversationId);
+          const entry = doc.tasks[task.input.ledgerId];
+          if (entry && (final === "done" || final === "partial")) {
+            // Delivery receipt (bd pibot-zy70, destination/account-aware in bd pibot-cida): the
+            // result's message id/type/destination come from the runner's own receipt (the media
+            // send) when it exists; otherwise from the notice push. A receipt field the transport did
+            // NOT attest stays unset — a missing destination/account/namespace is recorded as
+            // unverified, never manufactured from the requested chat (bd pibot-cida review). Keys with
+            // no evidence stay unset (strict JSON).
+            const noticeReceipt = typeof receipt === "object" ? (receipt as Delivery) : undefined;
+            const d: Delivery = { deliveredAt: now() };
+            if (delivery) {
+              if (delivery.messageId !== undefined) d.messageId = delivery.messageId;
+              if (delivery.peer !== undefined) d.peer = delivery.peer;
+              if (delivery.mediaType !== undefined) d.mediaType = delivery.mediaType;
+              if (delivery.account !== undefined) d.account = delivery.account;
+              if (delivery.idProtocol !== undefined) d.idProtocol = delivery.idProtocol;
+              if (delivery.evidence !== undefined) d.evidence = delivery.evidence;
+            } else if (noticeReceipt?.messageId !== undefined) {
+              d.messageId = noticeReceipt.messageId;
+              if (noticeReceipt.peer !== undefined) d.peer = noticeReceipt.peer;
+              if (noticeReceipt.mediaType !== undefined) d.mediaType = noticeReceipt.mediaType;
+              if (noticeReceipt.account !== undefined) d.account = noticeReceipt.account;
+              if (noticeReceipt.idProtocol !== undefined) d.idProtocol = noticeReceipt.idProtocol;
+              if (noticeReceipt.evidence !== undefined) d.evidence = noticeReceipt.evidence;
+            }
+            if (d.messageId !== undefined && d.evidence === undefined) d.evidence = "ack";
+            entry.delivery = d;
+          }
+          prune(doc);
           return { status: "terminal", outcome: ok ? { status: "completed", result: text } : { status: "failed", error: { message: text } } };
         }, ctx);
       },
@@ -184,6 +410,10 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
   harness.resume();
 
   const snapshot = async () => ((await harness.snapshot(Ledger, root.id, C)) ?? { tasks: {}, requests: {} }) as unknown as LedgerDoc;
+  const listTasks = async ({ agentId, chatKey }: { agentId: string; chatKey?: string }): Promise<LedgerEntry[]> =>
+    Object.values((await snapshot()).tasks)
+      .filter((t) => t.agentId === agentId && (!chatKey || t.chatKey === chatKey))
+      .sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt);
 
   return {
     async start(input, requestId) {
@@ -207,15 +437,32 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
       return (await snapshot()).tasks[id];
     },
     async list({ agentId, chatKey }) {
+      return listTasks({ agentId, chatKey });
+    },
+    async latestActive(agentId, chatKey) {
+      // Task keys are appended at creation; status updates do not change their
+      // insertion order. Pick the newest created active task, not the one whose
+      // status happened to update most recently.
       return Object.values((await snapshot()).tasks)
-        .filter((t) => t.agentId === agentId && (!chatKey || t.chatKey === chatKey))
-        .sort((a, b) => b.createdAt - a.createdAt);
+        .filter((t) => t.agentId === agentId && t.chatKey === chatKey && active(t.status))
+        .at(-1);
     },
     async cancel(id) {
       const entry = (await snapshot()).tasks[id];
       if (!entry?.durableId || !active(entry.status)) return false;
       await harness.abortTask(entry.durableId as never, C);
       return true;
+    },
+    async updateRecord(id, agentId, patch) {
+      const entry = (await snapshot()).tasks[id];
+      if (!entry || entry.agentId !== agentId || !active(entry.status)) return undefined;
+      await root.commit(async (tx) => {
+        const doc = await ledgerDoc(tx, root.id);
+        const task = doc.tasks[id];
+        if (task) Object.assign(task, patch, { updatedAt: now() });
+        return undefined;
+      }, C);
+      return (await snapshot()).tasks[id];
     },
     async close() {
       await harness.close(C);

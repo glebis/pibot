@@ -281,14 +281,19 @@ async def run_realtime(connection: Any, call: Any,
         for t in setup["tools"]
     ])
     session = events.SessionProperties(
-        instructions=setup["instructions"], tools=tools,
+        instructions=setup["instructions"], tools=tools, tool_choice=setup.get("tool_choice"),
         audio=events.AudioConfiguration(
             input=events.AudioInput(transcription=events.InputAudioTranscription(),
                                     turn_detection=events.SemanticTurnDetection(eagerness="medium")),
             output=events.AudioOutput(voice=os.environ.get("PIBOT_REALTIME_VOICE", "marin")),
         ),
     )
-    llm = OpenAIRealtimeLLMService(api_key=key, settings=OpenAIRealtimeLLMService.Settings(
+    from hermes_realtime import HermesRealtimeCall
+    service = OpenAIRealtimeLLMService
+    if isinstance(call, HermesRealtimeCall):
+        from hermes_realtime_service import HermesRealtimeLLMService
+        service = HermesRealtimeLLMService
+    llm = service(api_key=key, settings=service.Settings(
         model=os.environ.get("PIBOT_REALTIME_MODEL", "gpt-realtime-1.5"), session_properties=session))
 
     async def run_tool(params):
