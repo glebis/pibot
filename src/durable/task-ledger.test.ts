@@ -69,6 +69,18 @@ describe("durable task ledger", () => {
     } finally { await ledger.close(); }
   });
 
+  it("discloses the result cap instead of silently cutting a long output", async () => {
+    const { r, notes } = runner(async () => "y".repeat(5000));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      const done = await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      expect(done?.result).toMatch(/\[truncated: showing the first 4000 of 5000 characters/);
+      await until(async () => notes.length, (n) => n === 1);
+      expect(notes[0]).toMatch(/\[truncated: showing the first 4000 of 5000 characters/);
+    } finally { await ledger.close(); }
+  });
+
   it("records a failure and reports it", async () => {
     const { r, notes } = runner(async () => { throw new Error("tool exploded"); });
     const ledger = await openTaskLedger({ runner: r });

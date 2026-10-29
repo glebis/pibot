@@ -296,6 +296,7 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
           // alone is not proof.
           final = "partial";
         }
+        const resultChars = text.length;
         text = text.slice(0, RESULT_CHARS);
         // Relative-date wording (bd pibot-wr9m): rewrite mis-stated relative words from the absolute
         // date they sit beside rather than appending a warning to a reminder that still reads false.
@@ -308,6 +309,11 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
         const factCheck = ok ? scanNumericClaims(text) : { checked: 0, inconsistent: 0, failures: [] as string[] };
         if (factCheck.inconsistent > 0) {
           text += `\n\n⚠️ fact-check: ${factCheck.inconsistent} of ${factCheck.checked} numeric claim(s) inconsistent — e.g. "${truncate(factCheck.failures[0], 80)}"`;
+        }
+        // Disclose the cap instead of silently cutting a long result (bd pibot-wcp0): a
+        // consumer that cannot see truncation asks for ad hoc remainder slices.
+        if (resultChars > RESULT_CHARS) {
+          text += `\n\n[truncated: showing the first ${RESULT_CHARS} of ${resultChars} characters — request the remaining range from this task's output artifact]`;
         }
         await rt.commit(async (tx) => {
           const entry = (await ledgerDoc(tx, rt.conversationId)).tasks[ledgerId];

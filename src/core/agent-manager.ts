@@ -133,6 +133,8 @@ export class AgentManager {
   intake?: IntakeStore;
   /** durable background-task ledger; set by the host after wiring */
   tasks?: TaskLedger;
+  /** host STT enablement for transcription-route diagnosis (bd pibot-hn90); metadata only */
+  stt?: { hostProviderIds: readonly string[]; groqCredentialPresent: boolean };
   private agentsDir: string;
   private vaultDir: string;
   /** shared docs site source root (read-only course content); set by the host from config */
@@ -304,6 +306,7 @@ export class AgentManager {
       commitments: this.commitments,
       intake: this.intake,
       tasks: this.tasks,
+      ...(this.stt ? { stt: this.stt } : {}),
       avatar: applyProfilePhoto && chat.transport.startsWith("telegram") && agent.manifest.capabilities?.includes("avatar") ? {
         providers: createDefaultAvatarProviders(),
         store: new AvatarArtifactStore(path.join(agent.dir, "runtime", "avatars")),

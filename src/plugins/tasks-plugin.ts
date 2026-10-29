@@ -36,7 +36,7 @@ export interface TasksPluginDeps {
    * declares audio work carries the duration-aware route in its durable
    * contract. Absent for agents without a speech policy.
    */
-  transcription?: { policy?: SttPolicy };
+  transcription?: { policy?: SttPolicy; hostProviders?: readonly string[]; groqCredentialPresent?: boolean };
 }
 
 function line(t: LedgerEntry): string {
@@ -103,6 +103,8 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
               const plan = planTranscription({
                 durationSec: params.audioDurationUnknown ? null : params.audioDurationSec ?? null,
                 policy: transcription.policy,
+                hostProviders: transcription.hostProviders,
+                groqCredentialPresent: transcription.groqCredentialPresent,
               });
               if (plan.route === "blocked") {
                 return text(`REFUSED: ${plan.blocker} Nothing started.`, { refused: true, route: plan.route });

@@ -13,7 +13,7 @@
  * quiet fallback — a caller that ignores the plan is the bug, and the plan says
  * so in words.
  */
-import { sttProviderChain, sttProvidersFromEnv, type SttPolicy, type SttProviderId } from "./stt.js";
+import { DEFAULT_STT_PROVIDERS, sttProviderChain, sttProvidersFromEnv, type SttPolicy, type SttProviderId } from "./stt.js";
 
 /** Owner rule: audio above this duration must be chunked. */
 export const LONG_AUDIO_THRESHOLD_SEC = 15 * 60;
@@ -61,6 +61,11 @@ export interface TranscriptionDurationInput {
   /** host-enabled providers (the SttService provider set); defaults to STT_PROVIDERS/env defaults */
   hostProviders?: readonly string[];
   /**
+   * Presence-only result of a Groq credential check (never the value). `false` is the
+   * only value that proves the credential layer is missing; `undefined` means unknown.
+   */
+  groqCredentialPresent?: boolean;
+  /**
    * Explicit, owner-recorded permission to transcribe >15-minute audio with the
    * local chain. Never inferred and never persisted — it must come from the owner.
    */
@@ -68,6 +73,13 @@ export interface TranscriptionDurationInput {
 }
 
 export type TranscriptionRoute = "policy" | "chunked-external" | "local-exception" | "blocked" | "probe-required";
+
+/**
+ * Which layer actually lacks the approved Groq route. Declared agent policy, host
+ * enablement and credentials are distinct layers; conflating them made the blocker
+ * tell the owner to re-enable fields that were already true (bd pibot-hn90).
+ */
+export type TranscriptionBlockerLayer = "agent-policy" | "host-provider" | "credential" | "unknown";
 
 export interface TranscriptionPlan {
   longAudio: boolean;
@@ -84,6 +96,8 @@ export interface TranscriptionPlan {
   constraint: string;
   /** precise, actionable reason when ok=false */
   blocker?: string;
+  /** the layer named by `blocker` when the long-audio route is unavailable */
+  blockerLayer?: TranscriptionBlockerLayer;
   /** set only for route "local-exception" */
   exception?: string;
 }
@@ -103,6 +117,35 @@ function longAudioConstraint(durationSec: number | null, chunks: number | null):
 }
 
 /**
+ * Name the layer that is actually missing the Groq route. Only a layer this function
+ * can prove missing is reported as such; when the caller did not supply the host
+ * provider set, it says so instead of guessing and blaming the agent manifest.
+ */
+function groqBlockerLayer(input: TranscriptionDurationInput, policy: SttPolicy): { layer: TranscriptionBlockerLayer; detail: string } {
+  const requested = policy.providers ?? [...DEFAULT_STT_PROVIDERS];
+  const declaresGroq = requested.includes("groq");
+  if (!declaresGroq) {
+    return { layer: "agent-policy", detail: `the agent's speech.sttProviders does not list "groq".` };
+  }
+  if (policy.allowExternal !== true) {
+    return { layer: "agent-policy", detail: `the agent's speech.sttProviders lists "groq" but speech.allowExternalStt is not true, so external STT is disabled.` };
+  }
+  if (input.hostProviders === undefined) {
+    return {
+      layer: "unknown",
+      detail: `the agent manifest already requests groq with external STT allowed; the planner was not given the host provider set, so the remaining layers are host enablement (STT_PROVIDERS) or the Groq credential — NOT the agent manifest.`,
+    };
+  }
+  if (!input.hostProviders.includes("groq")) {
+    return { layer: "host-provider", detail: `the host STT provider set (STT_PROVIDERS) does not enable "groq"; the agent manifest is already correct.` };
+  }
+  if (input.groqCredentialPresent === false) {
+    return { layer: "credential", detail: `the host enables "groq" and the agent permits it, but no Groq credential (GROQ_API_KEY) is present.` };
+  }
+  return { layer: "unknown", detail: `groq is declared, host-enabled and permitted; the route is blocked for a reason this planner cannot see.` };
+}
+
+/**
  * Decide the transcription route for one audio file. Pure — no IO, no network.
  * Returns `ok:false` with a precise blocker when the approved long-audio route
  * is unavailable, never a disallowed provider.
@@ -112,7 +155,8 @@ export function planTranscription(input: TranscriptionDurationInput): Transcript
   const durationSec = durationKnown ? Math.max(0, input.durationSec as number) : null;
   const chain = sttProviderChain(input.hostProviders ?? sttProvidersFromEnv(), input.policy ?? {});
   const localChain = chain.filter((provider) => provider !== "groq");
-  const groqPermitted = chain.includes("groq");
+  // A route with no credential is not usable: only `false` disproves it, `undefined` means unchecked.
+  const groqPermitted = chain.includes("groq") && input.groqCredentialPresent !== false;
 
   // An explicit, owner-recorded permission overrides the duration rule — it is
   // recorded intent, never inferred from a missing/unknown duration.
@@ -187,7 +231,8 @@ export function planTranscription(input: TranscriptionDurationInput): Transcript
     };
   }
 
-  const blocker = `audio ${durationLabel(durationSec)} is longer than 15 minutes: the standing owner policy requires chunks of <=15 min through Groq, but Groq is not permitted/available for this agent (add "groq" to speech.sttProviders and set allowExternalStt=true, then retry). Local WhisperKit is not a permitted substitute at this duration.`;
+  const { layer, detail } = groqBlockerLayer(input, input.policy ?? {});
+  const blocker = `audio ${durationLabel(durationSec)} is longer than 15 minutes: the standing owner policy requires chunks of <=15 min through Groq, but the Groq route is unusable. Missing layer: ${layer}. ${detail} Local WhisperKit is not a permitted substitute at this duration.`;
   return {
     longAudio: true,
     durationKnown,
@@ -199,6 +244,7 @@ export function planTranscription(input: TranscriptionDurationInput): Transcript
     chunkSeconds: LONG_AUDIO_CHUNK_SEC,
     chunks,
     blocker,
+    blockerLayer: layer,
     constraint: `TRANSCRIPTION POLICY (owner instruction): this audio ${durationLabel(durationSec)} (>15 min) and the approved route (chunks of <=15 min via Groq) is unavailable — do NOT transcribe it locally; return this blocker to the owner instead: ${blocker}`,
   };
 }
@@ -220,6 +266,6 @@ export function formatTranscriptionPlan(plan: TranscriptionPlan): string {
           ? `policy (${plan.providers.join(" -> ") || "none"})`
           : plan.route === "probe-required"
             ? "probe-required (duration unknown — ffprobe first)"
-            : "blocked";
+            : `blocked (missing layer: ${plan.blockerLayer ?? "unknown"})`;
   return `[transcription] ${dur} - ${route}${plan.blocker ? ` - blocker: ${plan.blocker}` : ""}`;
 }

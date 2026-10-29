@@ -465,6 +465,12 @@ describe('exec trace tools', () => {
       expect(rows.content[0].text).not.toContain('SECRET');
       const denied = await tools.get('exec_result_read')!.execute('read', { path: '../../agent.json' });
       expect(denied.details.ok).toBe(false);
+      fs.mkdirSync(path.join(dir, 'runtime', 'artifacts'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'runtime', 'artifacts', 'captions.txt'), 'x'.repeat(100));
+      const page = await tools.get('exec_result_read')!.execute('read', { path: 'captions.txt', offset: 40, limit: 20 });
+      const extract = JSON.parse(page.content[0].text);
+      expect(extract).toMatchObject({ path: 'captions.txt', totalBytes: 100, offset: 40, bytes: 20, truncated: true, nextOffset: 60 });
+      expect(extract.content).toBe('x'.repeat(20));
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

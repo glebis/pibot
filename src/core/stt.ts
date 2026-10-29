@@ -204,6 +204,11 @@ export class SttService {
     return sttProviderChain(this.providers, policy).some((p) => (p === "groq" ? !!process.env.GROQ_API_KEY : true));
   }
 
+  /** Presence-only credential check for route diagnosis; never reads or returns the value. */
+  get groqCredentialPresent(): boolean {
+    return Boolean(process.env.GROQ_API_KEY);
+  }
+
   /**
    * Execute the long-audio Groq route end to end (bd pibot-0xpf.4): probe the
    * duration when the plan cannot supply one, segment with ffmpeg, transcribe

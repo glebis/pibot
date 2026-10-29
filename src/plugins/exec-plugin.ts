@@ -7,7 +7,7 @@ import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { childEnv } from "../core/child-env.js";
 import { truncate } from "../core/util.js";
-import { appendExecTrace, searchExecTrace, readExecArtifact, type ExecTraceInput } from "./exec-trace.js";
+import { appendExecTrace, searchExecTrace, readExecArtifactExtract, ARTIFACT_MAX_PAGE_BYTES, ARTIFACT_PAGE_BYTES, type ExecTraceInput } from "./exec-trace.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -463,12 +463,18 @@ export function execPlugin(deps: ExecPluginDeps): InlineExtension {
         },
       });
       pi.registerTool({
-        name: 'exec_result_read', label: 'Read processing text artifact',
-        description: 'Read UTF-8 text outputs only from your own runtime/artifacts directory. Supply a relative filename; no symlinks or traversal. Maximum 64 KiB, text formats only. Configure processing output there using an already allowlisted command; this tool does not authorize a previously refused command.',
-        parameters: Type.Object({ path: Type.String({ minLength: 1, maxLength: 1000 }) }),
+        name: 'exec_result_read', label: 'Read processing text artifact range',
+        description: `Read a UTF-8 text output only from your own runtime/artifacts directory. Returns JSON with path, totalBytes, offset, bytes, truncated and nextOffset (pass nextOffset as offset to continue); nextOffset null means the end was reached. Supply a relative filename; no symlinks or traversal. Up to ${ARTIFACT_MAX_PAGE_BYTES} bytes per call (default ${ARTIFACT_PAGE_BYTES}), text formats only. Configure processing output there using an already allowlisted command; this tool does not authorize a previously refused command.`,
+        parameters: Type.Object({
+          path: Type.String({ minLength: 1, maxLength: 1000 }),
+          offset: Type.Optional(Type.Integer({ minimum: 0, description: 'Byte offset to start at; use the previous nextOffset.' })),
+          limit: Type.Optional(Type.Integer({ minimum: 1, maximum: ARTIFACT_MAX_PAGE_BYTES, description: 'Bytes to return in this extract.' })),
+        }),
         async execute(_id, params) {
-          try { return { content: [{ type: 'text', text: readExecArtifact(deps.agentDir, params.path) }], details: { ok: true } }; }
-          catch { return refuse('artifact unavailable or outside the permitted text artifact boundary'); }
+          try {
+            const extract = readExecArtifactExtract(deps.agentDir, params.path, { offset: params.offset, limit: params.limit });
+            return { content: [{ type: 'text', text: JSON.stringify(extract) }], details: { ok: true } };
+          } catch { return refuse('artifact unavailable or outside the permitted text artifact boundary'); }
         },
       });
       pi.registerTool({

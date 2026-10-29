@@ -76,6 +76,8 @@ export interface CapabilityContext {
   intake?: IntakeStore;
   /** durable background-task ledger (pi-durable); absent when not wired */
   tasks?: TaskLedger;
+  /** host STT enablement for route diagnosis (bd pibot-hn90); metadata only */
+  stt?: { hostProviderIds: readonly string[]; groqCredentialPresent: boolean };
 }
 
 export type { CommitmentPluginEngine };
@@ -176,7 +178,10 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
       agentId: ctx.agent.id,
       chat: ctx.chat,
       preflight: ctx.dictionary ? resourcePreflight(ctx.dictionary.dataDir) : undefined,
-      transcription: { policy: { providers: ctx.agent.manifest.speech?.sttProviders, allowExternal: ctx.agent.manifest.speech?.allowExternalStt === true } },
+      transcription: {
+        policy: { providers: ctx.agent.manifest.speech?.sttProviders, allowExternal: ctx.agent.manifest.speech?.allowExternalStt === true },
+        ...(ctx.stt ? { hostProviders: ctx.stt.hostProviderIds, groqCredentialPresent: ctx.stt.groqCredentialPresent } : {}),
+      },
     }),
   },
   {

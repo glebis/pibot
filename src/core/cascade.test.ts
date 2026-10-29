@@ -44,6 +44,8 @@ describe("classifyModelError", () => {
     ["500 Internal server error", "transient"],
     ["timeout", "transient"],
     ["ECONNREFUSED", "transient"],
+    ["Cannot submit a prompt while compaction is in progress", "local-state"],
+    ["session busy", "local-state"],
     ["unknown error type", "unknown"],
     ["", "unknown"],
     [null as unknown as string, "unknown"],
@@ -73,6 +75,20 @@ describe("noteFailure cooldown + noteSuccess recovery", () => {
     expect(e?.lastSuccessAt).toBe(t + 1000);
     expect(c.isOpen("ollama/local", t + 1001)).toBe(false);
     expect(e?.failures).toBe(4);
+  });
+
+  it("never cools a model for a local session state, so one compaction error cannot poison the chain", () => {
+    const c = cascade();
+    const t = 1_700_000_000_000;
+    const msg = "Cannot submit a prompt while compaction is in progress";
+    expect(COOLDOWN_MS["local-state"]).toBe(0);
+    for (const spec of ["ollama/local", "anthropic/claude", "ollama/second"]) {
+      expect(c.noteFailure(spec, msg, t)).toBe("local-state");
+    }
+    expect(c.entry("ollama/local")).toBeUndefined();
+    expect(c.entry("anthropic/claude")).toBeUndefined();
+    expect(c.isOpen("ollama/local", t)).toBe(false);
+    expect(c.isOpen("anthropic/claude", t + 60_000)).toBe(false);
   });
 });
 

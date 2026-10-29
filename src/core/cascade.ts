@@ -26,9 +26,13 @@ import { errorMessage, readJson, truncate, uid, writeJsonAtomic } from "./util.j
 
 // ─── error classification ───────────────────────────────────────────────────
 
-export type ModelErrorClass = "unavailable" | "auth" | "credits" | "rate-limit" | "transient" | "context" | "unknown";
+export type ModelErrorClass = "local-state" | "unavailable" | "auth" | "credits" | "rate-limit" | "transient" | "context" | "unknown";
 
 const RX = {
+  // local session state: the prompt never reached a provider (compaction mutex, busy
+  // session). Cooling a model here would poison every slot the chain walks through —
+  // the Oct 2026 arda.ai wedge cooled 9 of 18 models on one compaction error.
+  localState: /compaction is in progress|cannot submit a prompt while compaction|session (is )?busy|another (turn|request) is (already )?in progress/i,
   // permanent unavailability: the model is gone upstream or can never work with
   // the current auth. These fail identically every retry, so they are MARKED and
   // removed from rotation instead of cooling down (checked first — most specific).
@@ -49,6 +53,7 @@ export function classifyModelError(message: string): ModelErrorClass {
   // order matters: permanent-unavailability markers are the most specific and
   // win over everything; credit/billing markers beat bare status codes;
   // rate-limit mentions counting tokens; auth messages may mention quota; context is a model mismatch, not an outage
+  if (RX.localState.test(m)) return "local-state";
   if (RX.unavailable.test(m)) return "unavailable";
   if (RX.context.test(m)) return "context";
   if (RX.credits.test(m)) return "credits";
@@ -60,6 +65,7 @@ export function classifyModelError(message: string): ModelErrorClass {
 
 /** How long a failing model is skipped after an error of each class. */
 export const COOLDOWN_MS: Record<ModelErrorClass, number> = {
+  "local-state": 0, // never a model failure: nothing is cooled
   unavailable: 24 * 3600e3, // nominally long; the unavailable flag removes it from rotation outright
   auth: 4 * 3600e3, // bad keys rarely self-heal mid-session
   credits: 60 * 60e3, // exhaustion heals by top-up, not time — the recovery probe catches it early
@@ -367,6 +373,12 @@ export class ModelCascade {
    *  escalation — the model is removed from rotation outright. */
   noteFailure(spec: string, err: string, now = Date.now()): ModelErrorClass {
     const cls = classifyModelError(err);
+    // A local session state never reached this model: record nothing, open nothing.
+    // The caller stops the walk on this class instead of trying the next slot.
+    if (cls === "local-state") {
+      this.deps.log?.(`[cascade] ${spec} not attempted (local-state): ${truncate(err, 140)}`);
+      return cls;
+    }
     const key = spec.trim().toLowerCase();
     const prev = this.state.entries[key];
     const streak = (prev?.streak ?? 0) + 1;

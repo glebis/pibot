@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { appendExecTrace, searchExecTrace, readExecArtifact } from './exec-trace.js';
+import { appendExecTrace, searchExecTrace, readExecArtifact, readExecArtifactExtract, ARTIFACT_MAX_PAGE_BYTES } from './exec-trace.js';
 
 const dirs: string[] = [];
 function temp() { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-trace-')); dirs.push(d); return d; }
@@ -33,6 +33,46 @@ describe('private exec trace and artifact boundary', () => {
     fs.writeFileSync(path.join(d, 'runtime', 'artifacts', 'bad.txt'), Buffer.from([0, 1, 2]));
     expect(() => readExecArtifact(d, 'bad.txt')).toThrow();
   });
+  it('returns confined extracts whose cursor reconstructs a long multi-byte transcript', () => {
+    const d = temp();
+    fs.mkdirSync(path.join(d, 'runtime', 'artifacts'), { recursive: true });
+    const text = 'Ж'.repeat(5000) + '\nконец';
+    fs.writeFileSync(path.join(d, 'runtime', 'artifacts', 'long.txt'), text);
+    let offset = 0;
+    let rebuilt = '';
+    let pages = 0;
+    for (;;) {
+      const page = readExecArtifactExtract(d, 'long.txt', { offset, limit: 4096 });
+      expect(page.path).toBe('long.txt');
+      expect(page.totalBytes).toBe(Buffer.byteLength(text));
+      expect(page.offset).toBe(offset);
+      expect(page.bytes).toBeGreaterThan(0);
+      expect(page.content).not.toContain('\uFFFD');
+      rebuilt += page.content;
+      pages++;
+      if (page.nextOffset === null) { expect(page.truncated).toBe(false); break; }
+      expect(page.truncated).toBe(true);
+      expect(page.nextOffset).toBeGreaterThan(offset);
+      offset = page.nextOffset;
+    }
+    expect(rebuilt).toBe(text);
+    expect(pages).toBeGreaterThan(1);
+  });
+
+  it('pages artifacts larger than the former whole-file cap and refuses unsafe ranges', () => {
+    const d = temp();
+    fs.mkdirSync(path.join(d, 'runtime', 'artifacts'), { recursive: true });
+    fs.writeFileSync(path.join(d, 'runtime', 'artifacts', 'big.txt'), 'a'.repeat(70_000));
+    const tail = readExecArtifactExtract(d, 'big.txt', { offset: 65536 });
+    expect(tail.totalBytes).toBe(70_000);
+    expect(tail.bytes).toBe(4464);
+    expect(tail.nextOffset).toBeNull();
+    expect(() => readExecArtifactExtract(d, 'big.txt', { offset: 70_001 })).toThrow();
+    expect(() => readExecArtifactExtract(d, 'big.txt', { offset: -1 })).toThrow();
+    expect(() => readExecArtifactExtract(d, 'big.txt', { limit: ARTIFACT_MAX_PAGE_BYTES + 1 })).toThrow();
+    expect(() => readExecArtifactExtract(d, '../outside.txt')).toThrow();
+  });
+
   it('rejects a symlinked runtime and ignores corrupt audit lines', () => {
     const d = temp(), other = temp(); fs.symlinkSync(other, path.join(d, 'runtime'));
     expect(() => appendExecTrace(d, { callId: 'x', argv: [], outcome: 'refused' })).toThrow();

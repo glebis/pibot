@@ -88,8 +88,11 @@ async function main(): Promise<void> {
   });
 
   const modelRuntime = await ModelRuntime.create();
+  const stt = new SttService();
   const agents = new AgentManager(config.agentsDir, modelRuntime, config.vaultDir, process.cwd(), config.dataDir);
   agents.docsDir = config.docsDir;
+  // Host STT enablement for route diagnosis (bd pibot-hn90): metadata only, no credential value.
+  agents.stt = { hostProviderIds: stt.hostProviderIds, groqCredentialPresent: stt.groqCredentialPresent };
   const events = new EventLog(config.agentsDir);
 
   // model cascade: primary → manifest fallbacks → PIBOT_MODEL_CASCADE → authenticated models → queue
@@ -252,7 +255,7 @@ async function main(): Promise<void> {
   };
 
   const providerManager = new ProviderManager(modelRuntime);
-  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, commitments, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt: new SttService(), audioMedia: new AudioMediaProcessor(mediaDir), goalIO });
+  bot = new PiBot({ config, agents, scheduler, heartbeat, events, transports, evolution, consolidation, commitments, modelRuntime, secrets: secretStore, cascade, providers: providerManager, stt, audioMedia: new AudioMediaProcessor(mediaDir), goalIO });
   diskGuard?.setNotify((text) => void bot.notifyOwnerEvent(text));
 
   // Durable background tasks (pi-durable ledger, bead pibot-e9t). Wired BEFORE bot.start():

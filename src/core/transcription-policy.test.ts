@@ -76,6 +76,38 @@ describe("planTranscription", () => {
     expect(plan.route).toBe("blocked");
   });
 
+  it("names the agent policy layer only when the manifest does not request Groq", () => {
+    const plan = planTranscription({ durationSec: 20 * 60, policy: { providers: ["whisperkit"], allowExternal: true }, hostProviders: HOST });
+    expect(plan.blockerLayer).toBe("agent-policy");
+    expect(plan.blocker).toMatch(/does not list "groq"/);
+  });
+
+  it("names host enablement, not the already-correct manifest, when the agent policy allows Groq", () => {
+    const plan = planTranscription({ durationSec: 20 * 60, policy: AGENT_POLICY, hostProviders: ["whisperkit", "local_whisper"] });
+    expect(plan.blockerLayer).toBe("host-provider");
+    expect(plan.blocker).toMatch(/STT_PROVIDERS/);
+    expect(plan.blocker).toMatch(/agent manifest is already correct/);
+    expect(plan.blocker).not.toMatch(/add "groq" to speech\.sttProviders/);
+  });
+
+  it("names the credential layer when the host enables Groq but no key is present", () => {
+    const plan = planTranscription({ durationSec: 20 * 60, policy: AGENT_POLICY, hostProviders: HOST, groqCredentialPresent: false });
+    expect(plan.blockerLayer).toBe("credential");
+    expect(plan.blocker).toMatch(/GROQ_API_KEY/);
+  });
+
+  it("says the host layer is unknown instead of blaming the manifest when it was not supplied", () => {
+    const plan = planTranscription({ durationSec: 20 * 60, policy: AGENT_POLICY });
+    expect(plan.blockerLayer).toBe("unknown");
+    expect(plan.blocker).toMatch(/not given the host provider set/);
+    expect(plan.blocker).toMatch(/NOT the agent manifest/);
+  });
+
+  it("reports the missing layer in the evidence-shaped plan line", () => {
+    const plan = planTranscription({ durationSec: 20 * 60, policy: AGENT_POLICY, hostProviders: ["whisperkit"] });
+    expect(formatTranscriptionPlan(plan)).toMatch(/blocked \(missing layer: host-provider\)/);
+  });
+
   it("mandates a probe for an unknown duration instead of asserting it is >15 min", () => {
     const plan = planTranscription({ durationSec: null, policy: { providers: ["whisperkit"] }, hostProviders: HOST });
     // it must not claim the audio is long, nor silently route it locally

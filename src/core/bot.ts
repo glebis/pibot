@@ -1540,7 +1540,7 @@ export class PiBot implements HeartbeatHost {
       // WhisperKit; an unknown duration is probed before any route is chosen. An unavailable approved
       // route is reported as a blocker — there is NO silent local fallback.
       const knownDuration = prepared.durationSec ?? media.durationSec;
-      const planInput = { durationSec: knownDuration, policy, hostProviders: stt.hostProviderIds };
+      const planInput = { durationSec: knownDuration, policy, hostProviders: stt.hostProviderIds, groqCredentialPresent: stt.groqCredentialPresent };
       const plan = planTranscription(planInput);
       const transcribeOnce = () =>
         stt.transcribe(prepared.filePath, policy, ...(bias ? [{ bias }] as const : [])).catch((e) => ({ ok: false as const, text: "", provider: "none", error: errorMessage(e) }));
@@ -1857,6 +1857,7 @@ export class PiBot implements HeartbeatHost {
 
     let landed = false; // has the user's text entered the session history?
     let lastError = "";
+    let localStateError = "";
     let failedSpec: string | undefined;
     let ambiguousPartialFailure = false;
     // The walk must be able to reach healthy models BEHIND a sick chain head:
@@ -1893,8 +1894,12 @@ export class PiBot implements HeartbeatHost {
       lastError = err;
       failedSpec = spec || undefined;
       attempts.push(spec || "(auto)");
-      if (spec) failures.push({ spec, cls: cascade.noteFailure(spec, err) });
-      this.deps.events.log(agentId, "system", `model error on ${spec || "(auto)"} [${classifyModelError(err)}]: ${truncate(err, 160)}`);
+      const cls = spec ? cascade.noteFailure(spec, err) : classifyModelError(err);
+      if (spec) failures.push({ spec, cls });
+      this.deps.events.log(agentId, "system", `model error on ${spec || "(auto)"} [${cls}]: ${truncate(err, 160)}`);
+      // Local session state (compaction mutex / busy session) never reached this model.
+      // Walking the rest of the chain would blame every slot for one local condition.
+      if (cls === "local-state") { localStateError = err; break; }
 
       const next = cascade.nextCandidate(chain, spec || undefined);
       if (!next) break; // whole chain exhausted → deterministic fallback
@@ -1908,6 +1913,15 @@ export class PiBot implements HeartbeatHost {
         cascade.noteFailure(next, `cannot bind model: ${errorMessage(e)}`);
         continue;
       }
+    }
+
+    // A local session state is not a cascade outage: no model was attempted, no breaker
+    // opened, and queueing the prompt would replay it into the same wedge. Fail fast with
+    // a distinct non-model error so the caller can bound/retry locally instead of
+    // dead-lettering a message nothing was wrong with.
+    if (localStateError) {
+      this.deps.events.log(agentId, "system", `local session state blocked the turn — not a model failure: ${truncate(localStateError, 160)}`);
+      throw new Error(`session busy (local compaction/state): ${truncate(localStateError, 200)}`);
     }
 
     // deterministic fallback: queue genuine user messages, tell the user honestly.

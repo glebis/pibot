@@ -67,8 +67,15 @@ export function searchExecTrace(agentDir: string, query: string): ExecTraceRow[]
     } catch { return []; }
   }).slice(-20);
 }
-/** This intentionally does not read arbitrary workspace files: only text outputs under runtime/artifacts. */
-export function readExecArtifact(agentDir: string, relative: string): string {
+/** Default bytes per paged read; a caller must use the returned cursor for the rest. */
+export const ARTIFACT_PAGE_BYTES = 16384;
+/** Hard per-call ceiling, so one call cannot dump an unbounded transcript. */
+export const ARTIFACT_MAX_PAGE_BYTES = 65536;
+/** Files above this are refused outright rather than paged. */
+const ARTIFACT_MAX_FILE_BYTES = 16 * 1024 * 1024;
+
+/** Confine and validate an artifact path. Reads only under own runtime/artifacts. */
+function artifactPath(agentDir: string, relative: string): string {
   if (path.isAbsolute(relative) || relative.split(/[\\/]/).includes('..')) throw new Error('Artifact path must be relative without traversal');
   const base = path.join(runtimeDir(agentDir), 'artifacts');
   if (!fs.existsSync(base) || fs.lstatSync(base).isSymbolicLink() || fs.realpathSync(base) !== base) throw new Error('Unsafe or missing artifact directory');
@@ -76,6 +83,69 @@ export function readExecArtifact(agentDir: string, relative: string): string {
   const canonical = fs.realpathSync(file);
   if (!canonical.startsWith(base + path.sep) || canonical !== file) throw new Error('Artifact symlinks are not allowed');
   if (!/\.(txt|md|json|vtt|srt|csv)$/i.test(file)) throw new Error('Only text artifact formats are supported');
+  return file;
+}
+
+/** Largest index <= max that does not split a UTF-8 sequence. */
+function utf8Boundary(buf: Buffer, max: number): number {
+  const end = Math.min(max, buf.length);
+  if (end <= 0) return 0;
+  let i = end - 1;
+  let back = 0;
+  while (i >= 0 && back < 4 && (buf[i] & 0xc0) === 0x80) { i--; back++; }
+  if (i < 0) return end;
+  const lead = buf[i];
+  const len = (lead & 0x80) === 0 ? 1 : (lead & 0xe0) === 0xc0 ? 2 : (lead & 0xf0) === 0xe0 ? 3 : (lead & 0xf8) === 0xf0 ? 4 : 1;
+  return i + len > end ? i : end;
+}
+
+export interface ArtifactExtract {
+  path: string;
+  totalBytes: number;
+  offset: number;
+  bytes: number;
+  truncated: boolean;
+  /** Byte offset to request next; null when this extract reaches the end. */
+  nextOffset: number | null;
+  content: string;
+}
+
+/**
+ * Confined, paged read of one text artifact. Every extract carries its identity, byte
+ * range, truncation state and continuation cursor so a consumer can prove coverage of a
+ * long transcript instead of asking for ad hoc prose slices (bd pibot-wcp0).
+ */
+export function readExecArtifactExtract(agentDir: string, relative: string, opts: { offset?: number; limit?: number } = {}): ArtifactExtract {
+  const offset = opts.offset ?? 0;
+  const limit = opts.limit ?? ARTIFACT_PAGE_BYTES;
+  if (!Number.isInteger(offset) || offset < 0) throw new Error('offset must be a non-negative integer');
+  if (!Number.isInteger(limit) || limit < 1 || limit > ARTIFACT_MAX_PAGE_BYTES) throw new Error(`limit must be an integer between 1 and ${ARTIFACT_MAX_PAGE_BYTES}`);
+  const file = artifactPath(agentDir, relative);
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw new Error('Artifact must be a regular text file');
+    if (stat.size > ARTIFACT_MAX_FILE_BYTES) throw new Error('Artifact is too large to read');
+    if (offset > stat.size) throw new Error('offset is past the end of the artifact');
+    const want = Math.min(limit, stat.size - offset);
+    const buf = Buffer.alloc(want + 4); // +4 so a multi-byte sequence at the edge can complete
+    const n = want ? fs.readSync(fd, buf, 0, buf.length, offset) : 0;
+    const window = buf.subarray(0, n);
+    if (window.includes(0)) throw new Error('Artifact is oversized or binary');
+    let take = utf8Boundary(window, Math.min(want, n));
+    if (take === 0 && n > 0) {
+      take = utf8Boundary(window, n); // one character is wider than the requested limit: return it whole
+      if (take === 0) throw new Error('Artifact does not contain valid UTF-8 text');
+    }
+    const content = new TextDecoder('utf-8', { fatal: true }).decode(window.subarray(0, take));
+    const next = offset + take;
+    return { path: relative, totalBytes: stat.size, offset, bytes: take, truncated: next < stat.size, nextOffset: next < stat.size ? next : null, content };
+  } finally { fs.closeSync(fd); }
+}
+
+/** This intentionally does not read arbitrary workspace files: only text outputs under runtime/artifacts. */
+export function readExecArtifact(agentDir: string, relative: string): string {
+  const file = artifactPath(agentDir, relative);
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
     const stat = fs.fstatSync(fd);
