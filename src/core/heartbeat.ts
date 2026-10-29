@@ -126,6 +126,62 @@ function fileAgeHours(p: string, now: number): number | null {
   }
 }
 
+// ─── Persona staleness keyed to CONTENT, not mtime ──────────────────────────
+// bd: bl_raqq2k loop — an mtime-only staleness marker re-flags AGENTS.md every
+// ~24h even when its content is byte-identical, which forced a daily
+// timestamp-bumping ghost-write treadmill (Oct 27–28: two verified no-drift
+// ghost-writes, then the marker re-flagged exactly ~24h later — recurrence by
+// design, not noise). Key the marker to the content sha256 instead: identical
+// content self-clears until real drift appears, and a review is recorded once
+// through the gated maintain path (ticks cannot forge baselines: file tools
+// confine writes to memory/, and the baseline records the sha AT record time).
+
+const PERSONA_REVIEW_FILE = path.join("memory", "persona-review.json");
+/** A maintain note that records a persona review (e.g. "persona: reviewed — no drift"). */
+export const PERSONA_MAINTAIN_RE = /^persona\b/i;
+
+export interface PersonaReviewBaseline {
+  sha256: string;
+  reviewedAt: string;
+  note: string;
+}
+
+function fileSha256(p: string): string | null {
+  try {
+    return createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function readPersonaReview(agentDir: string): PersonaReviewBaseline | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(agentDir, PERSONA_REVIEW_FILE), "utf8")) as PersonaReviewBaseline;
+    if (raw && typeof raw.sha256 === "string" && typeof raw.reviewedAt === "string" && Number.isFinite(Date.parse(raw.reviewedAt))) return raw;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Records a persona review baseline keyed to the CURRENT AGENTS.md content sha256.
+ *  Written only by the gated maintain path (heartbeat_act), never by raw agent
+ *  file writes — so a baseline proves content was seen as of that record. */
+export function recordPersonaReview(agentDir: string, note: string): void {
+  try {
+    const sha = fileSha256(path.join(agentDir, "AGENTS.md"));
+    if (!sha) return; // nothing to baseline a record on
+    const data: PersonaReviewBaseline = {
+      sha256: sha,
+      reviewedAt: new Date().toISOString(),
+      note: truncate(note.trim(), 300),
+    };
+    writeJsonAtomic(path.join(agentDir, PERSONA_REVIEW_FILE), data);
+  } catch {
+    /* best effort — a review record must never break a tick */
+  }
+}
+
 /** Appends a durable maintenance note to memory/maintenance.jsonl (best-effort). */
 export function recordMaintenanceNote(agentDir: string, note: string): void {
   try {
@@ -214,11 +270,22 @@ export function buildMaintenancePanel(agentDir: string, now = Date.now()): strin
         : memoryHours < ROTATION_FLOOR_H
           ? `current (updated ${memoryAge}) — durable memory your digest carries; memory_save does NOT refresh this line (write with file tools)`
           : `STALE ${ageAgo(now - memoryHours * 3600e3, now)} — service this rotation (memory_save does NOT refresh this line; write with file tools)`;
+      // Persona staleness is CONTENT-keyed (see the persona-review section above):
+      // a recorded review that still matches the current sha256 reads current even
+      // with an old mtime, so zero-drift days self-clear instead of demanding daily
+      // timestamp-bumping writes. Only real content drift (or no baseline yet) falls
+      // back to the mtime floor.
+      const personaSha = fileSha256(path.join(agentDir, "AGENTS.md"));
+      const personaReview = readPersonaReview(agentDir);
       const personaLine = personaHours == null
         ? "(missing) — you cannot write AGENTS.md from a tick; record maintain \"backlog: write persona paragraph\""
-        : personaHours < ROTATION_FLOOR_H
-          ? `current (updated ${personaAge}) — read-only from ticks`
-          : `STALE ${ageAgo(now - personaHours * 3600e3, now)} — service this rotation (read-only from ticks: if it has drifted, record maintain "backlog: persona refresh — <what changed>")`;
+        : personaSha != null && personaReview && personaReview.sha256 === personaSha
+          ? `current (content-verified — sha matches the ${ageAgo(Date.parse(personaReview.reviewedAt), now)} review; no write needed unless content drifts)`
+          : personaSha != null && personaReview
+            ? `STALE (content drifted since the ${ageAgo(Date.parse(personaReview.reviewedAt), now)} review) — service this rotation (read AGENTS.md, then record maintain "persona: reviewed — <what changed or 'no drift found'>")`
+            : personaHours < ROTATION_FLOOR_H
+              ? `current (updated ${personaAge}) — read-only from ticks`
+              : `STALE ${ageAgo(now - personaHours * 3600e3, now)} — service this rotation (read-only from ticks: if it has drifted, record maintain "persona: reviewed — <what changed or 'no drift found'>")`;
       return [
         `- memory (memory/MEMORY.md): ${memLine}`,
         `- persona (AGENTS.md): ${personaLine}`,
@@ -600,6 +667,10 @@ export class HeartbeatEngine {
         } else {
           recordMaintenanceNote(agent.dir, act.maintain);
           this.deps.events.log(agent.id, "maintenance", act.maintain);
+          // content-keyed persona staleness (see PERSONA_MAINTAIN_RE): a persona
+          // review note baselines the CURRENT AGENTS.md sha so zero-drift days
+          // self-clear without further writes.
+          if (PERSONA_MAINTAIN_RE.test(raw)) recordPersonaReview(agent.dir, act.maintain);
         }
       }
     }

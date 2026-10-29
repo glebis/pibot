@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { nextActs } = vi.hoisted(() => ({ nextActs: [] as Array<null | { speak?: string; escalate?: string; note?: string; wakeup?: string; maintain?: string }> }));
@@ -43,7 +44,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   };
 });
 
-import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine, recordMaintenanceNote, verifyMemoryClaim, triageEscalationLoop, escalationsSimilar, type EscalationLoopState } from "./heartbeat.js";
+import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine, recordMaintenanceNote, recordPersonaReview, verifyMemoryClaim, triageEscalationLoop, escalationsSimilar, type EscalationLoopState } from "./heartbeat.js";
 import { appendBacklogItems, loadBacklogItems } from "./backlog.js";
 import { clearSignalsCache } from "./research-signals.js";
 import type { LoadedAgent } from "./agent-manager.js";
@@ -443,6 +444,23 @@ describe("HeartbeatEngine backoff", () => {
       expect(calls.some((c) => c[1] === "maintenance" && c[2].includes("voice notes"))).toBe(true);
     });
 
+    it("heartbeat_act persona maintain records a content-sha review baseline", async () => {
+      const agent = makeAgent(dir);
+      const { engine } = makeEngine(agent, dir);
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "persona content v1");
+      queueActs([{ maintain: "persona: reviewed — no drift" }]);
+      await engine.tick(agent.id);
+      const sidecar = JSON.parse(
+        fs.readFileSync(path.join(dir, "memory", "persona-review.json"), "utf8"),
+      ) as { sha256: string; reviewedAt: string; note: string };
+      expect(sidecar.sha256).toBe(createHash("sha256").update("persona content v1").digest("hex"));
+      expect(sidecar.reviewedAt).toBeTruthy();
+      expect(sidecar.note).toContain("reviewed");
+      // the durable journal still gets the persona note (both books, one write path)
+      const journal = fs.readFileSync(path.join(dir, "memory", "maintenance.jsonl"), "utf8").trim();
+      expect(JSON.parse(journal).note).toContain("reviewed");
+    });
+
     it("services a stale-events item by running the consolidation engine", async () => {
       const agent = makeAgent(dir);
       const consolidation = { consolidate: vi.fn(async () => ({ agentId: agent.id, ok: true, summary: "ok" })) };
@@ -528,6 +546,32 @@ describe("HeartbeatEngine backoff", () => {
       expect(panel).toContain("current (updated 21h ago)");
       expect(panel).toContain("STALE 26h ago");
       expect(panel).not.toContain("STALE 22h");
+    });
+
+    it("persona staleness is content-keyed: a matching sha baseline reads current despite old mtime", () => {
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "persona content v1");
+      utime(path.join(dir, "AGENTS.md"), 3); // 72h — legacy mtime logic would flag STALE
+      recordPersonaReview(dir, "persona: reviewed — no drift");
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toMatch(/persona \(AGENTS\.md\): current \(content-verified/);
+      expect(panel).not.toContain("content drifted");
+      expect(panel).not.toMatch(/persona \(AGENTS\.md\): STALE/);
+    });
+
+    it("persona content drift after a review baseline flags STALE with content wording", () => {
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "persona content v1");
+      recordPersonaReview(dir, "persona: reviewed");
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "persona content v2");
+      utime(path.join(dir, "AGENTS.md"), 0.5); // fresh mtime — the marker keys to CONTENT, not age
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toMatch(/persona \(AGENTS\.md\): STALE \(content drifted since the .* review\)/);
+    });
+
+    it("no review baseline keeps the legacy 24h mtime behavior for persona", () => {
+      fs.writeFileSync(path.join(dir, "AGENTS.md"), "persona content");
+      utime(path.join(dir, "AGENTS.md"), 2); // 48h — past the rotation floor, no baseline
+      const panel = buildMaintenancePanel(dir);
+      expect(panel).toMatch(/persona \(AGENTS\.md\): STALE 2d ago/);
     });
 
     it("marks missing files and shows the last maintenance entry", () => {
