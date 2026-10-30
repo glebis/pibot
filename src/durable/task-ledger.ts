@@ -14,6 +14,7 @@ import { createModels } from "@earendil-works/pi-ai";
 import { Harness, createRegistry, defineDoc, defineExtension, defineTask, type JsonObject } from "@earendil-works/pi-durable";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
+import { lockStorageDir, type StorageLock } from "./storage-lock.js";
 import { truncate } from "../core/util.js";
 import { scanNumericClaims } from "../core/fact-check.js";
 import { correctRelativeDateClaims } from "../core/relative-date-guard.js";
@@ -142,6 +143,10 @@ export interface TaskLedger {
   list(filter: { agentId: string; chatKey?: string }): Promise<LedgerEntry[]>;
   /** true when an abort was requested for a live task */
   cancel(id: string): Promise<boolean>;
+  /** the whole ledger document, for the offline compaction path (bd pibot-b708) */
+  exportSnapshot(): Promise<LedgerSnapshot>;
+  /** write a whole document value into an EMPTY ledger in one commit (bd pibot-b708) */
+  importSnapshot(value: LedgerSnapshot): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -234,7 +239,69 @@ function prune(doc: LedgerDoc): void {
   }
 }
 
-export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: string; now?: () => number }): Promise<TaskLedger> {
+  /** A ledger directory that cannot be read. Owner-visible and fatal to the task subsystem,
+   *  never papered over by reopening onto empty state. */
+export class LedgerUnreadableError extends Error {
+  readonly dir: string;
+  constructor(dir: string, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(
+      `The task ledger in ${dir} could not be read: ${detail}. ` +
+        `Do not delete it silently — inspect main.jsonl and its sidecars, or move the directory aside to start a fresh ledger.`,
+      { cause: cause instanceof Error ? cause : undefined },
+    );
+    this.name = "LedgerUnreadableError";
+    this.dir = dir;
+  }
+}
+
+/** Snapshot of the whole ledger document, as the daemon would read it (bd pibot-b708). */
+export interface LedgerSnapshot {
+  tasks: Record<string, LedgerEntry>;
+  requests: Record<string, string>;
+}
+
+/**
+ * Rebuild a ledger directory so its marker log holds ONE commit instead of history
+ * (bd pibot-b708). The backend has no compaction: `reclaimSidecars()` prunes doc-/task-
+ * sidecars but main.jsonl markers are append-only, and `document.retire` only empties a
+ * retired doc's sidecar. So the supported way to shrink it is to write the current
+ * document value into a fresh directory and swap.
+ *
+ * The caller is responsible for quiescence — this function takes the directory lock, and
+ * therefore fails loudly if a live writer holds it, but it cannot know whether an
+ * unfinished task would be lost; that check belongs to the caller (see
+ * `compactTaskLedger` in ./compact-ledger.ts).
+ */
+export async function rewriteLedgerStorage(opts: {
+  storageDir: string;
+  stagingDir: string;
+  label?: string;
+}): Promise<{ tasks: number; requests: number }> {
+  // Read the current document through the ordinary open path, then close it so the
+  // directory is free — the read lock is released before the staging ledger is built.
+  const source = await openTaskLedger({ runner: { run: async () => "", notify: async () => undefined }, storageDir: opts.storageDir, label: `${opts.label ?? "compaction"} (read)` });
+  let snapshot: LedgerSnapshot;
+  try {
+    snapshot = (await source.exportSnapshot()) as LedgerSnapshot;
+  } finally {
+    await source.close();
+  }
+
+  const target = await openTaskLedger({
+    runner: { run: async () => "", notify: async () => undefined },
+    storageDir: opts.stagingDir,
+    label: `${opts.label ?? "compaction"} (write)`,
+  });
+  try {
+    await target.importSnapshot(snapshot);
+  } finally {
+    await target.close();
+  }
+  return { tasks: Object.keys(snapshot.tasks ?? {}).length, requests: Object.keys(snapshot.requests ?? {}).length };
+}
+
+export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: string; now?: () => number; label?: string }): Promise<TaskLedger> {
   const now = opts.now ?? Date.now;
   const runner = opts.runner;
 
@@ -400,12 +467,32 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
 
   const registry = createRegistry();
   registry.install(defineExtension({ name: "pibot-task-ledger", tasks: [AgentTask] }));
-  const storage = opts.storageDir ? await openNodeJsonlStorage(opts.storageDir, C) : new MemoryStorage();
-  const harness = await Harness.open(storage, {
-    models: createModels(), // the ledger never calls a model; agents do the work through the runner
-    registry,
-    onReport: (e) => console.warn("[task-ledger]", e instanceof Error ? e.message : e),
-  }, C);
+  // One owner per ledger directory (bd pibot-cea8): the JSONL backend has no lock of its
+  // own, so a second writer — the satellite script pointed at the live directory, or a
+  // second daemon — would interleave commits and corrupt the task index.
+  const lock: StorageLock | undefined = opts.storageDir
+    ? lockStorageDir(opts.storageDir, { label: `task-ledger ${opts.label ?? "pibot"}`, onStaleTakeover: (holder) => console.warn(`[task-ledger] took over a stale storage lock in ${opts.storageDir} from pid ${holder?.pid ?? "?"}`) })
+    : undefined;
+  let storage;
+  try {
+    storage = opts.storageDir ? await openNodeJsonlStorage(opts.storageDir, C) : new MemoryStorage();
+  } catch (e) {
+    // Corruption is a hard stop, never a silent reopen onto a rewritten ledger: the
+    // owner has to see that the task index needs repair (bd pibot-cea8).
+    lock?.release();
+    throw new LedgerUnreadableError(opts.storageDir!, e);
+  }
+  let harness: Awaited<ReturnType<typeof Harness.open>>;
+  try {
+    harness = await Harness.open(storage, {
+      models: createModels(), // the ledger never calls a model; agents do the work through the runner
+      registry,
+      onReport: (e) => console.warn("[task-ledger]", e instanceof Error ? e.message : e),
+    }, C);
+  } catch (e) {
+    lock?.release();
+    throw new LedgerUnreadableError(opts.storageDir!, e);
+  }
   const root = await harness.root(C);
   harness.resume();
 
@@ -464,8 +551,31 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
       }, C);
       return (await snapshot()).tasks[id];
     },
+    async exportSnapshot() {
+      return (await snapshot()) as unknown as LedgerSnapshot;
+    },
+    /**
+     * Write a whole document value into a FRESH ledger in one commit (bd pibot-b708).
+     * Refuses a ledger that already has history: this is a rebase, not a merge.
+     */
+    async importSnapshot(value) {
+      const existing = await snapshot();
+      if (Object.keys(existing.tasks).length || Object.keys(existing.requests).length) {
+        throw new Error("importSnapshot target already holds a ledger; compaction must write into an empty directory");
+      }
+      await root.commit(async (tx) => {
+        const doc = await ledgerDoc(tx, root.id);
+        doc.tasks = structuredClone(value.tasks ?? {});
+        doc.requests = structuredClone(value.requests ?? {});
+        return undefined;
+      }, C);
+    },
     async close() {
-      await harness.close(C);
+      try {
+        await harness.close(C);
+      } finally {
+        lock?.release();
+      }
     },
   };
 }

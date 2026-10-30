@@ -188,7 +188,7 @@ export function recordMaintenanceNote(agentDir: string, note: string): void {
     ensureDir(path.join(agentDir, "memory"));
     const now = Date.now();
     const entry = JSON.stringify({ ts: new Date(now).toISOString(), note: truncate(note.trim(), 300) });
-    const verification = verifyMemoryClaim(agentDir, note, now);
+    const verification = verifyMemoryClaim(agentDir, note, now) ?? verifyConsolidationClaim(agentDir, note, now);
     const lines = verification ? `${entry}\n${JSON.stringify(verification)}\n` : `${entry}\n`;
     fs.appendFileSync(path.join(agentDir, MAINTENANCE_JOURNAL), lines);
   } catch {
@@ -199,6 +199,9 @@ export function recordMaintenanceNote(agentDir: string, note: string): void {
 /** A maintenance note that claims a MEMORY.md write ("seeded", "refreshed"…). */
 const MEMORY_CLAIM_RE = /\bMEMORY\.md\b/i;
 const CLAIM_VERB_RE = /\b(seed(ed)?|refresh(ed)?|updat(ed)?|writ(ten|es)?|wrot(e)?|rewrot(e|e)|rebuilt?|restore(d)?|recreated?)\b/i;
+/** A maintenance note claiming event consolidation was serviced (bl_xbl5c2 pattern). */
+const CONSOLIDATION_CLAIM_RE = /\bevents? consolidation\b/i;
+const CONSOLIDATION_VERB_RE = /\b(fold(ed|s)?|consolidat(ed|es|ion|ing)?|ran|run|servic(ed|es)?|distill(ed|s)?|handled|cleared)\b/i;
 /** Same-turn writes may precede the claim by minutes in a long heartbeat turn. */
 const CLAIM_GRACE_MS = 10 * 60e3;
 
@@ -229,6 +232,39 @@ export function verifyMemoryClaim(agentDir: string, note: string, now = Date.now
     return { ...base, verified: false, detail: `MEMORY.md untouched (${ageAgo(mtimeMs, now)}) — ghost write?` };
   } catch {
     return { ...base, verified: false, detail: "MEMORY.md missing — ghost write?" };
+  }
+}
+
+/**
+ * Ghost-service guard for consolidation (bl_xbl5c2 / Oct 30 pattern): a note
+ * claiming "events consolidation folded N" does not advance the engine cursor
+ * — only a real consolidate run (engine lastRunAt) does. Journal the mismatch
+ * explicitly so the maintenance history shows WHY the panel still counts the
+ * events as pending. Returns null for notes without a consolidation claim.
+ */
+export function verifyConsolidationClaim(agentDir: string, note: string, now = Date.now()): MaintenanceVerification | null {
+  const trimmed = note.trim();
+  if (!CONSOLIDATION_CLAIM_RE.test(trimmed) || !CONSOLIDATION_VERB_RE.test(trimmed)) return null;
+  const base = { ts: new Date(now).toISOString(), type: "verify" as const, claim: truncate(trimmed, 160) };
+  try {
+    const st = readJson<{ meta?: { lastRunAt?: number } }>(path.join(agentDir, "memory", "consolidated", "blocks.json"), {} as { meta?: { lastRunAt?: number } });
+    const lastRunAt = st?.meta?.lastRunAt ?? 0;
+    const delta = now - lastRunAt;
+    if (lastRunAt && delta <= CLAIM_GRACE_MS) {
+      return { ...base, verified: true, detail: `consolidation engine ran ${ageAgo(lastRunAt, now)}` };
+    }
+    // a manual fold into MEMORY.md is legitimate service but does NOT move the
+    // engine cursor — spell that out so journal vs panel reads as explained,
+    // not as drift
+    return {
+      ...base,
+      verified: false,
+      detail:
+        `engine cursor unchanged (last run ${lastRunAt ? ageAgo(lastRunAt, now) : "never"}) — ` +
+        `manual folds don't advance it; the panel keeps counting until a real "consolidate events" run`,
+    };
+  } catch {
+    return { ...base, verified: false, detail: "consolidation state unreadable — ghost service?" };
   }
 }
 

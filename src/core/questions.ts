@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Card, ChatRef, Transport } from "./types.js";
 import { uid } from "./util.js";
+import { QuestionStore } from "./question-store.js";
 
 export interface QuestionSpec {
   text: string;
@@ -14,6 +15,12 @@ export interface QuestionSpec {
   deadlineReason?: string;
   /** "question" = clarifying ask_user (spoken on a live voice call); anything else blocks for an explicit tap */
   kind?: "question" | "approval";
+  /**
+   * Stable caller-supplied identity for this question (bd pibot-jciq). A resumed
+   * ask() with the same key returns the recorded answer instead of asking the
+   * owner again after a restart.
+   */
+  questionKey?: string;
 }
 
 export interface QuestionAnswer {
@@ -40,8 +47,9 @@ interface PendingQuestion {
   agentId: string;
   chatKey: string;
   spec: QuestionSpec;
-  resolve: (a: QuestionAnswer) => void;
-  timer: NodeJS.Timeout;
+  /** absent for a question restored from the journal after a restart: nobody is waiting in THIS process */
+  resolve?: (a: QuestionAnswer) => void;
+  timer?: NodeJS.Timeout;
   snapshot:QuestionSnapshot;
 }
 
@@ -59,7 +67,7 @@ export class QuestionBus {
   questionSnapshot(qid:string):QuestionSnapshot|undefined {const s=this.pending.get(qid)?.snapshot;return s?structuredClone(s):undefined;}
   pendingSnapshots():QuestionSnapshot[] {return [...this.pending.values()].map(p=>structuredClone(p.snapshot));}
   private emit(snapshot:QuestionSnapshot):void {for(const listener of this.lifecycle){try{listener(structuredClone(snapshot));}catch{/* source feed must fail closed independently, never block an owner answer */}}}
-  private accepted(qid:string):void {const p=this.pending.get(qid);if(!p||p.snapshot.acceptedMessageAt!==undefined)return;p.snapshot.acceptedMessageAt=Date.now();this.emit(p.snapshot);}
+  private accepted(qid:string):void {const p=this.pending.get(qid);if(!p||p.snapshot.acceptedMessageAt!==undefined)return;p.snapshot.acceptedMessageAt=Date.now();this.deps.store?.update(qid, { acceptedMessageAt: p.snapshot.acceptedMessageAt });this.emit(p.snapshot);}
   private pollMap = new Map<string, string>(); // telegram poll_id → qid
 
   constructor(
@@ -67,12 +75,76 @@ export class QuestionBus {
       getTransport: (name: string) => Transport | undefined;
       /** small confirmation push for poll votes (buttons get a toast instead) */
       notify?: (chatKey: string, text: string) => void;
+      /**
+       * Durable journal (bd pibot-jciq). Omitted = in-memory only, which is what
+       * tests and owner-less agents get.
+       */
+      store?: QuestionStore;
     }
-  ) {}
+  ) { this.restore(); }
+
+  /**
+   * Re-materialise questions a previous process had already shown the owner, so a
+   * tap, poll vote or typed answer that arrives after this restart is still
+   * recorded instead of reported stale (bd pibot-jciq). Restored entries have no
+   * resolver: their asking turn died with the old process, and the answer is kept
+   * in the journal for the resumed turn to read via `answerFor`.
+   */
+  private restore(): void {
+    for (const rec of this.deps.store?.listPending() ?? []) {
+      if (this.pending.has(rec.snapshot.qid)) continue;
+      this.pending.set(rec.snapshot.qid, {
+        qid: rec.snapshot.qid,
+        agentId: rec.snapshot.agentId,
+        chatKey: rec.snapshot.canonicalChatId,
+        spec: rec.spec,
+        snapshot: rec.snapshot,
+      });
+    }
+  }
+
+  /** The durable answer for a question, whoever recorded it (used by a resumed turn). */
+  answerFor(questionKey: string): QuestionAnswer | undefined {
+    const rec = this.deps.store?.findByKey(questionKey);
+    return rec?.answer ? { ...rec.answer } : undefined;
+  }
+
+  /** Questions whose owner answered while this process was down. */
+  answersRecordedOffline(): Array<{ qid: string; agentId: string; chatKey: string; questionKey?: string; answer: QuestionAnswer }> {
+    return (this.deps.store?.listAnsweredOffline() ?? []).map((rec) => ({
+      qid: rec.snapshot.qid,
+      agentId: rec.snapshot.agentId,
+      chatKey: rec.snapshot.canonicalChatId,
+      ...(rec.questionKey !== undefined ? { questionKey: rec.questionKey } : {}),
+      answer: { ...rec.answer! },
+    }));
+  }
 
   async ask(agentId: string, chat: ChatRef, spec: QuestionSpec): Promise<QuestionAnswer | null> {
     if(spec.usefulUntil!==undefined && (!Number.isSafeInteger(spec.usefulUntil)||spec.usefulUntil<=Date.now()||typeof spec.deadlineReason!=='string'||!spec.deadlineReason.trim()||spec.deadlineReason.length>500)) throw new Error('Explicit useful deadline requires a future timestamp and reason');
     const chatKey = `${chat.transport}:${chat.chatId}`;
+    // A prior attempt of the same logical question already has an answer: after a
+    // restart the asking turn resumes here, not at the owner's chat (bd pibot-jciq).
+    const key = spec.questionKey?.trim();
+    if (key) {
+      const prior = this.deps.store?.findByKey(key);
+      if (prior?.answer) return { ...prior.answer };
+      const live = prior ? this.pending.get(prior.snapshot.qid) : undefined;
+      // The message is already on the owner's screen and its window is still open:
+      // re-attach to it rather than asking a second time. Re-attaching is what makes
+      // a resumed task inherit the owner's pending decision (bd pibot-jciq).
+      if (live && live.snapshot.status === "pending" && live.snapshot.pendingUntil > Date.now() && !live.resolve) {
+        return await new Promise<QuestionAnswer>((resolve) => {
+          live.resolve = resolve;
+          live.timer = setTimeout(() => this.expire(live.snapshot.qid), Math.max(0, live.snapshot.pendingUntil - Date.now()));
+        });
+      }
+      // The same logical question was already settled without an answer (it expired
+      // while the process was down, or the owner dismissed/replaced it). Reporting the
+      // timeout is the honest outcome; re-asking would buzz the owner again about a
+      // question they already resolved one way or the other.
+      if (prior) return { choice: "", index: -1, via: "button", timedOut: true };
+    }
     // one pending question per chat — a new question REPLACES the old one
     const previous = [...this.pending.values()].find((p) => p.chatKey === chatKey);
     if (previous) this.cancel(previous.qid, true);
@@ -84,16 +156,20 @@ export class QuestionBus {
     const snapshot:QuestionSnapshot={qid,agentId,canonicalChatId:chatKey,question:spec.text,options:[...spec.options],createdAt,pendingUntil:createdAt+timeoutMs,status:'pending',revision:'sha256:'+createHash('sha256').update(JSON.stringify({qid,agentId,chatKey,text:spec.text,options:spec.options,usefulUntil:spec.usefulUntil,deadlineReason:spec.deadlineReason})).digest('hex'),...(spec.usefulUntil!==undefined?{usefulUntil:spec.usefulUntil,deadlineReason:spec.deadlineReason!.trim(),provenance:'agent_declared_deadline' as const}:{})};
     const answer = await new Promise<QuestionAnswer>((resolve) => {
       const timer = setTimeout(() => {
-        this.pending.delete(qid);snapshot.status='expired';this.emit(snapshot);
+        this.expire(qid);
         resolve({ choice: "", index: -1, via: "button", timedOut: true });
       }, timeoutMs);
-      this.pending.set(qid, { qid, agentId, chatKey, spec, resolve, timer, snapshot });this.emit(snapshot);
+      this.pending.set(qid, { qid, agentId, chatKey, spec, resolve, timer, snapshot });
+      // Durable BEFORE the owner is asked: a crash between here and the push
+      // leaves a recorded question, not a silently lost one.
+      this.deps.store?.save({ snapshot: structuredClone(snapshot), spec: structuredClone(spec), questionKey: key, recordedAt: createdAt });
+      this.emit(snapshot);
     console.log(`[questions] registered ${qid} → ${chatKey} (${spec.options.length} options, poll=${Boolean(spec.poll)})`);
 
       const transport = this.deps.getTransport(chat.transport);
       if (!transport) {
         clearTimeout(timer);
-        this.pending.delete(qid);snapshot.status='cancelled';this.emit(snapshot);
+        this.pending.delete(qid);snapshot.status='cancelled';this.deps.store?.update(qid, { status: 'cancelled' });this.emit(snapshot);
         resolve({ choice: "", index: -1, via: "button", timedOut: true });
         return;
       }
@@ -130,8 +206,18 @@ export class QuestionBus {
     const [, qid, idxStr] = action.split(":");
     const p = this.pending.get(qid);
     if (!p || (expectedChatKey !== undefined && p.chatKey !== expectedChatKey)) return null;
+    // A question whose wait window closed is never answered late, even if its
+    // message is still on the owner's screen.
+    if (p.snapshot.status === "pending" && p.snapshot.pendingUntil <= Date.now()) {
+      this.expire(qid);
+      return null;
+    }
     const idx = parseInt(idxStr, 10);
     if (!Number.isInteger(idx) || idx < 0 || idx >= p.spec.options.length) return null;
+    // First answer wins: a tap replayed from a previous process cannot overwrite
+    // an answer already on record.
+    const prior = this.deps.store?.get(qid)?.answer;
+    if (prior) return { ...prior };
     const answer: QuestionAnswer = { choice: p.spec.options[idx], index: idx, via: "button" };
     console.log(`[questions] tap ${action} → resolved: ${answer.choice}`);
     this.finish(qid, answer);
@@ -145,6 +231,12 @@ export class QuestionBus {
     this.pollMap.delete(pollId);
     const p = this.pending.get(qid);
     if (!p || optionIndex < 0 || optionIndex >= p.spec.options.length) return null;
+    if (p.snapshot.status === "pending" && p.snapshot.pendingUntil <= Date.now()) {
+      this.expire(qid);
+      return null;
+    }
+    const prior = this.deps.store?.get(qid)?.answer;
+    if (prior) return { ...prior };
     const answer: QuestionAnswer = { choice: p.spec.options[optionIndex], index: optionIndex, via: "poll" };
     this.finish(qid, answer);
     // polls have no callback toast — push a tiny confirmation instead
@@ -194,17 +286,34 @@ export class QuestionBus {
   private finish(qid: string, answer: QuestionAnswer): void {
     const p = this.pending.get(qid);
     if (!p) return;
-    clearTimeout(p.timer);
+    if (p.timer) clearTimeout(p.timer);
+    // Durable BEFORE the asking turn is woken: a crash right after the owner's tap
+    // still leaves the answer on record for the resumed turn.
+    this.deps.store?.recordAnswer(qid, answer, { offline: p.resolve === undefined });
     this.pending.delete(qid);p.snapshot.status='answered';this.emit(p.snapshot);
-    p.resolve(answer);
+    p.resolve?.({ ...answer });
+  }
+
+  /** Mark a question expired and record it durably. */
+  private expire(qid: string): void {
+    const p = this.pending.get(qid);
+    if (!p) return;
+    if (p.timer) clearTimeout(p.timer);
+    this.pending.delete(qid);
+    p.snapshot.status = 'expired';
+    this.deps.store?.update(qid, { status: 'expired' });
+    this.emit(p.snapshot);
+    p.resolve?.({ choice: "", index: -1, via: "button", timedOut: true });
   }
 
   /** Drop a pending question (replaced/failed delivery); resolver gets timedOut */
   private cancel(qid: string, replaced = false): void {
     const p = this.pending.get(qid);
     if (!p) return;
-    clearTimeout(p.timer);
-    this.pending.delete(qid);p.snapshot.status=replaced?'replaced':'cancelled';this.emit(p.snapshot);
-    p.resolve({ choice: "", index: -1, via: "button", timedOut: true, replaced });
+    if (p.timer) clearTimeout(p.timer);
+    this.pending.delete(qid);p.snapshot.status=replaced?'replaced':'cancelled';
+    this.deps.store?.update(qid, { status: p.snapshot.status });
+    this.emit(p.snapshot);
+    p.resolve?.({ choice: "", index: -1, via: "button", timedOut: true, replaced });
   }
 }

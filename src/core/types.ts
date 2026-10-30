@@ -30,6 +30,27 @@ export interface Schedule {
   /** direct: host formats the ping. agent: full agent session composes it */
   delivery: "direct" | "agent";
   status: "pending" | "paused" | "done" | "cancelled";
+  /**
+   * Why a `done` job is done. `fired` = its side effect was dispatched; `missed` =
+   * it came due while the daemon was down past the catch-up window and was closed
+   * without firing. Absent on legacy rows and on non-done jobs.
+   */
+  outcome?: "fired" | "missed";
+  /** When the job was closed as missed, for the owner-facing record. */
+  missedAt?: number;
+  /**
+   * Set while an occurrence is claimed on disk but not yet settled (bd pibot-awhs).
+   * The claim records what the fire is *going* to resolve to, so a boot can finish the
+   * transition instead of re-deciding it — the whole point of persisting before dispatch.
+   */
+  firing?: {
+    claimedAt: number;
+    /** dueAt this fire consumed, so a mid-flight reschedule is still respected. */
+    dueAtAtFire: number;
+    firedCount: number;
+    /** where a repeat occurrence moves next; absent when this fire closes the job. */
+    nextDueAt?: number;
+  };
   /** bot should show an inline card (✅ / +10m / +1h / Cancel) after the agent's turn */
   cardPending?: boolean;
   createdAt: number;

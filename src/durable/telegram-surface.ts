@@ -1,6 +1,12 @@
 // Telegram surface for the Pi Durable satellite: chat messages become exactly-once
 // satellite submissions, and settled answers are pushed back into the chat.
 //
+// PROTOTYPE — no production caller (bd pibot-8ptd, decision in docs/durable-satellite-decision.md).
+// Do not confuse this with src/core/delivery-ledger.ts, which is the production answer to
+// the same question (an outbound message must not be lost and must not be sent twice). This
+// file stays as the reference implementation of exactly-once Telegram requestIds for a
+// future migration; it is wired only by the tests and scripts/durable-satellite.mts.
+//
 // The surface is deliberately transport-agnostic (anything with onMessage/push) —
 // production wires the real TelegramTransport; tests use fakes.
 //

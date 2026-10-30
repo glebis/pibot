@@ -1,4 +1,14 @@
-// Pi Durable satellite — first prototype (bead pibot-icv).
+// Pi Durable satellite — PROTOTYPE, no production caller (bead pibot-icv, pibot-8ptd).
+//
+// Decision 2026-10-29 (bd pibot-8ptd): the phase-1 "daemon-owned satellite" goal is RETIRED —
+// see docs/durable-satellite-decision.md. Nothing in the daemon opens a satellite; the only
+// caller is scripts/durable-satellite.mts. The durable properties this was meant to prove
+// (checkpoint/resume, exactly-once by requestId, crash-safe delivery) now live in the
+// existing pi-coding-agent stack instead: src/durable/task-ledger.ts (background tasks),
+// src/core/delivery-ledger.ts (outbound Telegram), src/core/question-store.ts (owner
+// questions), src/core/scheduler.ts (reminder fires). The gap that keeps this a prototype is
+// capability surface, not durability: this harness registers ONE read-only tool
+// (list_workspace) where a pibot agent has 28 capability definitions / 89 tools.
 //
 // One durable harness owning one SQLite/JSONL storage: every model call and
 // tool run is a checkpointed task, so the satellite survives its process dying
@@ -17,6 +27,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { Harness, createRegistry, defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
+import { lockStorageDir, type StorageLock } from "./storage-lock.js";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import type { SettledSubmissionRecord } from "@earendil-works/pi-durable";
 
@@ -58,15 +69,27 @@ export interface Satellite {
   /** low-level access for forks/configure (kept for the next prototype steps) */
   readonly harness: OpenedHarness;
   readonly root: RootConversation;
+  /** close the harness and release the storage lock */
+  close(): Promise<void>;
 }
 
 type OpenedHarness = Awaited<ReturnType<typeof Harness.open>>;
 type RootConversation = Awaited<ReturnType<OpenedHarness["root"]>>;
 
 export async function openSatellite(opts: SatelliteOptions): Promise<Satellite> {
-  const storage = opts.storageDir
-    ? await openNodeJsonlStorage(opts.storageDir, BACKGROUND_CONTEXT)
-    : new MemoryStorage();
+  // A satellite is by design a SECOND durable harness. It must never share a storage
+  // directory with the daemon's task ledger: the JSONL backend does not lock, so two
+  // writers interleave commits (bd pibot-cea8).
+  const lock: StorageLock | undefined = opts.storageDir ? lockStorageDir(opts.storageDir, { label: "durable satellite" }) : undefined;
+  let storage;
+  try {
+    storage = opts.storageDir
+      ? await openNodeJsonlStorage(opts.storageDir, BACKGROUND_CONTEXT)
+      : new MemoryStorage();
+  } catch (e) {
+    lock?.release();
+    throw e;
+  }
 
   const models = createModels({ credentials: opts.credentials });
   models.setProvider(opts.provider);
@@ -106,7 +129,16 @@ export async function openSatellite(opts: SatelliteOptions): Promise<Satellite> 
   // the scheduler on and kicks it, so repeat calls (the public `resume`) are harmless.
   harness.resume();
 
-  return { ask, resume: () => harness.resume(), harness, root };
+  /** Release the harness and the storage-directory lock. */
+  async function close(): Promise<void> {
+    try {
+      await harness.close(BACKGROUND_CONTEXT);
+    } finally {
+      lock?.release();
+    }
+  }
+
+  return { ask, resume: () => harness.resume(), harness, root, close };
 }
 
 /** Extract the assistant text of a settled submission's answer entry. */

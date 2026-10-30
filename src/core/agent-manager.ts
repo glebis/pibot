@@ -139,6 +139,8 @@ export class AgentManager {
   private vaultDir: string;
   /** shared docs site source root (read-only course content); set by the host from config */
   docsDir?: string;
+  /** owner's Codex activity-report root (read-only); set by the host from config */
+  codexReportsDir?: string;
   private repoRoot: string;
   private dataDir: string;
   private modelRuntime: ModelRuntime;
@@ -297,6 +299,7 @@ export class AgentManager {
       workspace: sessionCwd,
       vaultDir: this.vaultDir,
       docsDir: this.docsDir,
+      codexReportsDir: this.codexReportsDir ?? path.join(os.homedir(), "Documents", "Codex"),
       scheduler,
       chat,
       ask,

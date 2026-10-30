@@ -52,7 +52,7 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
           } else {
             try {
               const wake = params.wake === "important" ? "important" : params.wake === "notify" ? "notify" : "normal";
-              const delivery = params.delivery === "agent" ? "agent" : "direct";
+              const delivery = params.delivery === "agent" || chat.transport === "agent" ? "agent" : "direct";
               const kind = (params.kind as never) ?? "reminder";
               const job = scheduler.create({
                 agentId,

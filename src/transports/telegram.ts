@@ -7,6 +7,7 @@ import { Bot, InputFile, type Context } from "grammy";
 import type { InlineKeyboardButton } from "grammy/types";
 import type { Card, DeliveryReceipt, IncomingMedia, PushOptions, ReplyContext, Transport } from "../core/types.js";
 import { truncate } from "../core/util.js";
+import { DeliveryLedger, type DeliveryRow } from "../core/delivery-ledger.js";
 
 const TG_LIMIT = 4000;
 /** Bot API 10.1 rich-message text cap (32k UTF-8 chars). */
@@ -35,7 +36,12 @@ export function telegramRetryAfterMs(error: unknown): number | null {
   return Math.max(0, Math.min(60_000, value.parameters.retry_after * 1000));
 }
 
-/** Final transport-level backstop against accidental repeat sends. */
+/**
+ * Last-line duplicate backstop for call sites that cannot carry a durable row
+ * (media sends, edit paths). The PUSH path now uses the durable `DeliveryLedger`
+ * directly (bd pibot-qy88); this class is kept for the narrow cases where a short
+ * in-process window is genuinely all that is wanted.
+ */
 export class TelegramDuplicateGuard {
   private recent = new Map<string, number>();
 
@@ -65,6 +71,23 @@ export class TelegramDuplicateGuard {
 function messageIdOf(sent: unknown): number | undefined {
   const m = sent as { message_id?: unknown } | undefined;
   return typeof m?.message_id === "number" ? m.message_id : undefined;
+}
+
+/**
+ * A refusal that will not become a success by retrying: 4xx other than 429
+ * (chat not found, bot blocked, bad markup after the parse-mode safety net).
+ * Recorded as `failed` so boot reports it instead of resending forever.
+ * Anything else (timeout, 5xx, connection reset) stays ambiguous.
+ */
+function isDefinitiveSendRefusal(error: unknown): boolean {
+  const code = (error as { error_code?: unknown } | undefined)?.error_code;
+  return typeof code === "number" && code >= 400 && code < 500 && code !== 429;
+}
+
+function errorText(error: unknown): string {
+  const e = error as { description?: unknown; message?: unknown } | undefined;
+  const text = typeof e?.description === "string" ? e.description : typeof e?.message === "string" ? e.message : String(error);
+  return text.slice(0, 300);
 }
 
 /** The chat a returned Bot API message actually landed in — the truth a receipt must attest. */
@@ -482,6 +505,11 @@ export class TelegramTransport implements Transport {
   private onActionCb: ((action: string, chatId: string) => Promise<void>) | null = null;
   private onPollAnswerCb: ((pollId: string, optionIndex: number, voterId: string) => Promise<void>) | null = null;
   private duplicateGuard = new TelegramDuplicateGuard();
+  /**
+   * Durable record of every outbound push (bd pibot-qy88): survives a restart, so
+   * an owed message is replayable and a delivered dedupeKey stays suppressed.
+   */
+  private deliveries: DeliveryLedger;
   private outboxByChat = new Map<string, Promise<unknown>>();
   private lastSentAtByChat = new Map<string, number>();
 
@@ -506,7 +534,10 @@ export class TelegramTransport implements Transport {
     /** in group chats, react to @mentions of this bot and replies to its messages only — not to every message (main-bot group behavior unchanged) */
     groupMentionOnly?: boolean;
     coordinatorIngress?: DurableTelegramIngress;
+    /** JSON file for the durable delivery ledger; omitted = in-memory only. */
+    deliveryLedgerPath?: string;
   } = {}) {
+    this.deliveries = new DeliveryLedger(opts.deliveryLedgerPath ? { file: opts.deliveryLedgerPath } : {});
     this.bot = new Bot(token);
     if (opts.coordinatorIngress) {
       const ingress = opts.coordinatorIngress;
@@ -1184,9 +1215,16 @@ export class TelegramTransport implements Transport {
       // and falls back to payload equality — repeated unchanged proactive output is
       // exactly the case this backstop exists for (and the only one ever observed).
       const dedupeKey = opts.dedupeKey ?? payload;
-      if (!this.duplicateGuard.shouldSend(chatId, dedupeKey)) {
-        console.warn(`[telegram] (${this.name}) suppressed duplicate send to chat ${chatId}: ${payload.slice(0, 140)}`);
-        await this.settleIncoming(chatId); // the identical earlier copy was delivered
+      // Durable claim BEFORE any API call: after a crash the row proves the message
+      // was owed. `suppress` = already delivered (survives restarts); `review` = a
+      // previous process died mid-send, so nobody knows whether it landed — that is
+      // surfaced, never silently resent (bd pibot-qy88).
+      const claim = this.deliveries.claim({ transport: this.name, chatId, dedupeKey, text });
+      if (claim.action !== "send") {
+        console.warn(
+          `[telegram] (${this.name}) ${claim.action === "suppress" ? "suppressed duplicate" : "ambiguous earlier send — not resending"} to chat ${chatId}: ${payload.slice(0, 140)}`,
+        );
+        if (claim.action === "suppress") await this.settleIncoming(chatId); // the identical earlier copy was delivered
         return;
       }
       // first plain message in a chat attaches the persistent quick-action keyboard —
@@ -1194,19 +1232,22 @@ export class TelegramTransport implements Transport {
       let sent: unknown;
       let sentId: number | undefined;
       try {
-        sent = await this.sendPushBody(chatId, text, opts);
+        sent = await this.sendPushBody(chatId, text, opts, () => this.deliveries.beginAttempt(claim.id));
         sentId = messageIdOf(sent);
       } catch (e) {
         // The 👍 must never claim a delivery that did not happen: it is settled
         // BEFORE the send precisely so a wedged outbox cannot block it, which also
         // means a failed send used to leave "answered" on the user's message.
         await this.settleIncoming(chatId, "👎");
+        // A definitive refusal is recorded as failed (reported at boot, never
+        // resent); an ambiguous outcome stays pending so the boot replay sees it.
+        if (isDefinitiveSendRefusal(e)) this.deliveries.markFailed(claim.id, errorText(e));
         throw e;
       }
       await this.settleIncoming(chatId);
       this.recordCardMessage(chatId, sentId, Boolean(opts.card));
       await this.sweepStaleCards(chatId);
-      this.duplicateGuard.markSent(chatId, dedupeKey);
+      this.deliveries.markDelivered(claim.id, sentId);
       // delivery receipt for task records (bd pibot-zy70), destination-aware (bd pibot-cida);
       // nothing observable when suppressed
       return sentId !== undefined ? this.receiptFor(chatId, sent) : undefined;
@@ -1215,7 +1256,10 @@ export class TelegramTransport implements Transport {
 
   /** Push body: rich/legacy routing, quick-action keyboard, reply threading.
    *  Returns the raw Bot API message so the caller can derive a receipt from the ACTUAL response. */
-  private async sendPushBody(chatId: string, text: string, opts: PushOptions): Promise<unknown> {
+  private async sendPushBody(chatId: string, text: string, opts: PushOptions, beforeAttempt?: () => void): Promise<unknown> {
+      // Every network attempt is recorded durably BEFORE it starts: a crash from
+      // here on leaves an ambiguous row for the boot report, never silence.
+      const onAttempt = beforeAttempt ?? (() => {});
       // reply threading: a push can answer a specific incoming message
       const replyParams = opts.replyToMessageId
         ? { reply_parameters: { message_id: opts.replyToMessageId, allow_sending_without_reply: true } }
@@ -1229,7 +1273,7 @@ export class TelegramTransport implements Transport {
           return await this.sendTelegram(chatId, () => this.bot.api.sendRichMessage(chatId, { markdown: text }, {
             reply_markup: keyboard(opts.card),
             ...replyParams,
-          }));
+          }), onAttempt);
         } catch (e) {
           // 404 → legacy server (classic entities below); markup rejection → same
           // degrade as the classic path, so a formatting bug never eats a reply.
@@ -1237,20 +1281,20 @@ export class TelegramTransport implements Transport {
           return await this.sendClassicMessage(chatId, text.length > TG_LIMIT ? truncate(text, TG_LIMIT) + "\n\n…(truncated)" : text, {
             reply_markup: keyboard(opts.card),
             ...replyParams,
-          });
+          }, onAttempt);
         }
       } else if (!this.keyboardSent.has(chatId) && !opts.card && !this.boundAgentId && process.env.PIBOT_QUICK_KEYBOARD !== "0") {
         const sent = await this.sendClassicMessage(chatId, text, {
           reply_markup: TelegramTransport.QUICK_KEYBOARD,
           ...replyParams,
-        });
+        }, onAttempt);
         this.keyboardSent.add(chatId);
         return sent;
       } else {
         return await this.sendClassicMessage(chatId, text, {
           reply_markup: keyboard(opts.card),
           ...replyParams,
-        });
+        }, onAttempt);
       }
   }
 
@@ -1260,13 +1304,13 @@ export class TelegramTransport implements Transport {
    * text with no parse_mode. Formatting is cosmetic — a dropped reply is not.
    * Real 400s (chat not found, blocked bot) still surface.
    */
-  private async sendClassicMessage(chatId: string, text: string, extra: SendMessageExtra): Promise<unknown> {
+  private async sendClassicMessage(chatId: string, text: string, extra: SendMessageExtra, onAttempt?: () => void): Promise<unknown> {
     try {
-      return await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), { parse_mode: "HTML", ...extra }));
+      return await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, toTelegramHtml(text), { parse_mode: "HTML", ...extra }), onAttempt);
     } catch (e) {
       if (!isEntityParseError(e)) throw e;
       console.warn(`[telegram] (${this.name}) markup rejected for chat ${chatId} — resending as plain text`);
-      return await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, text, extra));
+      return await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, text, extra), onAttempt);
     }
   }
 
@@ -1298,13 +1342,47 @@ export class TelegramTransport implements Transport {
   async notifyError(chatId: string, message: string): Promise<void> {
     return this.enqueue(chatId, async () => {
       const text = `⚠︎ ${truncate(message, 500)}`;
-      if (!this.duplicateGuard.shouldSend(chatId, text)) return;
+      // Notices are best effort and carry no caller dedupeKey: the durable ledger
+      // keys them by their own text, which is exactly the repeat-suppression the
+      // old in-memory guard provided — now surviving a restart too (bd pibot-qy88).
+      const claim = this.deliveries.claim({ transport: this.name, chatId, dedupeKey: `error:${text}`, text });
+      if (claim.action !== "send") return;
       try {
-        await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, text));
+        await this.sendTelegram(chatId, () => this.bot.api.sendMessage(chatId, text), () => this.deliveries.beginAttempt(claim.id));
         await this.settleIncoming(chatId, "👎");
-        this.duplicateGuard.markSent(chatId, text);
+        this.deliveries.markDelivered(claim.id);
       } catch {
-        // Error notices are best effort; a failed attempt remains eligible for retry.
+        // Error notices are best effort; an unconfirmed attempt stays pending so
+        // the boot replay can decide, and never poisons the notice channel.
+      }
+    });
+  }
+
+  /**
+   * Boot recovery for outbound messages (bd pibot-qy88).
+   *
+   * `owes()` returns messages a previous process accepted and never sent — the ones
+   * that used to evaporate. `ambiguous()` returns sends whose outcome is unknown (the
+   * process died mid-call) plus definitive API refusals: those are REPORTED, never
+   * auto-resent, because a duplicate outbound message is worse than one human review.
+   */
+  deliveryRecovery(): { owed: DeliveryRow[]; ambiguous: DeliveryRow[] } {
+    return { owed: this.deliveries.owed(), ambiguous: this.deliveries.ambiguous() };
+  }
+
+  /** Re-send one owed message. Only ever called on a row the ledger knows was never sent. */
+  async replayOwed(row: DeliveryRow): Promise<boolean> {
+    return this.enqueue(row.chatId, async () => {
+      const claim = this.deliveries.claim({ transport: this.name, chatId: row.chatId, dedupeKey: row.dedupeKey, text: row.text });
+      if (claim.action !== "send") return false;
+      try {
+        const sent = await this.sendPushBody(row.chatId, row.text, { text: row.text }, () => this.deliveries.beginAttempt(claim.id));
+        this.deliveries.markDelivered(claim.id, messageIdOf(sent));
+        return true;
+      } catch (e) {
+        if (isDefinitiveSendRefusal(e)) this.deliveries.markFailed(claim.id, errorText(e));
+        else this.deliveries.markUnconfirmed(claim.id, errorText(e));
+        return false;
       }
     });
   }
@@ -1319,7 +1397,7 @@ export class TelegramTransport implements Transport {
     return current;
   }
 
-  private async sendTelegram(chatId: string, send: () => Promise<unknown>): Promise<unknown> {
+  private async sendTelegram(chatId: string, send: () => Promise<unknown>, onAttempt?: () => void): Promise<unknown> {
     const waitMs = MIN_CHAT_SEND_GAP_MS - (Date.now() - (this.lastSentAtByChat.get(chatId) ?? 0));
     if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -1327,6 +1405,7 @@ export class TelegramTransport implements Transport {
       // chat's outbox queue forever: each attempt is raced against a hard timeout,
       // then fails loudly so callers and logs see it.
       const limit = sendTimeoutMs();
+      onAttempt?.();
       const sendP = send();
       sendP.catch(() => {}); // a call we already abandoned must not raise unhandled rejections later
       try {

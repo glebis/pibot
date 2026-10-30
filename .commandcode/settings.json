@@ -3,7 +3,12 @@
     "allow": [
       "Shell(cmd:*)",
       "Shell(bd:*)",
-      "Shell(python3 -c import json,sys; d=json.load(sys.stdin); print(len(d)); [print(f\"{i['id']} P{i['priority']} {i['title']}\") for i in sorted(d,key=lambda x:x['priority'])])"
+      "Shell(python3 -c import json,sys; d=json.load(sys.stdin); print(len(d)); [print(f\"{i['id']} P{i['priority']} {i['title']}\") for i in sorted(d,key=lambda x:x['priority'])])",
+      "Shell(python3 -c  import json,sys d=json.load(sys.stdin) print('STATUS',d.get('status')) for c in d.get('comments',[]): print('---',c.get('created_at'),c.get('author')) )",
+      "Shell(for:*)",
+      "Shell(do:*)",
+      "Shell(done:*)",
+      "Shell(cd /Users/glebkalinin/ai_projects/pibot && ls src && echo \"---\" && ls src/plugins | head -60 && echo \"---\" && wc -l src/plugins/exec-trace.ts 2>/dev/null; ls src/plugins/*exec* 2>/dev/null)"
     ],
     "deny": [],
     "defaultMode": "default"

@@ -392,7 +392,7 @@ describe("Scheduler", () => {
     s.stop();
   });
 
-  it("drops stale one-shots missed by more than a day on boot", () => {
+  it("closes stale one-shots missed by more than a day as missed, not as fired (bd pibot-awhs)", () => {
     const file = path.join(dataDir, "schedules.json");
     fs.mkdirSync(dataDir, { recursive: true });
     fs.writeFileSync(
@@ -403,8 +403,17 @@ describe("Scheduler", () => {
         ],
       })
     );
-    const s = new Scheduler(dataDir, () => {});
-    expect(s.get("old")).toBeUndefined();
+    const fired: string[] = [];
+    const s = new Scheduler(dataDir, (job) => { fired.push(job.id); });
+    // it must never fire late, and it must not claim to have fired
+    expect(fired).toEqual([]);
+    const job = s.get("old");
+    expect(job?.status).toBe("done");
+    expect(job?.outcome).toBe("missed");
+    expect(job?.firedCount).toBe(0);
+    expect(job?.missedAt).toBeGreaterThan(0);
+    expect(s.recentMissed("a1").map((j) => j.id)).toEqual(["old"]);
+    expect(s.list("a1")).toHaveLength(0); // still not pending
     s.stop();
   });
 
@@ -523,5 +532,128 @@ describe("Scheduler MAX_TIMEOUT chaining", () => {
       fs.rmSync(dir, { recursive: true, force: true });
       vi.useRealTimers();
     }
+  });
+});
+
+describe("fire durability (bd pibot-awhs)", () => {
+  let dataDir: string;
+  beforeEach(() => { dataDir = tmpDir(); });
+  afterEach(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+
+  const onDisk = (): { jobs: Schedule[] } => JSON.parse(fs.readFileSync(path.join(dataDir, "schedules.json"), "utf8"));
+  const jobOnDisk = (id: string): Schedule | undefined => onDisk().jobs.find((j) => j.id === id);
+
+  it("writes the post-fire state to disk BEFORE the delivery callback runs", async () => {
+    let during: Schedule | undefined;
+    const s = new Scheduler(dataDir, (job) => {
+      // read from INSIDE the delivery: the fire must already be durable
+      during = jobOnDisk(job.id);
+    });
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 20 }) });
+    await waitFor(() => s.get(job.id)?.status === "done");
+    // the claim is the only thing on disk while delivery is in flight
+    expect(during?.firing).toBeDefined();
+    expect(during?.firing?.firedCount).toBe(1);
+    expect(during?.firing?.dueAtAtFire).toBe(during?.dueAt);
+    s.stop();
+  });
+
+  it("never re-fires an already-delivered one-shot when the process dies mid-fire", () => {
+    // A crashed process leaves exactly this: the claim on disk, nothing settled.
+    const s = new Scheduler(dataDir, () => {});
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60 }) });
+    s.stop();
+    const store = onDisk();
+    const onDuty = store.jobs.find((j) => j.id === job.id)!;
+    onDuty.firing = { claimedAt: Date.now(), dueAtAtFire: onDuty.dueAt, firedCount: 1 };
+    fs.writeFileSync(path.join(dataDir, "schedules.json"), JSON.stringify(store));
+
+    const refired: string[] = [];
+    const reopened = new Scheduler(dataDir, (j) => void refired.push(j.id));
+    expect(refired).toEqual([]); // THE BUG: this used to fire a second time
+    const settled = reopened.get(job.id);
+    expect(settled?.status).toBe("done");
+    expect(settled?.outcome).toBe("fired");
+    expect(settled?.firedCount).toBe(1);
+    expect(settled?.firing).toBeUndefined();
+    // and the settled state is on disk, so the next boot has nothing left to decide
+    expect(jobOnDisk(job.id)?.firing).toBeUndefined();
+    expect(jobOnDisk(job.id)?.outcome).toBe("fired");
+    reopened.stop();
+  });
+
+  it("settles a repeat job's claimed occurrence to its next slot, not to a re-fire", () => {
+    const s = new Scheduler(dataDir, () => {});
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60, repeat: { everyMs: 20 * 60_000 } }) });
+    s.stop();
+    const nextDueAt = job.dueAt + 20 * 60_000;
+    const store = onDisk();
+    const onDuty = store.jobs.find((j) => j.id === job.id)!;
+    onDuty.firing = { claimedAt: Date.now(), dueAtAtFire: onDuty.dueAt, firedCount: 1, nextDueAt };
+    fs.writeFileSync(path.join(dataDir, "schedules.json"), JSON.stringify(store));
+
+    const refired: string[] = [];
+    const reopened = new Scheduler(dataDir, (j) => void refired.push(j.id));
+    const settled = reopened.get(job.id);
+    expect(refired).toEqual([]);
+    expect(settled?.status).toBe("pending");
+    expect(settled?.firedCount).toBe(1);
+    expect(settled?.dueAt).toBe(nextDueAt); // the claimed next occurrence, not a repeat
+    expect(settled?.firing).toBeUndefined();
+    reopened.stop();
+  });
+
+  it("reports a mid-fire job at boot instead of hiding the lost occurrence", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const s = new Scheduler(dataDir, () => {});
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 20 }) });
+    s.stop();
+    // plant a claim as a crashed process would leave it
+    const store = onDisk();
+    store.jobs.find((j) => j.id === job.id)!.firing = { claimedAt: Date.now(), dueAtAtFire: job.dueAt, firedCount: 1 };
+    fs.writeFileSync(path.join(dataDir, "schedules.json"), JSON.stringify(store));
+
+    const reopened = new Scheduler(dataDir, () => {});
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("mid-fire when the process stopped"))).toBe(true);
+    expect(reopened.get(job.id)?.status).toBe("done");
+    expect(reopened.get(job.id)?.outcome).toBe("fired");
+    warn.mockRestore();
+    reopened.stop();
+  });
+
+  it("keeps a repeat job's next occurrence durable across a clean stop", async () => {
+    const s = new Scheduler(dataDir, () => {});
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 10, repeat: { everyMs: 20 * 60_000 } }) });
+    await waitFor(() => (s.get(job.id)?.firedCount ?? 0) === 1);
+    s.stop();
+
+    const reopened = new Scheduler(dataDir, () => {});
+    const stored = reopened.get(job.id);
+    expect(stored?.status).toBe("pending");
+    expect(stored?.firedCount).toBe(1);
+    expect(stored?.dueAt).toBeGreaterThan(Date.now()); // not the consumed occurrence
+    expect(stored?.firing).toBeUndefined();
+    reopened.stop();
+  });
+
+  it("persists a snooze set during a fire", async () => {
+    const s = new Scheduler(dataDir, (job) => { s.snooze(job.agentId, Date.now() + 60_000, "during fire"); });
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 10 }) });
+    await waitFor(() => s.get(job.id)?.status === "done");
+    s.stop();
+    const reopened = new Scheduler(dataDir, () => {});
+    expect(reopened.snoozeState("a1")?.until).toBeGreaterThan(Date.now());
+    reopened.stop();
+  });
+
+  it("keeps a synchronous flush cheap for a 20-job set", () => {
+    const s = new Scheduler(dataDir, () => {});
+    for (let i = 0; i < 20; i++) s.create({ ...makeJob({ id: `perf${i}`, title: `job ${i}`, dueAt: Date.now() + (i + 1) * 60_000 }) });
+    const started = process.hrtime.bigint();
+    for (let i = 0; i < 20; i++) s.flush();
+    const perFlushMs = Number(process.hrtime.bigint() - started) / 1e6 / 20;
+    // the budget the issue asks us to measure: a synchronous save on every fire
+    expect(perFlushMs).toBeLessThan(15);
+    s.stop();
   });
 });

@@ -40,14 +40,14 @@ describe("scheduler plugin", () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
-  function pluginFor(agentId = "a1") {
+  function pluginFor(agentId = "a1", chat = { transport: "test", chatId: "c1" }) {
     const tools = new Map<string, Tool>();
     const api = {
       registerTool: (t: ToolDefinition) => tools.set(t.name, t as Tool),
       registerCommand: vi.fn(),
       on: vi.fn(),
     } as unknown as ExtensionAPI;
-    factoryOf(schedulerPlugin({ scheduler, agentId, chat: { transport: "test", chatId: "c1" } }))(api);
+    factoryOf(schedulerPlugin({ scheduler, agentId, chat }))(api);
     return { tools };
   }
 
@@ -101,6 +101,14 @@ describe("scheduler plugin", () => {
     expect(job.dueAt).toBeGreaterThan(Date.now());
     expect(job.cardPending).toBe(true);
     expect(res.details.scheduleId).toBe(job.id);
+  });
+
+  it("schedule_create in a task session routes through agent delivery, never the synthetic chat", async () => {
+    const { tools } = pluginFor("a1", { transport: "agent", chatId: "task-t1" });
+    await tools.get("schedule_create")!.execute("t1", { title: "vault cleanup", when: "in 20m" });
+    const job = scheduler.list("a1")[0];
+    expect(job.chat).toEqual({ transport: "agent", chatId: "task-t1" });
+    expect(job.delivery).toBe("agent");
   });
 
   it("schedule_create reports unparseable times as ERROR", async () => {

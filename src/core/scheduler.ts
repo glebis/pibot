@@ -3,6 +3,13 @@ import * as path from "node:path";
 import type { Schedule, ScheduleRepeat } from "./types.js";
 import { ensureDir, errorMessage, nextRepeatAt, readJson, uid, writeJsonAtomic } from "./util.js";
 
+/**
+ * Why a job is no longer pending. Kept separate from `status` so "fired" and
+ * "missed while offline" stay distinguishable in the persisted state and in what
+ * the owner sees (bd pibot-awhs).
+ */
+export type ScheduleOutcome = "fired" | "missed";
+
 interface SnoozeState {
   until: number;
   reason?: string;
@@ -19,6 +26,12 @@ const MIN_AGENT_REPEAT_MS = 15 * 60_000;
 const MAX_ACTIVE_AGENT_SCHEDULES = 20;
 const MAX_ATTEMPTS_PER_OCCURRENCE = 3;
 const MAX_CONSECUTIVE_FAILURES = 5;
+/**
+ * A one-shot whose due time is further in the past than this was missed while the
+ * daemon was down; it is closed as `missed` instead of firing late. Unchanged policy,
+ * now recorded as such rather than as a successful fire (bd pibot-awhs).
+ */
+export const MISSED_AFTER_MS = 86400e3;
 
 export interface ScheduleFailureNotice {
   kind: "first-failure" | "paused";
@@ -66,26 +79,83 @@ export class Scheduler {
   private load(): void {
     const store = readJson<{ jobs?: Schedule[]; snooze?: Record<string, SnoozeState> }>(this.file, {});
     const now = Date.now();
+    let prunedMissed = 0;
+    const interrupted: Schedule[] = [];
     for (const job of store.jobs ?? []) {
       // prune finished jobs, and stale pending one-shots from a previous boot
       if ((job.status === "done" || job.status === "cancelled") && now - job.dueAt > PRUNE_MS) continue;
-      if (job.status === "pending" && !job.repeat && job.dueAt + 86400e3 < now) {
-        job.status = "done"; // missed while offline > 1 day; don't spam old fires
+      if (job.status === "pending" && !job.repeat && job.dueAt + MISSED_AFTER_MS < now) {
+        // Missed while the daemon was down past the catch-up window: firing it days
+        // late would be worse than silence. Recorded as `missed`, NOT as a fire, so
+        // the owner-facing state and the logs stop lying about what happened.
+        job.status = "done";
+        job.outcome = "missed";
+        job.missedAt = now;
+        prunedMissed += 1;
+        this.jobs.set(job.id, job);
         continue;
+      }
+      if (job.status === "pending" && job.firing) {
+        // The process died holding a claimed occurrence. The claim said what this fire
+        // resolves to BEFORE dispatching it, so finish that transition instead of
+        // re-deciding: an already-delivered reminder can never be re-fired (the bug),
+        // and a job that died before delivery is not repeated either (the trade the
+        // issue asks for). Report it — silence would hide the lost occurrence.
+        interrupted.push(job);
+        const claim = job.firing;
+        delete job.firing;
+        job.firedCount = claim.firedCount;
+        job.deliveryAttempts = 0;
+        job.consecutiveFailures = 0;
+        if (claim.nextDueAt != null) {
+          if (job.dueAt === claim.dueAtAtFire) job.dueAt = claim.nextDueAt;
+        } else if (job.status === "pending") {
+          job.status = "done";
+          job.outcome = "fired";
+        }
       }
       this.jobs.set(job.id, job);
     }
     for (const [agentId, sn] of Object.entries(store.snooze ?? {})) {
       if (sn && sn.until > now) this.snoozeByAgent.set(agentId, sn);
     }
+    if (prunedMissed) {
+      console.warn(`[scheduler] ${prunedMissed} one-shot schedule(s) came due while offline and were closed as missed`);
+      // persist the outcome now: leaving it in memory would let the next boot re-decide
+      this.flush();
+    }
+    if (interrupted.length) {
+      // Persist the completed transition: the claim must not survive into another boot.
+      this.flush();
+    }
+    for (const job of interrupted) {
+      console.warn(
+        `[scheduler] schedule ${job.id} ("${job.title}") was mid-fire when the process stopped; its delivery is unconfirmed, and the occurrence is settled (not repeated) to avoid a duplicate`,
+      );
+    }
   }
 
+  /**
+   * Batched persistence for changes where a lost frame is harmless (a new job, a
+   * cancel, a snooze window). NEVER used for a fire transition: see `saveNow`.
+   */
   private save(): void {
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
       this.flush();
     }, 250);
+  }
+
+  /**
+   * Persist immediately (bd pibot-awhs). Used where a crash between the in-memory
+   * change and the flush would make the daemon redo a side effect it cannot redo
+   * safely: every job-state transition inside `fireOnce`, and every missed-prune.
+   * A 20-job set serialises to a few KB, so the synchronous write is cheap next to
+   * the delivery it protects.
+   */
+  private saveNow(): void {
+    this.flush();
   }
 
   flush(): void {
@@ -182,6 +252,18 @@ export class Scheduler {
     const all = [...this.jobs.values()].filter((j) => j.status === "pending" || (opts.includePaused && j.status === "paused"));
     const filtered = agentId ? all.filter((j) => j.agentId === agentId) : all;
     return filtered.sort((a, b) => a.dueAt - b.dueAt);
+  }
+
+  /**
+   * Jobs closed as missed rather than fired (bd pibot-awhs). These used to be
+   * indistinguishable from delivered ones; the owner can now see that a reminder was
+   * skipped while the daemon was down instead of assuming it went out.
+   */
+  recentMissed(agentId?: string, withinMs = 7 * 86400e3): Schedule[] {
+    const since = Date.now() - withinMs;
+    return [...this.jobs.values()]
+      .filter((j) => j.outcome === "missed" && (j.missedAt ?? 0) > since && (!agentId || j.agentId === agentId))
+      .sort((a, b) => (b.missedAt ?? 0) - (a.missedAt ?? 0));
   }
 
   /** Jobs the bot owes an inline adjustment card for (drains the pending set) */
@@ -299,6 +381,46 @@ export class Scheduler {
     }
   }
 
+  /**
+   * Close a job as done for an explicit reason (bd pibot-awhs). `fired` means the side
+   * effect was dispatched, `missed` means it never was — the two used to look identical
+   * on disk, which made a missed reminder indistinguishable from a delivered one.
+   */
+  private finish(job: Schedule, outcome: ScheduleOutcome): void {
+    job.status = "done";
+    job.outcome = outcome;
+    if (outcome === "missed") job.missedAt = Date.now();
+  }
+
+  /**
+   * Write the post-fire state to disk BEFORE the side effect leaves the process
+   * (bd pibot-awhs).
+   *
+   * The old order was: deliver → mutate → debounced save. A kill inside that 250 ms
+   * window left `schedules.json` still saying `pending`, so the reopened daemon fired an
+   * already-delivered reminder a second time. The claim inverts the failure: a job that
+   * dies mid-fire is settled on the next boot exactly as if the delivery had happened.
+   * One occurrence may therefore be lost in that crash window; a duplicate is never
+   * sent. The issue asks for precisely this trade — a missed reminder is recoverable,
+   * an uninvited repeat is not.
+   *
+   * `nextDueAt` is computed at claim time so the claim fully determines the outcome and
+   * the boot has nothing left to decide.
+   */
+  private claimOccurrence(job: Schedule, dueAtAtFire: number, nextDueAt: number | null): void {
+    job.firing = {
+      claimedAt: Date.now(),
+      dueAtAtFire,
+      firedCount: job.firedCount + 1,
+      ...(nextDueAt != null ? { nextDueAt } : {}),
+    };
+    this.saveNow();
+  }
+
+  private settleOccurrence(job: Schedule): void {
+    delete job.firing;
+  }
+
   private async fireOnce(job: Schedule): Promise<void> {
     const now = Date.now();
 
@@ -309,7 +431,7 @@ export class Scheduler {
         // heartbeats simply skip a beat while snoozed
         const next = this.nextFire(job, sn.until);
         if (next) { job.dueAt = next; this.save(); this.rearm(job.id); }
-        else job.status = "done";
+        else { this.finish(job, "fired"); this.saveNow(); }
         return;
       }
       if (job.wake !== "important") {
@@ -326,15 +448,21 @@ export class Scheduler {
     // Snapshot the due time so a cancel/reschedule that lands mid-flight is respected
     // instead of being clobbered by the post-delivery bookkeeping below.
     const dueAtAtFire = job.dueAt;
+    // What this fire resolves to is fixed BEFORE dispatching the side effect
+    // (bd pibot-awhs): a kill from here on can no longer resurrect an already-delivered
+    // reminder, because the boot finishes this transition instead of re-deciding it.
+    const claimedNext = job.repeat ? this.nextFire(job, now) : null;
+    this.claimOccurrence(job, dueAtAtFire, claimedNext != null && claimedNext > now ? claimedNext : null);
     try {
       this.assertRoute(job);
       await this.fireCb(job, Boolean(sn && now < sn.until && job.wake === "important"));
     } catch (e) {
       console.error("[scheduler] fire handler error:", e);
+      this.settleOccurrence(job);
       // Never resurrect a job from a stale failure path: if it was cancelled
       // while delivery was in flight, keep the cancelled state (Aug 2026:
       // cancelled "morning brief" resurrected itself from a retry and re-fired).
-      if (job.status !== "pending") { this.save(); return; }
+      if (job.status !== "pending") { this.saveNow(); return; }
       job.deliveryAttempts = (job.deliveryAttempts ?? 0) + 1;
       job.lastDeliveryError = errorMessage(e).slice(0, 300);
       let noticeKind: ScheduleFailureNotice["kind"] | null = null;
@@ -363,33 +491,34 @@ export class Scheduler {
         }
         if (!job.repeat && job.deliveryAttempts === 1) noticeKind = "first-failure";
       }
-      this.save();
+      // a failed occurrence is retried, so it must not stay claimed on disk
+      this.saveNow();
       this.rearm(job.id);
       if (noticeKind) await this.notifyFailure(job, { kind: noticeKind, error: job.lastDeliveryError });
       return;
     }
 
-    // Respect a cancel (or reschedule) that landed while delivery was in flight
-    if (job.status !== "pending") { this.save(); return; }
+    this.settleOccurrence(job);
 
-    job.firedCount += 1;
+    // Respect a cancel (or reschedule) that landed while delivery was in flight
+    if (job.status !== "pending") { this.saveNow(); return; }
+
+    // The claim already recorded firedCount, the reset counters and the next occurrence;
+    // settlement drops the claim and commits that state.
+    job.firedCount = (job.firing?.firedCount ?? job.firedCount + 1);
     job.deliveryAttempts = 0;
     job.consecutiveFailures = 0;
     delete job.lastDeliveryError;
     delete job.pauseReason;
-    if (job.repeat) {
-      const next = this.nextFire(job, now);
-      if (next != null && next > now) {
-        if (job.dueAt === dueAtAtFire) job.dueAt = next; // keep a mid-flight reschedule
-        this.save();
-        this.rearm(job.id);
-      } else {
-        job.status = "done";
-        this.save();
-      }
+    const next = claimedNext != null && claimedNext > now ? claimedNext : null;
+    this.settleOccurrence(job);
+    if (next != null) {
+      if (job.dueAt === dueAtAtFire) job.dueAt = next; // keep a mid-flight reschedule
+      this.saveNow();
+      this.rearm(job.id);
     } else {
-      job.status = "done";
-      this.save();
+      this.finish(job, "fired");
+      this.saveNow();
     }
   }
 

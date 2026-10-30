@@ -30,7 +30,9 @@ import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
 import type { TelegramSendHooks, TelegramSendResult } from "../plugins/telegram-send-plugin.js";
-import { QuestionBus, type QuestionSpec } from "./questions.js";
+import { QuestionBus, type QuestionAnswer, type QuestionSpec } from "./questions.js";
+import { QuestionStore } from "./question-store.js";
+import type { DeliveryRow } from "./delivery-ledger.js";
 import { MessageCoalescer } from "./message-coalescer.js";
 import { ScheduleRouteError, type Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
@@ -556,14 +558,8 @@ export class PiBot implements HeartbeatHost {
 
   /** combines rapid-fire texts (forwards, split messages) into one agent turn; off when messageBufferMs is 0 */
   private coalescer?: MessageCoalescer;
-  private questions = new QuestionBus({
-    getTransport: (name) => this.transports.get(name),
-    notify: (chatKey, text) => {
-      const { transport, chatId } = this.splitChatKey(chatKey);
-      const t = this.transports.get(transport);
-      if (t) void t.push(chatId, { text }).catch((e) => console.error("[bot] notify push failed:", e));
-    },
-  });
+  /** Owner questions with a durable journal (bd pibot-jciq); armed in the constructor once dataDir is known. */
+  private questions!: QuestionBus;
   private statePath: string;
 
   constructor(
@@ -599,6 +595,18 @@ export class PiBot implements HeartbeatHost {
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
+    this.questions = new QuestionBus({
+      getTransport: (name) => this.transports.get(name),
+      notify: (chatKey, text) => {
+        const { transport, chatId } = this.splitChatKey(chatKey);
+        const t = this.transports.get(transport);
+        if (t) void t.push(chatId, { text }).catch((e) => console.error("[bot] notify push failed:", e));
+      },
+      // Restoring here (in the constructor) re-materialises questions a previous
+      // process had already shown the owner, so a late tap is recorded rather
+      // than reported stale (bd pibot-jciq).
+      store: new QuestionStore(path.join(deps.config.dataDir, "questions.json")),
+    });
     const windowMs = deps.config.messageBufferMs ?? 0;
     if (windowMs > 0) {
       this.coalescer = new MessageCoalescer(windowMs, MessageCoalescer.DEFAULT_MAX_PARTS, (turn) => {
@@ -734,6 +742,90 @@ export class PiBot implements HeartbeatHost {
     }
   }
 
+  /**
+   * Boot replay for owner questions answered while this process was down (bd pibot-jciq).
+   *
+   * The asking turn died with the old process, so nobody can be woken; what must not
+   * happen is silence. Every such answer is (a) already durable in the question journal
+   * so a resumed task reads it via its `questionKey`, and (b) acknowledged once to the
+   * owner so the tap never looks ignored. Runs after transports are armed, before
+   * `started` resolves, so the acknowledgment has a live delivery route.
+   */
+  /**
+   * Where a transport's durable delivery ledger lives (bd pibot-qy88). Runtime-private:
+   * `data/` is gitignored and the file is written 0600. One file per transport so a
+   * sub-bot restart cannot rewrite the main bot's owed messages.
+   */
+  private deliveryLedgerPath(agentId?: string): string {
+    return path.join(this.deps.config.dataDir, agentId ? `deliveries-${agentId}.json` : "deliveries-main.json");
+  }
+
+  /**
+   * Boot recovery for outbound delivery (bd pibot-qy88).
+   *
+   * Messages a previous process accepted and never sent are re-sent now, BEFORE new
+   * traffic (this runs before `started` resolves). Sends whose outcome is unknown —
+   * the process died mid-call — and definitive API refusals are REPORTED to the log
+   * and left alone: a duplicate outbound message is worse than one human review.
+   */
+  private async recoverOwedDeliveries(): Promise<void> {
+    for (const t of this.transports.values()) {
+      const recovery = (t as { deliveryRecovery?: () => { owed: DeliveryRow[]; ambiguous: DeliveryRow[] } }).deliveryRecovery;
+      const replay = (t as { replayOwed?: (row: DeliveryRow) => Promise<boolean> }).replayOwed;
+      if (!recovery || !replay) continue;
+      let state: { owed: DeliveryRow[]; ambiguous: DeliveryRow[] };
+      try {
+        state = recovery.call(t);
+      } catch (e) {
+        console.error(`[pibot] delivery recovery unavailable on ${t.name}:`, errorMessage(e));
+        continue;
+      }
+      for (const row of state.ambiguous) {
+        this.deps.events.log(
+          "system",
+          "system",
+          `delivery ${row.state} on ${t.name} chat ${row.chatId} (${row.attempts} attempt(s), ${row.dedupeKey}): ${truncate(row.error ?? "no detail", 120)}`,
+        );
+      }
+      let replayed = 0;
+      for (const row of state.owed) {
+        try {
+          if (await replay.call(t, row)) replayed += 1;
+        } catch (e) {
+          console.error(`[pibot] owed delivery replay failed on ${t.name} (${row.dedupeKey}):`, errorMessage(e));
+        }
+      }
+      if (state.owed.length || state.ambiguous.length) {
+        console.log(`[pibot] delivery recovery on ${t.name}: replayed ${replayed}/${state.owed.length} owed, ${state.ambiguous.length} need review`);
+      }
+    }
+  }
+
+  private replayOfflineQuestionAnswers(): void {
+    let recovered: Array<{ qid: string; agentId: string; chatKey: string; questionKey?: string; answer: QuestionAnswer }>;
+    try {
+      recovered = this.questions.answersRecordedOffline();
+    } catch (e) {
+      console.error("[pibot] question journal replay failed:", errorMessage(e));
+      return;
+    }
+    for (const item of recovered) {
+      this.deps.events.log(
+        item.agentId,
+        "system",
+        `question ${item.qid} answered while offline: "${truncate(item.answer.choice, 80)}"${item.questionKey ? ` (${truncate(item.questionKey, 80)})` : ""}`,
+      );
+      const { transport, chatId } = this.splitChatKey(item.chatKey);
+      const t = this.transports.get(transport);
+      if (!t) continue;
+      // One acknowledgment, deduped by qid: a second restart cannot repeat it.
+      void t
+        .push(chatId, { text: `✅ Noted while I was restarting: ${truncate(item.answer.choice, 200)}`, dedupeKey: `question-offline:${item.qid}` })
+        .catch((e) => console.error("[pibot] offline-answer acknowledgment failed:", errorMessage(e)));
+    }
+    if (recovered.length) console.log(`[pibot] replayed ${recovered.length} answer(s) the owner gave while the daemon was down`);
+  }
+
   async start(): Promise<void> {
     await this.deps.agents.discover();
     if (!this.deps.agents.list().length) {
@@ -825,6 +917,8 @@ export class PiBot implements HeartbeatHost {
       this.labTimer.unref();
     }
     console.log(`[pibot] running · agents: ${this.deps.agents.list().map((a) => a.id).join(", ")} · transport: ${[...this.transports.keys()].join("+")}`);
+    this.replayOfflineQuestionAnswers();
+    await this.recoverOwedDeliveries();
     this.resolveStarted?.();
   }
 
@@ -886,7 +980,7 @@ export class PiBot implements HeartbeatHost {
     const groupMentionOnly = opts?.groupMentionOnly ?? persisted?.groupMentionOnly;
     // persist only an explicit/persisted choice — inheritance stays live so main-allowlist edits propagate
     const pinned = allowedChats ?? persisted?.allowedChats;
-    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0", memberGroups, groupMentionOnly });
+    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0", memberGroups, groupMentionOnly, deliveryLedgerPath: this.deliveryLedgerPath(agentId) });
     let botName: string;
     try {
       botName = await t.verify();
@@ -1045,7 +1139,7 @@ export class PiBot implements HeartbeatHost {
     if (this.transports.has("telegram")) {
       return { ok: false, error: "Telegram is already enabled — disable it first." };
     }
-    const t = new TelegramTransport(token, allowedChats, { openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0" });
+    const t = new TelegramTransport(token, allowedChats, { openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0", deliveryLedgerPath: this.deliveryLedgerPath() });
     let botName: string;
     try {
       botName = await t.verify();
@@ -3582,7 +3676,13 @@ export class PiBot implements HeartbeatHost {
     const taskGuard = transcriptionGuardForInstructions(run.instructions);
     const session = await this.deps.agents.getOrCreateSession(
       run.agentId, ck, { transport: "agent", chatId: `task-${run.taskId}` }, this.deps.scheduler,
-      (spec: QuestionSpec) => this.questions.ask(run.agentId, originChat, spec), this.commsHooks(),
+      (spec: QuestionSpec) => this.questions.ask(run.agentId, originChat, {
+        ...spec,
+        // Key omits the attempt so a resumed attempt finds the answer the owner
+        // already gave (bd pibot-jciq). First recorded answer wins: asking the
+        // same question text twice inside one task returns the first answer.
+        questionKey: spec.questionKey ?? `task:${run.taskId}:${spec.text.slice(0, 120)}`,
+      }), this.commsHooks(),
       undefined, undefined, undefined, undefined, undefined,
       taskGuard ? [taskGuard] : [],
     );

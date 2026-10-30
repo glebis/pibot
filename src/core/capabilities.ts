@@ -7,6 +7,7 @@ import { resourcePreflight } from "./preflight.js";
 import { avatarPlugin } from "../plugins/avatar-plugin.js";
 import { attendPlugin, ATTEND_CLI } from "../plugins/attend-plugin.js";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
+import { codexReportPlugin } from "../plugins/codex-report-plugin.js";
 import { delegateCommand, delegatePlugin, DELEGATE_CLIS } from "../plugins/delegate-plugin.js";
 import { devToolsPlugin } from "../plugins/dev-tools-plugin.js";
 import { docsPlugin } from "../plugins/docs-plugin.js";
@@ -50,6 +51,8 @@ export interface CapabilityContext {
   chat: ChatRef;
   /** shared docs site source root (read-only course content for participant-facing agents) */
   docsDir?: string;
+  /** owner's Codex activity-report root (read-only; ~/Documents/Codex default) */
+  codexReportsDir?: string;
   ask?: (spec: QuestionSpec) => Promise<QuestionAnswer | null>;
   comms?: CommsHooks;
   /** host-injected send hook for bot-identity Telegram sends */
@@ -240,6 +243,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     prompt: "docs_read and docs_list read files strictly inside the shared docs site source (course content: schedule, meetings, materials, library). Read-only — never modify these files; they are shared with course participants. Check the docs before answering factual questions about the course; never invent dates, links, or prices.",
     available: (ctx) => Boolean(ctx.docsDir && fs.existsSync(ctx.docsDir)),
     create: (ctx) => docsPlugin({ docsDir: ctx.docsDir!, publicOnly: ctx.agent.id === "lab" }),
+  },
+  {
+    id: "codex-reports", defaultEnabled: false, tools: ["codex_report_list", "codex_report_read"],
+    prompt: "codex_report_list and codex_report_read surf the owner's Codex activity reports (~/Documents/Codex/<date>/…) — weekly activity and screen-time data. READ-ONLY: there is no write tool; never claim directory or file changes. Codex regenerates these files, so always list before reading and never cache paths across days.",
+    available: (ctx) => Boolean(ctx.codexReportsDir && fs.existsSync(ctx.codexReportsDir)),
+    create: (ctx) => codexReportPlugin({ reportsDir: ctx.codexReportsDir! }),
   },
   {
     id: "agent-comms", defaultEnabled: true, tools: ["agent_message", "agent_ask", "agent_list", "handoff"],
