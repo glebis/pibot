@@ -168,6 +168,11 @@ function validateOsascript(rest: string[], deps: ExecPluginDeps): ExecValidateRe
  *   only --json / --jq. No methods, fields, --input, --web.
  */
 export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
+  // Truthful capability check with no URL: the agent can ask what impersonation targets
+  // exist locally instead of asserting "impersonation is installed" from memory (Oct 30).
+  // Listed before the general yt-dlp entry so its exact-match pin wins and so a refusal
+  // reported by the general entry is not overwritten by the pin mismatch.
+  { bin: "yt-dlp", pin: ["--list-impersonate-targets"] },
   {
     bin: "yt-dlp",
     allowFlags: [
@@ -185,6 +190,10 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
       { flag: "--sub-format", takesValue: true, valueRe: SAFE_VALUE },
       { flag: "--convert-subs", takesValue: true, valueRe: /^(srt|vtt|ass|lrc)$/ },
       { flag: "--list-subs" },
+      // Impersonation is the documented remedy for YouTube's bot checks. It was absent
+      // from the allowlist, so every "repair" attempt was refused at the harness and the
+      // agent concluded the wrong thing. Value is a client (and optional OS) token only.
+      { flag: "--impersonate", takesValue: true, valueRe: /^[A-Za-z0-9_-]{1,40}(:[A-Za-z0-9_]{1,20})?$/ },
       { flag: "--dump-json" },
       { flag: "-j" },
       { flag: "--dump-single-json" },
@@ -219,6 +228,10 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
   // Groq parts-transcription wrapper (free-tier pinned: key from 0600 file/Keychain at runtime,
   // 1 concurrent + 8 calls/day local caps, <=15-min owner rule, adaptive 22MB part sizing):
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_parts.py")], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
+  // ffprobe metadata probe (read-only): exact fixed argv, single file positional. Lets an
+  // agent satisfy "probe duration before choosing a transcription route" without ffprobe
+  // being generally executable.
+  { bin: "ffprobe", pin: ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"], allowPositionalRe: /^[^\-]/, positionals: { min: 1, max: 1 } },
   // Groq key intake (native hidden dialog; stores to 0600 file / Keychain / sops-encrypted copy),
   // and a no-arg config-setter entry so the sops key path can be registered without shell:
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_key_setup.py")] },
@@ -499,6 +512,8 @@ export function execPlugin(deps: ExecPluginDeps): InlineExtension {
             const reason = resolved.error.includes('not found') ? 'command missing'
               : resolved.error.includes('shell metacharacters') ? 'shell syntax denied'
               : resolved.error.includes('denied argument') ? 'argument denied'
+              : resolved.error.includes('is not allowlisted') && /flag /.test(resolved.error) ? 'flag not allowlisted'
+              : resolved.error.includes('value for') ? 'flag value denied'
               : resolved.error.includes('not on this agent') ? 'not allowlisted' : 'constraint denied';
             const logged = trace('refused', reason);
             return refuse(resolved.error + (logged ? '' : ' (audit unavailable)'));
