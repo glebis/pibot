@@ -3679,18 +3679,32 @@ export class PiBot implements HeartbeatHost {
         `target agent ${agentId} is busy with run ${inFlight.id} ("${inFlight.label}") — do not resubmit; its result will be delivered when it finishes`,
       );
     }
-    const session = await this.deps.agents.getOrCreateSession(
-      agentId,
-      ck,
-      { transport: "agent", chatId: fromAgent },
-      this.deps.scheduler,
-      // origin-chat routing for inter-agent questions: ask_user from a delegated
-      // turn renders in the chat the owner typed in; answers flow back here
-      originChat
-        ? (spec: QuestionSpec) => this.questions.ask(agentId, originChat, spec)
-        : undefined,
-      this.commsHooks()
+    // bd pibot-cida P0 (bd pibot-0r0t): a delegated turn must run with the target's
+    // REAL capability context — its own dedicated transport (sub-bot with boundAgentId).
+    // The synthetic "agent" transport intentionally strips execution caps (tasks/speech/
+    // …) and turned inter-agent work into toolless prose. The pair-session key and
+    // history stay; only the delivery context upgrades. Agents without a dedicated
+    // transport keep the old stripped behavior.
+    const ownedChat = [...(this.agentChats.get(agentId) ?? [])].find(
+      (ck2) => this.transports.get(this.splitChatKey(ck2).transport)?.boundAgentId === agentId,
     );
+    const ownedTransportInstance = ownedChat ? this.transports.get(this.splitChatKey(ownedChat).transport) : undefined;
+    const session = ownedTransportInstance
+      // full-capability lane: the target's own transport wiring (staleness reset, per-session
+      // hooks, speech/video targets) — the pair key keeps its history; the context is its real chat
+      ? await this.sessionFor(ownedTransportInstance, this.splitChatKey(ownedChat!).chatId, agentId, ck)
+      : await this.deps.agents.getOrCreateSession(
+          agentId,
+          ck,
+          { transport: "agent", chatId: fromAgent },
+          this.deps.scheduler,
+          // origin-chat routing for inter-agent questions: ask_user from a delegated
+          // turn renders in the chat the owner typed in; answers flow back here
+          originChat
+            ? (spec: QuestionSpec) => this.questions.ask(agentId, originChat, spec)
+            : undefined,
+          this.commsHooks()
+        );
     if ((session as { isStreaming?: boolean }).isStreaming) {
       throw new Error(`target agent ${agentId} is busy — do not resubmit; wait for the current turn to finish`);
     }

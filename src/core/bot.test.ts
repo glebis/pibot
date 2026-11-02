@@ -3355,3 +3355,57 @@ describe("guarded manifest writes (bd pibot-4wq1)", () => {
     fs.rmSync(agentDir, { recursive: true, force: true });
   });
 });
+
+
+describe("delegation routes through the target's owned chat (bd pibot-cida P0, bd pibot-0r0t)", () => {
+  const bot = (t: ReturnType<typeof makeBot>) => t.bot as unknown as {
+    agentChats: Map<string, Set<string>>;
+    chatAgent: Map<string, string>;
+    transports: Map<string, Transport>;
+    commsHooks(): {
+      askAgent: (from: string, to: string, text: string) => Promise<string>;
+    };
+  };
+  it("agent ask wires the target's real transport bundle when it owns a sub-bot chat", async () => {
+    const t = makeBot();
+    const targetSessions = new Map<string, AgentSession>();
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => ({ id, dir: `/tmp/${id}`, manifest: { name: id, capabilities: ["agent-comms", "speech", "tasks"] } }));
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockImplementation(async (agentId: string, key: string) => {
+      const session = {
+        prompt: vi.fn(async () => {}),
+        subscribe: vi.fn(() => () => {}),
+        agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: `${agentId} reply` }] }] } },
+      } as unknown as AgentSession;
+      targetSessions.set(key, session);
+      return session;
+    });
+    const b = bot(t);
+    b.transports.set("telegram:creator", { name: "telegram:creator", boundAgentId: "creator" } as unknown as Transport);
+    b.agentChats.set("creator", new Set([ownerChatKey("creator")]));
+    await b.commsHooks().askAgent("assistant", "creator", "run the receipt scenarios");
+    expect(targetSessions.has("agent::creator::from-assistant")).toBe(true);
+    const call = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.find((c) => c[1] === "agent::creator::from-assistant");
+    expect(call?.[2]).toEqual({ transport: "telegram:creator", chatId: OWNER_CHAT_ID });
+    expect(typeof call?.[7]).toBe("function"); // speech delivery wired
+    expect(typeof call?.[8]).toBe("function"); // video-note delivery wired
+  });
+
+  it("agent ask keeps the stripped pair lane when the target owns no dedicated chat", async () => {
+    const t = makeBot();
+    const targetSessions = new Map<string, AgentSession>();
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => ({ id, dir: `/tmp/${id}`, manifest: { name: id, capabilities: ["agent-comms"] } }));
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockImplementation(async (agentId: string, key: string) => {
+      const session = {
+        prompt: vi.fn(async () => {}),
+        subscribe: vi.fn(() => () => {}),
+        agent: { state: { messages: [{ role: "assistant", content: [{ type: "text", text: `${agentId} reply` }] }] } },
+      } as unknown as AgentSession;
+      targetSessions.set(key, session);
+      return session;
+    });
+    await bot(t).commsHooks().askAgent("assistant", "tax", "plain question");
+    const call = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.find((c) => c[1] === "agent::tax::from-assistant");
+    expect(call?.[2]).toEqual({ transport: "agent", chatId: "assistant" });
+    expect(call?.[7]).toBeUndefined(); // speech stays unwired without ownership
+  });
+});
