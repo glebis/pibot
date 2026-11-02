@@ -1912,6 +1912,72 @@ describe("task ack confirmations", () => {
   }
 });
 
+describe("inter-agent run identity across timeout (bd pibot-jiqv)", () => {
+  it("a timed-out ask stays one tracked run, and a same-request retry joins it instead of hitting busy", async () => {
+    const t = makeBot();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const messages: unknown[] = [];
+    const sess = {
+      agent: { state: { messages } },
+      prompt: vi.fn(async () => {
+        await gate;
+        messages.push({ role: "assistant", content: [{ type: "text", text: "rewrite finished" }] });
+      }),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "assistant" ? { id, dir: "/x", manifest: { name: id } } : undefined
+    );
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
+    const bot = t.bot as unknown as {
+      agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string>;
+    };
+    const origin = { transport: "mock", chatId: "42" };
+
+    await expect(bot.agentAsk("knower", "assistant", "rewrite the post in ChatGPT Pro", 10, origin))
+      .rejects.toThrow(/still running after 1s — do not resubmit/);
+    // the retry is the same request: it joins the live run, so there is no second prompt
+    await expect(bot.agentAsk("knower", "assistant", "rewrite the post in ChatGPT Pro", 10, origin))
+      .rejects.toThrow(/do not resubmit/);
+    expect(sess.prompt).toHaveBeenCalledTimes(1);
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("busy"))).toBe(false);
+
+    release();
+    await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.opts.text.includes("rewrite finished"))).toBe(true));
+    const replies = t.transport.pushed.filter((p) => p.opts.text.includes("rewrite finished"));
+    expect(replies).toHaveLength(1); // late completion reconciles once with the same run
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("a different request against a live run is refused with the run id, not resubmitted", async () => {
+    const t = makeBot();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const sess = {
+      agent: { state: { messages: [] as unknown[] } },
+      prompt: vi.fn(async () => { await gate; }),
+      subscribe: vi.fn(() => () => {}),
+      isStreaming: false,
+    };
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === "assistant" ? { id, dir: "/x", manifest: { name: id } } : undefined
+    );
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
+    const bot = t.bot as unknown as {
+      agentTurn(a: string, f: string, text: string, timeoutMs?: number): Promise<string>;
+    };
+
+    await expect(bot.agentTurn("assistant", "knower", "rewrite A", 10)).rejects.toThrow(/still running/);
+    await expect(bot.agentTurn("assistant", "knower", "rewrite B", 10))
+      .rejects.toThrow(/busy with run run_.*\(.*rewrite A.*\) — do not resubmit/);
+    expect(sess.prompt).toHaveBeenCalledTimes(1);
+    release();
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+});
+
 describe("session capability inventory at the acceptance path (bd pibot-4wq1)", () => {
   function emptySession() {
     return {

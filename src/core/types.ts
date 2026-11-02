@@ -48,9 +48,20 @@ export interface Schedule {
     /** dueAt this fire consumed, so a mid-flight reschedule is still respected. */
     dueAtAtFire: number;
     firedCount: number;
+    /** identity of this occurrence's dispatch (bd pibot-0xpf.5); absent on legacy claims. */
+    runId?: string;
     /** where a repeat occurrence moves next; absent when this fire closes the job. */
     nextDueAt?: number;
   };
+  /** Identity of the last dispatched occurrence, persisted with the pre-dispatch claim so a
+   *  received message can be bound to THIS run even if the process stops before settlement. */
+  lastRunId?: string;
+  /** When the last occurrence was dispatched. */
+  lastAttemptAt?: number;
+  /** Delivery receipt the transport returned for the last direct fire (message id, peer,
+   *  account, id namespace, evidence). Absent for agent-delivered jobs, whose output is
+   *  pushed inside the agent turn and is not observable here (bd pibot-0xpf.5). */
+  lastReceipt?: DeliveryReceipt;
   /** bot should show an inline card (✅ / +10m / +1h / Cancel) after the agent's turn */
   cardPending?: boolean;
   createdAt: number;

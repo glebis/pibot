@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ChatRef, Schedule, ScheduleRepeat } from "./types.js";
+import type { ChatRef, DeliveryReceipt, Schedule, ScheduleRepeat } from "./types.js";
 import { ensureDir, errorMessage, nextRepeatAt, readJson, uid, writeJsonAtomic } from "./util.js";
 
 /**
@@ -69,7 +69,7 @@ export class Scheduler {
   private firing = new Set<string>();
   private file: string;
   private saveTimer: NodeJS.Timeout | null = null;
-  private fireCb: (job: Schedule, snoozed: boolean) => void | Promise<void>;
+  private fireCb: (job: Schedule, snoozed: boolean) => void | DeliveryReceipt | Promise<void | DeliveryReceipt>;
   private noticeCb?: (job: Schedule, event: ScheduleFailureNotice) => void | Promise<void>;
   private stopped = false;
   /**
@@ -95,7 +95,7 @@ export class Scheduler {
 
   constructor(
     dataDir: string,
-    fireCb: (job: Schedule, snoozed: boolean) => void | Promise<void>,
+    fireCb: (job: Schedule, snoozed: boolean) => void | DeliveryReceipt | Promise<void | DeliveryReceipt>,
     noticeCb?: (job: Schedule, event: ScheduleFailureNotice) => void | Promise<void>,
   ) {
     this.file = path.join(dataDir, "schedules.json");
@@ -466,13 +466,19 @@ export class Scheduler {
    * `nextDueAt` is computed at claim time so the claim fully determines the outcome and
    * the boot has nothing left to decide.
    */
-  private claimOccurrence(job: Schedule, dueAtAtFire: number, nextDueAt: number | null): void {
+  private claimOccurrence(job: Schedule, dueAtAtFire: number, nextDueAt: number | null, runId: string): void {
+    const now = Date.now();
     job.firing = {
-      claimedAt: Date.now(),
+      claimedAt: now,
       dueAtAtFire,
       firedCount: job.firedCount + 1,
+      runId,
       ...(nextDueAt != null ? { nextDueAt } : {}),
     };
+    job.lastRunId = runId;
+    job.lastAttemptAt = now;
+    // A new occurrence must not inherit the previous occurrence's receipt.
+    delete job.lastReceipt;
     this.saveNow();
   }
 
@@ -511,10 +517,12 @@ export class Scheduler {
     // (bd pibot-awhs): a kill from here on can no longer resurrect an already-delivered
     // reminder, because the boot finishes this transition instead of re-deciding it.
     const claimedNext = job.repeat ? this.nextFire(job, now) : null;
-    this.claimOccurrence(job, dueAtAtFire, claimedNext != null && claimedNext > now ? claimedNext : null);
+    const runId = uid("scrun", 8);
+    this.claimOccurrence(job, dueAtAtFire, claimedNext != null && claimedNext > now ? claimedNext : null, runId);
+    let receipt: DeliveryReceipt | void;
     try {
       this.assertRoute(job);
-      await this.fireCb(job, Boolean(sn && now < sn.until && job.wake === "important"));
+      receipt = await this.fireCb(job, Boolean(sn && now < sn.until && job.wake === "important"));
     } catch (e) {
       console.error("[scheduler] fire handler error:", e);
       this.settleOccurrence(job);
@@ -557,6 +565,17 @@ export class Scheduler {
       return;
     }
 
+    if (receipt) {
+      // Persist only what the transport actually attested; unset fields stay unset (strict JSON).
+      const stored: DeliveryReceipt = {};
+      if (receipt.messageId !== undefined) stored.messageId = receipt.messageId;
+      if (receipt.mediaType !== undefined) stored.mediaType = receipt.mediaType;
+      if (receipt.peer !== undefined) stored.peer = receipt.peer;
+      if (receipt.account !== undefined) stored.account = receipt.account;
+      if (receipt.idProtocol !== undefined) stored.idProtocol = receipt.idProtocol;
+      if (receipt.evidence !== undefined) stored.evidence = receipt.evidence;
+      if (Object.keys(stored).length) job.lastReceipt = stored;
+    }
     this.settleOccurrence(job);
 
     // Respect a cancel (or reschedule) that landed while delivery was in flight

@@ -270,6 +270,52 @@ describe("Scheduler", () => {
     s.stop();
   });
 
+  it("records each occurrence's run id and the transport receipt, persisted across reload", async () => {
+    const receipt = {
+      messageId: 321, peer: "test:c1", account: "@testbot", idProtocol: "bot_api", evidence: "ack" as const,
+    };
+    const s = new Scheduler(dataDir, () => receipt);
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000 }) });
+    const fire = (s as unknown as { fire: (j: Schedule) => Promise<void> }).fire.bind(s);
+    await fire(job);
+
+    expect(job.status).toBe("done");
+    expect(job.lastRunId).toMatch(/^scrun_/);
+    expect(job.lastAttemptAt).toBeTypeOf("number");
+    expect(job.lastReceipt).toEqual(receipt);
+
+    const runId = job.lastRunId;
+    s.flush();
+    s.stop();
+    const restarted = new Scheduler(dataDir, () => {});
+    expect(restarted.get(job.id)?.lastRunId).toBe(runId);
+    expect(restarted.get(job.id)?.lastReceipt).toEqual(receipt);
+    restarted.stop();
+  });
+
+  it("does not carry a previous occurrence's receipt into the next one", async () => {
+    let calls = 0;
+    const s = new Scheduler(dataDir, () => {
+      calls += 1;
+      return calls === 1 ? { messageId: 1, evidence: "ack" as const } : undefined;
+    });
+    const job = s.create({ ...makeJob({ dueAt: Date.now() + 60_000, repeat: { everyMs: 15 * 60_000 } }) });
+    const fire = (s as unknown as { fire: (j: Schedule) => Promise<void> }).fire.bind(s);
+
+    await fire(job);
+    expect(job.lastReceipt?.messageId).toBe(1);
+    const firstRunId = job.lastRunId;
+
+    job.dueAt = Date.now() - 1;
+    await fire(job);
+    expect(calls).toBe(2);
+    expect(job.lastRunId).toMatch(/^scrun_/);
+    expect(job.lastRunId).not.toBe(firstRunId);
+    // the second occurrence returned no receipt: an absent receipt is not a stale one
+    expect(job.lastReceipt).toBeUndefined();
+    s.stop();
+  });
+
   it("retains an old paused schedule across restart", () => {
     const s = new Scheduler(dataDir, () => {});
     const job = s.create({ ...makeJob({ dueAt: Date.now() - 4 * 86400e3 }) });

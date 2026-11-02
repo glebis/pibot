@@ -88,6 +88,10 @@ export interface LedgerTaskInput {
   nextAction?: string;
   /** where the task's artifacts live on disk (absolute paths) */
   outputLocation?: string;
+  /** private source files this task still needs (absolute paths, comma-separated). Recorded so
+   *  a cleanup pass can tell a pending task's input from a disposable cache artifact
+   *  (bd pibot-7bo) — the Voss audio was named only in prose and was gone before the retry. */
+  inputLocations?: string;
   /** reference-only link to the tracker (Linear/beads) — the ledger stays authoritative */
   linearRef?: string;
 }
@@ -135,10 +139,10 @@ export interface TaskLedger {
   latestActive(agentId: string, chatKey: string): Promise<LedgerEntry | undefined>;
   /**
    * Update a task's canonical record fields (task-record-canon, bd pibot-r47f):
-   * nextAction / outputLocation. scoped to the owning agent; only pending/running
-   * (and blocked) tasks accept record updates — finished tasks are history.
+   * nextAction / outputLocation / inputLocations. scoped to the owning agent; only
+   * pending/running (and blocked) tasks accept record updates — finished tasks are history.
    */
-  updateRecord(id: string, agentId: string, patch: { nextAction?: string; outputLocation?: string }): Promise<LedgerEntry | undefined>;
+  updateRecord(id: string, agentId: string, patch: { nextAction?: string; outputLocation?: string; inputLocations?: string }): Promise<LedgerEntry | undefined>;
   get(id: string): Promise<LedgerEntry | undefined>;
   list(filter: { agentId: string; chatKey?: string }): Promise<LedgerEntry[]>;
   /** true when an abort was requested for a live task */

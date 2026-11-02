@@ -1,3 +1,6 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { openTaskLedger } from "../durable/task-ledger.js";
@@ -87,6 +90,41 @@ describe("task-record-canon (bd pibot-r47f)", () => {
     expect(listed).toContain("MHT-12");
     expect((await t.get("list_tasks")!.execute("l2", { lane: "dev" })).content[0].text).toBe("No background tasks yet.");
     ledger.close();
+  });
+
+  it("records private input paths and surfaces inputs that are gone (bd pibot-7bo)", async () => {
+    let resolveRun!: (v: string) => void;
+    const gate = new Promise<string>((res) => (resolveRun = res));
+    const run = vi.fn(async () => gate);
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    const t = tools(tasksPlugin({ ledger, agentId: "knower", chat: { transport: "telegram", chatId: "42" } }));
+    const present = path.join(os.tmpdir(), `pibot-input-${Date.now()}.m4a`);
+    const missing = path.join(os.tmpdir(), `pibot-gone-${Date.now()}.m4a`);
+    fs.writeFileSync(present, "audio");
+    try {
+      const started = (await t.get("start_task")!.execute("i1", {
+        title: "re-transcribe Voss",
+        instructions: "use the recorded audio",
+        inputLocations: `${present}, ${missing}`,
+      })) as unknown as { details?: { taskId?: string } };
+      const id = started.details?.taskId ?? "";
+      await new Promise((r) => setTimeout(r, 120)); // let it enter running
+      expect((await ledger.get(id))?.inputLocations).toBe(`${present}, ${missing}`);
+
+      const status = await text(t.get("task_status")!.execute("i2", { id }));
+      expect(status).toContain(`Inputs missing from disk: ${missing}`);
+      expect(status).not.toContain(`Inputs missing from disk: ${present}`);
+      expect(status).toContain("INPUT MISSING");
+
+      const up = await t.get("task_update")!.execute("i3", { id, inputLocations: present });
+      expect(up.content[0].text).toContain("record updated");
+      expect((await ledger.get(id))?.inputLocations).toBe(present);
+      resolveRun("done");
+      for (let i = 0; i < 200 && (await ledger.get(id))?.status !== "done"; i++) await new Promise((r) => setTimeout(r, 10));
+    } finally {
+      fs.rmSync(present, { force: true });
+      await ledger.close();
+    }
   });
 
   it("task_update sets nextAction/outputLocation on live tasks and refuses finished ones", async () => {

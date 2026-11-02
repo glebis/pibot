@@ -58,6 +58,21 @@ describe("scheduler plugin", () => {
     }
   });
 
+  it("shows the last occurrence's run id and direct-delivery receipt (bd pibot-0xpf.5)", async () => {
+    const { tools } = pluginFor();
+    const job = scheduler.create({
+      agentId: "a1", chat: { transport: "test", chatId: "c1" }, title: "daily digest",
+      kind: "subject", dueAt: Date.now() + 3600_000, wake: "normal", delivery: "direct",
+    });
+    job.lastRunId = "scrun_test1";
+    job.lastAttemptAt = Date.now() - 60_000;
+    job.lastReceipt = { messageId: 987, peer: "test:c1", evidence: "ack" };
+    const listed = (await tools.get("schedule_list")!.execute("l1", {})).content[0].text;
+    expect(listed).toContain("last run scrun_test1");
+    expect(listed).toContain("msg 987");
+    expect(listed).toContain("(ack)");
+  });
+
   it("schedule_create accepts wake:'notify' for awareness-only task wakes", async () => {
     const { tools } = pluginFor();
     const res = await tools.get("schedule_create")!.execute("t1", {

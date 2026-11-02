@@ -107,6 +107,49 @@ export function parsePendingSubBots(
   return out;
 }
 
+/**
+ * One inter-agent turn currently running in this process (bd pibot-jiqv). A timeout must
+ * not orphan the run: the transport call and session stay busy, so a later retry of the
+ * same request has to join THIS run rather than submit a second one.
+ */
+interface InFlightAgentRun {
+  id: string;
+  /** normalized request text — the identity a retry must match */
+  fingerprint: string;
+  label: string;
+  startedAt: number;
+  result: Promise<string>;
+}
+
+function agentRunKey(agentId: string, fromAgent: string): string {
+  return `${agentId}\u0000agent::${agentId}::from-${fromAgent}`;
+}
+
+function agentRunFingerprint(text: string): string {
+  return truncate(text.replace(/\s+/g, " ").trim(), 240);
+}
+
+/**
+ * Wait for an in-flight run without abandoning it. On timeout the run keeps going and
+ * its result is still delivered to the origin chat; the caller gets a bounded next step
+ * naming the run instead of a blind "try again" (bd pibot-jiqv).
+ */
+function waitForAgentRun(run: InFlightAgentRun, timeoutMs: number): Promise<string> {
+  let timer: NodeJS.Timeout | undefined;
+  const waited = timeoutMs >= 60_000
+    ? `${Math.round(timeoutMs / 60_000)}m`
+    : `${Math.max(1, Math.round(timeoutMs / 1000))}s`;
+  return Promise.race([
+    run.result,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`run ${run.id} is still running after ${waited} — do not resubmit; its result will be delivered when it finishes`)),
+        timeoutMs,
+      );
+    }),
+  ]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
 export class PiBot implements HeartbeatHost {
   private labEnrollment?: LabEnrollmentFlow;
   private enrollmentFor(t?: Transport): LabEnrollmentFlow | undefined {
@@ -3384,7 +3427,7 @@ export class PiBot implements HeartbeatHost {
     });
   }
 
-  async deliverFire(job: Schedule, snoozed: boolean): Promise<void> {
+  async deliverFire(job: Schedule, snoozed: boolean): Promise<DeliveryReceipt | void> {
     if (job.kind === "heartbeat") {
       await this.deps.heartbeat.tick(job.agentId);
       // Adaptive wakeup: the agent may request a shorter/longer gap for its next
@@ -3469,7 +3512,10 @@ export class PiBot implements HeartbeatHost {
     if (snoozed) lines.push("_(fired during snooze — marked important)_");
     // shared-bot fallback: attribute the sender (dedicated identity doesn't need it)
     if (t.boundAgentId !== job.agentId) lines[0] = `**[${job.agentId}]** ${lines[0]}`;
-    await t.push(job.chat.chatId, {
+    // Return the transport receipt so the schedule record can bind a received message to
+    // this occurrence (bd pibot-0xpf.5). Agent-delivered jobs return nothing: their output
+    // is pushed inside the agent turn and is not observable from here.
+    return (await t.push(job.chat.chatId, {
       text: lines.join("\n"),
       card: {
         text: "",
@@ -3479,7 +3525,7 @@ export class PiBot implements HeartbeatHost {
           { label: "🗑 Done", action: `scd:${job.id}:cancel` },
         ],
       },
-    });
+    })) ?? undefined;
   }
 
   /**
@@ -3620,6 +3666,19 @@ export class PiBot implements HeartbeatHost {
     const target = this.deps.agents.getAgent(agentId);
     if (!target) throw new Error(`unknown agent "${agentId}"`);
     const ck = `agent::${agentId}::from-${fromAgent}`;
+    // A timed-out turn is not a cancelled one: the session is still streaming, so a retry
+    // must join the same run instead of submitting a duplicate (bd pibot-jiqv).
+    const runKey = agentRunKey(agentId, fromAgent);
+    const fingerprint = agentRunFingerprint(text);
+    const inFlight = this.agentRuns.get(runKey);
+    if (inFlight) {
+      if (inFlight.fingerprint === fingerprint) {
+        return timeoutMs ? await waitForAgentRun(inFlight, timeoutMs) : inFlight.result;
+      }
+      throw new Error(
+        `target agent ${agentId} is busy with run ${inFlight.id} ("${inFlight.label}") — do not resubmit; its result will be delivered when it finishes`,
+      );
+    }
     const session = await this.deps.agents.getOrCreateSession(
       agentId,
       ck,
@@ -3632,7 +3691,9 @@ export class PiBot implements HeartbeatHost {
         : undefined,
       this.commsHooks()
     );
-    if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("target agent is busy");
+    if ((session as { isStreaming?: boolean }).isStreaming) {
+      throw new Error(`target agent ${agentId} is busy — do not resubmit; wait for the current turn to finish`);
+    }
     // delegation acceptance: record the target session's ACTUAL authorised capability set (bd pibot-4wq1)
     this.logSessionInventory(agentId, ck, `delegation accepted from ${fromAgent}`);
     // pibot-dff: extract only assistant text PRODUCED BY THIS TURN. The old last-assistant
@@ -3654,27 +3715,38 @@ export class PiBot implements HeartbeatHost {
     }
     const run = trackActivity({ kind: "agent-message", label: `from ${fromAgent}: ${text}`, agentId, chatKey: originChat ? `${originChat.transport}:${originChat.chatId}` : undefined, session },
       () => this.promptTaskWithCascade(agentId, session, ck, `[agent-message from "${fromAgent}"]\n\n${envelopeText}`));
-    const reply = timeoutMs
-      ? await Promise.race([
-          run.then(() => this.freshAssistantText(session, beforeCount)),
-          new Promise<string>((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
-        ])
-      : await run.then(() => this.freshAssistantText(session, beforeCount));
-    const finalReply = reply || "(no reply)";
-    if (originChat) {
-      // owner-facing status: the reply lands in the chat the work was requested from
-      const t = this.transports.get(originChat.transport);
-      if (t) {
-        // Delegated-reply cap: the old 900 silently ate long tails of agent-to-agent
-        // replies (LinkedIn cue tail delivered 5x, Sep 17 handoff half). Telegram
-        // truncates at ~4096 anyway — keep the attribution, keep the bound sane.
-        const outbound = t.boundAgentId === agentId ? finalReply : `**[${agentId}]** ${truncate(finalReply, 4000)}`;
-        await t.push(originChat.chatId, { text: outbound }).catch(() => {});
-        this.deps.events.log(agentId, "send", `→ ${originChat.transport}:${originChat.chatId}: ${truncate(finalReply, 80)}`);
-      }
-    }
-    this.maybeEmitTaskAck(agentId, fromAgent, text, finalReply);
-    return finalReply;
+    // Delivery is part of the run, not of the caller's wait: a timed-out request keeps
+    // working and its late reply still lands in the origin chat (bd pibot-jiqv).
+    const result = run
+      .then(() => this.freshAssistantText(session, beforeCount))
+      .then(async (reply) => {
+        const finalReply = reply || "(no reply)";
+        if (originChat) {
+          // owner-facing status: the reply lands in the chat the work was requested from
+          const t = this.transports.get(originChat.transport);
+          if (t) {
+            // Delegated-reply cap: the old 900 silently ate long tails of agent-to-agent
+            // replies (LinkedIn cue tail delivered 5x, Sep 17 handoff half). Telegram
+            // truncates at ~4096 anyway — keep the attribution, keep the bound sane.
+            const outbound = t.boundAgentId === agentId ? finalReply : `**[${agentId}]** ${truncate(finalReply, 4000)}`;
+            await t.push(originChat.chatId, { text: outbound }).catch(() => {});
+            this.deps.events.log(agentId, "send", `→ ${originChat.transport}:${originChat.chatId}: ${truncate(finalReply, 80)}`);
+          }
+        }
+        this.maybeEmitTaskAck(agentId, fromAgent, text, finalReply);
+        return finalReply;
+      });
+    const record: InFlightAgentRun = {
+      id: uid("run", 6),
+      fingerprint,
+      label: truncate(text.replace(/\s+/g, " ").trim(), 120),
+      startedAt: Date.now(),
+      result,
+    };
+    this.agentRuns.set(runKey, record);
+    const settle = () => { if (this.agentRuns.get(runKey) === record) this.agentRuns.delete(runKey); };
+    void result.then(settle, settle);
+    return timeoutMs ? await waitForAgentRun(record, timeoutMs) : result;
   }
 
   /**
@@ -3952,12 +4024,18 @@ export class PiBot implements HeartbeatHost {
     }
     const dedupeKey = `${fromAgent}->${toAgent}:${truncate(question, 120)}`;
     const hit = this.recentAsks.get(dedupeKey);
-    if (hit && now - hit < 5 * 60e3) throw new Error(`loop guard: the same question was sent to ${toAgent} recently`);
-    this.recentAsks.set(dedupeKey, now);
+    // A retry of a request that is still running is the SAME run, not a loop: let it join
+    // that run (bd pibot-jiqv). A completed duplicate stays under the loop guard.
+    const inFlight = this.agentRuns.get(agentRunKey(toAgent, fromAgent));
+    const sameInFlight = inFlight?.fingerprint === agentRunFingerprint(question);
+    if (hit && now - hit < 5 * 60e3 && !sameInFlight) throw new Error(`loop guard: the same question was sent to ${toAgent} recently`);
+    if (!hit || now - hit >= 5 * 60e3) this.recentAsks.set(dedupeKey, now);
     return this.agentTurn(toAgent, fromAgent, question, timeoutMs, originChat);
   }
 
   private recentAsks = new Map<string, number>(); // "from->to:text" → ts
+  /** Inter-agent turns in flight, keyed by target session; a timeout does not remove one. */
+  private agentRuns = new Map<string, InFlightAgentRun>();
 
   // ── HeartbeatHost ─────────────────────────────────────────────────────
 

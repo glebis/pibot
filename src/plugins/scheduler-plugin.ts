@@ -184,9 +184,15 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
           if (!jobs.length) {
             return { content: [{ type: "text", text: "Nothing scheduled." }], details: {} };
           }
-          const lines = jobs.slice(0, 30).map(
-            (j) => `- [${j.id}]${j.status === "paused" ? " PAUSED" : ""} ${j.title} — ${fmtWhen(j.dueAt)}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " (!)" : ""}${j.detail ? ` — ${j.detail}` : ""}${j.status === "paused" && j.lastDeliveryError ? ` — last error: ${j.lastDeliveryError}` : ""}`
-          );
+          const lines = jobs.slice(0, 30).map((j) => {
+            // Causal trace for the last occurrence (bd pibot-0xpf.5): run identity and, for
+            // direct delivery, the message the transport actually sent. An agent-composed
+            // digest has no receipt here — distinguish that from "nothing was delivered".
+            const trace = j.lastRunId
+              ? ` — last run ${j.lastRunId}${j.lastAttemptAt ? ` ${fmtWhen(j.lastAttemptAt)}` : ""}${j.lastReceipt?.messageId !== undefined ? `, msg ${j.lastReceipt.messageId}` : ""}${j.lastReceipt?.evidence ? ` (${j.lastReceipt.evidence})` : ""}`
+              : "";
+            return `- [${j.id}]${j.status === "paused" ? " PAUSED" : ""} ${j.title} — ${fmtWhen(j.dueAt)}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " (!)" : ""}${j.detail ? ` — ${j.detail}` : ""}${j.status === "paused" && j.lastDeliveryError ? ` — last error: ${j.lastDeliveryError}` : ""}${trace}`;
+          });
           return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
         },
       });

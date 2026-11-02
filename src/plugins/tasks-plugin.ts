@@ -1,5 +1,6 @@
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import * as fs from "node:fs";
 import type { LedgerEntry, TaskLedger } from "../durable/task-ledger.js";
 import type { ChatRef } from "../core/types.js";
 import { fmtWhen } from "../core/util.js";
@@ -39,15 +40,28 @@ export interface TasksPluginDeps {
   transcription?: { policy?: SttPolicy; hostProviders?: readonly string[]; groqCredentialPresent?: boolean };
 }
 
+function splitLocations(value?: string): string[] {
+  return (value ?? "").split(",").map((entry) => entry.trim()).filter(Boolean);
+}
+
+/** Inputs the record still points at that are no longer on disk (bd pibot-7bo). A missing
+ *  source must be visible in the record instead of reading as an available path. */
+function missingInputs(t: LedgerEntry): string[] {
+  return splitLocations(t.inputLocations).filter((entry) => !fs.existsSync(entry));
+}
+
 function line(t: LedgerEntry): string {
   const tail = t.status === "done" ? ` — ${t.result?.slice(0, 160) ?? ""}`
     : t.status === "failed" || t.status === "partial" ? ` — ${t.error?.slice(0, 160) ?? t.blocker?.slice(0, 160) ?? ""}`
     : t.status === "blocked" ? ` — blocked: ${t.blocker?.slice(0, 160) ?? ""}`
     : "";
+  const missing = missingInputs(t);
   const canon = [
     t.lane ? `lane:${t.lane}` : "",
     t.nextAction ? `next: ${t.nextAction.slice(0, 120)}` : "",
     t.outputLocation ? `out: ${t.outputLocation.slice(0, 120)}` : "",
+    t.inputLocations ? `in: ${t.inputLocations.slice(0, 120)}` : "",
+    missing.length ? `INPUT MISSING: ${missing.slice(0, 3).join(", ")}` : "",
     t.linearRef ? `ref: ${t.linearRef}` : "",
   ].filter(Boolean).join(" • ");
   return `${t.id} [${t.status}] "${t.title}" (started ${fmtWhen(t.createdAt)})${tail}${canon ? `\n    ${canon}` : ""}`;
@@ -81,6 +95,7 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
           lane: Type.Optional(Type.String({ description: "'dev' (pibot source work) or 'cross-agent' (owner-facing content/tooling) — keeps the two lanes separate in records" })),
           acceptanceCriteria: Type.Optional(Type.String({ description: "Verifiable criteria the task must satisfy (what 'done' means in checkable words)" })),
           outputLocation: Type.Optional(Type.String({ description: "Where artifacts live on disk (absolute paths, comma-separated if many)" })),
+          inputLocations: Type.Optional(Type.String({ description: "Absolute paths of private source files this task still needs (comma-separated). Recorded so retention cleanup can protect pending-task inputs, and status reports any that went missing. Use for downloaded audio/video or other non-reproducible inputs." })),
           linearRef: Type.Optional(Type.String({ description: "Reference-only link to the tracker (e.g. Linear id)" })),
           audioDurationSec: Type.Optional(Type.Number({ description: "Set ONLY when this task will transcribe audio: the media duration in seconds. The duration-aware transcription policy is then attached to the task's contract (<=15 min may run locally; >15 min must be Groq chunks of <=15 min, never WhisperKit)." })),
           audioDurationUnknown: Type.Optional(Type.Boolean({ description: "Set when the task transcribes audio whose duration could not be probed: the contract then mandates an ffprobe first, instead of assuming a duration." })),
@@ -126,6 +141,7 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
               ...(params.lane === "dev" ? { lane: "dev" as const } : params.lane === "cross-agent" ? { lane: "cross-agent" as const } : {}),
               ...(params.acceptanceCriteria ? { acceptanceCriteria: params.acceptanceCriteria.slice(0, 500) } : {}),
               ...(params.outputLocation ? { outputLocation: params.outputLocation.slice(0, 500) } : {}),
+              ...(params.inputLocations ? { inputLocations: params.inputLocations.slice(0, 1000) } : {}),
               ...(params.linearRef ? { linearRef: params.linearRef.slice(0, 120) } : {}),
             };
             if (preflight) {
@@ -167,7 +183,11 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
             : t.status === "blocked" ? `\n\nBlocker: ${t.blocker ?? ""}`
             : "";
           const receipt = t.delivery ? `\n\nDelivery: ${t.delivery.mediaType ?? "text"}${t.delivery.messageId !== undefined ? ` (message ${t.delivery.messageId})` : ""}` : "";
-          return text(`${line(t)}; attempts ${t.attempts}${body}${receipt}`, { status: t.status });
+          const missing = missingInputs(t);
+          const inputWarning = missing.length
+            ? `\n\n⚠ Inputs missing from disk: ${missing.join(", ")} — reacquire or replace them before resuming; this record no longer presents them as available.`
+            : "";
+          return text(`${line(t)}; attempts ${t.attempts}${body}${receipt}${inputWarning}`, { status: t.status });
         },
       });
       pi.registerTool({
@@ -187,17 +207,19 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
       pi.registerTool({
         name: "task_update",
         label: "Update task record",
-        description: "Update a task's canonical record: next action and/or artifact output location. Use after a blocker lands or an artifact is placed so the record stays authoritative.",
+        description: "Update a task's canonical record: next action, artifact output location and/or private input paths. Use after a blocker lands or an artifact is placed so the record stays authoritative.",
         parameters: Type.Object({
           id: Type.String(),
           nextAction: Type.Optional(Type.String({ description: "What would unblock/advance this task next" })),
           outputLocation: Type.Optional(Type.String({ description: "Absolute paths of the artifacts produced/deliverable" })),
+          inputLocations: Type.Optional(Type.String({ description: "Absolute paths of private inputs this task still needs (comma-separated), so cleanup can protect them" })),
         }),
         async execute(_id, params) {
           try {
             const t = await ledger.updateRecord(params.id, agentId, {
               ...(params.nextAction ? { nextAction: params.nextAction.slice(0, 300) } : {}),
               ...(params.outputLocation ? { outputLocation: params.outputLocation.slice(0, 500) } : {}),
+              ...(params.inputLocations ? { inputLocations: params.inputLocations.slice(0, 1000) } : {}),
             });
             if (!t) return text(`No task ${params.id} for this agent.`);
             return text(`Task record updated: ${t.id}.`);
