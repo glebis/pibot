@@ -48,6 +48,7 @@ import { applyCorrections, composeBias, loadDictionary } from "./dictionary.js";
 import { getMediaLinkKey, mediaBase, mediaLinkUrl, stashForLink } from "./media-links.js";
 import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
+import { describeImage } from "./vision.js";
 import { applyVoiceStyle, isOperationalNotice, requestsFullPath, VOICE_STYLE_DIRECTIVE } from "./voice-style.js";
 import {
   advanceGoal, goalCard, newGoal, renderGoalBlock, renderGoalStatus, shouldContinue, withMethodBlocker,
@@ -620,6 +621,11 @@ export class PiBot implements HeartbeatHost {
     for (const t of deps.transports) this.addTransport(t);
     deps.scheduler.setRouteValidator?.((job) => this.scheduleRouteError(job));
     this._startGate = new Promise<void>((resolve) => { this.resolveStarted = resolve; });
+  }
+
+  /** True when this job's delivery route resolves right now (read-only twin of the validator). */
+  canRouteSchedule(job: Pick<Schedule, "agentId" | "chat" | "delivery" | "internal">): boolean {
+    return this.scheduleRouteError(job) === undefined;
   }
 
   private scheduleRouteError(job: Pick<Schedule, "agentId" | "chat" | "delivery" | "internal">): string | undefined {
@@ -1608,7 +1614,36 @@ export class PiBot implements HeartbeatHost {
       await this.handleVoiceMedia(t, media, agentId);
       return;
     }
-    await this.routeUserTurn(t, media.chatId, mediaPromptText(media));
+    await this.routeUserTurn(t, media.chatId, await this.imageAwareTurnText(t, media));
+  }
+
+  /** bd: image turns on text-only models — a vision-capable model from the agent's
+   *  own allowed providers relays what the pixels show, in text, before the turn.
+   *  Degrades to the old text stub when no permitted vision model exists. */
+  private async imageAwareTurnText(t: Transport, media: IncomingMedia): Promise<string> {
+    const imageLike = media.kind === "photo" || (media.kind === "document" && /\.(png|jpe?g|webp|gif|heic|bmp)$/i.test(media.filePath));
+    const stub = mediaPromptText(media);
+    if (!imageLike) return stub;
+    const agentId = this.currentAgent(this.chatKey(t, media.chatId));
+    const agent = agentId ? this.deps.agents.getAgent(agentId) : undefined;
+    if (!agentId || !agent) return stub;
+    const runtime = this.deps.modelRuntime;
+    if (!runtime) return stub;
+    const res = await describeImage(
+      runtime as never,
+      { filePath: media.filePath, caption: media.caption },
+      agent.manifest.providers,
+      agent.manifest.model,
+    );
+    if (!res.ok) {
+      console.warn(`[vision] ${agentId}: image describe unavailable (${res.error}) — text-only fallback`);
+      return stub;
+    }
+    return (
+      `🖼 [${path.basename(media.filePath)}] described by the vision model ${res.modelSpec}` +
+      `${media.caption ? ` — owner caption: ${media.caption}` : ""}` +
+      `\n\nImage description:\n${res.description}\n\n(file stored at ${media.filePath} — read tool)`
+    );
   }
 
   /** Download-and-transcribe path for voice notes and audio files. */
@@ -3975,6 +4010,31 @@ export class PiBot implements HeartbeatHost {
     const { transport, chatId } = this.splitChatKey(target);
     const t = this.transports.get(transport);
     if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] notify failed:", e));
+  }
+
+  /**
+   * After every transport is attached, report paused schedules whose route has since
+   * become valid. They are NOT resumed automatically: a paused job is a decision the
+   * owner made (or one the host made on their behalf), and silently re-arming it would
+   * re-deliver an occurrence nobody asked for. One consolidated message, no per-job
+   * push (Oct 30: five jobs sat paused with a route that was already repaired).
+   */
+  async reportRepairedSchedules(jobs: Schedule[]): Promise<void> {
+    if (!jobs.length) return;
+    const lines = jobs.map((job) => {
+      const intended = job.delivery === "agent"
+        ? (this.primaryChat(job) ?? `(no owned chat for ${job.agentId})`)
+        : (job.chat.chatId ? `${job.chat.transport}:${job.chat.chatId}` : "(none)");
+      return `· ${job.id} "${truncate(job.title, 60)}" → ${intended}`;
+    });
+    const text = [
+      `⏸ ${jobs.length} scheduled item${jobs.length === 1 ? "" : "s"} stopped earlier because a delivery route was missing.`,
+      `The route works again now, so ${jobs.length === 1 ? "it" : "they"} can be resumed — nothing was sent automatically:`,
+      ...lines,
+      `Resume from the dashboard, or ask me to resume a specific job.`,
+    ].join("\n");
+    this.deps.events.log("system", "system", `repaired schedules reported: ${jobs.map((j) => j.id).join(", ")}`);
+    await this.notifyOwnerEvent(text);
   }
 
   /** Post-boot confirmation: the owner should always know the daemon came back —

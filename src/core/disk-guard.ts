@@ -122,6 +122,8 @@ export interface GuardRun {
 
 interface GuardState {
   lastRunAt?: string;
+  /** Last sustained-pressure escalation, so the window is honoured across restarts. */
+  lastEscalationAt?: string;
   runs: GuardRun[];
 }
 
@@ -139,6 +141,19 @@ interface ScriptResult {
 
 const DEFAULT_MIN_FREE = 2 * 1024 * 1024 * 1024; // 2 GiB
 const DEFAULT_COOLDOWN = 30 * 60_000;
+/**
+ * How many runs stay in data/disk-guard.json. Ten was a day's worth on a quiet day and
+ * silently truncated the Oct 30 incident at 11 runs, which is exactly the count the
+ * owner needed to see that pressure was recurring rather than a one-off.
+ */
+const RUN_RETENTION = 50;
+/**
+ * Recurring low-water inside this window is degradation, not an incident: the same
+ * cleanup succeeded 11 times on Oct 30 and pushed 11 near-identical "still low on
+ * space" messages. Escalation is announced once per window instead.
+ */
+const SUSTAINED_WINDOW_MS = 6 * 3600e3;
+const SUSTAINED_MIN_RUNS = 3;
 const DEFAULT_WATCH = 10 * 60_000;
 const RUN_TIMEOUT_MS = 15 * 60_000; // clean.py caps each target at 300s
 
@@ -206,7 +221,9 @@ export class DiskGuard {
   private loadState(): GuardState {
     try {
       const raw = JSON.parse(fs.readFileSync(this.statePath, "utf8")) as GuardState;
-      if (raw && Array.isArray(raw.runs)) return { lastRunAt: raw.lastRunAt, runs: raw.runs.slice(0, 10) };
+      if (raw && Array.isArray(raw.runs)) {
+        return { lastRunAt: raw.lastRunAt, lastEscalationAt: raw.lastEscalationAt, runs: raw.runs.slice(0, RUN_RETENTION) };
+      }
     } catch {
       /* fresh state */
     }
@@ -294,10 +311,75 @@ export class DiskGuard {
       ok: outcome.ran,
       ...(outcome.ran ? { freedHuman: outcome.freedHuman, diskBeforeGb: outcome.diskBeforeGb, diskAfterGb: outcome.diskAfterGb } : { error: outcome.error }),
     };
-    this.state = { lastRunAt: run.at, runs: [run, ...this.state.runs].slice(0, 10) };
+    this.state = {
+      lastRunAt: run.at,
+      lastEscalationAt: this.state.lastEscalationAt,
+      runs: [run, ...this.state.runs].slice(0, RUN_RETENTION),
+    };
     this.saveState();
+    const escalation = this.sustainedEscalation(Date.parse(run.at));
+    if (escalation) {
+      this.log(`[disk-guard] sustained pressure: ${escalation.runs} runs in ${Math.round(escalation.windowMs / 60_000)} min`);
+      await this.push(escalation.text);
+      return outcome;
+    }
+    const stillLow = free !== null && free < this.opts.minFreeBytes;
+    if (stillLow && this.escalationWindowOpen(Date.parse(run.at))) {
+      // the owner was already told this keeps recurring; another "still low" push is noise
+      this.log(`[disk-guard] cleanup ran (${outcome.ran ? `freed ${outcome.freedHuman}` : "no run"}); escalation already reported within the window`);
+      return outcome;
+    }
     await this.push(resultMessage(reason, outcome, free, this.opts.minFreeBytes, this.scriptPath));
     return outcome;
+  }
+
+  /**
+   * Recurring low-water is a different failure from one low-water event: cleanup keeps
+   * succeeding, so every run looks healthy while the disk refills faster than the
+   * cooldown can act. Report that once per window instead of pushing "still low on
+   * space" every 30 minutes (bd pibot-4wm).
+   */
+  private sustainedEscalation(now: number): { runs: number; windowMs: number; text: string } | null {
+    if (!Number.isFinite(now)) return null;
+    const recent = this.state.runs.filter((r) => now - Date.parse(r.at) <= SUSTAINED_WINDOW_MS);
+    if (recent.length < SUSTAINED_MIN_RUNS) return null;
+    const last = this.state.lastEscalationAt ? Date.parse(this.state.lastEscalationAt) : NaN;
+    if (Number.isFinite(last) && now - last < SUSTAINED_WINDOW_MS) return null;
+    this.state.lastEscalationAt = new Date(now).toISOString();
+    this.saveState(); // honour the window across a restart, like the cooldown
+
+    const spanMs = now - Date.parse(recent[recent.length - 1]!.at);
+    const freed = recent.reduce((sum, r) => {
+      const m = /([\d.]+)\s*([KMGT]?)i?B/i.exec(r.freedHuman ?? "");
+      if (!m) return sum;
+      const mult = { K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4, "": 1 }[m[2]!.toUpperCase() as "K" | "M" | "G" | "T" | ""] ?? 1;
+      return sum + Number(m[1]) * mult;
+    }, 0);
+    const lowest = recent.reduce<number | null>((min, r) => {
+      const gb = r.diskBeforeGb;
+      return gb === undefined ? min : min === null ? gb : Math.min(min, gb);
+    }, null);
+
+    const every = Math.max(1, Math.round(spanMs / Math.max(1, recent.length - 1) / 60_000));
+    return {
+      runs: recent.length,
+      windowMs: SUSTAINED_WINDOW_MS,
+      text: [
+        `💾 Disk pressure is recurring, not a one-off: ${recent.length} cleanup runs in ${Math.round(spanMs / 60_000)} min (about one every ${every} min),`,
+        freed > 0 ? `freed ${humanBytes(freed)} total,` : null,
+        lowest !== null ? `lowest seen ${lowest} GB free,` : null,
+        `and it is still filling at least as fast as cleanup drains it.`,
+        `Automatic cleanup is working but cannot keep up — this needs a decision about what is consuming the space, not another cleanup run.`,
+        `Inspect: python3 ${this.scriptPath} --preset full --go --dry-run --json  (medium targets: ML models, project node_modules)`,
+      ].filter(Boolean).join(" "),
+    };
+  }
+
+  /** True while a sustained-pressure escalation is still current. */
+  private escalationWindowOpen(now: number): boolean {
+    if (!Number.isFinite(now) || !this.state.lastEscalationAt) return false;
+    const last = Date.parse(this.state.lastEscalationAt);
+    return Number.isFinite(last) && now - last < SUSTAINED_WINDOW_MS;
   }
 
   private async push(text: string): Promise<void> {

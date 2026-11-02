@@ -1046,6 +1046,11 @@ export class TelegramTransport implements Transport {
   private async downloadTelegramFileOnce(fileId: string, extension: string): Promise<string> {
     fs.mkdirSync(this.mediaDir, { recursive: true, mode: 0o700 });
     fs.chmodSync(this.mediaDir, 0o700);
+    // Reuse an existing copy of the same Telegram file. The name is derived from the
+    // file id, not a fresh UUID: a re-sent or re-fetched file used to land as a second
+    // full copy (Oct 30: uwCampbell.mp4 and uwCampbellA.mp4, both 982,855,910 bytes).
+    const reusePath = this.mediaPathFor(fileId, extension);
+    if (reusePath && fs.existsSync(reusePath)) return reusePath;
     const file = await this.bot.api.getFile(fileId);
     if (!file.file_path) throw new Error(`getFile returned no path for ${fileId}`);
     const url = `https://api.telegram.org/file/bot${(this.bot as unknown as { token: string }).token}/${file.file_path}`;
@@ -1056,10 +1061,27 @@ export class TelegramTransport implements Transport {
     const bytes = Buffer.from(await res.arrayBuffer());
     if (bytes.length > MEDIA_MAX_BYTES) throw new Error("file download exceeds 20MB limit");
     const safeExtension = /^\.[a-z0-9]{1,5}$/i.test(extension) ? extension.toLowerCase() : ".bin";
-    const destPath = path.join(this.mediaDir, `${randomUUID()}${safeExtension}`);
-    await fsp.writeFile(destPath, bytes, { mode: 0o600, flag: "wx" });
+    const destPath = reusePath ?? path.join(this.mediaDir, `${randomUUID()}${safeExtension}`);
+    try {
+      await fsp.writeFile(destPath, bytes, { mode: 0o600, flag: "wx" });
+    } catch (e) {
+      // a concurrent download of the same file won the race — reuse its bytes
+      if ((e as { code?: string }).code === "EEXIST" && fs.existsSync(destPath)) return destPath;
+      throw e;
+    }
     await fsp.chmod(destPath, 0o600);
     return destPath;
+  }
+
+  /**
+   * Stable path for a Telegram file id, or null when the id cannot name a file. Two
+   * different bot accounts can carry colliding ids, so the transport name is mixed in.
+   */
+  private mediaPathFor(fileId: string, extension: string): string | null {
+    if (!this.mediaDir || !fileId) return null;
+    const safeExtension = /^\.[a-z0-9]{1,5}$/i.test(extension) ? extension.toLowerCase() : ".bin";
+    const digest = createHash("sha256").update(`${this.name}:${fileId}`).digest("hex").slice(0, 32);
+    return path.join(this.mediaDir, `${digest}${safeExtension}`);
   }
 
   onAction(cb: (action: string, chatId: string) => Promise<void>): void {

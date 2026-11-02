@@ -917,6 +917,35 @@ describe("media download retry (transient network)", () => {
     }
   });
 
+  it("reuses an existing copy of the same file instead of downloading a second one", async () => {
+    const t = new TelegramTransport("123:test", ["42"]);
+    let getFileCalls = 0;
+    (t as unknown as { bot: { api: Record<string, unknown> } }).bot.api.getFile = async () => {
+      getFileCalls++;
+      return { file_path: "videos/clip.mp4" };
+    };
+    let fetchCalls = 0;
+    const buf = Buffer.from("fakevideo");
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      fetchCalls++;
+      return { ok: true, status: 200, headers: new Headers({ "content-length": String(buf.length) }), arrayBuffer: async () => buf } as unknown as Response;
+    }) as typeof fetch;
+    try {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tgdedupe-"));
+      (t as unknown as { mediaDir: string }).mediaDir = dir;
+      const dl = (t as unknown as { downloadTelegramFile(fid: string, ext: string): Promise<string> }).downloadTelegramFile.bind(t);
+      const first = await dl("fid", ".mp4");
+      const second = await dl("fid", ".mp4");
+      expect(second).toBe(first);
+      expect(fetchCalls).toBe(1); // the second call never hit the network
+      expect(fs.readdirSync(dir)).toHaveLength(1);
+      fs.rmSync(dir, { recursive: true, force: true });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it("does not retry permanent errors (HTTP 404)", async () => {
     const t = new TelegramTransport("123:test", ["42"]);
     let calls = 0;

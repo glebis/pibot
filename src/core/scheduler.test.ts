@@ -43,6 +43,56 @@ describe("Scheduler", () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
+  it("does not fire a job created while the wheel is disarmed, and fires it on arm", async () => {
+    const deliver = vi.fn();
+    const s = new Scheduler(dataDir, deliver);
+    try {
+      s.disarm();
+      // An overdue job created during boot (heartbeat/brief/attend) must not fire against
+      // a half-attached route table — that is the Oct 30 ScheduleRouteError self-pause.
+      const job = s.create(makeJob({ dueAt: Date.now() - 1000 }));
+      await new Promise((r) => setTimeout(r, 60));
+      expect(deliver).not.toHaveBeenCalled();
+      expect(s.get(job.id)?.status).toBe("pending");
+
+      s.arm();
+      await waitFor(() => deliver.mock.calls.length === 1);
+      expect(s.get(job.id)?.status).toBe("done");
+    } finally { s.stop(); }
+  });
+
+  it("keeps a resumed job pending until the wheel is armed", async () => {
+    const deliver = vi.fn();
+    const s = new Scheduler(dataDir, deliver);
+    try {
+      const job = s.create(makeJob({ dueAt: Date.now() + 60_000 }));
+      job.status = "paused";
+      job.pauseReason = "Delivery route needs repair: repair it";
+      s.disarm();
+      expect(s.resume(job.id)).not.toBeNull();
+      await new Promise((r) => setTimeout(r, 60));
+      expect(deliver).not.toHaveBeenCalled();
+      s.arm();
+      await waitFor(() => deliver.mock.calls.length === 1);
+    } finally { s.stop(); }
+  });
+
+  it("never persists a synthetic transport as a schedule's chat", () => {
+    const s = new Scheduler(dataDir, () => {});
+    try {
+      const job = s.create(makeJob({ chat: { transport: "agent", chatId: "task-t1" }, delivery: "agent" }));
+      expect(job.chat).toEqual({ transport: "", chatId: "" });
+      const internal: Schedule = {
+        ...makeJob({ chat: { transport: "internal", chatId: "hb" }, internal: true }),
+        id: "hb",
+        status: "pending",
+        createdAt: Date.now(),
+        firedCount: 0,
+      };
+      expect(s.ensure(internal).chat).toEqual({ transport: "internal", chatId: "hb" });
+    } finally { s.stop(); }
+  });
+
   it("rejects creation when the host cannot resolve a delivery route", () => {
     const s = new Scheduler(dataDir, () => {});
     try {

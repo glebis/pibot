@@ -1,6 +1,7 @@
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Scheduler } from "../core/scheduler.js";
+import { isRoutableChat } from "../core/scheduler.js";
 import type { ChatRef } from "../core/types.js";
 import { fmtWhen, nextQuietEnd, parseDuration, parseWhen, uid } from "../core/util.js";
 
@@ -52,11 +53,15 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
           } else {
             try {
               const wake = params.wake === "important" ? "important" : params.wake === "notify" ? "notify" : "normal";
-              const delivery = params.delivery === "agent" || chat.transport === "agent" ? "agent" : "direct";
+              // A session bound to a synthetic chat (`agent:task-…`) cannot be routed later:
+              // `agent` is a marker, not a transport. Such a job is agent-delivered and falls
+              // back to the agent's own owned chat at fire time (Oct 30: three jobs stored
+              // transport "agent" and were permanently undeliverable).
+              const delivery = params.delivery === "agent" || !isRoutableChat(chat) ? "agent" : "direct";
               const kind = (params.kind as never) ?? "reminder";
               const job = scheduler.create({
                 agentId,
-                chat,
+                chat: delivery === "direct" ? chat : { transport: "", chatId: "" },
                 title: params.title,
                 detail: params.detail,
                 kind,

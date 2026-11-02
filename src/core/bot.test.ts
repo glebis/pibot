@@ -2310,6 +2310,31 @@ describe("post-boot confirmation", () => {
     fs.rmSync(t.dir, { recursive: true, force: true });
   });
 
+  it("reports repaired-route schedules once, without resuming them", async () => {
+    const t = makeBot();
+    await t.transport.say("hi"); // binds the default agent's chat
+    t.transport.pushed.length = 0;
+    const paused = {
+      id: "sc_1", agentId: "pibot", title: "stretch", kind: "reminder" as const,
+      chat: { transport: "telegram", chatId: "42" }, dueAt: Date.now(),
+      wake: "normal" as const, delivery: "direct" as const, status: "paused" as const,
+      createdAt: Date.now(), firedCount: 3,
+      pauseReason: "Delivery route needs repair: transport unavailable",
+    };
+    await t.bot.reportRepairedSchedules([paused]);
+    const text = t.transport.pushed.map((p) => p.opts.text).join("\n");
+    expect(text).toContain("1 scheduled item stopped earlier");
+    expect(text).toContain("sc_1");
+    expect(text).toContain("nothing was sent automatically");
+    // reporting is not resuming
+    expect(paused.status).toBe("paused");
+    // and an empty list is silence, not an empty message
+    t.transport.pushed.length = 0;
+    await t.bot.reportRepairedSchedules([]);
+    expect(t.transport.pushed).toHaveLength(0);
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
   it("stays silent when no chat is bound (suppression, not a crash)", async () => {
     const t = makeBot();
     await expect(t.bot.notifyBoot({ attached: [], failed: [] })).resolves.toBeUndefined();

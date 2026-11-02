@@ -21,6 +21,7 @@ import { CommitmentEngine } from "./core/commitments.js";
 import { IntakeStore } from "./core/research-intake.js";
 import { HeartbeatEngine } from "./core/heartbeat.js";
 import { Scheduler } from "./core/scheduler.js";
+import type { Schedule } from "./core/types.js";
 import { createWebApp } from "./web.js";
 import { CliTransport } from "./transports/cli.js";
 import { TelegramTransport } from "./transports/telegram.js";
@@ -282,6 +283,10 @@ async function main(): Promise<void> {
   });
   agents.tasks = taskLedger;
 
+  // Hold the timer wheel until every delivery transport is live. boot creates jobs
+  // (heartbeat/brief/attend) whose rearm() would otherwise fire an overdue job against
+  // an empty route table — ScheduleRouteError, then a self-pause (Oct 30).
+  scheduler.disarm();
   await bot.start();
   await coordinator?.start();
   if (ledgerUnavailable) {
@@ -331,7 +336,7 @@ async function main(): Promise<void> {
   // Arm due jobs only after the main transport and every sub-bot are attached:
   // rearming earlier let an overdue agent-delivered job fire against an empty
   // route table, raising ScheduleRouteError and pausing itself (Oct 30).
-  scheduler.rearm();
+  scheduler.arm();
   // Voice attaches to this daemon's canonical sessions; never starts another AgentManager.
   const voiceRuntime = process.env.PIBOT_VOICE_CONFIG
     ? await (await import('./voice/runtime.js')).startCanonicalVoiceRuntime(bot, process.env.PIBOT_VOICE_CONFIG)
@@ -351,6 +356,16 @@ async function main(): Promise<void> {
   // post-boot confirmation (owner request, Sep 20): one line, every boot —
   // the restart verdict reaches the owner's chat without anyone asking
   await bot.notifyBoot(subBoot).catch(() => {});
+
+  // A paused schedule whose route was repaired during this boot is still paused: nothing
+  // re-checks it. Report them once, together — resuming stays the owner's call.
+  try {
+    const repaired = (scheduler.list(undefined, { includePaused: true }) as Schedule[])
+      .filter((job) => job.status === "paused" && bot.canRouteSchedule(job));
+    await bot.reportRepairedSchedules(repaired);
+  } catch (e) {
+    console.error("[pibot] repaired-schedule report failed:", e);
+  }
 
   const shutdown = () => {
     console.log("\n[pibot] stopping…");

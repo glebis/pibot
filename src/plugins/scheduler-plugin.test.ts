@@ -107,7 +107,10 @@ describe("scheduler plugin", () => {
     const { tools } = pluginFor("a1", { transport: "agent", chatId: "task-t1" });
     await tools.get("schedule_create")!.execute("t1", { title: "vault cleanup", when: "in 20m" });
     const job = scheduler.list("a1")[0];
-    expect(job.chat).toEqual({ transport: "agent", chatId: "task-t1" });
+    // "agent" is a session marker, not a transport: persisting it produced jobs that
+    // could never route ("delivery transport unavailable: agent"). The job keeps no
+    // chat and resolves through the agent's owned chats when it fires.
+    expect(job.chat).toEqual({ transport: "", chatId: "" });
     expect(job.delivery).toBe("agent");
   });
 

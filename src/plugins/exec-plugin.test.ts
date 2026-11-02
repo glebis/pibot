@@ -507,6 +507,30 @@ describe('exec outcome audit', () => {
   });
 });
 
+describe("yt-dlp impersonation flags", () => {
+  it("allows --list-impersonate-targets and a client-token --impersonate value", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "execytimp-"));
+    try {
+      const allow = DEFAULT_EXEC_ALLOWLIST.filter((e) => e.bin === "yt-dlp");
+      const list = await resolveExec(["yt-dlp", "--list-impersonate-targets"], { agentDir: dir, workspace: dir }, allow);
+      expect(list.error).toBeUndefined();
+      const one = await resolveExec(["yt-dlp", "--skip-download", "--impersonate", "chrome", "https://youtu.be/N8mV_E3IcZU"], { agentDir: dir, workspace: dir }, allow);
+      expect(one.error).toBeUndefined();
+      const withOs = await resolveExec(["yt-dlp", "--impersonate=chrome:macos", "--list-subs", "https://youtu.be/N8mV_E3IcZU"], { agentDir: dir, workspace: dir }, allow);
+      expect(withOs.error).toBeUndefined();
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("still refuses an impersonate value that is not a client token", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "execytimp-"));
+    try {
+      const allow = DEFAULT_EXEC_ALLOWLIST.filter((e) => e.bin === "yt-dlp");
+      const bad = await resolveExec(["yt-dlp", "--impersonate", "chrome; rm -rf /", "https://youtu.be/x"], { agentDir: dir, workspace: dir }, allow);
+      expect(bad.error).toMatch(/value for --impersonate is not allowed/);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe("yt-dlp description metadata flag", () => {
   it("allowlists --write-description for https URLs (workspace-relative outputs)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yt-desc-"));

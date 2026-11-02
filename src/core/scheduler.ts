@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Schedule, ScheduleRepeat } from "./types.js";
+import type { ChatRef, Schedule, ScheduleRepeat } from "./types.js";
 import { ensureDir, errorMessage, nextRepeatAt, readJson, uid, writeJsonAtomic } from "./util.js";
 
 /**
@@ -40,6 +40,28 @@ export interface ScheduleFailureNotice {
 
 export class ScheduleRouteError extends Error {}
 
+/**
+ * Synthetic chat markers a session can be bound to. They address a session, not a
+ * transport: nothing in `transports` is ever named `agent` or `internal`, so persisting
+ * one as `chat.transport` produces a job that can never route (Oct 30: three jobs
+ * stored `transport: "agent"` and died with "delivery transport unavailable: agent").
+ */
+const SYNTHETIC_TRANSPORTS = new Set(["agent", "internal"]);
+
+/** True when `chat` addresses a real transport (so `direct` delivery can reach it). */
+export function isRoutableChat(chat: Pick<ChatRef, "transport" | "chatId"> | undefined): boolean {
+  return Boolean(chat?.transport && chat.chatId && !SYNTHETIC_TRANSPORTS.has(chat.transport));
+}
+
+/**
+ * The persisted chat for a new job. A synthetic marker is dropped rather than stored:
+ * an `agent`-delivered job with no chat resolves through the agent's owned chats at
+ * fire time, which is the only destination that can still be correct later.
+ */
+export function durableChat(chat: ChatRef): ChatRef {
+  return isRoutableChat(chat) ? { transport: chat.transport, chatId: chat.chatId } : { transport: "", chatId: "" };
+}
+
 export class Scheduler {
   private jobs = new Map<string, Schedule>();
   private snoozeByAgent = new Map<string, SnoozeState>();
@@ -50,6 +72,14 @@ export class Scheduler {
   private fireCb: (job: Schedule, snoozed: boolean) => void | Promise<void>;
   private noticeCb?: (job: Schedule, event: ScheduleFailureNotice) => void | Promise<void>;
   private stopped = false;
+  /**
+   * Timer wheel gate (bd Oct 30). Defaults to armed for standalone schedulers (tests,
+   * ACP sessions). The daemon calls `disarm()` before `bot.start()`, because boot
+   * creates jobs (`ensureHeartbeatJob`, `ensureMorningBriefJob`, `ensureAttendPassJob`)
+   * and `ensure()`/`create()` armed them immediately: an overdue job then fired before
+   * sub-bot transports attached, hit `assertRoute`, and paused itself.
+   */
+  private armed = true;
   private routeValidator?: (job: Pick<Schedule, "agentId" | "chat" | "delivery" | "internal">) => string | undefined;
 
   /** Host checks transport availability and ownership without rerouting a job. */
@@ -186,6 +216,8 @@ export class Scheduler {
       createdAt: Date.now(),
       firedCount: 0,
       ...job,
+      // never persist a synthetic marker ("agent", "internal") as a transport name
+      chat: job.internal ? job.chat : durableChat(job.chat),
       id: job.id ?? uid("sc", 6),
     };
     this.jobs.set(full.id, full);
@@ -205,6 +237,7 @@ export class Scheduler {
 
   /** Create or replace a job by id (used for heartbeat rhythm jobs) */
   ensure(job: Schedule & { id: string }): Schedule {
+    if (!job.internal) job = { ...job, chat: durableChat(job.chat) };
     this.jobs.set(job.id, job);
     this.save();
     this.rearm(job.id);
@@ -325,9 +358,35 @@ export class Scheduler {
     this.timers.clear();
   }
 
+  /**
+   * Hold the timer wheel until every delivery transport is live. Jobs created in the
+   * meantime stay persisted as `pending` and are armed by `arm()` in one pass.
+   */
+  disarm(): void {
+    this.armed = false;
+    for (const t of this.timers.values()) clearTimeout(t);
+    this.timers.clear();
+  }
+
+  /**
+   * Arm the timer wheel once every delivery transport is live. Until then `rearm()`
+   * records nothing: jobs stay persisted as `pending` and are armed here in one pass,
+   * so a boot-time `ensure()` can never fire against an empty route table.
+   */
+  arm(): void {
+    if (this.stopped || this.armed) { this.rearm(); return; }
+    this.armed = true;
+    this.rearm();
+  }
+
+  /** True once the host armed the wheel (jobs created before that are not firing yet). */
+  isArmed(): boolean {
+    return this.armed;
+  }
+
   /** (Re)arm timers; pass an id to rearm just that job */
   rearm(id?: string): void {
-    if (this.stopped) return;
+    if (this.stopped || !this.armed) return;
     const targets = id ? [id] : [...this.timers.keys(), ...this.jobs.keys()];
     for (const jid of targets) {
       const t = this.timers.get(jid);
