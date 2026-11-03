@@ -395,15 +395,19 @@ def create_app(token: str, bridge_token: str, port: int = 8788, bridge_port: int
                 answer = await asyncio.wait_for(handler.handle_web_request(SmallWebRTCRequest(sdp=body["sdp"], type="offer"), connected), 20)
                 if not answer or state.task is None:
                     raise ValueError("Voice connection did not start")
-                return answer
+                return {**answer, "sessionId": sid}
             except Exception as error:
                 print(f"voice: offer failed ({type(error).__name__})", flush=True)
                 await close_session()
                 raise HTTPException(503, "Voice connection could not start") from None
 
     @app.delete("/api/session")
-    async def stop():
+    async def stop(sessionId: str | None = None):
+        if sessionId is not None and not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", sessionId):
+            raise HTTPException(400, "Invalid session id")
         async with state.lock:
+            if sessionId is not None and state.session_id is not None and sessionId != state.session_id:
+                raise HTTPException(409, "A different voice session is active")
             await close_session()
         return {"closed": True}
 
