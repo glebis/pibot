@@ -66,8 +66,7 @@ tailnet). Microphone access needs a secure browser context and permission.
 - **Manage:** cancel a named active durable run. The runtime decides whether it
   is still cancellable. No arbitrary process kill, queue flush, replay, circuit
   reset, schedule mutation, or automatic restart is exposed.
-- **Chat:** select an existing live canonical agent/chat binding and open a
-  session. Type or use bb's native dictation. Transcripts remain editable;
+- **Chat:** select an existing live canonical agent/chat binding and type directly. Type or use bb's native dictation. Transcripts remain editable;
   recording/transcription blocks Send. Agent replies return through the shared
   PiBot session. The current canonical session loads automatically for the selected
   agent/chat binding. **Load session** refreshes it; **Load earlier messages**
@@ -81,8 +80,11 @@ tailnet). Microphone access needs a secure browser context and permission.
 
 Tools start disabled. **Allow tools** opts into the agent's existing allowed
 capabilities, never expands them, and keeps approvals in the authenticated
-PiBot chat. Only one plugin chat/call can be open at once. Close a session
-before changing agents. Calls/sessions expire after 15 minutes.
+PiBot chat. Text conversations do not reserve an idle session. Different agents/chats and
+clients can send independently; only overlapping turns against the same
+canonical session remain protected by PiBot's turn gate. Drafts and pending
+requests stay with their originating agent/chat. Live audio still has one
+call slot, independent of text conversations; calls expire after 15 minutes.
 
 A timeout or disconnected response is an **unconfirmed outcome**. The plugin
 never retries a mutation automatically; inspect the canonical chat before
@@ -131,7 +133,8 @@ reloading the plugin. SOPS and the owner's age key must be available on the bb
 server machine. This discovers credentials; it does not deploy new endpoints.
 
 All connection settings are also editable **in the PiBot agents page**. Use
-**Configure connections** to jump to its inline panel. It shows the detected
+**Connections** to open its overlay panel. Close it with the same control, the
+backdrop, or Escape. It shows the detected
 checkout, has an optional advanced path override, supports blank-to-preserve
 password fields and explicit token clearing, and offers **Connect local PiBot**
 for the existing dashboard/chat-bridge credentials. You do not need to leave
@@ -151,8 +154,7 @@ notice; it never joins disconnected entries. Duplicate IDs and cycles are
 rejected. It supports existing
 indexed files in that same agent's legacy checkout storage without moving or
 rewriting them. Unindexed archives are never selected automatically. The UI
-continues the same canonical agent/chat session when **Open conversation** is
-used; it does not reset the session or switch its branch. Disk history can lag
+continues the same canonical agent/chat session when a message is sent; it does not reset the session or switch its branch. Disk history can lag
 a branch change that has not yet been persisted. History is available for
 local PiBot services; an advanced agent-storage override lives in the inline
 connection settings. Reads are limited to 64 MiB per session file.
@@ -180,3 +182,19 @@ arguments. Temporary audio remains private and is moved through `trash` on clean
 closing the page cleans it up. This feature requires bb to run on a Mac; it
 does not use browser speech synthesis or a paid voice service. Long voice-call
 instructions attached to saved messages appear in a collapsed disclosure.
+
+
+Message bodies use a statically bundled Markdown/GFM renderer so a failed bb
+lazy-loaded Markdown chunk cannot hide the conversation. Links still use bb's
+`UrlLink` primitive. Raw HTML is escaped, and unsafe URL schemes are rejected.
+Saved and new messages use the same renderer.
+
+
+The composer is available as soon as an agent/chat is selected. Each send opens
+a short-lived, text-purpose bridge connection and closes only that connection
+after the reply. It does not hold a global reservation between messages. The
+bridge supports up to 32 simultaneous text connections separately from its
+single audio/phone connection. Text-purpose support requires the updated PiBot
+bridge; the plugin refuses to silently reserve an old global audio slot.
+Request IDs deduplicate in-flight and recently completed submissions, including
+uncertain outcomes; no automatic send/replay retries occur.

@@ -29,11 +29,13 @@ export interface VoiceHost {
   voiceCancelTask?(agentId:string,chatKey:string,taskId:string):Promise<boolean|undefined>;
   blockedDecisionProjection?(scope:SourceScope):BlockedDecisionProjection|undefined;
 }
-interface Session { agentId:string;chatKey:string;callSid:string;tools?:string[];front?:boolean;expires:number;controller:AbortController;requests:Map<string,{text:string;reply?:string}>;busy:boolean }
+interface Session { purpose?:'chat';agentId:string;chatKey:string;callSid:string;tools?:string[];front?:boolean;expires:number;controller:AbortController;requests:Map<string,{text:string;reply?:string}>;busy:boolean }
 export function createCanonicalVoiceBridge(host:VoiceHost,token:string,clock=Date.now) {
   if(!/^[a-f0-9]{64}$/.test(token))throw new Error('Invalid voice bridge credential');
   const sessions=new Map<string,Session>();
   const consumedCalls=new Set<string>();
+  const hasAudioSession=()=>[...sessions.values()].some(s=>s.purpose!=='chat');
+  const chatSessionCount=()=>[...sessions.values()].filter(s=>s.purpose==='chat').length;
   const app=new Hono();
   const end=(id:string)=>{const s=sessions.get(id);if(!s)return;s.controller.abort();sessions.delete(id);if(s.front)void host.voiceFrontClose?.(id)?.catch(()=>{});};
   function sweep(){for(const [id,s] of sessions)if(s.expires<=clock())end(id);}
@@ -68,7 +70,7 @@ export function createCanonicalVoiceBridge(host:VoiceHost,token:string,clock=Dat
   app.post('/voice/sessions',async c=>{
     let b:any;try{b=await body(c);}catch{return c.json({error:'invalid_body'},400);}
     if(!b||typeof b.agentId!=='string'||typeof b.chatKey!=='string'||!/^CA[a-f0-9]{32}$/i.test(b.callSid??'')||!allowed(b))return c.json({error:'binding_denied'},403);
-    if(sessions.size||consumedCalls.has(b.callSid)||consumedCalls.size>=10000)return c.json({error:'session_unavailable'},409);
+    if(hasAudioSession()||consumedCalls.has(b.callSid)||consumedCalls.size>=10000)return c.json({error:'session_unavailable'},409);
     const sessionId=randomUUID();consumedCalls.add(b.callSid);
     sessions.set(sessionId,{agentId:b.agentId,chatKey:b.chatKey,callSid:b.callSid,expires:clock()+180000,controller:new AbortController(),requests:new Map(),busy:false});
     const greeting=pendingSummary(b);return c.json({sessionId,...(greeting?{greeting}: {})});
@@ -87,12 +89,15 @@ export function createCanonicalVoiceBridge(host:VoiceHost,token:string,clock=Dat
     if(!b||typeof b.agentId!=='string'||typeof b.chatKey!=='string'||!allowed(b))return c.json({error:'binding_denied'},403);
     if(b.tools!==undefined&&(!Array.isArray(b.tools)||b.tools.length>200||!b.tools.every((n:unknown)=>typeof n==='string'&&TOOL_NAME.test(n))))return c.json({error:'invalid_tools'},400);
     if(b.mode!==undefined&&b.mode!=='front'&&b.mode!=='agent')return c.json({error:'invalid_mode'},400);
-    if(sessions.size)return c.json({error:'session_unavailable'},409);
+    if(b.purpose!==undefined&&b.purpose!=='chat')return c.json({error:'invalid_purpose'},400);
+    const chat=b.purpose==='chat';
+    if(chat&&b.mode!=='agent')return c.json({error:'invalid_mode'},400);
+    if(chat?chatSessionCount()>=32:hasAudioSession())return c.json({error:'session_unavailable'},409);
     const sessionId=randomUUID();
     const front=(b.mode??'front')==='front'&&!!host.voiceFrontOpen&&!!host.voiceFrontTurn;
     if(front&&!host.voiceFrontOpen!(sessionId,b.agentId,b.chatKey,b.tools))return c.json({error:'binding_denied'},403);
-    sessions.set(sessionId,{agentId:b.agentId,chatKey:b.chatKey,callSid:'browser',...(front?{front:true}:{}),...(b.tools?{tools:[...b.tools]}:{}),expires:clock()+15*60000,controller:new AbortController(),requests:new Map(),busy:false});
-    const greeting=pendingSummary(b);return c.json({sessionId,mode:front?'front':'agent',...(greeting?{greeting}: {})});
+    sessions.set(sessionId,{agentId:b.agentId,chatKey:b.chatKey,callSid:'browser',...(chat?{purpose:'chat' as const}:{}),...(front?{front:true}:{}),...(b.tools?{tools:[...b.tools]}:{}),expires:clock()+15*60000,controller:new AbortController(),requests:new Map(),busy:false});
+    const greeting=pendingSummary(b);return c.json({sessionId,mode:front?'front':'agent',...(chat?{purpose:'chat'}:{}),...(greeting?{greeting}: {})});
   });
   app.delete('/voice/sessions/:id',c=>{end(c.req.param('id'));return c.json({closed:true});});
   // front calls: task events to announce, plus the instructions/tools seam for speech-to-speech fronts
@@ -160,7 +165,7 @@ export function createCanonicalVoiceBridge(host:VoiceHost,token:string,clock=Dat
         // the front hung up: the voice service ends the call once this goodbye has been spoken
         return c.json({text:spoken,...(host.voiceFrontEnding?.(sessionId)?{end:true}:{})});
       }
-      const turn=host.voiceTurn({agentId:s.agentId,chatKey:s.chatKey,text:b.text,...(s.tools?{allowedTools:s.tools}:{}),signal:controller.signal,onApprovalRequired:()=>{approvalPending=true;approval();}});
+      const turn=host.voiceTurn({agentId:s.agentId,chatKey:s.chatKey,text:b.text,...(s.tools?{allowedTools:s.tools}:{}),...(s.purpose==='chat'?{queueIfBusy:false}:{}),signal:controller.signal,onApprovalRequired:()=>{approvalPending=true;approval();}});
       const result=await Promise.race([turn,approvalNotice,detached]);
       if(approvalPending){controller.abort();const reply=result.text!;s.requests.set(b.requestId,{text:b.text,reply});return c.json({text:reply,pendingApproval:true});}
       if(controller.signal.aborted||result.status==='detached')return c.json({error:'turn_detached'},409);

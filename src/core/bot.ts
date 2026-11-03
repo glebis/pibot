@@ -409,7 +409,7 @@ export class PiBot implements HeartbeatHost {
       finally { input.signal?.removeEventListener('abort',detach); this.activeVoiceTurns.delete(key); }
     });
     const result = run ? await run : {status:'busy' as const};
-    if (result.status !== 'busy') return result;
+    if (result.status !== 'busy' || input.queueIfBusy === false) return result;
     // The chat is still on an earlier turn (often a voice turn that outlived the 40 s audio wait).
     // Don't drop what was said: queue it behind that turn (at most two); the answers land in the chat.
     const holder=this.activeVoiceTurns.get(key);

@@ -6,7 +6,7 @@ async function session(r:ReturnType<typeof setup>){const x=await r.request('/voi
 describe('canonical voice bridge',()=>{
  it('rejects unauthenticated access',async()=>{const r=setup();try{expect((await r.bridge.app.request('/voice/bindings')).status).toBe(401);}finally{r.bridge.close();}});
  it('rejects nonowner or stale bindings',async()=>{const r=setup();try{expect((await r.request('/voice/sessions',{callSid,agentId:'assistant',chatKey:'telegram:-42'})).status).toBe(403);}finally{r.bridge.close();}});
- it('runs one canonical turn and deduplicates its request',async()=>{const r=setup();try{const id=await session(r),body={text:'Hello',requestId:'r1'};expect((await r.request(`/voice/sessions/${id}/turn`,body)).status).toBe(200);expect((await r.request(`/voice/sessions/${id}/turn`,body)).status).toBe(200);expect(r.host.voiceTurn).toHaveBeenCalledTimes(1);expect((await r.request(`/voice/sessions/${id}/turn`,{...body,text:'Other'})).status).toBe(409);}finally{r.bridge.close();}});
+ it('runs one canonical turn and deduplicates its request',async()=>{const r=setup();try{const id=await session(r),body={text:'Hello',requestId:'r1'};expect((await r.request(`/voice/sessions/${id}/turn`,body)).status).toBe(200);expect((await r.request(`/voice/sessions/${id}/turn`,body)).status).toBe(200);expect(r.host.voiceTurn).toHaveBeenCalledTimes(1);expect(vi.mocked(r.host.voiceTurn).mock.calls[0][0]).not.toHaveProperty('queueIfBusy');expect((await r.request(`/voice/sessions/${id}/turn`,{...body,text:'Other'})).status).toBe(409);}finally{r.bridge.close();}});
  it('revalidates binding before every turn',async()=>{const r=setup();try{const id=await session(r);r.host.voiceBindings=()=>[];expect((await r.request(`/voice/sessions/${id}/turn`,{text:'Hi',requestId:'r1'})).status).toBe(403);expect(r.host.voiceTurn).not.toHaveBeenCalled();}finally{r.bridge.close();}});
  it('never recreates a consumed call session',async()=>{const r=setup();try{const id=await session(r);await r.request(`/voice/sessions/${id}`,undefined,'DELETE');expect((await r.request('/voice/sessions',{callSid,agentId:'assistant',chatKey:'telegram:42'})).status).toBe(409);}finally{r.bridge.close();}});
  it('refuses another call while one is attached',async()=>{const r=setup();try{await session(r);expect((await r.request('/voice/sessions',{callSid:'CA'+'c'.repeat(32),agentId:'assistant',chatKey:'telegram:42'})).status).toBe(409);}finally{r.bridge.close();}});
@@ -45,3 +45,62 @@ describe('canonical voice bridge',()=>{
 });
 
 it('reads a pending blocked decision without entering its locked agent and resumes after the chat answer',async()=>{const r=setup();let pending=true;r.host.voicePendingDecision=()=>pending?{decisionId:'q1',question:'Choose the deadline action.',options:['Approve','Cancel']}:undefined;try{const response=await r.request('/voice/sessions',{callSid,agentId:'assistant',chatKey:'telegram:42'});const created=await response.json() as any;expect(created.greeting).toContain('Choose the deadline action');expect(created.greeting).toContain('authenticated chat');const result=await r.request(`/voice/sessions/${created.sessionId}/turn`,{requestId:'pending',text:'Approve'});expect(await result.json()).toMatchObject({readOnly:true,pendingApproval:true});expect(r.host.voiceTurn).not.toHaveBeenCalled();pending=false;expect((await r.request(`/voice/sessions/${created.sessionId}/turn`,{requestId:'after',text:'Continue'})).status).toBe(200);expect(r.host.voiceTurn).toHaveBeenCalledOnce();}finally{r.bridge.close();}});
+
+describe('canonical text conversation leases',()=>{
+ const binding={agentId:'assistant',chatKey:'telegram:42'};
+ const open=(r:ReturnType<typeof setup>,extra:Record<string,unknown>={})=>r.request('/voice/browser-sessions',{...binding,mode:'agent',purpose:'chat',...extra});
+ it('opens independent text conversations and preserves per-lease tools and targeted close',async()=>{
+  const r=setup();r.host.voiceBindings=()=>[binding,{agentId:'coach',chatKey:'telegram:43'}];
+  r.host.voiceFrontOpen=vi.fn(()=>true);r.host.voiceFrontTurn=vi.fn(async()=>'front');
+  try{
+   const first=await open(r,{tools:[]});expect(first.status).toBe(200);const a=await first.json() as any;
+   const second=await open(r,{agentId:'coach',chatKey:'telegram:43',tools:['read']});expect(second.status).toBe(200);const b=await second.json() as any;
+   expect(a).toMatchObject({purpose:'chat',mode:'agent'});expect(a.sessionId).not.toBe(b.sessionId);expect(r.host.voiceFrontOpen).not.toHaveBeenCalled();
+   await r.request(`/voice/sessions/${a.sessionId}/turn`,{requestId:'r1',text:'Hi'});
+   await r.request(`/voice/sessions/${b.sessionId}/turn`,{requestId:'r1',text:'Hi'});
+   expect(vi.mocked(r.host.voiceTurn).mock.calls[0][0]).toMatchObject({allowedTools:[],queueIfBusy:false});expect(vi.mocked(r.host.voiceTurn).mock.calls[1][0]).toMatchObject({agentId:'coach',allowedTools:['read']});
+   await r.request(`/voice/sessions/${a.sessionId}`,undefined,'DELETE');
+   expect((await r.request(`/voice/sessions/${a.sessionId}/turn`,{requestId:'r2',text:'Hi'})).status).toBe(404);
+   expect((await r.request(`/voice/sessions/${b.sessionId}/turn`,{requestId:'r2',text:'Hi'})).status).toBe(200);
+  }finally{r.bridge.close();}
+ });
+ it('keeps the single audio/phone limit independent of idle text leases',async()=>{
+  const r=setup();try{
+   expect((await open(r)).status).toBe(200);
+   const phone=await session(r);expect(phone).toBeTruthy();expect((await open(r)).status).toBe(200);
+   expect((await r.request('/voice/browser-sessions',binding)).status).toBe(409);
+   await r.request(`/voice/sessions/${phone}`,undefined,'DELETE');
+   const audio=await r.request('/voice/browser-sessions',binding);expect(audio.status).toBe(200);expect(await audio.json()).not.toHaveProperty('purpose');
+   expect((await r.request('/voice/sessions',{...binding,callSid:'CA'+'c'.repeat(32)})).status).toBe(409);
+   expect((await r.request('/voice/sessions',{...binding,callSid})).status).toBe(409);
+  }finally{r.bridge.close();}
+ });
+ it('caps text leases at32 while keeping an audio slot and reclaiming only closed leases',async()=>{
+  const r=setup();try{
+   let first='';for(let i=0;i<32;i++){const response=await open(r);expect(response.status).toBe(200);const b=await response.json() as any;if(!i)first=b.sessionId;}
+   expect((await open(r)).status).toBe(409);expect((await r.request('/voice/browser-sessions',binding)).status).toBe(200);
+   await r.request(`/voice/sessions/${first}`,undefined,'DELETE');expect((await open(r)).status).toBe(200);expect((await open(r)).status).toBe(409);
+  }finally{r.bridge.close();}
+ });
+ it('validates purpose, canonical agent mode, bindings, and tool narrowing',async()=>{
+  const r=setup();try{
+   for(const extra of [{purpose:'audio'},{purpose:null},{mode:'front'},{mode:undefined},{tools:['bad name']}])expect((await open(r,extra)).status).toBe(400);
+   expect((await open(r,{chatKey:'telegram:99'})).status).toBe(403);expect(r.host.voiceTurn).not.toHaveBeenCalled();
+  }finally{r.bridge.close();}
+ });
+ it('permits parallel bindings but preserves session and host busy gates',async()=>{
+  const r=setup();r.host.voiceBindings=()=>[binding,{agentId:'coach',chatKey:'telegram:43'}];
+  let finish!:(value:{status:'completed';text:string})=>void;let started!:()=>void;
+  const running=new Promise<void>(resolve=>{started=resolve;});
+  r.host.voiceTurn=vi.fn<VoiceHost['voiceTurn']>(input=>{if(input.agentId==='coach')return Promise.resolve({status:'completed',text:'Other reply.'});started();return new Promise(resolve=>{finish=resolve;});});
+  try{
+   const a=await(await open(r)).json() as any,b=await(await open(r,{agentId:'coach',chatKey:'telegram:43'})).json() as any;
+   const turn=r.request(`/voice/sessions/${a.sessionId}/turn`,{requestId:'one',text:'Hi'});await running;
+   expect(await(await r.request(`/voice/sessions/${a.sessionId}/turn`,{requestId:'two',text:'Hi'})).json()).toEqual({error:'session_busy_or_limit'});
+   expect((await r.request(`/voice/sessions/${b.sessionId}/turn`,{requestId:'other',text:'Hi'})).status).toBe(200);
+   finish({status:'completed',text:'Done.'});expect((await turn).status).toBe(200);
+   r.host.voiceTurn=vi.fn<VoiceHost['voiceTurn']>(async()=>({status:'busy'}));
+   expect(await(await r.request(`/voice/sessions/${b.sessionId}/turn`,{requestId:'busy',text:'Hi'})).json()).toEqual({error:'agent_busy'});
+  }finally{r.bridge.close();}
+ });
+});

@@ -160,3 +160,17 @@ describe('canonical turn gate',()=>{
 it('sends contract reminders through the bound transport and acknowledges without replacing questions',async()=>{const h=harness();const acknowledge=vi.fn(()=>true);h.b.urgentSourceStores=new Set([{acknowledge}]);h.b.questions.ask=vi.fn();const input={agentId:'assistant',canonicalChatId:'telegram:42',text:'Renewal decision',decisionId:'d1',questionVersion:1,revision:'r1',deadline:Date.now()+600000};expect((await h.bot.sendUrgentSourceMessage(input)).status).toBe('accepted');const args=h.t.push.mock.calls.at(-1)!;expect(args[0]).toBe('42');const action=(args[1] as any).card.buttons[0].action;expect(await h.bot.handleAction(h.t as any,'99',action)).toContain('no longer');expect(acknowledge).not.toHaveBeenCalled();expect(await h.bot.handleAction(h.t as any,'42',action)).toContain('No call');expect(acknowledge).toHaveBeenCalledWith(action.slice(6),'telegram:42');expect(h.b.questions.ask).not.toHaveBeenCalled();h.b.chatAgent.set('telegram:42','other');expect((await h.bot.sendUrgentSourceMessage(input)).status).toBe('rejected');});
 
 it('exposes only live accepted explicit-deadline questions for the exact bound voice agent',()=>{const h=harness();const now=Date.now();const q={qid:'q1',agentId:'assistant',canonicalChatId:'telegram:42',question:'Approve?',options:['Yes','No'],status:'pending',pendingUntil:now+60000,usefulUntil:now+60000,deadlineReason:'Deadline',provenance:'agent_declared_deadline',acceptedMessageAt:now};h.b.questions.pendingSnapshots=()=>[q];expect(h.bot.voicePendingDecision(h.input)).toEqual({decisionId:'q1',question:'Approve?',options:['Yes','No']});expect(h.bot.voicePendingDecision({...h.input,agentId:'other'})).toBeUndefined();for(const patch of [{status:'answered'},{acceptedMessageAt:undefined},{usefulUntil:undefined},{pendingUntil:now-1}]){h.b.questions.pendingSnapshots=()=>[{...q,...patch}];expect(h.bot.voicePendingDecision(h.input)).toBeUndefined();}});
+
+it('returns busy for nonqueueing text without scheduling an unrestricted follow-up, then permits explicit resend',async()=>{
+ const h=harness();const hold=deferred();h.session.prompt.mockImplementationOnce(()=>hold.promise);
+ const original=h.bot.promptAgent.bind(h.bot);const prompt=vi.spyOn(h.bot,'promptAgent');
+ const text=original(h.t as any,'42','assistant','Existing text turn',{taskAckFrom:null});
+ try{
+  expect(await h.bot.voiceTurn({...h.input,allowedTools:[],queueIfBusy:false})).toEqual({status:'busy'});
+  expect(prompt).not.toHaveBeenCalled();expect(h.b.voiceQueued.size).toBe(0);
+  hold.resolve();await text;await Promise.resolve();expect(h.session.prompt).toHaveBeenCalledTimes(1);
+  const tools=Object.assign(h.session,{getActiveToolNames:()=>['read','bash'],setActiveToolsByName:vi.fn()});
+  expect((await h.bot.voiceTurn({...h.input,allowedTools:[],queueIfBusy:false})).status).toBe('completed');
+  expect(h.session.prompt).toHaveBeenCalledTimes(2);expect(tools.setActiveToolsByName).toHaveBeenNthCalledWith(1,[]);
+ }finally{hold.resolve();await text;prompt.mockRestore();}
+});

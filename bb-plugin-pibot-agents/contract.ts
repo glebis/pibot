@@ -25,6 +25,7 @@ export const rpcContract = defineRpcContract({
   speechStatus:{input:z.object({playbackId:id}).strict(),output:z.object({status:z.enum(['speaking','finished','stopped','failed'])})},
   stopSpeech:{input:z.object({playbackId:id}).strict(),output:z.object({stopped:z.boolean()})},
   history:{input:z.object({agentId,chatKey:z.string().min(1).max(200),before:z.string().max(256).optional()}).strict(),output:z.object({sessionId:z.string().nullable(),messages:z.array(z.object({id:z.string(),role:z.enum(['user','assistant']),text:z.string().max(16000),timestamp:z.string().optional()})).max(50),before:z.string().nullable(),hasMore:z.boolean(),truncated:z.boolean().optional(),watchKey:z.string().regex(/^[a-f0-9]{64}$/).optional()})},
+  chat:{input:z.object({agentId,chatKey:z.string().min(1).max(200),allowTools:z.boolean(),text:z.string().trim().min(1).max(4000),requestId:id}).strict(),output:z.object({text:z.string().max(2000),pendingApproval:z.boolean().optional()})},
   openChat:{input:z.object({agentId,chatKey:z.string().min(1).max(200),allowTools:z.boolean()}).strict(),output:z.object({sessionId:id,greeting:z.string().optional()})},
   send:{input:z.object({sessionId:id,text:z.string().trim().min(1).max(4000),requestId:id}).strict(),output:z.object({text:z.string().max(2000),pendingApproval:z.boolean().optional()})},
   closeChat:{input:z.object({sessionId:id}).strict(),output:z.object({closed:z.boolean()})},

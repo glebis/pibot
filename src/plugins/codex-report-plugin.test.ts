@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { codexReportPlugin } from "./codex-report-plugin.js";
+import { codexReportPlugin, DATALESS_ERROR_HINT } from "./codex-report-plugin.js";
 
 function factoryOf(ext: InlineExtension): (pi: ExtensionAPI) => void {
   return typeof ext === "function" ? ext : ext.factory;
@@ -31,6 +31,7 @@ describe("codex-report plugin", () => {
     fs.mkdirSync(path.join(reportsDir, "2026-10-27"));
     fs.writeFileSync(path.join(reportsDir, "2026-10-27", "report.md"), "# Weekly report\n\nscreen time data");
     fs.writeFileSync(path.join(reportsDir, "2026-10-27", "raw.json"), "{\"minutes\":42}");
+    fs.writeFileSync(path.join(reportsDir, "2026-10-27", "cloud.md"), "cloud content");
     fs.writeFileSync(path.join(outsideDir, "secret.md"), "not for agents");
   });
 
@@ -95,5 +96,52 @@ describe("codex-report plugin", () => {
     const res = await tools.get("codex_report_read")!.execute("t1", { path: "2026-10-27/big.md" });
     expect(res.details.ok).toBe(false);
     expect(res.content[0].text).toContain("caps at");
+  });
+
+  it("materializes an iCloud dataless file and retries the read", async () => {
+    let materialized = false;
+    const readRaw = (f: string): string => {
+      if (!materialized) throw new Error("Unknown system error -11, read");
+      return fs.readFileSync(f, "utf8");
+    };
+    const materialize = vi.fn(async () => {
+      materialized = true;
+    });
+    const sleeps: number[] = [];
+    const sleep = async (ms: number) => { sleeps.push(ms); };
+    const { pi, tools } = captureTools();
+    factoryOf(codexReportPlugin({ reportsDir, readRaw, materialize, sleep }))(pi);
+    const res = await tools.get("codex_report_read")!.execute("t1", { path: "2026-10-27/cloud.md" });
+    expect(res.details.ok).toBe(true);
+    expect(materialize).toHaveBeenCalledTimes(1);
+    expect(res.content[0].text).toContain("cloud content");
+  });
+
+  it("refuses honestly when materialization never lands", async () => {
+    const readRaw = (): string => {
+      throw new Error("Unknown system error -11, read");
+    };
+    const materialize = vi.fn(async () => {});
+    let sleeps = 0;
+    const sleep = async () => { sleeps++ };
+    const { pi, tools } = captureTools();
+    factoryOf(codexReportPlugin({ reportsDir, readRaw, materialize, sleep }))(pi);
+    const res = await tools.get("codex_report_read")!.execute("t1", { path: "2026-10-27/cloud.md" });
+    expect(res.details.ok).toBe(false);
+    expect(res.content[0].text).toContain(DATALESS_ERROR_HINT);
+    expect(materialize).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes non-dataless read errors straight through", async () => {
+    const materialize = vi.fn(async () => {});
+    const readRaw = (): string => {
+      throw new Error("EACCES: permission denied");
+    };
+    const { pi, tools } = captureTools();
+    factoryOf(codexReportPlugin({ reportsDir, readRaw, materialize, sleep: async () => {} }))(pi);
+    const res = await tools.get("codex_report_read")!.execute("t1", { path: "2026-10-27/cloud.md" });
+    expect(res.details.ok).toBe(false);
+    expect(res.content[0].text).toContain("EACCES");
+    expect(materialize).not.toHaveBeenCalled();
   });
 });

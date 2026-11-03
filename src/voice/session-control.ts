@@ -32,6 +32,8 @@ export interface BotVoiceInput {
   agentId: string; chatKey: string; text: string;
   /** owner-chosen tools for this call (names); undefined = the agent's full set, [] = talk only */
   allowedTools?: string[];
+  /** false returns busy without voice-only automatic queueing; text clients retry explicitly */
+  queueIfBusy?: boolean;
   onApprovalRequired?: () => void;
   onOutput?: (text: string) => void | Promise<void>;
   signal?: AbortSignal;

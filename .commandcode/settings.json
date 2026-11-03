@@ -8,7 +8,9 @@
       "Shell(for:*)",
       "Shell(do:*)",
       "Shell(done:*)",
-      "Shell(cd /Users/glebkalinin/ai_projects/pibot && ls src && echo \"---\" && ls src/plugins | head -60 && echo \"---\" && wc -l src/plugins/exec-trace.ts 2>/dev/null; ls src/plugins/*exec* 2>/dev/null)"
+      "Shell(cd /Users/glebkalinin/ai_projects/pibot && ls src && echo \"---\" && ls src/plugins | head -60 && echo \"---\" && wc -l src/plugins/exec-trace.ts 2>/dev/null; ls src/plugins/*exec* 2>/dev/null)",
+      "Shell(node -e const p=require('./package.json'); console.log(JSON.stringify(p.scripts,null,2)))",
+      "Shell(node -e const p=require('./bb-plugin-pibot-agents/package.json'); console.log(JSON.stringify(p.scripts,null,2)))"
     ],
     "deny": [],
     "defaultMode": "default"
