@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { BlockedError, MAX_ACTIVE_PER_AGENT, openTaskLedger, type Delivery, type TaskRun, type TaskRunner } from "./task-ledger.js";
+import { BlockedError, MAX_ACTIVE_PER_AGENT, openTaskLedger, type Delivery, type TaskRun, type TaskRunner , ownerReport } from "./task-ledger.js";
 
 const input = { agentId: "coach", chatKey: "telegram:42", title: "Draft the weekly note", instructions: "Write it." };
 
@@ -450,5 +450,24 @@ describe("durable task ledger", () => {
       expect(notes[0]).toContain("Task partial");
       expect(notes[0]).not.toContain("Task done");
     } finally { await ledger.close(); }
+  });
+});
+
+describe("owner-facing task completion report (attention budget)", () => {
+  it("keeps a short report whole", () => {
+    const head = "✅ Task done: **x**";
+    const text = ["Вердин verdict", "note path", "provenance"].join("\n");
+    expect(ownerReport(head, text)).toBe(`${head}\n\n${text}`);
+  });
+  it("caps a long operational memo to its first lines plus a ledger pointer", () => {
+    const head = "✅ Task done: **transcription**";
+    const text = ["line one", "line two", "line three", "line four", "line five", "line twenty"].join("\n");
+    const out = ownerReport(head, text);
+    expect(out).toContain(head);
+    expect(out).toContain("line one");
+    expect(out).toContain("line four");
+    expect(out).not.toContain("line five");
+    expect(out).not.toContain("line twenty");
+    expect(out).toContain("task log");
   });
 });

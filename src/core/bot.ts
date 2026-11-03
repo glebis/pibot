@@ -3828,7 +3828,7 @@ export class PiBot implements HeartbeatHost {
     const limit = new Promise<never>((_, reject) => { timer = setTimeout(() => { void session.abort().catch(() => {}); reject(new Error(`Task took longer than ${capMinutes} minutes and was stopped.`)); }, capMinutes * 60_000); });
     try {
       await Promise.race([
-        trackActivity({ kind: "task", label: run.title, agentId: run.agentId, chatKey: run.chatKey, session }, () => this.promptTaskWithCascade(run.agentId, session, ck, `[background task ${run.taskId}: "${run.title}" — requested from the owner's chat]\n\n${run.instructions}${resume}\n\nWork on it now with your tools. Finish with a short result summary for the owner; it is posted to their chat.`)),
+        trackActivity({ kind: "task", label: run.title, agentId: run.agentId, chatKey: run.chatKey, session }, () => this.promptTaskWithCascade(run.agentId, session, ck, `[background task ${run.taskId}: "${run.title}" — requested from the owner's chat]\n\n${run.instructions}${resume}\n\nWork on it now with your tools. Finish with a result report the owner reads in seconds: first line = the verdict, then up to three short lines (deliverable paths, provenance marker). Keep operational details (tool args, file sizes, failure forensics) in your own notes and event log — they are not posted to the owner's chat.`)),
         stop, limit,
       ]);
       this.deps.events.log(run.agentId, "system", `task done ${run.taskId}: ${truncate(run.title, 60)}`);

@@ -133,6 +133,14 @@ export interface TaskRunner {
   notify(chatKey: string, text: string): Promise<Delivery | void>;
 }
 
+/** bd attention budget: the owner’s chat sees the verdict and the deliverable pointers;
+ *  the full operational memo stays in the ledger. Deterministic cap, not model manners. */
+export function ownerReport(head: string, text: string): string {
+  const lines = text.split("\n");
+  if (lines.length <= 4 && text.length <= 420) return `${head}\n\n${text}`;
+  const keep = lines.slice(0, 4).join("\n").trimEnd();
+  return `${head}\n\n${keep}\n\n… full report is in the task log (${lines.length} lines).`;
+}
 export interface TaskLedger {
   start(input: LedgerTaskInput, requestId?: string): Promise<LedgerEntry>;
   /** Return the newest active task for an agent/chat, if any. */
@@ -412,7 +420,7 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
           : `⚠️ Task failed: **${task.input.title}**`;
         let receipt: Delivery | void;
         try {
-          receipt = await runner.notify(task.input.chatKey, `${head}\n\n${text}`);
+          receipt = await runner.notify(task.input.chatKey, ownerReport(head, text));
         } catch (e) {
           // The owner never saw the result, so the ledger must not claim done (bd pibot-zy70).
           // rt.report keeps the harness retry semantics; the entry stops saying ✅.
