@@ -1,9 +1,10 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_EXEC_ALLOWLIST, execPlugin, resolveExec, type ExecAllowEntry } from "./exec-plugin.js";
+import { DEFAULT_EXEC_ALLOWLIST, execPlugin, resolveExec, validateGroqKeySetup, type ExecAllowEntry } from "./exec-plugin.js";
 
 function factoryOf(ext: InlineExtension): (pi: ExtensionAPI) => void {
   return typeof ext === "function" ? ext : ext.factory;
@@ -385,6 +386,70 @@ describe("default allowlist hardening (bypass regressions)", () => {
 });
 
 describe("exec plugin tool", () => {
+  it("classifies actual pinned Groq parts exec_run failures without forwarding wrapper replacement prose", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-groq-exec-"));
+    const bin = path.join(dir, "mock-python3");
+    const pin = path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_parts.py");
+    const cases = [
+      ["blocked: blocked: Groq says Invalid API Key (401) — get a fresh key SECRET_PAYLOAD", "auth", "action=inspect-source rotation=source-unresolved"],
+      ["blocked: Groq rate limit (429) — wait SECRET_PAYLOAD", "quota", "action=wait rotation=not-warranted"],
+      ["blocked: transcription call failed (403) SECRET_PAYLOAD", "access-refused", "action=investigate rotation=not-warranted"],
+      ["blocked: GROQ_API_KEY missing SECRET_PAYLOAD", "credential-missing", "action=setup-manual rotation=not-warranted"],
+      ["HTTP Error 401: Unauthorized. Get a fresh API key SECRET_PAYLOAD", "auth", "action=inspect-source rotation=source-unresolved"],
+      ["HTTP Error 429: Too Many Requests SECRET_PAYLOAD", "quota", "action=wait rotation=not-warranted"],
+      ["HTTP Error 403: Forbidden SECRET_PAYLOAD", "access-refused", "action=investigate rotation=not-warranted"],
+      ["URLError: connection failed SECRET_PAYLOAD", "network", "action=investigate rotation=not-warranted"],
+      ["EOFError: stdin required SECRET_PAYLOAD", "stdin-unavailable", "action=none rotation=not-warranted"],
+      ["refused: local limit reached SECRET_PAYLOAD", "refusal", "action=none rotation=not-warranted"],
+      ["Invalid API key; get a fresh key SECRET_PAYLOAD", "unknown", "action=none rotation=not-warranted"],
+    ] as const;
+    try {
+      for (const [wrapperText, category, disposition] of cases) {
+        fs.writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' '${wrapperText}' ${wrapperText.startsWith("blocked:") ? "" : ">&2"}\nexit 1\n`);
+        fs.chmodSync(bin, 0o755);
+        const { pi, tools } = captureTools();
+        factoryOf(execPlugin({ workspace: dir, agentDir: dir, allowlist: [
+          { bin, pin: [pin], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
+        ] }))(pi);
+        const result = await tools.get("exec_run")!.execute(`groq-${category}`, { argv: [bin, pin, "audio.m4a"] });
+        const text = result.content[0].text;
+        expect(result.details.ok).toBe(false);
+        expect(text).toContain("service=groq-parts-exec");
+        expect(text).toContain(`executor=${path.basename(dir)}`);
+        expect(text).toContain(`source=${category === "credential-missing" ? "none" : "unknown"}`);
+        expect(text).toContain(`category=${category}`);
+        expect(text).toContain(disposition);
+        expect(text).toMatch(/at=\d{4}-\d\d-\d\dT/);
+        expect(text).not.toContain("SECRET_PAYLOAD");
+        expect(text).not.toContain("fresh key");
+      }
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("scopes a timeout to Groq parts even when a sibling command succeeded", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-groq-exec-"));
+    const bin = path.join(dir, "mock-python3");
+    const pin = path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_parts.py");
+    try {
+      fs.writeFileSync(bin, "#!/bin/sh\nsleep 1\n");
+      fs.chmodSync(bin, 0o755);
+      const { pi, tools } = captureTools();
+      factoryOf(execPlugin({ workspace: dir, agentDir: dir, timeoutMs: 20, allowlist: [
+        { bin: "/bin/echo" },
+        { bin, pin: [pin], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
+      ] }))(pi);
+      const sibling = await tools.get("exec_run")!.execute("sibling", { argv: ["/bin/echo", "ok"] });
+      expect(sibling.details.ok).toBe(true);
+      const result = await tools.get("exec_run")!.execute("groq-timeout", { argv: [bin, pin, "audio.m4a"] });
+      expect(result.details.ok).toBe(false);
+      expect(result.content[0].text).toContain("service=groq-parts-exec");
+      expect(result.content[0].text).toContain("source=unknown");
+      expect(result.content[0].text).toContain("category=timeout");
+      expect(result.content[0].text).toContain("rotation=not-warranted");
+      expect(result.content[0].text).not.toContain("sibling");
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it("registers exec_run and runs an allowlisted command end-to-end", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-exec-tool-"));
     try {
@@ -431,23 +496,90 @@ describe("exec plugin tool", () => {
     expect(twoPos.error).toMatch(/positional/);
   });
 
+  it("vtt-text pin: exactly one file positional, no flags, mirrored to production allowlist", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-vtt-"));
+    try {
+      const py = path.join(dir, "fake-py");
+      fs.writeFileSync(py, "#!/bin/sh\nexit 0\n");
+      fs.chmodSync(py, 0o755);
+      const pin = path.join(os.homedir(), ".agents/skills/vtt-text/scripts/vtt_text.py");
+      const prod = DEFAULT_EXEC_ALLOWLIST.find((item) => item.pin?.[0] === pin);
+      expect(prod).toBeDefined();
+      expect(prod!.positionals).toEqual({ min: 1, max: 1 });
+      expect(prod!.allowFlags).toBeUndefined();
+      const allow: ExecAllowEntry[] = [
+        { bin: py, pin: [pin], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
+      ];
+      const deps = { workspace: dir, agentDir: dir };
+      const ok = await resolveExec([py, pin, "~/inbox/captions.vtt"], deps, allow);
+      expect(ok.error).toBeUndefined();
+      const flag = await resolveExec([py, pin, "in.vtt", "--chunk", "6500"], deps, allow);
+      expect(flag.error).toMatch(/flag-like/);
+      const none = await resolveExec([py, pin], deps, allow);
+      expect(none.error).toMatch(/positional/);
+      const dashpath = await resolveExec([py, pin, "-o", "out.txt"], deps, allow);
+      expect(dashpath.error).toMatch(/flag-like|positional/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
-  it("groq key setup: pin-only intake takes no positionals (dialog-driven, zero argv surface)", async () => {
+
+  it("groq key setup: production allowlist refuses unattended interactive intake and never reports the key invalid", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-groqsetup-"));
-    const py = path.join(dir, "fake-py");
-    fs.writeFileSync(py, "#!/bin/sh\nexit 0\n");
-    fs.chmodSync(py, 0o755);
-    const pin = path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_key_setup.py");
-    const allowBB: ExecAllowEntry[] = [{ bin: py, pin: [pin], allowPositionalRe: /^[^-]/, positionals: { max: 2 } }];
-    const deps = { workspace: dir, agentDir: dir };
-    const ok = await resolveExec([py, pin, "keychain"], deps, allowBB);
-    expect(ok.error).toBeUndefined();
-    const ok2 = await resolveExec([py, pin, "sops"], deps, allowBB);
-    expect(ok2.error).toBeUndefined();
-    const dash = await resolveExec([py, pin, "--env-file", "x"], deps, allowBB);
-    expect(dash.error).toMatch(/flag-like|not allowed/);
-    const three = await resolveExec([py, pin, "keychain", "sops", "extra"], deps, allowBB);
-    expect(three.error).toBeTruthy();
+    try {
+      const pin = path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_key_setup.py");
+      const entry = DEFAULT_EXEC_ALLOWLIST.find((item) => item.pin?.[0] === pin);
+      expect(entry).toBeDefined();
+      expect(entry!.validate).toBe(validateGroqKeySetup);
+      const deps = { workspace: dir, agentDir: dir };
+      for (const args of [[], ["sops"], ["keychain"], ["bogus"]]) {
+        const result = entry!.validate!(args, deps);
+        expect("error" in result).toBe(true);
+        const error = (result as { error: string }).error;
+        expect(error).toContain("service=groq-key-setup");
+        expect(error).toContain(`executor=${path.basename(dir)}`);
+        expect(error).toContain("source=unknown");
+        expect(error).toContain("category=setup-intake-interactive");
+        expect(error).toContain("rotation=not-warranted");
+        expect(error).toMatch(/not an authentication result/i);
+        expect(error).toMatch(/NOT thereby shown to be invalid/i);
+        expect(error).toMatch(/owner-initiated terminal session/i);
+      }
+      const status = entry!.validate!(["status"], deps);
+      expect("error" in status).toBe(true);
+      expect((status as { error: string }).error).toContain("category=noninteractive-probe-refused");
+      expect((status as { error: string }).error).toContain("rotation=not-warranted");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  const python3 = (() => {
+    try {
+      return execFileSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).trim() || null;
+    } catch {
+      return null;
+    }
+  })();
+
+  it.skipIf(!python3)("production resolution refuses key-setup before any spawn for bare and absolute interpreter argv", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pibot-groqsetup-"));
+    try {
+      const pin = path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_key_setup.py");
+      for (const interpreter of ["python3", python3!]) {
+        const result = await resolveExec([interpreter, pin], { workspace: dir, agentDir: dir }, DEFAULT_EXEC_ALLOWLIST);
+        expect(result.argv).toEqual([]);
+        const error = result.error ?? "";
+        expect(error).toContain("service=groq-key-setup");
+        expect(error).toContain("category=setup-intake-interactive");
+        expect(error).toContain("rotation=not-warranted");
+        expect(error).toMatch(/not an authentication result/i);
+        expect(error).toMatch(/NOT thereby shown to be invalid/i);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
 describe('exec trace tools', () => {
