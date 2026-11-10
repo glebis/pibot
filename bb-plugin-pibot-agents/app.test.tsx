@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, waitFor, cleanup, act } from '@testing-library/react';
+import { fireEvent, waitFor, cleanup, act, render } from '@testing-library/react';
 import { loadPluginApp, renderSlot } from '@get-bb/plugin-sdk/testing/app';
 import { rpcContract } from './contract';
+import {VideoNotePlayer} from './video-note-player';
 
 // Keep the official app runtime and RPC harness; replace only the native host dictation widget.
 vi.mock('@get-bb/plugin-sdk/app',async(importOriginal)=>{
@@ -14,12 +15,84 @@ const selectedWatch='a'.repeat(64);
 const agent={id:'assistant',description:'Helps with tasks',model:'local',providers:['local'],capabilities:['read']};
 const snapshot={agents:[agent],processes:{takenAt:1,daemon:{pid:42,uptimeSec:60,rssKb:1024},turns:[],tasks:{active:[],recent:[]},children:[],goals:[],voiceCalls:[]}};
 const openInput={agentId:'assistant',chatKey:'telegram:second',allowTools:false};
-function handlers(){const h={config:vi.fn(async()=>({dashboardConfigured:true,bridgeConfigured:true,audioConfigured:true})),overview:vi.fn(async()=>snapshot),bindings:vi.fn(async()=>({bindings:[{agentId:'assistant',chatKey:'telegram:first'},{agentId:'assistant',chatKey:'telegram:second'}]})),openChat:vi.fn(async()=>({sessionId:'local-session'})),chat:vi.fn(async()=>({text:'Agent reply'})),send:vi.fn(async()=>({text:'Agent reply'})),closeChat:vi.fn(async()=>({closed:true})),createAgent:vi.fn(async()=>({id:'new-agent'})),cancelTask:vi.fn(async()=>({cancelled:true})),prepareAudio:vi.fn(async()=>({ready:true})),audioOffer:vi.fn(async()=>({sdp:'v=0',type:'answer' as const,callId:'call-1'})),audioEnd:vi.fn(async()=>({closed:true})),configure:vi.fn(async()=>({saved:true})),discoverLocal:vi.fn(async()=>({connected:true})),speak:vi.fn(async()=>({playbackId:'owned-speech'})),speechStatus:vi.fn(async()=>({status:'speaking'})),stopSpeech:vi.fn(async()=>({stopped:true})),history:vi.fn(async()=>({sessionId:null,messages:[],before:null,hasMore:false}))};h.chat.mockImplementation(async()=>{h.history.mockRejectedValue(new Error('Snapshot awaiting persistence'));return {text:'Agent reply'}});return h;}
+function handlers(){const h={conversations:vi.fn(async(_input:{agentId:string})=>({conversations:[] as {agentId:string;chatKey:string;canSend:boolean;kind?:'bb'|'telegram'|'saved'}[],nativeAvailable:false})),config:vi.fn(async()=>({dashboardConfigured:true,bridgeConfigured:true,audioConfigured:true})),overview:vi.fn(async()=>snapshot),bindings:vi.fn(async()=>({bindings:[{agentId:'assistant',chatKey:'telegram:first'},{agentId:'assistant',chatKey:'telegram:second'}]})),openChat:vi.fn(async()=>({sessionId:'local-session'})),chat:vi.fn(async()=>({text:'Agent reply'})),send:vi.fn(async()=>({text:'Agent reply'})),closeChat:vi.fn(async()=>({closed:true})),createAgent:vi.fn(async()=>({id:'new-agent'})),cancelTask:vi.fn(async()=>({cancelled:true})),prepareAudio:vi.fn(async()=>({ready:true})),audioOffer:vi.fn(async()=>({sdp:'v=0',type:'answer' as const,callId:'call-1'})),audioEnd:vi.fn(async()=>({closed:true})),configure:vi.fn(async()=>({saved:true})),discoverLocal:vi.fn(async()=>({connected:true})),speak:vi.fn(async()=>({playbackId:'owned-speech'})),speechStatus:vi.fn(async()=>({status:'speaking'})),stopSpeech:vi.fn(async()=>({stopped:true})),history:vi.fn(async()=>({sessionId:null,messages:[],before:null,hasMore:false}))};h.conversations.mockImplementation(async({agentId})=>({conversations:(await h.bindings()).bindings.filter(b=>b.agentId===agentId).map(b=>({...b,canSend:true,kind:'telegram' as const})),nativeAvailable:false}));h.chat.mockImplementation(async()=>{h.history.mockRejectedValue(new Error('Snapshot awaiting persistence'));return {text:'Agent reply'}});return h;}
 async function mount(rpc=handlers()){const app=await loadPluginApp(()=>import('./app'));const view=renderSlot(app.navPanels[0],{}, {rpc:rpc as any,experimental_rpcContract:rpcContract});return {view,rpc};}
+it.each([['heartbeat','Heartbeat'],['goal','Goal']])('starts %s messages folded with an expandable preview',async(kind,name)=>{
+ const rpc=handlers();rpc.history.mockResolvedValue({sessionId:'saved',messages:[
+  {id:kind,role:'user',text:`[Tue, Oct 27, 2026, 10:31 AM]\n\n[${kind}] Check recent changes.\n\nFull service instructions.`},
+  {id:'cascade',role:'user',text:'[cascade] Internal retry details.\n\n[goal] Finish the task.\n\n[ordinary] Keep plain prose.'},
+ ] as any,before:null,hasMore:false});
+ const {view}=await mount(rpc);const badge=(await view.findAllByRole('img',{name}))[0];
+ expect(badge.getAttribute('title')).toBe(`[${kind}]`);expect(badge.textContent).toBe('');
+ const folded=badge.closest('details')!;expect(folded.open).toBe(false);
+ expect(folded.querySelector('summary')?.textContent).toContain('Check recent changes.');
+ fireEvent.click(folded.querySelector('summary')!);expect(folded.open).toBe(true);
+ expect(view.getByText('Full service instructions.')).toBeTruthy();
+ expect(view.getByRole('img',{name:'Cascade'}).classList.contains('pb-message-marker')).toBe(true);
+ expect(view.getAllByRole('img',{name:'Goal'})[0].classList.contains('pb-message-marker')).toBe(true);
+ expect(view.getByText('[ordinary] Keep plain prose.').classList.contains('pb-message-marker')).toBe(false);
+});
+it('hides the user clock envelope while keeping header time and dates inside message content',async()=>{
+ const rpc=handlers();rpc.history.mockResolvedValue({sessionId:'saved',messages:[
+  {id:'clock',role:'user',text:'[Tue, Oct 27, 2026, 10:31 AM]\n\nOriginal message\n\n[27 October appointment]',timestamp:'2026-10-27T09:31:00Z'},
+  {id:'reply',role:'assistant',text:'[Tue, Oct 27, 2026, 10:31 AM]\n\nQuoted timestamp'},
+ ] as any,before:null,hasMore:false});
+ const {view}=await mount(rpc);const content=await view.findByText('Original message');
+ expect(content.closest('.pb-message-body')?.textContent).not.toContain('[Tue, Oct 27');
+ expect(view.getByText('[27 October appointment]')).toBeTruthy();
+ expect(content.closest('article')?.querySelector('time')?.getAttribute('datetime')).toBe('2026-10-27T09:31:00Z');
+ expect(view.getByText('[Tue, Oct 27, 2026, 10:31 AM]')).toBeTruthy();
+});
 beforeEach(()=>{HTMLElement.prototype.scrollIntoView=vi.fn();vi.spyOn(HTMLMediaElement.prototype,'pause').mockImplementation(()=>{});});
 afterEach(()=>{cleanup();vi.restoreAllMocks();vi.unstubAllGlobals();vi.useRealTimers();});
 
+describe('PiBot inline video notes',()=>{
+ const privatePath='/synthetic/pibot/data/media/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.mp4';
+ const wrapper=`[Video note attachment: "${privatePath}". Original video retained privately; save, forward to an editing agent, or edit only when requested. Do not echo its private path unless explicitly asked.]`;
+ const source='/api/v1/plugins/pibot-agents/http/video?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+ it('replaces the exact video wrapper inline, preserving captions and accessible controls',async()=>{
+  const rpc=handlers();rpc.history.mockResolvedValue({sessionId:'saved',messages:[{id:'video',role:'user',text:'[Tue, Oct 27, 2026, 10:31 AM]\n\n**Before the note**\n\n'+wrapper+'\n\nAfter the note.',videos:[{index:0,src:source}]}],before:null,hasMore:false} as any);const {view}=await mount(rpc);const video=await view.findByLabelText('Video note') as HTMLVideoElement;expect(video.tagName).toBe('VIDEO');expect(video.getAttribute('src')).toBe(source);expect(video.controls).toBe(false);expect(view.getByRole('button',{name:'Play video note'})).toBeTruthy();expect(view.getByRole('slider',{name:'Seek video note'})).toBeTruthy();expect(video.hasAttribute('playsinline')).toBe(true);expect(video.preload).toBe('metadata');expect(video.autoplay).toBe(false);expect(view.getByText('Before the note').tagName).toBe('STRONG');expect(view.getByText('After the note.')).toBeTruthy();const body=video.closest('.pb-message-body')!;expect(body.textContent).not.toContain(privatePath);expect(body.textContent).not.toContain('Original video retained privately');expect(body.textContent).not.toContain('10:31 AM');const player=video.closest('.pb-video-player')!;expect(player.previousElementSibling?.textContent).toContain('Before the note');expect(player.nextElementSibling?.textContent).toContain('After the note');
+ });
+ it('shows unavailable media without exposing or fetching a private file path',async()=>{
+  const rpc=handlers();rpc.history.mockResolvedValue({sessionId:'saved',messages:[{id:'missing',role:'user',text:'Caption\n\n'+wrapper}],before:null,hasMore:false} as any);const {view}=await mount(rpc);await view.findByText('Video note unavailable.');expect(view.getByText('Caption')).toBeTruthy();expect(view.queryByLabelText('Video note')).toBeNull();expect(view.container.innerHTML).not.toContain(privatePath);expect(view.container.querySelector('[src]')).toBeNull();
+ });
+ it('handles a player error locally and permits an explicit retry',async()=>{
+  const rpc=handlers();rpc.history.mockResolvedValue({sessionId:'saved',messages:[{id:'retry',role:'user',text:wrapper,videos:[{index:0,src:source}]}],before:null,hasMore:false} as any);const {view}=await mount(rpc);fireEvent.error(await view.findByLabelText('Video note'));await view.findByText('Video note unavailable.');expect(view.queryByLabelText('Video note')).toBeNull();fireEvent.click(view.getByRole('button',{name:'Retry video'}));expect((await view.findByLabelText('Video note')).getAttribute('src')).toBe(source);expect(view.container.textContent).not.toContain(privatePath);
+ });
+ it('refuses remote, file and non-plugin media URLs at the player boundary',()=>{
+  for(const src of ['https://remote.example/video.mp4','file:///private/video.mp4','/api/v1/plugins/another/http/video?id=aaaaaaaaaaaaaaaa','/api/v1/plugins/pibot-agents/http/video?id=aaaaaaaaaaaaaaaa&path=private']){const view=render(<VideoNotePlayer src={src}/>);expect(view.getByText('Video note unavailable.')).toBeTruthy();expect(view.container.querySelector('video')).toBeNull();expect(view.container.innerHTML).not.toContain(src);view.unmount();}
+ });
+ it('keeps private video paths out of collapsed previews and read aloud',async()=>{
+  const rpc=handlers();rpc.history.mockResolvedValue({sessionId:'saved',messages:[{id:'folded',role:'user',text:'[heartbeat] Check this note. '+wrapper},{id:'spoken',role:'assistant',text:'Here is the note. '+wrapper,videos:[{index:0,src:source}]}],before:null,hasMore:false} as any);const {view}=await mount(rpc);await view.findByLabelText('Video note');const preview=view.container.querySelector('.pb-heartbeat-preview')!;expect(preview.textContent).toContain('Video note attached.');expect(preview.textContent).not.toContain(privatePath);fireEvent.click(view.getByRole('button',{name:'Read aloud'}));await waitFor(()=>expect(rpc.speak).toHaveBeenCalledWith({text:'Here is the note. Video note attached.'}));expect(view.container.innerHTML).not.toContain(privatePath);
+ });
+});
+
+describe('PiBot composer attachments',()=>{
+ function native(){const rpc=handlers();rpc.conversations.mockImplementation(async({agentId})=>({conversations:[{agentId,chatKey:`bb:${agentId}:owner`,canSend:true,kind:'bb' as const}],nativeAvailable:true}));return rpc;}
+ const png=(name='shot.png')=>new File([new Uint8Array([137,80,78,71,13,10,26,10,0])],name,{type:'image/png'});
+ async function ready(rpc=native()){const result=await mount(rpc);await waitFor(()=>expect((result.view.getByRole('button',{name:'Attach files or images'}) as HTMLButtonElement).disabled).toBe(false));return result;}
+ async function add(view:any,file:File){fireEvent.change(view.getByLabelText('Choose attachments'),{target:{files:[file]}});await view.findByRole('button',{name:`Remove ${file.name}`});await waitFor(()=>expect(view.queryByText('Reading attachments…')).toBeNull());}
+ it('previews selected images, removes them and supports an image-only send',async()=>{
+  const {view,rpc}=await ready();await add(view,png());expect(view.getByAltText('Preview of shot.png')).toBeTruthy();fireEvent.click(view.getByRole('button',{name:'Remove shot.png'}));expect(view.queryByAltText('Preview of shot.png')).toBeNull();expect((view.getByRole('button',{name:'Send ↑'}) as HTMLButtonElement).disabled).toBe(true);await add(view,png());fireEvent.click(view.getByRole('button',{name:'Send ↑'}));await view.findByText('Agent reply');expect(rpc.chat).toHaveBeenCalledWith({agentId:'assistant',chatKey:'bb:assistant:owner',text:'',allowTools:false,requestId:expect.any(String),attachments:[{name:'shot.png',mimeType:'image/png',dataBase64:'iVBORw0KGgoA'}]});expect(view.queryByRole('button',{name:'Remove shot.png'})).toBeNull();expect(view.getByText('Attached files: shot.png')).toBeTruthy();
+ });
+ it('accepts clipboard images and dropped files, requiring tools for a document',async()=>{
+  const {view,rpc}=await ready();const draft=view.getByRole('textbox',{name:'Message draft'});expect(fireEvent.paste(draft,{clipboardData:{files:[png('pasted.png')]}})).toBe(false);await view.findByAltText('Preview of pasted.png');fireEvent.drop(draft.closest('.pb-composer')!,{dataTransfer:{files:[new File(['hello'],'note.txt',{type:'text/plain'})]}});await view.findByRole('button',{name:'Remove note.txt'});await waitFor(()=>expect(view.queryByText('Reading attachments…')).toBeNull());fireEvent.click(view.getByRole('button',{name:'Send ↑'}));await view.findByText('Enable Allow tools so the agent can read attached files. Images do not require tools.');expect(rpc.chat).not.toHaveBeenCalled();fireEvent.click(view.getByRole('checkbox',{name:'Allow tools'}));fireEvent.click(view.getByRole('button',{name:'Send ↑'}));await view.findByText('Agent reply');expect(rpc.chat).toHaveBeenCalledWith(expect.objectContaining({allowTools:true,attachments:[expect.objectContaining({name:'pasted.png'}),{name:'note.txt',mimeType:'text/plain',dataBase64:'aGVsbG8='}]}));
+ });
+ it('preserves attachment drafts after failure and across agents',async()=>{
+  const rpc=native();rpc.overview.mockResolvedValue({...snapshot,agents:[agent,{...agent,id:'second-agent',description:'Second helper'}]});rpc.chat.mockRejectedValue(new Error('Send failed'));const {view}=await ready(rpc);await add(view,png());fireEvent.click(view.getByRole('button',{name:'Send ↑'}));await view.findByText('Send failed');expect(view.getByRole('button',{name:'Remove shot.png'})).toBeTruthy();fireEvent.click(view.getByRole('button',{name:/second-agent/}));await waitFor(()=>expect(view.queryByRole('button',{name:'Remove shot.png'})).toBeNull());fireEvent.click(view.getByRole('button',{name:/assistant Helps/}));await view.findByRole('button',{name:'Remove shot.png'});expect(view.getByText('Send failed')).toBeTruthy();
+ });
+ it('keeps attachments added while an earlier submission is pending',async()=>{
+  const rpc=native();let finish!:(reply:{text:string})=>void;rpc.chat.mockImplementation(()=>new Promise(resolve=>{finish=resolve}));rpc.history.mockRejectedValue(new Error('Snapshot awaiting persistence'));const {view}=await ready(rpc);await add(view,png('first.png'));fireEvent.click(view.getByRole('button',{name:'Send ↑'}));await waitFor(()=>expect(finish).toBeTypeOf('function'));await add(view,png('next.png'));await act(async()=>finish({text:'Done'}));await view.findByText('Done');expect(view.queryByRole('button',{name:'Remove first.png'})).toBeNull();expect(view.getByRole('button',{name:'Remove next.png'})).toBeTruthy();
+ });
+ it('rejects oversized files and disables attachment selection on a Telegram conversation',async()=>{
+  const {view,rpc}=await ready();const file=png('large.png');Object.defineProperty(file,'size',{value:4*1024*1024+1});fireEvent.change(view.getByLabelText('Choose attachments'),{target:{files:[file]}});await view.findByText('Each attachment must be non-empty and no larger than 4 MB.');expect(view.queryByRole('list',{name:'Draft attachments'})).toBeNull();expect(rpc.chat).not.toHaveBeenCalled();view.unmount();const telegram=await mount();await waitFor(()=>expect((telegram.view.getByRole('textbox',{name:'Message draft'}) as HTMLTextAreaElement).disabled).toBe(false));expect((telegram.view.getByRole('button',{name:'Attach files or images'}) as HTMLButtonElement).disabled).toBe(true);expect(telegram.view.getByRole('button',{name:'Attach files or images'}).getAttribute('title')).toContain('independent BB chat');
+ });
+});
+
 describe('PiBot agents panel',()=>{
+ it('offers independent BB chat without any live Telegram binding or configured bridge',async()=>{const rpc=handlers();rpc.bindings.mockResolvedValue({bindings:[]});rpc.config.mockResolvedValue({dashboardConfigured:true,bridgeConfigured:false,audioConfigured:false});rpc.conversations.mockResolvedValue({conversations:[{agentId:'assistant',chatKey:'bb:assistant:owner',canSend:true,kind:'bb'}],nativeAvailable:true});const {view}=await mount(rpc);await view.findByRole('option',{name:'BB chat'});const draft=view.getByRole('textbox',{name:'Message draft'});await waitFor(()=>expect((draft as HTMLTextAreaElement).disabled).toBe(false));expect(rpc.chat).not.toHaveBeenCalled();fireEvent.change(draft,{target:{value:'Hello independently'}});fireEvent.click(view.getByRole('button',{name:'Send ↑'}));await view.findByText('Agent reply');expect(rpc.chat).toHaveBeenCalledWith({agentId:'assistant',chatKey:'bb:assistant:owner',text:'Hello independently',allowTools:false,requestId:expect.any(String)});expect(rpc.openChat).not.toHaveBeenCalled();expect(rpc.audioOffer).not.toHaveBeenCalled();});
+ it('shows saved-only history read-only and enables sending after choosing BB chat',async()=>{const rpc=handlers();rpc.bindings.mockResolvedValue({bindings:[]});rpc.conversations.mockResolvedValue({conversations:[{agentId:'assistant',chatKey:'telegram:old',canSend:false,kind:'saved'},{agentId:'assistant',chatKey:'bb:assistant:owner',canSend:true,kind:'bb'}],nativeAvailable:true});rpc.history.mockResolvedValue({sessionId:'old',messages:[{id:'old',role:'assistant',text:'Saved historical reply'}],before:null,hasMore:false} as any);const {view}=await mount(rpc);await view.findByText('Saved historical reply');await view.findByText('Saved conversation · read-only. Choose BB chat to send messages to this agent.');expect((view.getByRole('textbox',{name:'Message draft'}) as HTMLTextAreaElement).disabled).toBe(true);expect((view.getByRole('button',{name:'Send ↑'}) as HTMLButtonElement).disabled).toBe(true);expect(rpc.chat).not.toHaveBeenCalled();fireEvent.change(view.getByRole('combobox',{name:'PiBot chat binding'}),{target:{value:'bb:assistant:owner'}});await waitFor(()=>expect((view.getByRole('textbox',{name:'Message draft'}) as HTMLTextAreaElement).disabled).toBe(false));expect(view.queryByText('Saved conversation · read-only. Choose BB chat to send messages to this agent.')).toBeNull();});
+
  it('keeps raw HTML and unsafe Markdown URLs inert',async()=>{
   const rpc=handlers();rpc.history.mockResolvedValue({sessionId:'saved',messages:[{id:'unsafe-markdown',role:'assistant',text:'<script>window.bad = true</script>\n\n[Unsafe](javascript:alert(1))\n\n**Still visible**'}],before:null,hasMore:false} as any);
   const {view}=await mount(rpc);expect((await view.findByText('Still visible')).tagName).toBe('STRONG');

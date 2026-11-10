@@ -1,4 +1,4 @@
-export type ChatMessage={id?:string;role:string;text:string;timestamp?:string};
+export type ChatMessage={id?:string;role:string;text:string;timestamp?:string;videos?:Array<{index:number;src:string}>};
 /** Keep expanded earlier pages only when the saved tail proves this is an append. */
 export function mergeHistory(current:ChatMessage[],next:ChatMessage[],sameSession:boolean,savedTail?:string){
  const start=next[0]?.id?current.findIndex(m=>m.id===next[0].id):-1;

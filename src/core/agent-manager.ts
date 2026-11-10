@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { CommsHooks } from "../plugins/agent-comms-plugin.js";
 import { autoCompactPlugin } from "../plugins/auto-compact-plugin.js";
+import { sessionSearchPlugin } from "../plugins/session-search-plugin.js";
 import type { TelegramSendHooks } from "../plugins/telegram-send-plugin.js";
 import { AvatarArtifactStore, createDefaultAvatarProviders } from "./avatar.js";
 import { createDefaultSpeechProviders, SpeechArtifactStore, type SpeechKind } from "./speech.js";
@@ -356,6 +357,10 @@ export class AgentManager {
             dataDir: this.dataDir,
             log: (summary) => sessionEvents.log(agentId, "system", summary),
           }),
+          // Host-level, not a capability: every agent should be able to search its own past
+          // transcripts — including agents created before this existed, without editing
+          // private manifests. Read-only and scoped to this agent's own sessions dir.
+          sessionSearchPlugin({ sessionsDir: sessionsDir }),
         ],
       });
       await loader.reload();

@@ -9,6 +9,13 @@ import {readLocalAudioStartConfig,readLocalAudioToken} from './local-config';
 import {endpoint,request,type Endpoint} from './client';
 export function localAudioStartable(url:string,root:string){try{const target=endpoint(url,'validation-only');return !!root&&isAbsolute(root)&&target.url==='http://127.0.0.1:8788';}catch{return false;}}
 export async function audioListening():Promise<boolean>{return new Promise((resolve,reject)=>{const socket=connect({host:'127.0.0.1',port:8788});socket.setTimeout(1000);socket.once('connect',()=>{socket.destroy();resolve(true)});socket.once('error',(e:NodeJS.ErrnoException)=>{socket.destroy();if(e.code==='ECONNREFUSED')resolve(false);else reject(new Error('Could not determine local voice service status.'))});socket.once('timeout',()=>{socket.destroy();reject(new Error('Local voice service status timed out.'))});});}
+/** PiBot voice serves its HTML client at `/` without auth; other local services (e.g. claude-relay's JSON status) must not be mistaken for it. */
+export async function listenerIsPibotVoice():Promise<boolean>{
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),2000);
+ try{const r=await fetch('http://127.0.0.1:8788/',{redirect:'error',signal:controller.signal});await r.body?.cancel().catch(()=>{});return r.ok&&!!r.headers.get('content-type')?.includes('text/html');}
+ catch{return false;}finally{clearTimeout(timer);}
+}
+export const portConflict=()=>new Error('Port 8788 is held by another local service, not PiBot voice (claude-relay defaults to this port). Stop it or set RELAY_PORT to another port, then retry.');
 const failure=(stage="startup")=>new Error(`Local voice could not start (${stage}). Check the Pipecat Python environment, private speech credentials, and canonical bridge.`);
 export function createLocalAudioRuntime(){
  let child:ChildProcess|undefined,pending:Promise<Endpoint>|undefined,disposed=false,ownedTarget:Endpoint|undefined,ownedRoot:string|undefined,pendingRoot:string|undefined,state:string|undefined;
@@ -53,6 +60,6 @@ export function createLocalAudioRuntime(){
    const base=await realpath(root);
    if(pending){if(pendingRoot!==base)throw new Error('Local voice is starting from a different checkout. Wait before changing connections.');return pending;}
    if(ownedTarget&&child&&child.exitCode==null&&!child.killed){if(ownedRoot!==base)throw new Error('Local voice is running from a different checkout. Reload the plugin before changing connections.');return ownedTarget;}
-   pendingRoot=base;pending=(async()=>await audioListening()?endpoint(url,token||await readLocalAudioToken(base)):start(base))();try{return await pending}finally{pending=undefined;pendingRoot=undefined;}
+   pendingRoot=base;pending=(async()=>{if(!await audioListening())return start(base);if(!await listenerIsPibotVoice())throw portConflict();return endpoint(url,token||await readLocalAudioToken(base));})();try{return await pending}finally{pending=undefined;pendingRoot=undefined;}
  },async dispose(){disposed=true;child?.kill('SIGTERM');child=undefined;ownedTarget=undefined;ownedRoot=undefined;await cleanup().catch(()=>{});}};
 }

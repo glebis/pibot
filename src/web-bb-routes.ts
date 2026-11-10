@@ -5,6 +5,8 @@ import { createAgentFromSpec, validateAgentName } from "./core/agent-factory.js"
 import type { AgentManifest } from "./core/types.js";
 import type { LedgerEntry } from "./durable/task-ledger.js";
 import type { WebDeps } from "./web.js";
+import {validateChatAttachments,type ChatAttachment} from './core/chat-attachments.js';
+import { BbChatError } from './transports/bb.js';
 
 const bounded = (s: string | undefined, max = 160) => s?.slice(0, max);
 const strings = (values: string[] | undefined) => values?.slice(0, 100).map(s => bounded(s)!);
@@ -23,7 +25,24 @@ export function registerBbRoutes(app: Hono, deps: WebDeps, token: string | undef
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return c.json({ error: "unauthorized" }, 401);
     return next();
   });
-  app.use("/api/bb/*", bodyLimit({ maxSize: 8192, onError: c => c.json({ error: "Request body exceeds 8192 bytes" }, 400) }));
+  app.use("/api/bb/*",async(c,next)=>bodyLimit({maxSize:c.req.path==='/api/bb/chat'?12*1024*1024:8192,onError:c=>c.json({error:'Request body exceeds limit'},400)})(c,next));
+  app.get('/api/bb/conversations',c=>{
+    const agentId=c.req.query('agentId');
+    if(!agentId||!/^[A-Za-z0-9_-]{1,64}$/.test(agentId))return c.json({error:'Invalid agent ID'},400);
+    if(!deps.bbConversations)return c.json({error:'BB conversations unavailable'},503);
+    try{return c.json({conversations:deps.bbConversations.conversations(agentId)});}
+    catch(e){return c.json({error:e instanceof BbChatError?e.message:'BB conversations unavailable'},e instanceof BbChatError?e.status:503);}
+  });
+  app.post('/api/bb/chat',async c=>{
+    let body:unknown;try{body=await c.req.json();}catch{return c.json({error:'Invalid JSON'},400);}
+    if(!body||typeof body!=='object'||Array.isArray(body))return c.json({error:'Expected a BB message object'},400);
+    const b=body as Record<string,unknown>;
+    if(Object.keys(b).some(k=>!['agentId','chatKey','text','requestId','allowTools','attachments'].includes(k))||typeof b.agentId!=='string'||!/^[A-Za-z0-9_-]{1,64}$/.test(b.agentId)||b.chatKey!==`bb:${b.agentId}:owner`||typeof b.text!=='string'||(!b.text.trim()&&(!Array.isArray(b.attachments)||!b.attachments.length))||b.text.length>4000||typeof b.requestId!=='string'||!/^[A-Za-z0-9_-]{1,128}$/.test(b.requestId)||typeof b.allowTools!=='boolean')return c.json({error:'Invalid BB message'},400);
+    try{validateChatAttachments(b.attachments,b.allowTools as boolean);}catch(e){return c.json({error:e instanceof Error?e.message:'Invalid attachments'},400);}
+    if(!deps.bbConversations)return c.json({error:'BB conversations unavailable'},503);
+    try{return c.json(await deps.bbConversations.send({agentId:b.agentId,chatKey:b.chatKey as string,text:b.text,requestId:b.requestId,allowTools:b.allowTools,...(b.attachments!==undefined?{attachments:b.attachments as ChatAttachment[]}:{})}));}
+    catch(e){return c.json({error:e instanceof BbChatError?e.message:'BB message unavailable; the request may still be running. Retry only with the same request ID.'},e instanceof BbChatError?e.status:503);}
+  });
   app.get("/api/bb/agents", c => {
     try { return c.json({ agents: deps.agents.list().slice(0, 200).map(a => metadata(a.id, a.manifest, deps)) }); }
     catch { return c.json({ error: "Agents unavailable" }, 503); }

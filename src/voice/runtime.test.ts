@@ -6,7 +6,7 @@ async function session(r:ReturnType<typeof setup>){const x=await r.request('/voi
 describe('canonical voice bridge',()=>{
  it('rejects unauthenticated access',async()=>{const r=setup();try{expect((await r.bridge.app.request('/voice/bindings')).status).toBe(401);}finally{r.bridge.close();}});
  it('rejects nonowner or stale bindings',async()=>{const r=setup();try{expect((await r.request('/voice/sessions',{callSid,agentId:'assistant',chatKey:'telegram:-42'})).status).toBe(403);}finally{r.bridge.close();}});
- it('runs one canonical turn and deduplicates its request',async()=>{const r=setup();try{const id=await session(r),body={text:'Hello',requestId:'r1'};expect((await r.request(`/voice/sessions/${id}/turn`,body)).status).toBe(200);expect((await r.request(`/voice/sessions/${id}/turn`,body)).status).toBe(200);expect(r.host.voiceTurn).toHaveBeenCalledTimes(1);expect(vi.mocked(r.host.voiceTurn).mock.calls[0][0]).not.toHaveProperty('queueIfBusy');expect((await r.request(`/voice/sessions/${id}/turn`,{...body,text:'Other'})).status).toBe(409);}finally{r.bridge.close();}});
+ it('runs one canonical turn and deduplicates its request',async()=>{const r=setup();try{const id=await session(r),body={text:'Hello',requestId:'r1'};expect((await r.request(`/voice/sessions/${id}/turn`,body)).status).toBe(200);expect((await r.request(`/voice/sessions/${id}/turn`,body)).status).toBe(200);expect(r.host.voiceTurn).toHaveBeenCalledTimes(1);expect(vi.mocked(r.host.voiceTurn).mock.calls[0][0]).not.toHaveProperty('queueIfBusy');expect(vi.mocked(r.host.voiceTurn).mock.calls[0][0]).not.toHaveProperty('purpose');expect((await r.request(`/voice/sessions/${id}/turn`,{...body,text:'Other'})).status).toBe(409);}finally{r.bridge.close();}});
  it('revalidates binding before every turn',async()=>{const r=setup();try{const id=await session(r);r.host.voiceBindings=()=>[];expect((await r.request(`/voice/sessions/${id}/turn`,{text:'Hi',requestId:'r1'})).status).toBe(403);expect(r.host.voiceTurn).not.toHaveBeenCalled();}finally{r.bridge.close();}});
  it('never recreates a consumed call session',async()=>{const r=setup();try{const id=await session(r);await r.request(`/voice/sessions/${id}`,undefined,'DELETE');expect((await r.request('/voice/sessions',{callSid,agentId:'assistant',chatKey:'telegram:42'})).status).toBe(409);}finally{r.bridge.close();}});
  it('refuses another call while one is attached',async()=>{const r=setup();try{await session(r);expect((await r.request('/voice/sessions',{callSid:'CA'+'c'.repeat(32),agentId:'assistant',chatKey:'telegram:42'})).status).toBe(409);}finally{r.bridge.close();}});
@@ -58,10 +58,25 @@ describe('canonical text conversation leases',()=>{
    expect(a).toMatchObject({purpose:'chat',mode:'agent'});expect(a.sessionId).not.toBe(b.sessionId);expect(r.host.voiceFrontOpen).not.toHaveBeenCalled();
    await r.request(`/voice/sessions/${a.sessionId}/turn`,{requestId:'r1',text:'Hi'});
    await r.request(`/voice/sessions/${b.sessionId}/turn`,{requestId:'r1',text:'Hi'});
-   expect(vi.mocked(r.host.voiceTurn).mock.calls[0][0]).toMatchObject({allowedTools:[],queueIfBusy:false});expect(vi.mocked(r.host.voiceTurn).mock.calls[1][0]).toMatchObject({agentId:'coach',allowedTools:['read']});
+   expect(vi.mocked(r.host.voiceTurn).mock.calls[0][0]).toMatchObject({allowedTools:[],queueIfBusy:false,purpose:'chat'});expect(vi.mocked(r.host.voiceTurn).mock.calls[1][0]).toMatchObject({agentId:'coach',allowedTools:['read']});
    await r.request(`/voice/sessions/${a.sessionId}`,undefined,'DELETE');
    expect((await r.request(`/voice/sessions/${a.sessionId}/turn`,{requestId:'r2',text:'Hi'})).status).toBe(404);
    expect((await r.request(`/voice/sessions/${b.sessionId}/turn`,{requestId:'r2',text:'Hi'})).status).toBe(200);
+  }finally{r.bridge.close();}
+ });
+ it('keeps rich text for chat sessions and derives purpose only from the owned session',async()=>{
+  const r=setup();const full='**Detailed reply**\n\n[Read source](https://example.com/source).\n\n```ts\nconst answer = 42;\n```\n\n- Keep this list.\n- And this item.\n\nSentence five. Sentence six. Sentence seven.';
+  r.host.voiceTurn=vi.fn<VoiceHost['voiceTurn']>(async()=>({status:'completed',text:full}));
+  try{
+   const chat=await(await open(r)).json() as {sessionId:string};
+   const body={requestId:'rich-text',text:'Show details',purpose:'audio'};
+   expect(await(await r.request(`/voice/sessions/${chat.sessionId}/turn`,body)).json()).toEqual({text:full});
+   expect(vi.mocked(r.host.voiceTurn).mock.calls[0][0]).toMatchObject({purpose:'chat',queueIfBusy:false});
+   expect(await(await r.request(`/voice/sessions/${chat.sessionId}/turn`,body)).json()).toEqual({text:full});expect(r.host.voiceTurn).toHaveBeenCalledTimes(1);
+   const phone=await session(r);
+   const audioReply=await(await r.request(`/voice/sessions/${phone}/turn`,{requestId:'audio',text:'Speak',purpose:'chat'})).json() as {text:string};
+   expect(vi.mocked(r.host.voiceTurn).mock.calls[1][0]).not.toHaveProperty('purpose');expect(vi.mocked(r.host.voiceTurn).mock.calls[1][0]).not.toHaveProperty('queueIfBusy');
+   expect(audioReply.text).not.toContain('https://');expect(audioReply.text).not.toContain('```');expect(audioReply.text).not.toEqual(full);
   }finally{r.bridge.close();}
  });
  it('keeps the single audio/phone limit independent of idle text leases',async()=>{

@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { BlockedError, MAX_ACTIVE_PER_AGENT, openTaskLedger, type Delivery, type TaskRun, type TaskRunner , ownerReport } from "./task-ledger.js";
+import { BlockedError, MAX_ACTIVE_PER_AGENT, openTaskLedger, TaskDeadlineError, type TaskLedger, type TaskRun, type TaskRunner, type TaskRunResult, ownerReport } from "./task-ledger.js";
+import { formatDelegateEvidence } from "../core/task-reconcile.js";
 
 const input = { agentId: "coach", chatKey: "telegram:42", title: "Draft the weekly note", instructions: "Write it." };
 
@@ -12,7 +13,7 @@ const untilAborted = (t: TaskRun) => new Promise<string>((_, reject) => {
   t.signal.addEventListener("abort", () => reject(new Error("aborted")));
 });
 
-function runner(run: (t: TaskRun) => Promise<string | { text: string; delivery?: Omit<Delivery, "deliveredAt"> }>) {
+function runner(run: (t: TaskRun) => Promise<string | TaskRunResult>) {
   const notes: string[] = [];
   const r: TaskRunner = { run: vi.fn(run), notify: vi.fn(async (_ck: string, text: string) => { notes.push(text); }) };
   return { r, notes };
@@ -145,6 +146,169 @@ describe("durable task ledger", () => {
       for (let i = 0; i < MAX_ACTIVE_PER_AGENT; i++) await ledger.start({ ...input, title: `t${i}` });
       await expect(ledger.start(input)).rejects.toThrow(/active tasks/);
       await expect(ledger.start({ ...input, agentId: "knower" })).resolves.toBeTruthy();
+    } finally { await ledger.close(); }
+  });
+
+  // ─── correlated partial output and append-only evidence (bd pibot-jiqv) ───
+
+  it("records a runner-reported partial result and its evidence, never done or failed", async () => {
+    const { r, notes } = runner(async () => ({
+      text: "Delegate reply: transcript ready",
+      status: "partial" as const,
+      partialReason: "deadline reached; filing pending",
+      evidence: "Delegate pibot-dev returned a reply: /tmp/a.txt",
+    }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      const partial = await until(() => ledger.get(t.id), (e) => e?.status === "partial");
+      expect(partial).toMatchObject({ status: "partial", result: "Delegate reply: transcript ready", error: "deadline reached; filing pending" });
+      expect(partial?.evidence).toContain("/tmp/a.txt");
+      await until(async () => notes.length, (n) => n === 1);
+      expect(notes[0]).toContain("Task partial");
+      expect(notes[0]).not.toContain("Task done");
+      expect(notes[0]).not.toContain("Task failed");
+    } finally { await ledger.close(); }
+  });
+
+  it("never flips a done record to partial, but does store appended evidence", async () => {
+    const { r } = runner(async () => "work finished");
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const done = await ledger.start({ ...input, title: "done task" });
+      await until(() => ledger.get(done.id), (e) => e?.status === "done");
+      const amended = await ledger.appendEvidence(done.id, "late note /tmp/late.txt", { cause: "deadline" });
+      expect(amended).toMatchObject({ status: "done" });
+      expect(amended?.evidence).toContain("/tmp/late.txt");
+    } finally { await ledger.close(); }
+  });
+
+  it("promotes a DEADLINE failure to partial, but preserves an arbitrary failure", async () => {
+    const deadlineLedger = await openTaskLedger({ runner: runner(async () => { throw new TaskDeadlineError("Task took longer than X minutes and was stopped."); }).r });
+    try {
+      const f = await deadlineLedger.start({ ...input, title: "deadline task" });
+      await until(() => deadlineLedger.get(f.id), (e) => e?.status === "failed");
+      const amended = await deadlineLedger.appendEvidence(f.id, "late delegate reply /tmp/late.txt", { cause: "deadline", usable: true });
+      expect(amended).toMatchObject({ status: "partial", evidenceUsable: true });
+      expect(amended?.evidence).toContain("/tmp/late.txt");
+      expect(amended?.usableReceipt).toContain("/tmp/late.txt");
+      expect(amended?.error).toBeUndefined();
+      expect(amended?.blocker).toContain("filing/delivery is still unconfirmed");
+    } finally { await deadlineLedger.close(); }
+
+    const errorLedger = await openTaskLedger({ runner: runner(async () => { throw new Error("model exploded"); }).r });
+    try {
+      const f = await errorLedger.start({ ...input, title: "error task" });
+      await until(() => errorLedger.get(f.id), (e) => e?.status === "failed");
+      // Caller passes deadline+usable, but the RECORD was not a deadline failure: must stay failed.
+      const amended = await errorLedger.appendEvidence(f.id, "late delegate reply /tmp/late.txt", { cause: "deadline", usable: true });
+      expect(amended).toMatchObject({ status: "failed" }); // never relabel an arbitrary failure a deadline
+      expect(amended?.evidence).toContain("/tmp/late.txt");
+    } finally { await errorLedger.close(); }
+  });
+
+  it("keeps a cancelled outcome cancelled when evidence is appended", async () => {
+    const { r } = runner(untilAborted);
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      await until(() => ledger.get(t.id), (e) => e?.status === "running");
+      expect(await ledger.cancel(t.id)).toBe(true);
+      await until(() => ledger.get(t.id), (e) => e?.status === "cancelled");
+      const amended = await ledger.appendEvidence(t.id, "late delegate reply /tmp/late.txt", { cause: "deadline" });
+      expect(amended).toMatchObject({ status: "cancelled" });
+      expect(amended?.evidence).toContain("/tmp/late.txt");
+    } finally { await ledger.close(); }
+  });
+
+  it("dedupes concurrent appends inside the commit and bounds the stored evidence", async () => {
+    const { r } = runner(async () => "done");
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      await Promise.all([
+        ledger.appendEvidence(t.id, "same note /tmp/x.txt", { cause: "late" }),
+        ledger.appendEvidence(t.id, "same note /tmp/x.txt", { cause: "late" }),
+      ]);
+      let entry = await ledger.get(t.id);
+      expect(entry?.evidence?.split("same note /tmp/x.txt").length).toBe(2); // exactly once
+
+      await ledger.appendEvidence(t.id, `${"z".repeat(3500)}A`, { cause: "late" });
+      await ledger.appendEvidence(t.id, `${"y".repeat(3500)}B`, { cause: "late" });
+      entry = await ledger.get(t.id);
+      expect((entry?.evidence ?? "").length).toBeLessThanOrEqual(6000);
+      expect(entry?.evidence).toContain("[earlier evidence truncated]");
+    } finally { await ledger.close(); }
+  });
+
+  it("protects a compact usable path while later refusal context evicts rolling evidence", async () => {
+    const { r } = runner(async () => { throw new TaskDeadlineError("Task took longer than X minutes and was stopped."); });
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      await until(() => ledger.get(t.id), (e) => e?.status === "failed");
+      await ledger.appendEvidence(t.id, formatDelegateEvidence([{ toAgentId: "child", text: "Saved transcript to /tmp/protected.txt", usable: true }])!, { cause: "deadline", usable: true });
+      await ledger.appendEvidence(t.id, `BLOCKED: ${"x".repeat(3600)}`, { cause: "late", usable: false });
+      await ledger.appendEvidence(t.id, `REFUSED: ${"y".repeat(3600)}`, { cause: "late", usable: false });
+      const entry = await ledger.get(t.id);
+      expect(entry?.status).toBe("partial");
+      expect(entry?.evidence).not.toContain("/tmp/protected.txt");
+      expect(entry?.usableReceipt).toContain("/tmp/protected.txt");
+      expect(entry?.usableReceipt?.length).toBeLessThanOrEqual(1500);
+      expect(entry?.evidence?.length).toBeLessThanOrEqual(6000);
+    } finally { await ledger.close(); }
+  });
+
+  it("protects substantive no-path output from a formatted reply after context eviction", async () => {
+    const ledger = await openTaskLedger({ runner: runner(async () => "done").r });
+    try {
+      const t = await ledger.start(input);
+      await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      const report = formatDelegateEvidence([{ toAgentId: "child", text: "Summary:\nThe interview covers three hiring decisions.", usable: true }])!;
+      await ledger.appendEvidence(t.id, report, { usable: true });
+      await ledger.appendEvidence(t.id, `BLOCKED: ${"x".repeat(3600)}`, { usable: false });
+      await ledger.appendEvidence(t.id, `REFUSED: ${"y".repeat(3600)}`, { usable: false });
+      const entry = await ledger.get(t.id);
+      expect(entry?.evidence).not.toContain("three hiring decisions");
+      expect(entry?.usableReceipt).toContain("Summary: The interview covers three hiring decisions.");
+      expect(entry?.usableReceipt).not.toContain("Remaining gate:");
+    } finally { await ledger.close(); }
+  });
+
+  it("keeps a deadline failure partial when USABLE evidence lands while the run is still running", async () => {
+    let ledger!: TaskLedger;
+    const r = runner(async (run) => {
+      await ledger.appendEvidence(run.taskId, "receipt /tmp/race.txt", { cause: "late", usable: true });
+      throw new TaskDeadlineError("Task took longer than X minutes and was stopped.");
+    });
+    ledger = await openTaskLedger({ runner: r.r });
+    try {
+      const t = await ledger.start(input);
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial");
+      expect(entry?.evidence).toContain("/tmp/race.txt");
+      expect(entry?.result).toContain("/tmp/race.txt");
+      expect(entry?.result).toContain("Remaining gate:");
+      await until(async () => r.notes.length, (n) => n === 1);
+      expect(r.notes[0]).toContain("/tmp/race.txt");
+      expect(r.notes[0]).toContain("Remaining gate:");
+    } finally { await ledger.close(); }
+  });
+
+  it("does NOT promote a deadline failure when only refusal context lands before the terminal commit", async () => {
+    let ledger!: TaskLedger;
+    const r = runner(async (run) => {
+      // The child answered with a refusal/blocker, not usable output.
+      await ledger.appendEvidence(run.taskId, "Delegate pibot-dev returned a reply reporting a refusal/blocker: BLOCKED", { cause: "deadline", usable: false });
+      throw new TaskDeadlineError("Task took longer than X minutes and was stopped.");
+    });
+    ledger = await openTaskLedger({ runner: r.r });
+    try {
+      const t = await ledger.start(input);
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "failed");
+      expect(entry?.evidence).toContain("BLOCKED");
+      expect(entry?.evidenceUsable).toBeUndefined();
+      expect(entry?.failure).toBe("deadline");
     } finally { await ledger.close(); }
   });
 
@@ -449,6 +613,125 @@ describe("durable task ledger", () => {
       await until(async () => notes.length, (n) => n === 1);
       expect(notes[0]).toContain("Task partial");
       expect(notes[0]).not.toContain("Task done");
+    } finally { await ledger.close(); }
+  });
+  // ─── expected-content readback (bd pibot-cida, Nov 4 creator note) ───
+
+  const ADDITION = "as a meta-layer + allows you to see patterns, tensions, changes in quality of interactions";
+  const NOTE = "/tmp/agents/creator/shape of work.md";
+  const NOTE_BEFORE = "shape of work\n\nA plugin for your agent to illustrate what various parts of work look like";
+
+  it("records partial when an incapable executor reports success but wrote nothing", async () => {
+    // The real Nov 4 shape: "Task done" in the result text, "Not saved" in the body, file unchanged.
+    const { r, notes } = runner(async () => ({ text: "Task done. Not saved: file access is unavailable, and the agent creating the note is busy.", readback: { path: NOTE, text: NOTE_BEFORE, afterWrite: false } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedContent: ADDITION, outputLocation: NOTE });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial" || e?.status === "done");
+      expect(entry!.status).toBe("partial");
+      expect(entry!.error).toContain("did not happen after the write");
+      expect(entry!.readback).toMatchObject({ path: NOTE, afterWrite: false });
+      await until(async () => notes.length, (n) => n === 1);
+      expect(notes[0]).toContain("Task partial");
+      // the head line decides the owner's read; the run's own "Task done" prose in the body is
+      // exactly the claim this gate refuses to trust
+      expect(notes[0].split("\n")[0]).not.toContain("Task done");
+    } finally { await ledger.close(); }
+  });
+
+  it("records partial when the readback is post-write but lacks the exact addition", async () => {
+    const { r } = runner(async () => ({ text: "Appended the meta-layer line.", readback: { path: NOTE, text: `${NOTE_BEFORE}\n\nas a meta-layer`, afterWrite: true } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedContent: ADDITION, outputLocation: NOTE });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status !== "running" && e?.status !== "queued");
+      expect(entry!.status).toBe("partial");
+      expect(entry!.error).toContain("does not contain it");
+    } finally { await ledger.close(); }
+  });
+
+  it("records partial when the runner supplies no readback at all", async () => {
+    const { r } = runner(async () => "Saved and re-read the note.");
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedContent: ADDITION, outputLocation: NOTE });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status !== "running" && e?.status !== "queued");
+      expect(entry!.status).toBe("partial");
+      expect(entry!.error).toContain("no readback");
+    } finally { await ledger.close(); }
+  });
+
+  it("records done once the readback proves the addition exactly once", async () => {
+    const written = `${NOTE_BEFORE}\n\n${ADDITION}`;
+    const { r, notes } = runner(async () => ({ text: "Appended and re-read.", readback: { path: NOTE, text: written, afterWrite: true } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedContent: ADDITION, outputLocation: NOTE });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status !== "running" && e?.status !== "queued");
+      expect(entry!.status).toBe("done");
+      expect(entry!.error).toBeUndefined();
+      // exactly once: the continuation appended the sentence a single time
+      expect(entry!.readback?.text.split(ADDITION)).toHaveLength(2);
+      await until(async () => notes.length, (n) => n === 1);
+      expect(notes[0]).toContain("Task done");
+    } finally { await ledger.close(); }
+  });
+
+  it("matches the requested text across wrapped whitespace but not a partial sentence", async () => {
+    const wrapped = `${NOTE_BEFORE}\n\nas a meta-layer + allows you to see\npatterns, tensions, changes in quality of interactions`;
+    const { r } = runner(async () => ({ text: "ok", readback: { path: NOTE, text: wrapped, afterWrite: true } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedContent: ADDITION, outputLocation: NOTE });
+      expect((await until(() => ledger.get(t.id), (e) => e?.status !== "running" && e?.status !== "queued"))!.status).toBe("done");
+    } finally { await ledger.close(); }
+  });
+
+  it("records partial when the addition landed twice, so a retry cannot duplicate it silently", async () => {
+    // "records the addition once under the same task" — a resumed attempt that appends the same
+    // sentence again has changed the note twice, which is not the requested outcome.
+    const twice = `${NOTE_BEFORE}\n\n${ADDITION}\n\n${ADDITION}`;
+    const { r, notes } = runner(async () => ({ text: "Appended again.", readback: { path: NOTE, text: twice, afterWrite: true } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedContent: ADDITION, outputLocation: NOTE });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status !== "running" && e?.status !== "queued");
+      expect(entry!.status).toBe("partial");
+      expect(entry!.error).toContain("contains it 2 times");
+      await until(async () => notes.length, (n) => n === 1);
+      expect(notes[0].split("\n")[0]).not.toContain("Task done");
+    } finally { await ledger.close(); }
+  });
+
+  it("records done on a resumed attempt that leaves the single addition in place", async () => {
+    // Continuation shape: attempt 1 could not write; attempt 2 appends once and re-reads the note.
+    const { r } = runner(async () => ({ text: "Appended the requested line.", readback: { path: NOTE, text: `${NOTE_BEFORE}\n\n${ADDITION}`, afterWrite: true } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedContent: ADDITION, outputLocation: NOTE });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status !== "running" && e?.status !== "queued");
+      expect(entry!.status).toBe("done");
+      expect(entry!.readback?.text.split(ADDITION)).toHaveLength(2);
+    } finally { await ledger.close(); }
+  });
+
+  it("keeps the plain delivery gate when no expected content is named", async () => {
+    const { r } = runner(async () => ({ text: "no readback supplied", readback: { path: NOTE, text: "", afterWrite: false } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      expect((await until(() => ledger.get(t.id), (e) => e?.status !== "running" && e?.status !== "queued"))!.status).toBe("done");
+    } finally { await ledger.close(); }
+  });
+
+  it("records partial when the readback names a different artifact than the task's output location", async () => {
+    const { r } = runner(async () => ({ text: "wrote elsewhere", readback: { path: "/tmp/other.md", text: ADDITION, afterWrite: true } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedContent: ADDITION, outputLocation: NOTE });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status !== "running" && e?.status !== "queued");
+      expect(entry!.status).toBe("partial");
+      expect(entry!.error).toContain("/tmp/other.md");
     } finally { await ledger.close(); }
   });
 });

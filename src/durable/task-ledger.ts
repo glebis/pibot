@@ -18,6 +18,7 @@ import { lockStorageDir, type StorageLock } from "./storage-lock.js";
 import { truncate } from "../core/util.js";
 import { scanNumericClaims } from "../core/fact-check.js";
 import { correctRelativeDateClaims } from "../core/relative-date-guard.js";
+import { extractArtifactRefs } from "../core/task-reconcile.js";
 
 export type LedgerStatus = "queued" | "running" | "done" | "partial" | "blocked" | "failed" | "cancelled";
 
@@ -55,6 +56,15 @@ export class BlockedError extends Error {
   }
 }
 
+/** The run stopped because it reached its hard deadline (not a cancellation or a work error).
+ *  Lets the ledger distinguish a deadline reconciliation from an arbitrary failure (bd pibot-jiqv). */
+export class TaskDeadlineError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskDeadlineError";
+  }
+}
+
 export interface LedgerTaskInput {
   agentId: string;
   /** owner chat the task was requested from; the result is posted there */
@@ -84,6 +94,10 @@ export interface LedgerTaskInput {
   sourceMessageId?: number;
   /** verifiable acceptance criteria — the gate a completed task must satisfy */
   acceptanceCriteria?: string;
+  /** exact text the task must leave behind in `outputLocation` (bd pibot-cida: an append that was
+   *  reported as done while the file was unchanged). Checked by the ledger against a readback the
+   *  runner supplies AFTER writing; without that readback the task cannot be `done`. */
+  expectedContent?: string;
   /** what would unblock/advance this task next (task-record-canon) */
   nextAction?: string;
   /** where the task's artifacts live on disk (absolute paths) */
@@ -112,8 +126,32 @@ export interface LedgerEntry extends LedgerTaskInput {
   dateCheck?: { checked: number; inconsistent: number; corrected: boolean; blocked: boolean; failures: string[] };
   /** delivery receipt for the verified output (bd pibot-zy70) */
   delivery?: Delivery;
+  /** readback of the written artifact, captured after the write: path + extracted text (bd pibot-cida) */
+  readback?: ContentReadback;
+  /** correlated delegate evidence appended after the run (bd pibot-jiqv). Append-only: a late
+   *  result can prove usable work exists, but never turns a task into `done`. */
+  evidence?: string;
+  /** Compact usable reply and reported paths, protected from later context eviction. Delegate-reported, unverified. */
+  usableReceipt?: string;
+  /** structured proof that the stored evidence is usable output, not refusal/blocker prose.
+   *  Presence of `evidence` alone must never justify a `partial` promotion. */
+  evidenceUsable?: boolean;
+  /** structured identity of the failure cause. Only a real deadline may reconcile evidence. */
+  failure?: "deadline";
   /** pi-durable task id, kept so cancel() works after a restart */
   durableId?: number;
+}
+
+/** What a runner reports after an artifact write: the file it touched, the text it found there on
+ *  a fresh read, and whether that read happened after the write. The ledger never reads the file
+ *  itself — the runtime owns file access — but it refuses to call an unread work product done. */
+export interface ContentReadback {
+  /** absolute path that was written and then read back */
+  path: string;
+  /** text the artifact contained on that read (the ledger looks for the expected addition in it) */
+  text: string;
+  /** true only when the read happened after the write in the same run (bd pibot-cida) */
+  afterWrite: boolean;
 }
 
 export interface TaskRun extends LedgerTaskInput {
@@ -124,10 +162,24 @@ export interface TaskRun extends LedgerTaskInput {
   signal: AbortSignal;
 }
 
+/** A runner may report PARTIAL output it can prove (e.g. a correlated delegate result that
+ *  arrived before the deadline). It must never be presented as task completion (bd pibot-jiqv). */
+export interface TaskRunResult {
+  text: string;
+  delivery?: Omit<Delivery, "deliveredAt">;
+  status?: "partial";
+  /** why the output is partial; shown in the ledger record */
+  partialReason?: string;
+  /** correlated evidence to persist with the record (bd pibot-jiqv); append-only, never done */
+  evidence?: string;
+  /** post-write readback of the artifact named in `outputLocation` (bd pibot-cida) */
+  readback?: ContentReadback;
+}
+
 export interface TaskRunner {
   /** do the work; resolves with the owner-facing result text — or a result plus a delivery receipt
    *  (message id and actual media type) so completion can be verified against expected output */
-  run(task: TaskRun): Promise<string | { text: string; delivery?: Omit<Delivery, "deliveredAt"> }>;
+  run(task: TaskRun): Promise<string | TaskRunResult>;
   /** post a message to the owner chat (at-least-once: a crash right after posting may repeat it;
    *  may return a receipt with the sent message id) */
   notify(chatKey: string, text: string): Promise<Delivery | void>;
@@ -152,6 +204,13 @@ export interface TaskLedger {
    */
   updateRecord(id: string, agentId: string, patch: { nextAction?: string; outputLocation?: string; inputLocations?: string }): Promise<LedgerEntry | undefined>;
   get(id: string): Promise<LedgerEntry | undefined>;
+  /**
+   * Append correlated delegate evidence to a task WITHOUT marking it done and WITHOUT
+   * re-notifying the owner (bd pibot-jiqv). Only a `cause: "deadline"` append may promote a
+   * terminal `failed` entry to `partial`; any other cause and every other status keep their
+   * outcome semantics (a cancellation stays cancelled).
+   */
+  appendEvidence(id: string, evidence: string, opts?: { cause?: "deadline" | "late"; usable?: boolean }): Promise<LedgerEntry | undefined>;
   list(filter: { agentId: string; chatKey?: string }): Promise<LedgerEntry[]>;
   /** true when an abort was requested for a live task */
   cancel(id: string): Promise<boolean>;
@@ -166,6 +225,43 @@ export const MAX_ATTEMPTS = 2;
 export const MAX_ACTIVE_PER_AGENT = 5;
 const KEEP_FINISHED = 200;
 const RESULT_CHARS = 4000;
+const EVIDENCE_CHARS = 4000;
+const EVIDENCE_TOTAL_CHARS = 6000;
+const EVIDENCE_TRUNCATED = "[earlier evidence truncated]";
+const RECEIPT_CHARS = 1500;
+
+function compactUsableReceipt(note: string): string {
+  // The collector's formatted report begins with provenance and a gate; keep the actual
+  // reply body even when it has no path. Never cut a path in the middle.
+  const body = note.split("\n").map((line) => line.trim()).filter((line) => line
+    && !/^Delegate .+ returned (?:a reply|context\/refusal\/blocker)/.test(line)
+    && !/^(?:Remaining gate:|Paths reported by the delegate|Reported paths)/.test(line)).join(" ") || note.trim();
+  const excerpt = body.length > 800 ? `${body.slice(0, 797)}...` : body;
+  let receipt = excerpt;
+  let omitted = false;
+  for (const ref of extractArtifactRefs(note)) {
+    const next = `${receipt.includes("\nReported paths") ? ", " : "\nReported paths (unverified): "}${ref}`;
+    if (receipt.length + next.length + 22 > RECEIPT_CHARS) { omitted = true; break; }
+    receipt += next;
+  }
+  if (omitted) receipt += " (more paths omitted)";
+  return receipt;
+}
+
+function recoveredNotice(receipt: string): string {
+  const paths = receipt.split("\n").find((line) => line.startsWith("Reported paths"));
+  const summary = receipt.split("\n")[0].slice(0, 180);
+  return `Correlated delegate reply (unverified): ${summary}${paths ? `\n${paths}` : ""}\nRemaining gate: confirm filing and delivery; do not repeat delegate work without checking the reported result.`;
+}
+
+/** Append one note without duplicating it and keep the stored evidence bounded (bd pibot-jiqv). */
+function appendBoundedEvidence(existing: string | undefined, note: string): string {
+  const base = existing ?? "";
+  if (!note || base.includes(note)) return base;
+  const next = base ? `${base}\n\n${note}` : note;
+  if (next.length <= EVIDENCE_TOTAL_CHARS) return next;
+  return `${EVIDENCE_TRUNCATED}\n${next.slice(-(EVIDENCE_TOTAL_CHARS - EVIDENCE_TRUNCATED.length - 1))}`;
+}
 
 interface LedgerDoc {
   tasks: Record<string, LedgerEntry>;
@@ -243,8 +339,63 @@ function describeDeliveryGap(
   return undefined;
 }
 
-function prune(doc: LedgerDoc): void {
-  const finished = Object.values(doc.tasks).filter((t) => !active(t.status)).sort((a, b) => b.updatedAt - a.updatedAt);
+/** Collapse whitespace runs so a wrapped/indented note still matches the requested text. */
+function normalizeContent(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/** How many times the requested addition occurs in the readback (whitespace-insensitive). */
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let from = 0;
+  for (;;) {
+    const at = haystack.indexOf(needle, from);
+    if (at === -1) return count;
+    count += 1;
+    from = at + needle.length;
+  }
+}
+
+/**
+ * Why a requested content addition is not proven to be in the artifact (bd pibot-cida).
+ *
+ * The Nov 4 creator task asked to append one sentence to a note, the agent answered "Task
+ * done" and "Not saved", and the ledger still recorded `done` because the ONLY completion
+ * gate was the delivery receipt: `acceptanceCriteria` was prose nobody evaluated. The gate
+ * below is deliberately narrow and mechanical — when the caller names the expected text AND
+ * the artifact path, completion requires a readback taken AFTER the write that actually holds
+ * that text. A run that could not write says so and stays `partial`; a run that wrote records
+ * the addition once, and the readback proves it is still there (no duplicate append).
+ *
+ * Wording is a gap statement ("not verified"), never an assertion that nothing happened.
+ */
+function describeContentGap(
+  expect: string,
+  outputLocation: string | undefined,
+  readback: ContentReadback | undefined,
+): string | undefined {
+  const wanted = normalizeContent(expect);
+  if (!wanted) return undefined;
+  const where = outputLocation?.split(",")[0]?.trim() || "the output artifact";
+  if (!readback) return `expected the artifact to contain the requested addition, but no readback of ${where} was supplied (content unverified)`;
+  if (!readback.afterWrite) return `expected the artifact to contain the requested addition, but the readback of ${readback.path} did not happen after the write (content unverified)`;
+  if (outputLocation && readback.path.trim() !== where) {
+    return `expected the requested addition in ${where}, but the readback names ${readback.path} (content unverified)`;
+  }
+  if (!normalizeContent(readback.text).includes(wanted)) {
+    return `expected the requested addition in ${readback.path}, but the text read back does not contain it (write not proven)`;
+  }
+  // Exactly once: a retry that appends the same sentence again has changed the note twice, and
+  // "records the addition once under the same task" is part of what completion means.
+  const occurrences = countOccurrences(normalizeContent(readback.text), wanted);
+  if (occurrences > 1) {
+    return `expected the requested addition in ${readback.path} once, but the text read back contains it ${occurrences} times (duplicate append)`;
+  }
+  return undefined;
+}
+
+function prune(doc: LedgerDoc): void {  const finished = Object.values(doc.tasks).filter((t) => !active(t.status)).sort((a, b) => b.updatedAt - a.updatedAt);
   for (const old of finished.slice(KEEP_FINISHED)) {
     delete doc.tasks[old.id];
     for (const [rid, tid] of Object.entries(doc.requests)) if (tid === old.id) delete doc.requests[rid];
@@ -352,11 +503,23 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
         let text: string;
         let final: "done" | "partial" | "failed" | "blocked" = "done";
         let delivery: Omit<Delivery, "deliveredAt"> | undefined;
+        let runnerPartial: string | undefined;
+        let runnerEvidence: string | undefined;
+        let readback: ContentReadback | undefined;
+        let deadlineFailure = false;
         try {
           const raw = await runner.run({ ...input, taskId: ledgerId, attempt, resumed: attempt > 1, signal: rt.signal });
-          // A runner may return a bare string or a { text, delivery } receipt
-          text = (typeof raw === "string" ? raw : raw.text).trim();
-          delivery = typeof raw === "string" ? undefined : raw.delivery;
+          // A runner may return a bare string or a correlated result receipt
+          if (typeof raw === "string") {
+            text = raw.trim();
+          } else {
+            text = raw.text.trim();
+            delivery = raw.delivery;
+            readback = raw.readback;
+            // Correlated evidence proves usable PARTIAL output, never task completion (bd pibot-jiqv).
+            if (raw.status === "partial") runnerPartial = raw.partialReason ?? "the run returned a correlated partial result before it stopped";
+            runnerEvidence = raw.evidence;
+          }
           // Empty output is not a successful result: record an explicit failure
           // rather than delivering a fabricated success summary.
           if (!text) throw new Error("Task finished without a result summary");
@@ -365,6 +528,9 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
           ok = false;
           text = error instanceof Error ? error.message : String(error);
           if (error instanceof BlockedError) final = "blocked";
+          // Only a real deadline may reconcile evidence into `partial`; an arbitrary work
+          // failure keeps its failed semantics (bd pibot-jiqv review).
+          else if (error instanceof TaskDeadlineError) deadlineFailure = true;
         }
         const validMessageId = typeof delivery?.messageId === "number" && Number.isSafeInteger(delivery.messageId) && delivery.messageId > 0;
         const deliveryProblem = ok && expect ? describeDeliveryGap(delivery, input, expect, validMessageId) : undefined;
@@ -375,6 +541,15 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
           // alone is not proof.
           final = "partial";
         }
+        if (runnerPartial) final = "partial";
+        // Content gate (bd pibot-cida): a task that asks for a specific addition to a specific
+        // artifact must prove it by reading the file back AFTER writing it. Reported success is
+        // not proof — the Nov 4 case answered "Task done" and "Not saved" and still completed.
+        const contentExpect = ok ? task.input.expectedContent?.trim() || undefined : undefined;
+        const contentProblem = contentExpect
+          ? describeContentGap(contentExpect, task.input.outputLocation, readback)
+          : undefined;
+        if (contentProblem) final = "partial";
         const resultChars = text.length;
         text = text.slice(0, RESULT_CHARS);
         // Relative-date wording (bd pibot-wr9m): rewrite mis-stated relative words from the absolute
@@ -401,13 +576,34 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
             if (dateGuard && dateGuard.inconsistent > 0) {
               entry.dateCheck = { checked: dateGuard.checked, inconsistent: dateGuard.inconsistent, corrected: dateGuard.corrected, blocked: dateGuard.blocked, failures: dateGuard.failures };
             }
+            // Merge evidence the runner reported, and evidence appended concurrently while the
+            // task was still `running` (a late reply can land before this terminal commit).
+            if (deadlineFailure) entry.failure = "deadline";
+            // A readback that fails the content gate stays on the record as the reason, so the
+            // owner can see WHAT was read instead of a generic "output only partly delivered".
+            if (readback && contentExpect) {
+              entry.readback = { path: readback.path, text: readback.text.slice(0, 800), afterWrite: readback.afterWrite };
+            }
+            if (runnerEvidence) {
+              entry.evidence = appendBoundedEvidence(entry.evidence, runnerEvidence);
+              entry.evidenceUsable = true; // report() only returns usable replies
+              entry.usableReceipt = compactUsableReceipt(runnerEvidence);
+            }
             if (final === "blocked") Object.assign(entry, { status: "blocked", blocker: text }, { updatedAt: now() });
             else if (final === "partial") {
               const mismatch = deliveryProblem
+                ?? contentProblem
+                ?? runnerPartial
                 ?? (dateGuard?.blocked ? "relative date wording contradicted the absolute date and could not be corrected safely" : "output only partly delivered");
               Object.assign(entry, { status: "partial", error: mismatch, result: text, updatedAt: now() });
             } else if (ok) Object.assign(entry, { status: "done", result: text }, { updatedAt: now() });
-            else Object.assign(entry, { status: "failed", error: text }, { updatedAt: now() });
+            else if (deadlineFailure && entry.usableReceipt) {
+              // Evidence arrived as the deadline stopped the run. Keep the result partial (never
+              // done) and say only that filing/delivery is unconfirmed — not that work failed.
+              final = "partial";
+              text = recoveredNotice(entry.usableReceipt);
+              Object.assign(entry, { status: "partial", error: "the deadline stopped the run; correlated delegate evidence exists and filing/delivery is still unconfirmed", result: text, updatedAt: now() });
+            } else Object.assign(entry, { status: "failed", error: text }, { updatedAt: now() });
           }
           return { status: "running", checkpoint: { phase: "notify", ok, text, final, ...(delivery !== undefined && Object.entries(delivery).some(([, v]) => v !== undefined) ? { delivery: filterUndefined(delivery) } : {}) } };
         }, ctx);
@@ -559,6 +755,35 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
         const doc = await ledgerDoc(tx, root.id);
         const task = doc.tasks[id];
         if (task) Object.assign(task, patch, { updatedAt: now() });
+        return undefined;
+      }, C);
+      return (await snapshot()).tasks[id];
+    },
+    async appendEvidence(id, evidence, opts = {}) {
+      const note = evidence.trim().slice(0, EVIDENCE_CHARS);
+      if (!note) return undefined;
+      await root.commit(async (tx) => {
+        const doc = await ledgerDoc(tx, root.id);
+        const task = doc.tasks[id];
+        if (!task) return undefined;
+        const before = task.evidence;
+        // Dedupe INSIDE the transaction so two concurrent late replies cannot both append.
+        task.evidence = appendBoundedEvidence(task.evidence, note);
+        if (task.evidence === before) return undefined; // duplicate or empty: no status change
+        if (opts.usable === true) {
+          task.evidenceUsable = true;
+          task.usableReceipt = compactUsableReceipt(note);
+        }
+        // Promote only when BOTH sides attest a deadline: the record itself failed by deadline,
+        // and the caller's cause is a deadline. A refusal-only append never promotes, an
+        // arbitrary failure is never relabeled, and a cancelled/done outcome is never rewritten.
+        if (opts.cause === "deadline" && opts.usable === true && task.usableReceipt && task.status === "failed" && task.failure === "deadline") {
+          task.status = "partial";
+          task.blocker = "the deadline stopped the run; correlated delegate evidence exists and filing/delivery is still unconfirmed";
+          delete task.error; // stale generic timeout must not mask the reconciled reason
+          task.result = recoveredNotice(task.usableReceipt!);
+        }
+        task.updatedAt = now();
         return undefined;
       }, C);
       return (await snapshot()).tasks[id];

@@ -35,6 +35,53 @@ describe("vault plugin", () => {
     fs.rmSync(outsideDir, { recursive: true, force: true });
   });
 
+  it("discovers newly written content from a fresh instance without shell access", async () => {
+    const first = captureTools();
+    factoryOf(vaultPlugin({ vaultDir }))(first.pi);
+    await first.tools.get("vault_write")!.execute("w", { path: "Sources/browser.md", content: "# Browser survey\nComet and Dia" });
+    const fresh = captureTools();
+    factoryOf(vaultPlugin({ vaultDir }))(fresh.pi);
+    const result = await fresh.tools.get("vault_search")!.execute("s", { query: "comet" });
+    expect(result.content[0].text).toContain("Sources/browser.md");
+    expect(result.content[0].text).toContain('"complete":true');
+  });
+
+  it("search denies escaped scopes and skips hidden directories and symlinks", async () => {
+    fs.writeFileSync(path.join(outsideDir, "secret.md"), "needle");
+    fs.symlinkSync(outsideDir, path.join(vaultDir, "escape"));
+    fs.mkdirSync(path.join(vaultDir, ".private"));
+    fs.writeFileSync(path.join(vaultDir, ".private/hidden.md"), "needle");
+    const { pi, tools } = captureTools();
+    factoryOf(vaultPlugin({ vaultDir }))(pi);
+    const refused = await tools.get("vault_search")!.execute("s", { query: "needle", path: "../" });
+    expect(refused.details.ok).toBe(false);
+    const result = await tools.get("vault_search")!.execute("s", { query: "needle" });
+    expect(result.content[0].text).not.toContain("secret.md");
+    expect(result.content[0].text).not.toContain("hidden.md");
+  });
+
+  it("reports bounded results and permits a narrower live search", async () => {
+    fs.mkdirSync(path.join(vaultDir, "Sources"));
+    for (let i = 0; i < 32; i++) fs.writeFileSync(path.join(vaultDir, `Sources/note-${i}.md`), "needle");
+    const { pi, tools } = captureTools();
+    factoryOf(vaultPlugin({ vaultDir }))(pi);
+    const result = await tools.get("vault_search")!.execute("s", { query: "needle" });
+    const report = JSON.parse(result.content[0].text);
+    expect(report.matches).toHaveLength(30);
+    expect(report.complete).toBe(false);
+    expect(report.next).toContain("narrow path");
+    const narrow = await tools.get("vault_search")!.execute("s", { query: "note-31", path: "Sources" });
+    expect(JSON.parse(narrow.content[0].text).matches[0].path).toBe("Sources/note-31.md");
+  });
+
+  it("marks oversized text as incomplete rather than claiming absence", async () => {
+    fs.writeFileSync(path.join(vaultDir, "large.md"), "needle".repeat(100));
+    const { pi, tools } = captureTools();
+    factoryOf(vaultPlugin({ vaultDir, maxBytes: 20 }))(pi);
+    const result = await tools.get("vault_search")!.execute("s", { query: "needle" });
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ complete: false, skipped: 1, matches: [] });
+  });
+
   it("registers vault_read and vault_write", () => {
     const { pi, tools } = captureTools();
     factoryOf(vaultPlugin({ vaultDir }))(pi);

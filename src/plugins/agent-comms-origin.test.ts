@@ -45,13 +45,13 @@ describe("agent-comms plugin origin-chat routing", () => {
   it("agent_message passes the invoking chat as originChat", async () => {
     const { tools, askAgent } = makePlugin();
     await tools.get("agent_message")!.execute("id", { to: "pibot-dev", text: "please build X" });
-    expect(askAgent).toHaveBeenCalledWith("researcher", "pibot-dev", "please build X", undefined, CHAT);
+    expect(askAgent).toHaveBeenCalledWith("researcher", "pibot-dev", "please build X", undefined, CHAT, "message", undefined);
   });
 
   it("agent_ask passes its chat as originChat too", async () => {
     const { tools, askAgent } = makePlugin();
     await tools.get("agent_ask")!.execute("id", { to: "pibot-dev", question: "status?", timeoutMinutes: "2" });
-    expect(askAgent).toHaveBeenCalledWith("researcher", "pibot-dev", "status?", 2 * 60e3, CHAT);
+    expect(askAgent).toHaveBeenCalledWith("researcher", "pibot-dev", "status?", 2 * 60e3, CHAT, "ask", undefined);
   });
 
   it("handoff passes its chat as originChat", async () => {

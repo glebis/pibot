@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { errorMessage, truncate } from "./util.js";
+import { classifySttFailure, formatProviderDiagnostic, type ProviderDiagnostic, type ProviderFailureCategory } from "./provider-diagnostics.js";
 import {
   probeDurationSecWithFfprobe,
   runChunkedTranscription,
@@ -30,6 +31,7 @@ export interface SttResult {
   text: string;
   provider: string;
   error?: string;
+  diagnostic?: ProviderDiagnostic;
 }
 
 export type SttProviderId = "whisperkit" | "groq" | "local_whisper";
@@ -83,10 +85,38 @@ export interface SttOptions {
   bias?: string;
 }
 
+/** The host process is the executor for managed STT; agent/session identity is added by the caller. */
+const STT_DIAGNOSTIC_EXECUTOR = "host-stt-daemon";
+
+/** Evidence-shaped Groq failure line: service/executor/source/category, never credential values or bodies. */
+function groqDiagnostic(category: ProviderFailureCategory, detail?: string): ProviderDiagnostic {
+  return {
+    service: "groq-stt-host",
+    executor: STT_DIAGNOSTIC_EXECUTOR,
+    source: category === "credential-missing" ? "none" : "host-env",
+    category,
+    detail,
+  };
+}
+
+/** Null-safe error name: a rejected fetch may throw null/undefined instead of an Error. */
+function errorNameOf(e: unknown): string {
+  if (e === null || typeof e !== "object") return "";
+  const name = (e as { name?: unknown }).name;
+  return typeof name === "string" ? name : "";
+}
+
 async function transcribeGroq(audioPath: string, language: string | undefined, deps: SttDeps, bias?: string): Promise<SttResult> {
   const apiKey = process.env.GROQ_API_KEY;
-  if (!process.env.GROQ_API_KEY) {
-    return { ok: false, text: "", provider: "groq", error: "GROQ_API_KEY not set" };
+  if (!apiKey) {
+    const diagnostic = groqDiagnostic("credential-missing", "no host GROQ_API_KEY for this executor; owner-initiated setup is required. Presence in another executor is not validity here.");
+    return {
+      ok: false,
+      text: "",
+      provider: "groq",
+      error: `GROQ_API_KEY not set ${formatProviderDiagnostic(diagnostic)}`,
+      diagnostic,
+    };
   }
   const fetchFn = depsFetch(deps);
   try {
@@ -99,20 +129,38 @@ async function transcribeGroq(audioPath: string, language: string | undefined, d
     if (bias) form.append("prompt", truncate(bias, 800));
     const res = await fetchFn(GROQ_URL, {
       method: "POST",
-      headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      headers: { Authorization: `Bearer ${apiKey}` },
       body: form,
       signal: AbortSignal.timeout(deps.timeoutMs ?? 120_000),
     });
     if (!res.ok) {
-      const body = truncate(await res.text().catch(() => ""), 200);
-      return { ok: false, text: "", provider: "groq", error: `groq HTTP ${res.status}: ${body}` };
+      // Do not echo the provider body: it can carry a raw error payload. The status code and
+      // the classified category are the evidence an owner needs.
+      const category = classifySttFailure({ status: res.status });
+      const detail =
+        category === "access-refused"
+          ? `HTTP ${res.status}; response body omitted. A 403 is an access refusal, not an auth verdict.`
+          : category === "auth"
+            ? `HTTP ${res.status}; scoped rejection for source=host-env.`
+            : `HTTP ${res.status}; response body omitted`;
+      const diagnostic = groqDiagnostic(category, detail);
+      return { ok: false, text: "", provider: "groq", error: `groq HTTP ${res.status} ${formatProviderDiagnostic(diagnostic)}`, diagnostic };
     }
     const json = (await res.json()) as { text?: string };
     const text = (json.text ?? "").trim();
-    if (!text) return { ok: false, text: "", provider: "groq", error: "groq returned empty transcript" };
+    if (!text) {
+      const diagnostic = groqDiagnostic("empty-output", "provider answered without a transcript; not an authentication verdict");
+      return { ok: false, text: "", provider: "groq", error: `groq returned empty transcript ${formatProviderDiagnostic(diagnostic)}`, diagnostic };
+    }
     return { ok: true, text, provider: "groq" };
   } catch (e) {
-    return { ok: false, text: "", provider: "groq", error: `groq: ${errorMessage(e)}` };
+    // The exception message can embed a provider payload, URL or token. Classify it internally
+    // and emit bounded metadata only. This diagnostic travels out through SttResult.error, which
+    // the existing host consumer (bot.handleVoiceMedia) already surfaces.
+    const message = errorMessage(e);
+    const category = classifySttFailure({ errorText: message, timedOut: /abort/i.test(errorNameOf(e)) });
+    const diagnostic = groqDiagnostic(category, "request did not complete; classify before blaming credentials");
+    return { ok: false, text: "", provider: "groq", error: `groq request failed ${formatProviderDiagnostic(diagnostic)}`, diagnostic };
   }
 }
 
@@ -247,6 +295,7 @@ export class SttService {
   async transcribe(audioPath: string, policy: SttPolicy = {}, options: SttOptions = {}): Promise<SttResult> {
     const bias = options.bias ? truncate(options.bias, 800) : undefined;
     const failures: string[] = [];
+    let diagnostic: ProviderDiagnostic | undefined;
     const providers = sttProviderChain(this.providers, policy);
     if (!providers.length) {
       return { ok: false, text: "", provider: "none", error: "no STT provider permitted by agent policy" };
@@ -260,9 +309,10 @@ export class SttService {
             ? await transcribeWhisperkit(audioPath, this.language, "whisperkitBin" in deps ? deps.whisperkitBin ?? null : await whichBin(deps.execFileFn ?? execFile, "whisperkit-cli"), deps, bias)
             : await transcribeLocalWhisper(audioPath, this.language, "whisperBin" in deps ? deps.whisperBin ?? null : await whichBin(deps.execFileFn ?? execFile, "whisper"), deps, bias);
       if (result.ok) return result;
+      if (result.diagnostic) diagnostic = result.diagnostic;
       failures.push(`${result.provider}: ${result.error}`);
     }
-    return { ok: false, text: "", provider: "none", error: `all STT providers failed — ${failures.join("; ")}` };
+    return { ok: false, text: "", provider: "none", error: `all STT providers failed — ${failures.join("; ")}`, diagnostic };
   }
 }
 

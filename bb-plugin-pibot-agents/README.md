@@ -198,3 +198,39 @@ single audio/phone connection. Text-purpose support requires the updated PiBot
 bridge; the plugin refuses to silently reserve an old global audio slot.
 Request IDs deduplicate in-flight and recently completed submissions, including
 uncertain outcomes; no automatic send/replay retries occur.
+
+
+### Conversations without a Telegram binding
+
+The conversation selector combines connected Telegram chats, independent **BB
+chat**, and safe indexed saved history. Agents such as tax can receive prompts
+in BB without taking over an existing Telegram chat. Historical conversations
+without a live binding are read-only. BB chat requires the updated PiBot backend;
+older backends continue to expose connected chats and saved history.
+
+The first explicit BB prompt creates its own owner conversation and saved
+session. Availability checks create no session and invoke no model. Prompts use
+the agent's existing model, provider policy and capabilities; the Allow tools
+control narrows tools for that turn. Questions and approvals stay in the BB
+conversation and can be answered by replying there.
+
+BB conversations are excluded from proactive delivery, generic home-chat
+selection, automatic failed-prompt replay and goal continuation. Existing
+Telegram destinations are preserved. A private request receipt is written before
+execution; duplicate requests reuse their outcome, while uncertain outcomes after
+a restart fail closed for history review. The receipt store is bounded at 4096
+entries and refuses new requests at capacity rather than risking a replay.
+
+### Files and images in BB chat
+
+The independent BB conversation supports the attachment button, image paste and
+file drop. Each conversation keeps its own removable attachment previews alongside
+its text draft. A message can contain only attachments. Failed sends retain the
+selection; successful sends clear only the files included in that request.
+
+Up to four non-empty files, 4 MiB each and 8 MiB combined, are accepted. PNG, JPEG,
+WebP and GIF images are passed directly to the selected model when it supports
+images. Other files require **Allow tools** and are saved privately under PiBot's
+`data/bb-attachments` for the agent's read tools. Files remain there so saved sessions
+can reference them; no automatic cleanup or external image-description call runs.
+Telegram-backed conversations currently support text only and cannot accept uploads.

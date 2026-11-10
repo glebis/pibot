@@ -51,9 +51,10 @@ function missingInputs(t: LedgerEntry): string[] {
 }
 
 function line(t: LedgerEntry): string {
-  const tail = t.status === "done" ? ` — ${t.result?.slice(0, 160) ?? ""}`
-    : t.status === "failed" || t.status === "partial" ? ` — ${t.error?.slice(0, 160) ?? t.blocker?.slice(0, 160) ?? ""}`
-    : t.status === "blocked" ? ` — blocked: ${t.blocker?.slice(0, 160) ?? ""}`
+  const tail = t.status === "done" ? ` — ${(t.result ?? "").slice(0, 160)}`
+    : t.status === "partial" ? ` — ${(t.result ?? t.error ?? t.blocker ?? "").slice(0, 160)}`
+    : t.status === "failed" ? ` — ${(t.error ?? t.blocker ?? "").slice(0, 160)}`
+    : t.status === "blocked" ? ` — blocked: ${(t.blocker ?? "").slice(0, 160)}`
     : "";
   const missing = missingInputs(t);
   const canon = [
@@ -62,6 +63,12 @@ function line(t: LedgerEntry): string {
     t.outputLocation ? `out: ${t.outputLocation.slice(0, 120)}` : "",
     t.inputLocations ? `in: ${t.inputLocations.slice(0, 120)}` : "",
     missing.length ? `INPUT MISSING: ${missing.slice(0, 3).join(", ")}` : "",
+    t.usableReceipt ? `usable receipt (delegate-reported, unverified): ${t.usableReceipt.replace(/\n/g, " • ").slice(0, 360)}` : "",
+    // The rolling evidence string may now hold only refusals even when an earlier usable
+    // receipt survives. Never label the rolling string from the historical task-wide marker.
+    t.evidence
+      ? `${t.evidenceUsable && !t.usableReceipt ? "legacy mixed context" : "context"}: ${t.evidence.split("\n")[0].slice(0, 100)}`
+      : "",
     t.linearRef ? `ref: ${t.linearRef}` : "",
   ].filter(Boolean).join(" • ");
   return `${t.id} [${t.status}] "${t.title}" (started ${fmtWhen(t.createdAt)})${tail}${canon ? `\n    ${canon}` : ""}`;
@@ -94,6 +101,7 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
           expectedIdProtocol: Type.Optional(Type.String({ description: 'Set ONLY when the expected message-id namespace is known ("bot_api" | "mtproto"); completion then requires the receipt to name it.' })),
           lane: Type.Optional(Type.String({ description: "'dev' (pibot source work) or 'cross-agent' (owner-facing content/tooling) — keeps the two lanes separate in records" })),
           acceptanceCriteria: Type.Optional(Type.String({ description: "Verifiable criteria the task must satisfy (what 'done' means in checkable words)" })),
+          expectedContent: Type.Optional(Type.String({ description: "Set when the deliverable is a specific addition to a file: the EXACT text that must end up in outputLocation. The task cannot complete as done unless the file is read back after the write and contains this text — a run that reports success without writing stays partial." })),
           outputLocation: Type.Optional(Type.String({ description: "Where artifacts live on disk (absolute paths, comma-separated if many)" })),
           inputLocations: Type.Optional(Type.String({ description: "Absolute paths of private source files this task still needs (comma-separated). Recorded so retention cleanup can protect pending-task inputs, and status reports any that went missing. Use for downloaded audio/video or other non-reproducible inputs." })),
           linearRef: Type.Optional(Type.String({ description: "Reference-only link to the tracker (e.g. Linear id)" })),
@@ -140,6 +148,9 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
             const canon = {
               ...(params.lane === "dev" ? { lane: "dev" as const } : params.lane === "cross-agent" ? { lane: "cross-agent" as const } : {}),
               ...(params.acceptanceCriteria ? { acceptanceCriteria: params.acceptanceCriteria.slice(0, 500) } : {}),
+              // The exact addition the artifact must contain, checked against a post-write readback
+              // (bd pibot-cida): "Task done" plus "Not saved" must never record as done.
+              ...(params.expectedContent ? { expectedContent: params.expectedContent.slice(0, 1000) } : {}),
               ...(params.outputLocation ? { outputLocation: params.outputLocation.slice(0, 500) } : {}),
               ...(params.inputLocations ? { inputLocations: params.inputLocations.slice(0, 1000) } : {}),
               ...(params.linearRef ? { linearRef: params.linearRef.slice(0, 120) } : {}),
@@ -178,16 +189,25 @@ export function tasksPlugin(deps: TasksPluginDeps): InlineExtension {
         async execute(_id, params) {
           const t = await ledger.get(params.id);
           if (!t || t.agentId !== agentId) return text(`No task ${params.id} for this agent.`);
-          const body = t.status === "done" ? `\n\nResult:\n${t.result}`
-            : t.status === "failed" || t.status === "partial" ? `\n\nError: ${t.error ?? t.blocker ?? ""}`
+          const body = t.status === "done" ? `\n\nResult:\n${t.result ?? ""}`
+            : t.status === "partial" ? `\n\nResult (partial):\n${(t.result ?? "").slice(0, 1500)}${t.result && t.result.length > 1500 ? "\n… (truncated; full result in the ledger)" : ""}\n\nReason: ${t.error ?? t.blocker ?? ""}`
+            : t.status === "failed" ? `\n\nError: ${t.error ?? ""}`
             : t.status === "blocked" ? `\n\nBlocker: ${t.blocker ?? ""}`
             : "";
           const receipt = t.delivery ? `\n\nDelivery: ${t.delivery.mediaType ?? "text"}${t.delivery.messageId !== undefined ? ` (message ${t.delivery.messageId})` : ""}` : "";
+          const usableReceipt = t.usableReceipt
+            ? `\n\nCorrelated delegate usable receipt (delegate-reported, unverified):\n${t.usableReceipt}`
+            : "";
+          // Legacy marker-only records are readable, but their rolling text can contain a
+          // refusal after eviction. Keep it as context unless a protected receipt exists.
+          const evidence = t.evidence
+            ? `\n\n${t.evidenceUsable && !t.usableReceipt ? "Legacy correlated delegate context (usability of retained text unknown)" : "Correlated delegate context (not independently usable output)"}:\n${t.evidence}`
+            : "";
           const missing = missingInputs(t);
           const inputWarning = missing.length
             ? `\n\n⚠ Inputs missing from disk: ${missing.join(", ")} — reacquire or replace them before resuming; this record no longer presents them as available.`
             : "";
-          return text(`${line(t)}; attempts ${t.attempts}${body}${receipt}${inputWarning}`, { status: t.status });
+          return text(`${line(t)}; attempts ${t.attempts}${body}${receipt}${usableReceipt}${evidence}${inputWarning}`, { status: t.status });
         },
       });
       pi.registerTool({

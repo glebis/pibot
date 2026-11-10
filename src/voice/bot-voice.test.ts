@@ -14,7 +14,7 @@ function harness() {
  const b=bot as any;b.chatAgent.set('telegram:42','assistant');b.agentChats.set('assistant',new Set(['telegram:42']));
  // No test writes to runtime state or invokes unrelated plugin services.
  b.persistState=vi.fn();b.flushCards=vi.fn(async()=>{});b.continueGoal=vi.fn(async()=>{});b.maybeEmitTaskAck=vi.fn();
- return {bot,b,t,pushed,session,agents,subscribers,input:{agentId:'assistant',chatKey:'telegram:42',text:'Hi',onOutput:vi.fn(async()=>{})}};
+ return {bot,b,t,pushed,session,agents,subscribers,input:{agentId:'assistant',chatKey:'telegram:42',text:'Hi',onOutput:vi.fn(async(_text:string)=>{})}};
 }
 describe('canonical voice bridge',()=>{
  it('shares a cached canonical session, routes voice only, and does not create proactive recipients',async()=>{
@@ -24,6 +24,21 @@ describe('canonical voice bridge',()=>{
   expect(result.status).toBe('completed');expect(h.input.onOutput).toHaveBeenCalledWith('Here is the answer.');expect(h.pushed).toEqual([]);
   expect(h.session.subscribe).toHaveBeenCalledTimes(1);expect(h.agents.getOrCreateSession.mock.calls.at(-1)?.slice(0,3)).toEqual(['assistant','telegram:42',{transport:'telegram',chatId:'42'}]);
   expect(JSON.stringify([...h.b.agentChats].map(([k,v]:any)=>[k,[...v]]))).toBe(before);
+ });
+ it('keeps typed Telegram-binding turns free of listening directives and preserves rich replies without changing sticky minimal state',async()=>{
+  const h=harness();h.b.minimalChats.set('telegram:42',true);h.b.goals.set('telegram:42',{status:'active'});
+  const full='**Detailed answer.**\n\n[Reference](https://example.com/document?source=bb).\n\n```ts\nconst value = 42;\n```\n\n- First item.\n- Second item.\n\nA sixth sentence. A seventh sentence.';
+  const emit=()=>h.subscribers.forEach(f=>f({type:'agent_end',messages:[{role:'assistant',content:[{type:'text',text:full}],stopReason:'stop'}]}));
+  h.session.prompt.mockImplementationOnce(async()=>{emit();});
+  expect(await h.bot.voiceTurn({...h.input,purpose:'chat',queueIfBusy:false})).toEqual({status:'completed',text:full});
+  const typedPrompt=String((h.session.prompt.mock.calls[0] as unknown[])[0]);
+  expect(typedPrompt).toContain('Hi');expect(typedPrompt).not.toContain('Replying for listening');expect(typedPrompt).not.toContain('Live voice call');
+  expect(h.input.onOutput).toHaveBeenCalledWith(full);expect(h.pushed).toEqual([]);expect(h.b.minimalChats.get('telegram:42')).toBe(true);expect(h.b.continueGoal).not.toHaveBeenCalled();
+  h.input.onOutput.mockClear();h.session.prompt.mockImplementationOnce(async()=>{emit();});
+  await h.bot.voiceTurn(h.input);
+  const audioPrompt=String((h.session.prompt.mock.calls[1] as unknown[])[0]);
+  expect(audioPrompt).toContain('Replying for listening');expect(audioPrompt).toContain('Live voice call');
+  expect(h.input.onOutput.mock.calls[0]?.[0]).not.toContain('https://');expect(h.b.minimalChats.get('telegram:42')).toBe(true);
  });
  it('queues voice behind a canonical text turn and serializes incoming text behind voice',async()=>{
   const h=harness();const hold=deferred();h.session.prompt.mockImplementationOnce(()=>hold.promise);

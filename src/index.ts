@@ -306,6 +306,7 @@ async function main(): Promise<void> {
     const webToken = config.webToken ?? secretStore.get().web?.token;
     const webApp = createWebApp({
       agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
+      bbConversations: bot.bbConversationControl(),
       proactiveStore,
       inbox: bot.labInboxControl(),
       processes: bot.processControl(),

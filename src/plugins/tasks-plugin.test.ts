@@ -37,6 +37,81 @@ describe("tasks plugin", () => {
     } finally { await ledger.close(); }
   });
 
+  it("surfaces a partial result and correlated evidence in task_status and list_tasks", async () => {
+    const run = vi.fn(async () => ({
+      text: "Delegate reply: transcript ready",
+      status: "partial" as const,
+      partialReason: "deadline; filing pending",
+      evidence: "Delegate pibot-dev returned a reply: /tmp/a.txt",
+    }));
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    try {
+      const t = tools(tasksPlugin({ ledger, agentId: "coach", chat: { transport: "telegram", chatId: "42" } }));
+      const started = await text(t.get("start_task")!.execute("call-p", { title: "Partial task", instructions: "work" }));
+      const id = /task (t\w+)/.exec(started)![1];
+      for (let i = 0; i < 200 && (await ledger.get(id))?.status !== "partial"; i++) await new Promise((r) => setTimeout(r, 10));
+      const status = await text(t.get("task_status")!.execute("x", { id }));
+      expect(status).toContain("Result (partial)");
+      expect(status).toContain("transcript ready");
+      expect(status).toContain("/tmp/a.txt");
+      const list = await text(t.get("list_tasks")!.execute("x", {}));
+      expect(list).toContain("transcript ready"); // partial result visible, bounded
+      expect(list).toContain("usable receipt (delegate-reported, unverified):");
+    } finally { await ledger.close(); }
+  });
+
+  it("labels refusal-only context on a failed task without implying partial output", async () => {
+    const ledger = {
+      get: vi.fn(async () => ({
+        id: "t1", agentId: "coach", chatKey: "telegram:42", title: "refused", instructions: "x",
+        status: "failed", createdAt: 1, updatedAt: 2, attempts: 1, error: "deadline",
+        evidence: "Delegate pibot-dev returned a reply reporting a refusal/blocker: BLOCKED",
+      })),
+    } as unknown as import("../durable/task-ledger.js").TaskLedger;
+    const t = tools(tasksPlugin({ ledger, agentId: "coach", chat: { transport: "telegram", chatId: "42" } }));
+    const status = await text(t.get("task_status")!.execute("x", { id: "t1" }));
+    expect(status).toContain("context (not independently usable output)");
+    expect(status).not.toContain("evidence (usable");
+    expect(status).not.toContain("Result (partial)");
+  });
+
+  it("keeps full evidence visible when it equals a partial result truncated at 1500 chars", async () => {
+    const long = `${"x".repeat(1600)} /tmp/tail-path-after-1500.txt`;
+    const ledger = {
+      get: vi.fn(async () => ({
+        id: "t2", agentId: "coach", chatKey: "telegram:42", title: "same", instructions: "x",
+        status: "partial", createdAt: 1, updatedAt: 2, attempts: 1, error: "deadline", result: long,
+        evidence: long, evidenceUsable: true,
+      })),
+    } as unknown as import("../durable/task-ledger.js").TaskLedger;
+    const t = tools(tasksPlugin({ ledger, agentId: "coach", chat: { transport: "telegram", chatId: "42" } }));
+    const status = await text(t.get("task_status")!.execute("x", { id: "t2" }));
+    // The result body is cut at 1500; the evidence block must still show the reported tail path.
+    expect(status).toContain("Result (partial)");
+    expect(status).toContain("Legacy correlated delegate context (usability of retained text unknown)");
+    expect(status).toContain("/tmp/tail-path-after-1500.txt");
+  });
+
+  it("shows the protected usable receipt after refusal spam removes it from rolling evidence", async () => {
+    const ledger = await openTaskLedger({ runner: { run: async () => "done", notify: async () => {} } });
+    try {
+      const task = await ledger.start({ agentId: "coach", chatKey: "telegram:42", title: "Transcript", instructions: "work" });
+      for (let i = 0; i < 200 && (await ledger.get(task.id))?.status !== "done"; i++) await new Promise((r) => setTimeout(r, 10));
+      await ledger.appendEvidence(task.id, "Saved transcript to /tmp/only-usable.txt", { usable: true });
+      await ledger.appendEvidence(task.id, `BLOCKED: ${"x".repeat(3600)}`, { usable: false });
+      await ledger.appendEvidence(task.id, `REFUSED: ${"y".repeat(3600)}`, { usable: false });
+      expect((await ledger.get(task.id))?.evidence).not.toContain("/tmp/only-usable.txt");
+      const t = tools(tasksPlugin({ ledger, agentId: "coach", chat: { transport: "telegram", chatId: "42" } }));
+      const status = await text(t.get("task_status")!.execute("x", { id: task.id }));
+      const list = await text(t.get("list_tasks")!.execute("x", {}));
+      expect(status).toContain("Correlated delegate usable receipt (delegate-reported, unverified)");
+      expect(status).toContain("/tmp/only-usable.txt");
+      expect(status).toContain("Correlated delegate context (not independently usable output)");
+      expect(list).toContain("/tmp/only-usable.txt");
+      expect(list).toContain("context:");
+    } finally { await ledger.close(); }
+  });
+
   it("passes a per-task runtime cap to the runner, clamped to the 480-minute ceiling", async () => {
     const run = vi.fn(async (_task: unknown) => "long work done");
     const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });

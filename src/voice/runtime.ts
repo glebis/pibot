@@ -165,13 +165,13 @@ export function createCanonicalVoiceBridge(host:VoiceHost,token:string,clock=Dat
         // the front hung up: the voice service ends the call once this goodbye has been spoken
         return c.json({text:spoken,...(host.voiceFrontEnding?.(sessionId)?{end:true}:{})});
       }
-      const turn=host.voiceTurn({agentId:s.agentId,chatKey:s.chatKey,text:b.text,...(s.tools?{allowedTools:s.tools}:{}),...(s.purpose==='chat'?{queueIfBusy:false}:{}),signal:controller.signal,onApprovalRequired:()=>{approvalPending=true;approval();}});
+      const turn=host.voiceTurn({agentId:s.agentId,chatKey:s.chatKey,text:b.text,...(s.tools?{allowedTools:s.tools}:{}),...(s.purpose==='chat'?{purpose:'chat' as const,queueIfBusy:false}:{}),signal:controller.signal,onApprovalRequired:()=>{approvalPending=true;approval();}});
       const result=await Promise.race([turn,approvalNotice,detached]);
       if(approvalPending){controller.abort();const reply=result.text!;s.requests.set(b.requestId,{text:b.text,reply});return c.json({text:reply,pendingApproval:true});}
       if(controller.signal.aborted||result.status==='detached')return c.json({error:'turn_detached'},409);
       if(result.status==='busy')return c.json({error:'agent_busy'},409);
       if(result.status!=='completed'||!result.text)return c.json({error:'agent_reply_unavailable'},502);
-      const reply=applyVoiceStyle(result.text,{maxSentences:6,maxChars:1600,allowFullPaths:false}).trim().slice(0,1600);
+      const reply=s.purpose==='chat'?result.text.trim().slice(0,2000):applyVoiceStyle(result.text,{maxSentences:6,maxChars:1600,allowFullPaths:false}).trim().slice(0,1600);
       if(!reply)return c.json({error:'empty_reply'},502);
       s.requests.set(b.requestId,{text:b.text,reply});return c.json({text:reply});
     }finally{clearTimeout(timer);s.controller.signal.removeEventListener('abort',detach);c.req.raw.signal.removeEventListener('abort',detach);s.busy=false;}

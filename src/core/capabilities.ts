@@ -37,6 +37,7 @@ import type { SpeechArtifactStore, SpeechKind, SpeechProviderRegistry } from "./
 import type { CommitmentPluginEngine } from "../plugins/commitment-plugin.js";
 import { commitmentPlugin } from "../plugins/commitment-plugin.js";
 import { researchIntakePlugin } from "../plugins/research-intake-plugin.js";
+import { digestPlugin } from "../plugins/digest-plugin.js";
 import { linkTriageConfig, linkTriagePlugin } from "../plugins/link-triage-plugin.js";
 import { EventLog } from "./events.js";
 import type { IntakeStore } from "./research-intake.js";
@@ -201,6 +202,11 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     create: (ctx) => researchIntakePlugin({ agentId: ctx.agent.id, chat: ctx.chat, ask: ctx.ask!, store: ctx.intake! }),
   },
   {
+    id: "digest", defaultEnabled: false, tools: ["digest_verdict", "digest_late_result"],
+    prompt: "digest_verdict decides the daily research-digest verdict from what actually happened to each subject's search, and returns the exact wording to report; digest_late_result folds a late completion into the verdict already reported without searching anything again. THIN means every subject was searched and nothing qualified — a search that is still running, was deferred, or failed is PARTIAL/UNAVAILABLE and must never be reported as a thin day. Call digest_verdict right before reporting a digest, with one entry per active subject, instead of choosing the wording yourself; call digest_late_result when a digest search answers after you already reported.",
+    create: (ctx) => digestPlugin({ agentId: ctx.agent.id, agentDir: ctx.agent.dir }),
+  },
+  {
     id: "memory", defaultEnabled: true, tools: ["memory_save", "memory_recall"],
     prompt: "memory_save and memory_recall manage durable notes owned by this agent; it may also write directly inside its own memory directory.",
     create: (ctx) => memoryPlugin({ agentDir: ctx.agent.dir }),
@@ -233,8 +239,8 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     create: (ctx) => knowledgePlugin({ sharedFile: path.join(ctx.vaultDir, "pibot", "SHARED-FINDINGS.md"), agentId: ctx.agent.id }),
   },
   {
-    id: "vault-file", defaultEnabled: false, tools: ["vault_read", "vault_write"],
-    prompt: "vault_read and vault_write read and write files strictly inside the owner's Obsidian vault — the ground truth for personal context. Read freely; write only with owner intent or when following an established vault convention (e.g. Sources/ and Daily notes — match the existing note format exactly). Resolved paths must stay inside the vault; nothing outside it is accessible.",
+    id: "vault-file", defaultEnabled: false, tools: ["vault_search", "vault_read", "vault_write"],
+    prompt: "Use vault_search to discover filenames and note content before guessing paths or asking the owner for title hints. Search reads live files; incomplete coverage is not evidence of absence, so narrow the search scope. vault_read and vault_write read and write files strictly inside the owner's Obsidian vault — the ground truth for personal context. Read freely; write only with owner intent or when following an established vault convention (e.g. Sources/ and Daily notes — match the existing note format exactly). Resolved paths must stay inside the vault; nothing outside it is accessible.",
     available: (ctx) => fs.existsSync(ctx.vaultDir),
     create: (ctx) => vaultPlugin({ vaultDir: ctx.vaultDir }),
   },

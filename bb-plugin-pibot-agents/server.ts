@@ -5,12 +5,15 @@ import { fileURLToPath } from 'node:url';
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 import { z } from 'zod';
 import { rpcContract, agentSchema, processesSchema, bindingsSchema } from './contract';
-import { endpoint, request, type Endpoint } from './client';
+import { endpoint, request, ServiceError, type Endpoint } from './client';
 import { readLocalConfig, readLocalDashboardConfig } from './local-config';
-import { agentsRoot, loadHistory } from './history';
+import { agentsRoot, loadHistory, savedConversations } from './history';
 import {createHistoryWatch} from './history-watch';
 import { createMacSpeech } from './speech';
 import {createLocalAudioRuntime,localAudioStartable} from './audio-runtime';
+import {attachmentsSchema,type ChatAttachment} from './attachments';
+import {createVideoMedia} from './video-media';
+import {videoNoteParts} from './video-notes';
 export { rpcContract } from './contract';
 export type { Overview } from './contract';
 
@@ -23,6 +26,9 @@ function inferredPibotRoot(){
 }
 
 export default function plugin(bb:BbPluginApi) {
+  const videoMedia=createVideoMedia();
+  bb.http.route('GET','/video',c=>videoMedia.handle(c.req.raw),{auth:'local'});
+  bb.http.route('HEAD','/video',c=>videoMedia.handle(c.req.raw),{auth:'local'});
   const settings=bb.settings.define({
     autoDiscoverDashboard:{type:'boolean',label:'Discover local dashboard token automatically',default:true},
     localAgentsDir:{type:'string',label:'Local agent storage override (empty discovers default)',default:''},
@@ -108,12 +114,20 @@ export default function plugin(bb:BbPluginApi) {
   }
   // Keep request outcomes in memory briefly: never resubmit an uncertain turn.
   const requests=new Map<string,{fingerprint:string;outcome:Promise<z.infer<typeof replySchema>>;expires:number}>();
-  async function chat(input:{agentId:string;chatKey:string;allowTools:boolean;text:string;requestId:string}){
-    const fingerprint=createHash('sha256').update(JSON.stringify([input.agentId,input.chatKey,input.allowTools,input.text])).digest('hex');
+  async function chat(input:{agentId:string;chatKey:string;allowTools:boolean;text:string;attachments?:ChatAttachment[];requestId:string}){
+    const attachments=attachmentsSchema.parse(input.attachments??[]);
+    if(attachments.length&&input.chatKey!==`bb:${input.agentId}:owner`)throw new Error('Attachments are supported in the independent BB conversation. Select the BB chat to send files or images.');
+    if(attachments.some(a=>!a.mimeType.startsWith('image/'))&&!input.allowTools)throw new Error('Files require Allow tools so the agent can read them. Images can be sent without tools.');
+    const fingerprint=createHash('sha256').update(JSON.stringify([input.agentId,input.chatKey,input.allowTools,input.text,attachments.map(a=>[a.name,a.mimeType,createHash('sha256').update(a.dataBase64).digest('hex')])])).digest('hex');
     const previous=requests.get(input.requestId);
     if(previous){if(previous.fingerprint!==fingerprint)throw new Error('This request ID was already used for a different message.');return previous.outcome;}
     if(requests.size>=128)throw new Error('Request capacity reached. Wait before sending more messages.');
     const outcome=(async()=>{
+      if(input.chatKey===`bb:${input.agentId}:owner`){
+        const dashboard=await service('dashboard');await knownAgent(dashboard,input.agentId);
+        if(!await nativeAvailable(dashboard,input.agentId))throw new Error('Independent BB chat is unavailable. Update the PiBot dashboard before sending.');
+        return replySchema.parse(await call(dashboard,'/api/bb/chat','POST',input));
+      }
       const opened=await openChat(input);const current=own(opened.sessionId,'chat');
       try{return await send({...input,sessionId:opened.sessionId});}
       finally{await release(current).catch(()=>bb.log.warn('A completed chat request could not confirm connection cleanup.'));}
@@ -127,6 +141,29 @@ export default function plugin(bb:BbPluginApi) {
     reserveAudio();
     try{const info=z.object({mode:z.literal('shared'),audioReady:z.literal(true)}).safeParse(await call(await service('audio'),'/api/agents'));if(!info.success)throw new Error('Canonical audio is unavailable. Check the voice service and speech provider.');return {ready:true};}
     finally{openingAudio=false;}
+  }
+  async function knownAgent(dashboard:Endpoint,agentId:string){
+    const inventory=z.object({agents:z.array(agentSchema).max(200)}).parse(await call(dashboard,'/api/bb/agents'));
+    if(!inventory.agents.some(agent=>agent.id===agentId))throw new Error('This agent is unavailable. Refresh the agent list.');
+  }
+  async function nativeAvailable(dashboard:Endpoint,agentId:string){
+    try{
+      const result=z.object({conversations:z.array(z.object({agentId:z.string(),chatKey:z.string(),canSend:z.boolean(),kind:z.literal('bb')})).max(200)}).parse(await call(dashboard,`/api/bb/conversations?agentId=${encodeURIComponent(agentId)}`));
+      return result.conversations.some(row=>row.agentId===agentId&&row.chatKey===`bb:${agentId}:owner`&&row.canSend);
+    }catch(e){if(e instanceof ServiceError&&e.status===404)return false;throw e;}
+  }
+  async function conversationChoices(agentId:string){
+    const dashboard=await service('dashboard');await knownAgent(dashboard,agentId);
+    const native=await nativeAvailable(dashboard,agentId);
+    type Choice={agentId:string;chatKey:string;canSend:boolean;kind:'bb'|'telegram'|'saved'};
+    const choices=new Map<string,Choice>();let liveUnavailable=false;
+    try{const live=bindingsSchema.parse(await call(await service('bridge'),'/voice/bindings'));for(const row of live.bindings.filter(binding=>binding.agentId===agentId))choices.set(row.chatKey,{...row,canSend:true,kind:'telegram'});}catch{liveUnavailable=true;}
+    if(native)choices.set(`bb:${agentId}:owner`,{agentId,chatKey:`bb:${agentId}:owner`,canSend:true,kind:'bb'});
+    if(['localhost','127.0.0.1','[::1]'].includes(new URL(dashboard.url).hostname)){
+      const s=await settings.get();
+      for(const chatKey of await savedConversations(agentsRoot(s.localAgentsDir),agentId,s.localPibotRoot.trim()||inferredPibotRoot()))if(!choices.has(chatKey))choices.set(chatKey,{agentId,chatKey,canSend:false,kind:chatKey===`bb:${agentId}:owner`?'bb':'saved'});
+    }
+    return {conversations:[...choices.values()].slice(0,200),nativeAvailable:native,...(liveUnavailable?{liveUnavailable:true}:{})};
   }
   bb.rpc.register(rpcContract,{
     config:async()=>{await discoverDashboard();const s=await settings.get();const ready=(url:string,token?:string)=>{try{endpoint(url,token);return true;}catch{return false;}};
@@ -154,19 +191,36 @@ export default function plugin(bb:BbPluginApi) {
       return {agents:z.object({agents:z.array(agentSchema).max(200)}).parse(agents).agents,processes:processesSchema.parse(processes)};
     },
     bindings:async()=>bindingsSchema.parse(await call(await service('bridge'),'/voice/bindings')),
+    conversations:async({agentId})=>conversationChoices(agentId),
     createAgent:async(input)=>z.object({id:z.string()}).parse(await call(await service('dashboard'),'/api/bb/agents','POST',input)),
     cancelTask:async({id})=>z.object({cancelled:z.boolean()}).parse(await call(await service('dashboard'),`/api/bb/tasks/${encodeURIComponent(id)}/cancel`,'POST',{})),
     speak:({text})=>speech.speak(text),
     speechStatus:({playbackId})=>speech.status(playbackId),
     stopSpeech:({playbackId})=>speech.stop(playbackId),
     history:async({agentId,chatKey,before})=>{
-      const target=await service('bridge');const dashboard=await service('dashboard');
-      if(![target,dashboard].every(t=>['localhost','127.0.0.1','[::1]'].includes(new URL(t.url).hostname)))throw new Error('Local session history requires PiBot services on the bb server machine.');
-      const bindings=bindingsSchema.parse(await call(target,'/voice/bindings'));
-      if(!bindings.bindings.some(b=>b.agentId===agentId&&b.chatKey===chatKey))throw new Error('This agent/chat binding is unavailable.');
+      const dashboard=await service('dashboard');
+      if(!['localhost','127.0.0.1','[::1]'].includes(new URL(dashboard.url).hostname))throw new Error('Local session history requires PiBot services on the bb server machine.');
+      await knownAgent(dashboard,agentId);
       const s=await settings.get(),root=agentsRoot(s.localAgentsDir),checkout=s.localPibotRoot.trim()||inferredPibotRoot();
+      let allowed=(await savedConversations(root,agentId,checkout)).includes(chatKey);
+      if(!allowed&&chatKey===`bb:${agentId}:owner`)allowed=await nativeAvailable(dashboard,agentId);
+      if(!allowed&&chatKey!==`bb:${agentId}:owner`){
+        const bridge=await service('bridge');
+        if(!['localhost','127.0.0.1','[::1]'].includes(new URL(bridge.url).hostname))throw new Error('Local session history requires PiBot services on the bb server machine.');
+        const bindings=bindingsSchema.parse(await call(bridge,'/voice/bindings'));
+        allowed=bindings.bindings.some(binding=>binding.agentId===agentId&&binding.chatKey===chatKey);
+      }
+      if(!allowed)throw new Error('This agent/chat binding is unavailable.');
       const watchKey=await historyWatch.track(root,agentId,chatKey,checkout);
-      return {...await loadHistory(root,agentId,chatKey,before,checkout),watchKey};
+      const history=await loadHistory(root,agentId,chatKey,before,checkout);
+      const messages=await Promise.all(history.messages.map(async message=>{
+        const videos=[];
+        for(const part of videoNoteParts(message.text))if(part.kind==='video'){
+          const src=await videoMedia.issue(part.filePath,checkout);if(src)videos.push({index:part.index,src});
+        }
+        return videos.length?{...message,videos}:message;
+      }));
+      return {...history,messages,watchKey};
     },
     chat,
     openChat,
@@ -202,5 +256,5 @@ export default function plugin(bb:BbPluginApi) {
     }});
   // Expired canonical sessions sweep themselves; retain uncertain audio ownership until explicit close.
   const timer=setInterval(()=>{const now=Date.now();for(const [id,current] of chats)if(now>current.expires&&!current.closing)chats.delete(id);for(const [id,record] of requests)if(now>record.expires)requests.delete(id);},10_000);timer.unref();
-  bb.onDispose(async()=>{disposed=true;historyWatch.dispose();speech.dispose();clearInterval(timer);lifecycle.abort();await Promise.allSettled([...chats.values(),...(audio?[audio]:[])].map(release));requests.clear();await audioRuntime.dispose();});
+  bb.onDispose(async()=>{disposed=true;videoMedia.dispose();historyWatch.dispose();speech.dispose();clearInterval(timer);lifecycle.abort();await Promise.allSettled([...chats.values(),...(audio?[audio]:[])].map(release));requests.clear();await audioRuntime.dispose();});
 }

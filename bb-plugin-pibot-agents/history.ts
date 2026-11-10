@@ -22,19 +22,24 @@ function textOf(content:unknown):string{
  if(!Array.isArray(content))return '';
  return content.filter(c=>c&&typeof c==='object'&&c.type==='text'&&typeof c.text==='string').map(c=>c.text).join('\n').slice(0,16000);
 }
-/** Resolve only the exact indexed source; shared by the reader and invalidation watcher. */
-export async function resolveHistorySource(root:string,agentId:string,chatKey:string,checkoutRoot?:string):Promise<{file?:string;watchFiles:string[]}>{
- try{
+type HistoryIndex={sessions:string;watchFiles:string[];index:Record<string,unknown>};
+async function readHistoryIndex(root:string,agentId:string):Promise<HistoryIndex>{
  if(!/^[A-Za-z0-9_-]{1,64}$/.test(agentId)||!isAbsolute(root))throw unavailable();
- const base=await realpath(root);const agent=join(base,agentId);if(await realpath(agent)!==agent)throw unavailable();
+ const base=await realpath(root);const agent=join(base,agentId);
+ try{if(await realpath(agent)!==agent)throw unavailable();}catch(e){
+  if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;
+  const baseStat=await lstat(base);if(!baseStat.isDirectory()||baseStat.uid!==process.getuid?.()||(baseStat.mode&0o022))throw unavailable();
+  return {sessions:join(agent,'sessions'),watchFiles:[agent],index:{}};
+ }
  const agentStat=await lstat(agent);if(!agentStat.isDirectory()||agentStat.uid!==process.getuid?.()||(agentStat.mode&0o022))throw unavailable();
  const sessions=join(agent,'sessions');
- try{if(await realpath(sessions)!==sessions)throw unavailable();}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return {watchFiles:[join(agent,'sessions')]};throw e;}
+ try{if(await realpath(sessions)!==sessions)throw unavailable();}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return {sessions,watchFiles:[join(agent,'sessions')],index:{}};throw e;}
  const sessionsStat=await lstat(sessions);if(!sessionsStat.isDirectory()||sessionsStat.uid!==process.getuid?.()||(sessionsStat.mode&0o022))throw unavailable();
- let indexText:string;try{indexText=await readPrivate(join(sessions,'index.json'),1048576);}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return {watchFiles:[join(sessions,'index.json')]};throw e;}
+ let indexText:string;try{indexText=await readPrivate(join(sessions,'index.json'),1048576);}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return {sessions,watchFiles:[join(sessions,'index.json')],index:{}};throw e;}
  const index=JSON.parse(indexText);if(!index||typeof index!=='object'||Array.isArray(index))throw unavailable();
- const file=Object.hasOwn(index,chatKey)?index[chatKey]:undefined;
- if(file===undefined)return {watchFiles:[join(sessions,'index.json')]};
+ return {sessions,watchFiles:[join(sessions,'index.json')],index};
+}
+async function indexedSessionFile(sessions:string,agentId:string,file:unknown,checkoutRoot?:string):Promise<string>{
  if(typeof file!=='string'||!isAbsolute(file)||!file.endsWith('.jsonl')||await realpath(file)!==file)throw unavailable();
  let confined=inside(sessions,file);
  if(!confined&&checkoutRoot&&isAbsolute(checkoutRoot)){
@@ -46,7 +51,30 @@ export async function resolveHistorySource(root:string,agentId:string,chatKey:st
  }
  if(!confined)throw unavailable();
  const st=await lstat(file);if(!st.isFile()||st.isSymbolicLink()||st.uid!==process.getuid?.()||(st.mode&0o022)||st.size>64*1024*1024)throw unavailable();
- return {file,watchFiles:[join(sessions,'index.json'),file]};
+ return file;
+}
+/** Only positive owner-chat IDs; internal agent and group routes are never exposed. */
+export function isSavedOwnerConversation(chatKey:string):boolean{
+ if(!/^telegram:(?:[A-Za-z0-9_-]{1,64}:)?[1-9][0-9]{0,15}$/.test(chatKey))return false;
+ return Number.isSafeInteger(Number(chatKey.slice(chatKey.lastIndexOf(':')+1)));
+}
+/** Read metadata only from the same private index; never enumerate session archives. */
+export async function savedConversations(root:string,agentId:string,checkoutRoot?:string):Promise<string[]>{
+ try{
+  let source:HistoryIndex;try{source=await readHistoryIndex(root,agentId);}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return [];throw e;}
+  const keys=Object.keys(source.index).filter(key=>isSavedOwnerConversation(key)||key===`bb:${agentId}:owner`).sort().slice(0,200);
+  for(const key of keys)await indexedSessionFile(source.sessions,agentId,source.index[key],checkoutRoot);
+  return keys;
+ }catch{throw unavailable();}
+}
+/** Resolve only the exact indexed source; shared by the reader and invalidation watcher. */
+export async function resolveHistorySource(root:string,agentId:string,chatKey:string,checkoutRoot?:string):Promise<{file?:string;watchFiles:string[]}>{
+ try{
+  const {sessions,index,watchFiles}=await readHistoryIndex(root,agentId);
+  const value=Object.hasOwn(index,chatKey)?index[chatKey]:undefined;
+  if(value===undefined)return {watchFiles};
+  const file=await indexedSessionFile(sessions,agentId,value,checkoutRoot);
+  return {file,watchFiles:[...watchFiles,file]};
  }catch{throw unavailable();}
 }
 /** Read the persisted active branch only. Never open/migrate/write a Pi session. */

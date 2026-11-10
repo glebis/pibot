@@ -13,6 +13,8 @@ import type { ModelCascade } from "./cascade.js";
 import type { PushOptions, ReplyContext, Schedule, Transport, IncomingMedia, DeliveryReceipt } from "./types.js";
 import { OWNER_CHAT_ID, ownerChatKey } from "../test-fixtures.js";
 import { transcriptionPolicyMarker } from "./transcription-policy.js";
+import type { CommsHooks } from "../plugins/agent-comms-plugin.js";
+import { TaskDeadlineError } from "../durable/task-ledger.js";
 
 // The /newagent wizard runs the LLM-backed ambiguity gate before creating the
 // agent. With no modelRuntime stub the SDK falls back to the machine's real
@@ -671,6 +673,39 @@ describe("PiBot commands", () => {
     expect(t.promptSpy).not.toHaveBeenCalled();
     expect(t.transport.lastText()).toContain("Transcription failed");
     expect(t.transport.lastText()).toContain("network down");
+  });
+
+  it.each([
+    { status: 401, category: "auth", action: "rotate-credential", rotation: "warranted" },
+    { status: 429, category: "quota", action: "wait", rotation: "not-warranted" },
+    { status: 403, category: "access-refused", action: "investigate", rotation: "not-warranted" },
+    { status: 0, category: "network", action: "investigate", rotation: "not-warranted" },
+  ])("pushes the complete scoped STT decision for $category after local failures", async ({ status, category, action, rotation }) => {
+    (t.agents.getAgent as ReturnType<typeof vi.fn>).mockImplementation((id: string) => id === "assistant"
+      ? { id, dir: "/tmp/fake-assistant", manifest: { name: id, speech: { sttProviders: ["whisperkit", "groq"], allowExternalStt: true } } }
+      : undefined);
+    (t.stt as unknown as { hostProviderIds: string[] }).hostProviderIds = ["whisperkit", "groq"];
+    const privatePayload = "PROVIDER_PRIVATE_PAYLOAD_TOKEN";
+    t.stt.transcribe.mockResolvedValueOnce({
+      ok: false, text: "", provider: "none",
+      error: `all STT providers failed — whisperkit: ${"local failure ".repeat(30)}; groq: HTTP ${status} ${privatePayload}`,
+      diagnostic: { service: "groq-stt-host", executor: "host-stt-daemon", source: "host-env", category },
+    } as never);
+
+    await t.transport.sayMedia({ kind: "voice", durationSec: 5 });
+
+    const pushed = t.transport.pushed.at(-1);
+    expect(pushed?.chatId).toBe("42");
+    const message = pushed?.opts.text ?? "";
+    expect(message).toContain("Transcription failed");
+    for (const field of [
+      "service=groq-stt-host", "executor=host-stt-daemon", "source=host-env",
+      `category=${category}`, `action=${action}`, `rotation=${rotation}`,
+    ]) expect(message).toContain(field);
+    expect(message).not.toContain(privatePayload);
+    expect(message).not.toContain("local failure");
+    expect(message.length).toBeLessThan(240);
+    expect(t.promptSpy).not.toHaveBeenCalled();
   });
 
   it("switches agents with /agent", async () => {
@@ -1752,12 +1787,12 @@ describe("task ack confirmations", () => {
     };
   }
 
-  it("inter-agent task replies surface a passive ack line in the recipient's chat", async () => {
+  it("owner-audience inter-agent task replies surface a passive ack line in the recipient's chat (bd pibot-jq9m)", async () => {
     const t = makeBot();
     (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sessionWithReply("On it — leave it with me."));
     bBind(t, "assistant", "mock:42");
-    await (t.bot as unknown as { agentTurn(a: string, f: string, text: string): Promise<string> }).agentTurn(
-      "assistant", "knower", "file the Berlin takeaways"
+    await (t.bot as unknown as { agentTurn(a: string, f: string, text: string, timeoutMs?: number, origin?: { transport: string; chatId: string }, correlationId?: string, audience?: string): Promise<string> }).agentTurn(
+      "assistant", "knower", "file the Berlin takeaways", undefined, { transport: "mock", chatId: "42" }, undefined, "owner"
     );
     expect(t.transport.pushed.some((p) => p.opts.text.includes("🤝 **assistant** accepted **knower**'s task: “file the Berlin takeaways”"))).toBe(true);
     expect(t.events.log).toHaveBeenCalledWith("assistant", "task-ack", expect.stringContaining("accepted"));
@@ -1774,8 +1809,8 @@ describe("task ack confirmations", () => {
       isStreaming: false,
     };
     (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
-    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
-      "fitness", "assistant", "implement the dashboard", undefined, { transport: "mock", chatId: "42" }
+    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }, correlationId?: string, audience?: string): Promise<string> }).agentAsk(
+      "fitness", "assistant", "implement the dashboard", undefined, { transport: "mock", chatId: "42" }, undefined, "owner"
     );
     // final status pushed into the origin chat, sender-attributed (shared transport)
     const status = t.transport.pushed.find((p) => p.opts.text.includes("Built and committed"));
@@ -1793,8 +1828,8 @@ describe("task ack confirmations", () => {
     const tail = "TAIL-MARKER-cue-35-37-survive";
     const sess = sessionWithReply("A".repeat(900) + " … " + tail);
     (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
-    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
-      "fitness", "assistant", "long job with a long report", undefined, { transport: "mock", chatId: "42" }
+    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }, correlationId?: string, audience?: string): Promise<string> }).agentAsk(
+      "fitness", "assistant", "long job with a long report", undefined, { transport: "mock", chatId: "42" }, undefined, "owner"
     );
     const status = t.transport.pushed.find((p) => p.opts.text.includes(tail));
     expect(status).toBeDefined(); // the tail must survive the origin-chat push
@@ -1808,6 +1843,33 @@ describe("task ack confirmations", () => {
       "fitness", "assistant", "implement", undefined, { transport: "ghost", chatId: "42" }
     );
     expect(t.transport.pushed.length).toBe(0); // no push, no crash
+  });
+
+  it("internal audience: no acceptance, no reply push, no ack — even with an origin chat (bd pibot-jq9m)", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(
+      sessionWithReply("internal diagnostics: groq argv … completed")
+    );
+    bBind(t, "assistant", "mock:42");
+    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }, correlationId?: string, audience?: string): Promise<string> }).agentAsk(
+      "knower", "assistant", "internal transcription diagnostics", undefined, { transport: "mock", chatId: "42" }, undefined, "internal"
+    );
+    expect(t.transport.pushed.length).toBe(0);
+    expect(t.events.log).not.toHaveBeenCalledWith("assistant", "task-ack", expect.anything());
+  });
+
+  it("owner audience: acceptance + final reply delivered to the origin chat (bd pibot-jq9m)", async () => {
+    const t = makeBot();
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(
+      sessionWithReply("Built and committed. Dashboard is live.")
+    );
+    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }, correlationId?: string, audience?: string): Promise<string> }).agentAsk(
+      "fitness", "assistant", "implement the dashboard", undefined, { transport: "mock", chatId: "42" }, undefined, "owner"
+    );
+    expect(t.transport.pushed.some((p) => p.opts.text.includes("accepted"))).toBe(true);
+    const status = t.transport.pushed.find((p) => p.opts.text.includes("Built and committed"));
+    expect(status).toBeDefined();
+    expect(status!.opts.text).toContain("[assistant]");
   });
 
   it("origin-chat routing: inter-agent questions render in the owner's chat", async () => {
@@ -1932,14 +1994,14 @@ describe("inter-agent run identity across timeout (bd pibot-jiqv)", () => {
     );
     (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(sess);
     const bot = t.bot as unknown as {
-      agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string>;
+      agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }, correlationId?: string, audience?: string): Promise<string>;
     };
     const origin = { transport: "mock", chatId: "42" };
 
-    await expect(bot.agentAsk("knower", "assistant", "rewrite the post in ChatGPT Pro", 10, origin))
+    await expect(bot.agentAsk("knower", "assistant", "rewrite the post in ChatGPT Pro", 10, origin, undefined, "owner"))
       .rejects.toThrow(/still running after 1s — do not resubmit/);
     // the retry is the same request: it joins the live run, so there is no second prompt
-    await expect(bot.agentAsk("knower", "assistant", "rewrite the post in ChatGPT Pro", 10, origin))
+    await expect(bot.agentAsk("knower", "assistant", "rewrite the post in ChatGPT Pro", 10, origin, undefined, "owner"))
       .rejects.toThrow(/do not resubmit/);
     expect(sess.prompt).toHaveBeenCalledTimes(1);
     expect(t.transport.pushed.some((p) => p.opts.text.includes("busy"))).toBe(false);
@@ -1975,6 +2037,351 @@ describe("inter-agent run identity across timeout (bd pibot-jiqv)", () => {
     expect(sess.prompt).toHaveBeenCalledTimes(1);
     release();
     fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+});
+
+describe("background task deadline preserves correlated delegate evidence (bd pibot-jiqv)", () => {
+  let t: ReturnType<typeof makeBot>;
+  let ledger: import("../durable/task-ledger.js").TaskLedger;
+  let notes: string[];
+  let messages: unknown[];
+
+  const waitFor = async <T,>(read: () => Promise<T> | T, ok: (value: T) => boolean, ms = 4000): Promise<T> => {
+    const end = Date.now() + ms;
+    for (;;) {
+      const value = await read();
+      if (ok(value)) return value;
+      if (Date.now() > end) throw new Error(`timed out; last=${JSON.stringify(value)}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  beforeEach(async () => {
+    t = makeBot();
+    notes = [];
+    messages = [];
+    const { openTaskLedger } = await import("../durable/task-ledger.js");
+    ledger = await openTaskLedger({
+      runner: { run: (task) => t.bot.runLedgerTask(task), notify: async (_ck, text) => { notes.push(text); } },
+    });
+    // production wires the ledger onto the agent manager (src/index.ts); the reconciliation reads it there
+    (t.agents as unknown as { tasks?: typeof ledger }).tasks = ledger;
+    const session = {
+      agent: { state: { messages } },
+      prompt: t.promptSpy,
+      subscribe: vi.fn(() => () => {}),
+      setModel: vi.fn(async () => {}),
+      setActiveToolsByName: vi.fn(),
+      getActiveToolNames: vi.fn(() => [] as string[]),
+      abort: vi.fn(async () => {}),
+      isStreaming: false,
+    };
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(session);
+    t.promptSpy.mockImplementation(() => new Promise(() => {}));
+    // Shorten only the duration; runLedgerTask still owns the deadline/partial decision.
+    (t.bot as unknown as { taskDeadline: () => { minutes: number; ms: number } }).taskDeadline = () => ({ minutes: 0.05, ms: 300 });
+  });
+
+  afterEach(async () => {
+    await ledger.close();
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  async function startTask(title = "transcribe the arjay audio") {
+    const started = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title, instructions: "transcribe the arjay audio with the declared route" });
+    const call = await waitFor(
+      () => (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.find((c) => String(c[1]).includes(`task-${started.id}`)),
+      (value) => value !== undefined,
+    );
+    return { id: started.id, hooks: call![5] as CommsHooks };
+  }
+
+  it("keeps exactly the correlated child result when it arrives before the deadline", async () => {
+    const ask = vi.spyOn(t.bot as unknown as { agentAsk: (...args: unknown[]) => Promise<string> }, "agentAsk")
+      .mockResolvedValue("Transcript ready.\nSaved: /Users/glebkalinin/.local/share/pibot/agents/knower/arjay.groq.txt");
+    const { id, hooks } = await startTask();
+
+    await hooks.askAgent("assistant", "pibot-dev", "transcribe the arjay audio", undefined, { transport: "mock", chatId: "42" }, "ask");
+
+    const done = await waitFor(() => ledger.get(id), (entry) => entry?.status === "partial");
+    await waitFor(async () => notes.length, (count) => count >= 1);
+    expect(done?.result).toContain("delegate-returned, not independently verified");
+    expect(done?.evidence).toContain("arjay.groq.txt");
+    expect(done?.result).toContain("arjay.groq.txt");
+    expect(done?.result).toContain("Remaining gate");
+    expect(done?.status).toBe("partial");
+    expect(notes.join("\n")).toContain("Task partial");
+    expect(notes.join("\n")).not.toContain("Task failed");
+    expect(ask).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains a failure when no correlated child result exists", async () => {
+    const { id } = await startTask();
+    const failed = await waitFor(() => ledger.get(id), (entry) => entry?.status === "failed");
+    await waitFor(async () => notes.length, (count) => count >= 1);
+    expect(failed?.error).toMatch(/took longer than/i);
+    expect(failed?.evidence).toBeUndefined();
+    expect(notes.join("\n")).toContain("Task failed");
+    expect(notes.join("\n")).not.toContain("Task partial");
+  });
+
+  it("ignores an unrelated same-chat task's artifact and keeps the honest failure", async () => {
+    const unrelated = path.join(t.dir, "unrelated-arjay.groq.txt");
+    fs.writeFileSync(unrelated, "someone else's transcript");
+    let prompts = 0;
+    t.promptSpy.mockImplementation(async () => {
+      prompts++;
+      if (prompts === 1) {
+        messages.push({ role: "assistant", content: [{ type: "text", text: `other work\n${unrelated}` }], stopReason: "stop", timestamp: 1 });
+      } else {
+        await new Promise(() => {});
+      }
+    });
+    // A finished sibling task in the SAME chat, with its own artifact location.
+    const sibling = await ledger.start({ agentId: "pibot-dev", chatKey: "mock:42", title: "other task", instructions: "other work", outputLocation: unrelated });
+    await waitFor(() => ledger.get(sibling.id), (entry) => entry?.status === "done");
+    notes.length = 0;
+
+    const { id } = await startTask();
+    const failed = await waitFor(() => ledger.get(id), (entry) => entry?.status === "failed");
+    await waitFor(async () => notes.length, (count) => count >= 1);
+    // No filesystem or sibling lookup: the parent record/notice must not claim that artifact.
+    expect(JSON.stringify(failed)).not.toContain(unrelated);
+    expect(notes.join("\n")).not.toContain(unrelated);
+    expect(failed?.status).toBe("failed");
+  });
+
+  it("appends a late correlated result as partial evidence without re-notifying or marking done", async () => {
+    let release!: (text: string) => void;
+    const deferred = new Promise<string>((resolve) => { release = resolve; });
+    vi.spyOn(t.bot as unknown as { agentAsk: (...args: unknown[]) => Promise<string> }, "agentAsk").mockReturnValue(deferred);
+    const { id, hooks } = await startTask();
+    const pending = hooks.askAgent("assistant", "pibot-dev", "transcribe the arjay audio", undefined, { transport: "mock", chatId: "42" }, "ask");
+
+    const failed = await waitFor(() => ledger.get(id), (entry) => entry?.status === "failed");
+    await waitFor(async () => notes.length, (count) => count === 1);
+    expect(failed?.evidence).toBeUndefined();
+
+    release("Transcript ready.\nSaved: /tmp/late-arjay.groq.txt");
+    await pending;
+
+    const amended = await waitFor(() => ledger.get(id), (entry) => Boolean(entry?.evidence?.includes("late-arjay.groq.txt")));
+    expect(amended?.status).toBe("partial");
+    expect(amended?.status).not.toBe("done");
+    expect(notes).toHaveLength(1); // the deadline notice is not repeated
+    expect(notes[0]).toContain("Task failed");
+  });
+
+  it("does not treat a no-reply or refusal as usable evidence", async () => {
+    vi.spyOn(t.bot as unknown as { agentAsk: (...args: unknown[]) => Promise<string> }, "agentAsk")
+      .mockResolvedValueOnce("(no reply)")
+      .mockResolvedValueOnce("BLOCKED: no Groq credential");
+    const { id, hooks } = await startTask();
+    await hooks.askAgent("assistant", "pibot-dev", "transcribe", undefined, { transport: "mock", chatId: "42" }, "ask");
+    await hooks.askAgent("assistant", "pibot-dev", "transcribe again", undefined, { transport: "mock", chatId: "42" }, "ask");
+
+    const failed = await waitFor(() => ledger.get(id), (entry) => entry?.status === "failed");
+    await waitFor(async () => notes.length, (count) => count >= 1);
+    expect(failed?.evidence).toBeUndefined();
+    expect(notes.join("\n")).toContain("Task failed");
+    expect(notes.join("\n")).not.toContain("Task partial");
+  });
+
+  it("ignores agent_message deliveries, which are not delegate work evidence", async () => {
+    vi.spyOn(t.bot as unknown as { agentAsk: (...args: unknown[]) => Promise<string> }, "agentAsk")
+      .mockResolvedValue("Delivered to pibot-dev. Transcript ready /tmp/message.txt");
+    const { id, hooks } = await startTask();
+    await hooks.askAgent("assistant", "pibot-dev", "notify only", undefined, { transport: "mock", chatId: "42" }, "message");
+
+    const failed = await waitFor(() => ledger.get(id), (entry) => entry?.status === "failed");
+    await waitFor(async () => notes.length, (count) => count >= 1);
+    expect(failed?.evidence).toBeUndefined();
+  });
+
+  it("reaches task evidence when agent_ask times out but the underlying turn finishes later", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let prompts = 0;
+    t.promptSpy.mockImplementation(async () => {
+      prompts++;
+      if (prompts === 1) return new Promise(() => {}); // the parent task turn stays pending
+      await gate;
+      messages.push({ role: "assistant", content: [{ type: "text", text: "Transcript ready /tmp/after-ask-timeout.txt" }], stopReason: "stop", timestamp: 5 });
+    });
+    const { id, hooks } = await startTask();
+
+    await expect(hooks.askAgent("assistant", "pibot-dev", "transcribe", 20, { transport: "mock", chatId: "42" }, "ask"))
+      .rejects.toThrow(/still running|do not resubmit/);
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const done = await waitFor(() => ledger.get(id), (entry) => entry?.status === "partial");
+    expect(done?.result).toContain("after-ask-timeout.txt");
+  });
+
+  it("a cached session's old hooks resolve the current attempt's collector on resume", async () => {
+    let deadlineMs = 120;
+    (t.bot as unknown as { taskDeadline: () => { minutes: number; ms: number } }).taskDeadline = () => ({ minutes: 0.05, ms: deadlineMs });
+    vi.spyOn(t.bot as unknown as { agentAsk: (...args: unknown[]) => Promise<string> }, "agentAsk")
+      .mockResolvedValue("Transcript ready /tmp/resumed.txt");
+    const run = { agentId: "assistant", chatKey: "mock:42", taskId: "tk-resume", title: "resume", instructions: "work", attempt: 1, resumed: false, signal: new AbortController().signal } as unknown as import("../durable/task-ledger.js").TaskRun;
+
+    const first = t.bot.runLedgerTask(run);
+    await vi.waitFor(() => expect((t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(0));
+    const oldHooks = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls[0][5] as CommsHooks;
+    await expect(first).rejects.toThrow(/took longer/i);
+
+    deadlineMs = 400;
+    const second = t.bot.runLedgerTask({ ...run, attempt: 2, resumed: true });
+    // Attempt 2 registers its collector before creating the session; wait for that dispatch point.
+    await vi.waitFor(() => expect((t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(2));
+    // The fake manager returns the same cached session; drive the OLD hooks (as a cached
+    // session would) and prove the reply lands in attempt 2's collector.
+    await oldHooks.askAgent("assistant", "pibot-dev", "transcribe", undefined, { transport: "mock", chatId: "42" }, "ask");
+    const result = await second;
+    expect(typeof result === "string" ? result : result.text).toContain("resumed.txt");
+  });
+
+  it("a cached attempt's late reply records under THAT attempt, not the earlier collector", async () => {
+    const appended: Array<{ cause?: string; usable?: boolean }> = [];
+    (t.agents as unknown as { tasks: unknown }).tasks = {
+      appendEvidence: vi.fn(async (_id: string, _note: string, opts?: { cause?: string; usable?: boolean }) => { appended.push(opts ?? {}); return undefined; }),
+    };
+    let release!: (text: string) => void;
+    const deferred = new Promise<string>((resolve) => { release = resolve; });
+    vi.spyOn(t.bot as unknown as { agentAsk: (...args: unknown[]) => Promise<string> }, "agentAsk").mockReturnValue(deferred);
+    let deadlineMs = 100;
+    (t.bot as unknown as { taskDeadline: () => { minutes: number; ms: number } }).taskDeadline = () => ({ minutes: 0.05, ms: deadlineMs });
+    const base = { agentId: "assistant", chatKey: "mock:42", taskId: "tk-cached-late", title: "cached", instructions: "work", attempt: 1, resumed: false, signal: new AbortController().signal } as unknown as import("../durable/task-ledger.js").TaskRun;
+
+    const first = t.bot.runLedgerTask(base);
+    await vi.waitFor(() => expect((t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(0));
+    const oldHooks = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls[0][5] as CommsHooks;
+    await expect(first).rejects.toThrow(/took longer/i);
+
+    // Attempt 2 ends by CANCELLATION, not the deadline.
+    deadlineMs = 5000;
+    const controller = new AbortController();
+    const second = t.bot.runLedgerTask({ ...base, attempt: 2, resumed: true, signal: controller.signal });
+    await vi.waitFor(() => expect((t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(2));
+    const pending = oldHooks.askAgent("assistant", "pibot-dev", "transcribe", undefined, { transport: "mock", chatId: "42" }, "ask");
+    pending.catch(() => {});
+    controller.abort();
+    await expect(second).rejects.toThrow(/cancelled/);
+
+    release("Transcript ready /tmp/cached-late.txt");
+    await pending;
+    await vi.waitFor(() => expect(appended.length).toBe(1));
+    // If the reply had reverted to attempt 1's collector, cause would be "deadline".
+    expect(appended[0]).toMatchObject({ cause: "late", usable: true });
+  });
+
+  it("does not retain a collector when session setup rejects or the session is busy", async () => {
+    const map = (t.bot as unknown as { taskEvidence: Map<string, unknown> }).taskEvidence;
+    const base = { agentId: "assistant", chatKey: "mock:42", taskId: "tk-setup-err", title: "setup", instructions: "work", attempt: 1, resumed: false, signal: new AbortController().signal } as unknown as import("../durable/task-ledger.js").TaskRun;
+
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("session build failed"));
+    await expect(t.bot.runLedgerTask(base)).rejects.toThrow(/session build failed/);
+    expect(map.has("tk-setup-err")).toBe(false);
+
+    const busy = { agent: { state: { messages: [] as unknown[] } }, prompt: t.promptSpy, subscribe: vi.fn(() => () => {}), abort: vi.fn(async () => {}), isStreaming: true };
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce(busy);
+    await expect(t.bot.runLedgerTask({ ...base, taskId: "tk-busy" })).rejects.toThrow(/session is busy/);
+    expect(map.has("tk-busy")).toBe(false);
+  });
+
+  it("a deadline whose abort synchronously resolves the prompt is never a false done", async () => {
+    const ask = vi.spyOn(t.bot as unknown as { agentAsk: (...args: unknown[]) => Promise<string> }, "agentAsk")
+      .mockResolvedValue("Transcript ready /tmp/abort-resolve.txt");
+    const calls = t.agents.getOrCreateSession as ReturnType<typeof vi.fn>;
+
+    async function deadlineRun(taskId: string, evidence: boolean) {
+      let settle!: () => void;
+      const session = {
+        agent: { state: { messages: [] as unknown[] } },
+        prompt: vi.fn(() => new Promise<void>((resolve) => { settle = resolve; })),
+        subscribe: vi.fn(() => () => {}),
+        // Synchronously settles the prompt while the deadline timer is firing.
+        abort: vi.fn(() => { settle(); return Promise.resolve(); }),
+        isStreaming: false,
+      };
+      calls.mockResolvedValueOnce(session);
+      const before = calls.mock.calls.length;
+      const run = t.bot.runLedgerTask({ agentId: "assistant", chatKey: "mock:42", taskId, title: "deadline", instructions: "work", attempt: 1, resumed: false, signal: new AbortController().signal } as unknown as import("../durable/task-ledger.js").TaskRun);
+      await vi.waitFor(() => expect(calls.mock.calls.length).toBeGreaterThan(before));
+      if (evidence) await (calls.mock.calls.at(-1)![5] as CommsHooks).askAgent("assistant", "pibot-dev", "transcribe", undefined, { transport: "mock", chatId: "42" }, "ask");
+      return run;
+    }
+
+    await expect(deadlineRun("tk-resolve-evidence", true)).resolves.toMatchObject({ status: "partial" });
+    await expect(deadlineRun("tk-resolve-none", false)).rejects.toThrow(TaskDeadlineError);
+    expect(ask).toHaveBeenCalled();
+  });
+
+  it("a deadline whose abort rejects with a generic cancellation Error still reports the deadline", async () => {
+    vi.spyOn(t.bot as unknown as { agentAsk: (...args: unknown[]) => Promise<string> }, "agentAsk")
+      .mockResolvedValue("Transcript ready /tmp/abort-reject.txt");
+    const calls = t.agents.getOrCreateSession as ReturnType<typeof vi.fn>;
+
+    async function deadlineRun(taskId: string, evidence: boolean) {
+      let fail!: (e: Error) => void;
+      const session = {
+        agent: { state: { messages: [] as unknown[] } },
+        prompt: vi.fn(() => new Promise<void>((_resolve, reject) => { fail = reject; })),
+        subscribe: vi.fn(() => () => {}),
+        abort: vi.fn(() => { fail(new Error("aborted by provider")); return Promise.resolve(); }),
+        isStreaming: false,
+      };
+      calls.mockResolvedValueOnce(session);
+      const before = calls.mock.calls.length;
+      const run = t.bot.runLedgerTask({ agentId: "assistant", chatKey: "mock:42", taskId, title: "deadline", instructions: "work", attempt: 1, resumed: false, signal: new AbortController().signal } as unknown as import("../durable/task-ledger.js").TaskRun);
+      await vi.waitFor(() => expect(calls.mock.calls.length).toBeGreaterThan(before));
+      if (evidence) await (calls.mock.calls.at(-1)![5] as CommsHooks).askAgent("assistant", "pibot-dev", "transcribe", undefined, { transport: "mock", chatId: "42" }, "ask");
+      return run;
+    }
+
+    await expect(deadlineRun("tk-reject-evidence", true)).resolves.toMatchObject({ status: "partial" });
+    await expect(deadlineRun("tk-reject-none", false)).rejects.toThrow(TaskDeadlineError);
+  });
+
+  it("owner cancellation stays cancelled even while the deadline timer exists", async () => {
+    const calls = t.agents.getOrCreateSession as ReturnType<typeof vi.fn>;
+    const session = {
+      agent: { state: { messages: [] as unknown[] } },
+      prompt: vi.fn(() => new Promise(() => {})),
+      subscribe: vi.fn(() => () => {}),
+      abort: vi.fn(async () => {}),
+      isStreaming: false,
+    };
+    calls.mockResolvedValueOnce(session);
+    const controller = new AbortController();
+    const before = calls.mock.calls.length;
+    const run = t.bot.runLedgerTask({ agentId: "assistant", chatKey: "mock:42", taskId: "tk-owner-cancel", title: "cancel", instructions: "work", attempt: 1, resumed: false, signal: controller.signal } as unknown as import("../durable/task-ledger.js").TaskRun);
+    await vi.waitFor(() => expect(calls.mock.calls.length).toBeGreaterThan(before));
+    controller.abort();
+    await expect(run).rejects.toThrow(/cancelled/);
+  });
+
+  it("does not share an in-flight ask across different task correlations", async () => {
+    const session = {
+      agent: { state: { messages: [] as unknown[] } },
+      prompt: t.promptSpy,
+      subscribe: vi.fn(() => () => {}),
+      setModel: vi.fn(async () => {}),
+      abort: vi.fn(async () => {}),
+      isStreaming: false,
+    };
+    (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mockResolvedValue(session);
+    t.promptSpy.mockImplementation(async () => { session.isStreaming = true; await new Promise(() => {}); });
+    const bot = t.bot as unknown as { agentAsk: (from: string, to: string, q: string, ms?: number, origin?: unknown, correlationId?: string) => Promise<string> };
+    const origin = { transport: "mock", chatId: "42" };
+
+    const a = bot.agentAsk("assistant", "pibot-dev", "same question", 20, origin, "taskA");
+    a.catch(() => {});
+    await vi.waitFor(() => expect(t.promptSpy).toHaveBeenCalledTimes(1));
+    await expect(bot.agentAsk("assistant", "pibot-dev", "same question", 20, origin, "taskB")).rejects.toThrow(/busy/);
+    await expect(bot.agentAsk("assistant", "pibot-dev", "same question", 20, origin, "taskA")).rejects.toThrow(/still running|do not resubmit/);
+    expect(t.promptSpy).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -2457,8 +2864,8 @@ describe("acceptance acks for delegated work", () => {
     const gate = new Promise<void>((r) => (release = r));
     sess.prompt = vi.fn(async () => { await gate; sess.agent.state.messages.push({ role: "assistant", content: [{ type: "text", text: "Built and committed. Dashboard is live." }] }); });
     setTimeout(release, 20);
-    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentAsk(
-      "fitness", "assistant", "implement the dashboard", undefined, { transport: "mock", chatId: "42" }
+    await (t.bot as unknown as { agentAsk(f: string, to: string, q: string, timeoutMs?: number, origin?: { transport: string; chatId: string }, correlationId?: string, audience?: string): Promise<string> }).agentAsk(
+      "fitness", "assistant", "implement the dashboard", undefined, { transport: "mock", chatId: "42" }, undefined, "owner"
     );
     const texts = t.transport.pushed.map((p) => p.opts.text);
     const ackIdx = texts.findIndex((x) => x.includes("accepted"));
@@ -3015,6 +3422,67 @@ describe("task media delivery receipts (bd pibot-zy70)", () => {
   });
 });
 
+describe("task content readback (bd pibot-cida)", () => {
+  let t: ReturnType<typeof makeBot>;
+  const ADDITION = "as a meta-layer + allows you to see patterns, tensions, changes in quality of interactions";
+  let note: string;
+  const run = (extra: Record<string, unknown> = {}) =>
+    ({ agentId: "assistant", chatKey: "mock:42", taskId: "tkc", title: "append the line", instructions: "append it", attempt: 1, resumed: false, signal: new AbortController().signal, expectedContent: ADDITION, outputLocation: note, ...extra }) as never;
+
+  beforeEach(() => {
+    t = makeBot();
+    note = path.join(t.dir, "shape of work.md");
+    fs.writeFileSync(note, "shape of work\n\nA plugin for your agent");
+  });
+  afterEach(() => { fs.rmSync(t.dir, { recursive: true, force: true }); });
+
+  // `during` runs inside the turn, so a write it performs is genuinely post-run-start —
+  // exactly like an agent that appends to the note and then reports.
+  const answer = async (text: string, during?: () => void) => {
+    const session = await t.agents.getOrCreateSession("assistant", "x", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      during?.();
+      messages.push({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: 2 });
+    });
+  };
+
+  it("reports a post-write readback that proves the addition once", async () => {
+    await answer("Appended it.", () => fs.writeFileSync(note, `shape of work\n\nA plugin for your agent\n\n${ADDITION}`));
+    const result = await t.bot.runLedgerTask(run());
+    expect(result).toMatchObject({ text: "Appended it.", readback: { path: note, afterWrite: true } });
+    expect((result as { readback: { text: string } }).readback.text.split(ADDITION)).toHaveLength(2);
+  });
+
+  it("reports an UNCHANGED file as not post-write when the agent only claimed success", async () => {
+    // The Nov 4 shape: the run says "Task done", the file it was asked to extend is untouched.
+    await answer("Task done. Not saved: file access is unavailable, and the agent creating the note is busy.");
+    const past = new Date(Date.now() - 3600_000);
+    fs.utimesSync(note, past, past);
+    const result = await t.bot.runLedgerTask(run());
+    expect(result).toMatchObject({ readback: { path: note, afterWrite: false } });
+    expect((result as { readback: { text: string } }).readback.text).not.toContain(ADDITION);
+  });
+
+  it("reports a missing artifact as an empty, non-post-write readback instead of throwing", async () => {
+    await answer("Saved.");
+    fs.rmSync(note);
+    const result = await t.bot.runLedgerTask(run());
+    expect(result).toMatchObject({ readback: { path: note, text: "", afterWrite: false } });
+  });
+
+  it("reports an unusable output location as unverified rather than reading the wrong file", async () => {
+    await answer("Saved.");
+    const result = await t.bot.runLedgerTask(run({ outputLocation: "shape of work.md" }));
+    expect(result).toMatchObject({ readback: { path: "shape of work.md", text: "", afterWrite: false } });
+  });
+
+  it("supplies no readback when the task names no expected addition", async () => {
+    await answer("Found it: the answer.");
+    await expect(t.bot.runLedgerTask(run({ expectedContent: undefined, outputLocation: undefined }))).resolves.toBe("Found it: the answer.");
+  });
+});
+
 // ─── transcription exec guard wiring into the background run (bd pibot-0xpf.4 review) ───
 
 describe("background task transcription guard wiring (bd pibot-0xpf.4)", () => {
@@ -3293,6 +3761,34 @@ describe("duration-aware voice transcription (bd pibot-0xpf.4)", () => {
     expect(t.stt.transcribe).not.toHaveBeenCalled(); // no forbidden local fallback
     expect(t.transport.lastText()).toContain("Transcription failed");
     expect(t.transport.lastText()).toContain("Groq");
+    fs.rmSync(t.dir, { recursive: true, force: true });
+  });
+
+  it("pushes the scoped Groq 401 decision from a failed long-audio chunk without local fallback", async () => {
+    const t = makeBot();
+    speechAgent(t, ["whisperkit", "groq"], true);
+    (t.stt as unknown as { hostProviderIds: string[] }).hostProviderIds = ["whisperkit", "groq"];
+    const transcribeChunked = vi.fn(async () => ({
+      ok: false, route: "chunked-external", provider: "none", text: "", durationSec: 1200,
+      chunks: 2, transcripts: [] as string[],
+      error: `chunk 2: ${"local precursor ".repeat(30)} PRIVATE_PROVIDER_RESPONSE`,
+      diagnostic: { service: "groq-stt-host", executor: "host-stt-daemon", source: "host-env", category: "auth" },
+    }));
+    (t.stt as unknown as { transcribeChunked: unknown }).transcribeChunked = transcribeChunked;
+    t.audioMedia.prepare.mockResolvedValueOnce({ ok: true, filePath: "/tmp/long.ogg", durationSec: 1200, cleanup: vi.fn(async () => {}) } as never);
+
+    await t.transport.sayMedia({ kind: "voice", durationSec: 1200 });
+
+    expect(transcribeChunked).toHaveBeenCalledOnce();
+    expect(t.stt.transcribe).not.toHaveBeenCalled();
+    const message = t.transport.pushed.at(-1)?.opts.text ?? "";
+    for (const field of [
+      "service=groq-stt-host", "executor=host-stt-daemon", "source=host-env",
+      "category=auth", "action=rotate-credential", "rotation=warranted",
+    ]) expect(message).toContain(field);
+    expect(message).not.toContain("PRIVATE_PROVIDER_RESPONSE");
+    expect(message).not.toContain("local precursor");
+    expect(t.promptSpy).not.toHaveBeenCalled();
     fs.rmSync(t.dir, { recursive: true, force: true });
   });
 

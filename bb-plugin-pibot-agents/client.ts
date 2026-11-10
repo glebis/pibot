@@ -8,9 +8,17 @@ export function endpoint(url:string, token:string|undefined):Endpoint {
   if(!token?.trim()||/[\r\n]/.test(token)) throw new Error('Add the service bearer token in plugin settings.');
   return {url:u.origin,token:token.trim()};
 }
-export class ServiceError extends Error { constructor(public status:number) {
-  super(status===401||status===403?'PiBot rejected authentication or the selected chat binding. Check plugin settings.':status===409?'PiBot is busy or this session is no longer current. No automatic retry was made.':status===404?'This PiBot endpoint or session is unavailable. Check the service version and reconnect.':`PiBot service failed (${status}). Check its health before retrying.`);
+export class ServiceError extends Error { constructor(public status:number,attachmentError?:string) {
+  super(attachmentError??(status===401||status===403?'PiBot rejected authentication or the selected chat binding. Check plugin settings.':status===409?'PiBot is busy or this session is no longer current. No automatic retry was made.':status===404?'This PiBot endpoint or session is unavailable. Check the service version and reconnect.':`PiBot service failed (${status}). Check its health before retrying.`));
 } }
+async function attachmentError(response:Response):Promise<string|undefined>{
+ const reader=response.body?.getReader();if(!reader)return;
+ const chunks:Uint8Array[]=[];let size=0;
+ try{for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>1024)return;chunks.push(value);}
+  const body=JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  if(typeof body.error==='string'&&body.error.length<=240&&/^(?:Attachments?|Images?|Files?|This model)\b/.test(body.error))return body.error;
+ }catch{}finally{await reader.cancel().catch(()=>{});reader.releaseLock();}
+}
 export async function request(target:Endpoint,path:string,method='GET',body?:unknown,signal?:AbortSignal,timeoutMs=50_000):Promise<unknown> {
   const controller=new AbortController();
   const abort=()=>controller.abort(); signal?.addEventListener('abort',abort,{once:true}); if(signal?.aborted)abort();
@@ -19,7 +27,7 @@ export async function request(target:Endpoint,path:string,method='GET',body?:unk
     const r=await fetch(`${target.url}${path}`,{method,redirect:'error',signal:controller.signal,
       headers:{authorization:`Bearer ${target.token}`,accept:'application/json',...(body===undefined?{}:{'content-type':'application/json'})},
       ...(body===undefined?{}:{body:JSON.stringify(body)})});
-    if(!r.ok){await r.body?.cancel();throw new ServiceError(r.status);}
+    if(!r.ok){const detail=path==='/api/bb/chat'&&[400,409].includes(r.status)?await attachmentError(r):undefined;if(!r.body?.locked)await r.body?.cancel().catch(()=>{});throw new ServiceError(r.status,detail);}
     if(!r.headers.get('content-type')?.includes('application/json')){await r.body?.cancel();throw new Error('PiBot returned a non-JSON response. Check the service URL.');}
     const reader=r.body?.getReader(); if(!reader)throw new Error('Empty service response.');
     const chunks:Uint8Array[]=[];let size=0;

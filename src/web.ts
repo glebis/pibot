@@ -53,6 +53,7 @@ export interface TelegramControl {
 }
 
 export interface WebDeps {
+  bbConversations?: import('./transports/bb.js').BbConversationControl;
   coordinator?: CoordinatorControl;
   inbox?: InboxControl;
   /** live turns, durable tasks, goal loops, voice calls and child OS processes */
