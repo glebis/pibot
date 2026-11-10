@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { BlockedError, MAX_ACTIVE_PER_AGENT, openTaskLedger, TaskDeadlineError, type TaskLedger, type TaskRun, type TaskRunner, type TaskRunResult, ownerReport } from "./task-ledger.js";
+import { BlockedError, MAX_ACTIVE_PER_AGENT, openTaskLedger, TaskDeadlineError, taskDecisionKey, type TaskLedger, type TaskDecision, type TaskRun, type TaskRunner, type TaskRunResult, ownerReport } from "./task-ledger.js";
 import { formatDelegateEvidence } from "../core/task-reconcile.js";
 
 const input = { agentId: "coach", chatKey: "telegram:42", title: "Draft the weekly note", instructions: "Write it." };
@@ -19,11 +20,11 @@ function runner(run: (t: TaskRun) => Promise<string | TaskRunResult>) {
   return { r, notes };
 }
 
-async function until<T>(read: () => Promise<T>, ok: (v: T) => boolean, ms = 3000): Promise<T> {
+async function until<T>(read: () => Promise<T>, ok: (v: T) => boolean, ms = 3000): Promise<NonNullable<T>> {
   const end = Date.now() + ms;
   for (;;) {
     const v = await read();
-    if (ok(v)) return v;
+    if (ok(v)) return v as NonNullable<T>;
     if (Date.now() > end) throw new Error(`timed out; last value ${JSON.stringify(v)}`);
     await new Promise((res) => setTimeout(res, 10));
   }
@@ -736,6 +737,226 @@ describe("durable task ledger", () => {
   });
 });
 
+describe("recovery decision + verified artifact (bd pibot-0xpf.5)", () => {
+  const decisionFor = (taskId: string, overrides: Partial<TaskDecision> = {}): TaskDecision => ({
+    action: "restore the launch note",
+    options: ["Restore from trash", "Leave it"],
+    choice: "Restore from trash",
+    optionIndex: 0,
+    outcome: "approved",
+    qid: "q_owner",
+    questionKey: taskDecisionKey(taskId, "telegram:worker", "approval:abc"),
+    source: "owner_question",
+    ownerChatKey: "telegram:worker",
+    answeredAt: 1_700_000_000_000,
+    executor: "coach",
+    ...overrides,
+  });
+  const hash = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+
+  it("persists an owner decision and reuses it on a resumed attempt after a restart", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "task-decision-"));
+    const first = runner(untilAborted);
+    let ledger = await openTaskLedger({ runner: first.r, storageDir: dir });
+    const t = await ledger.start(input);
+    await until(() => ledger.get(t.id), (e) => e?.status === "running");
+    const decision = decisionFor(t.id);
+    const saved = await ledger.recordDecision(t.id, input.agentId, decision);
+    expect(saved?.decisions?.[0]).toMatchObject({ source: "owner_question", choice: "Restore from trash", executor: "coach", outcome: "approved" });
+    await ledger.close(); // the process "dies" mid-run
+
+    let seen: TaskDecision[] | undefined;
+    const second = runner(async (run) => { seen = run.decisions; return "restored"; });
+    ledger = await openTaskLedger({ runner: second.r, storageDir: dir });
+    try {
+      const done = await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      expect(seen).toMatchObject([{ qid: "q_owner", choice: "Restore from trash", questionKey: decision.questionKey }]);
+      expect(done.decisions?.[0]).toMatchObject({ source: "owner_question", choice: "Restore from trash" });
+    } finally { await ledger.close(); }
+  });
+
+  it("keeps two distinct approvals separate and replays only the SAME decision after a restart", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "task-decisions-"));
+    const first = runner(untilAborted);
+    let ledger = await openTaskLedger({ runner: first.r, storageDir: dir });
+    const t = await ledger.start(input);
+    await until(() => ledger.get(t.id), (e) => e?.status === "running");
+    const restore = decisionFor(t.id);
+    const remove = decisionFor(t.id, {
+      action: "delete the draft",
+      options: ["Delete", "Keep"],
+      choice: "Delete",
+      optionIndex: 0,
+      questionKey: taskDecisionKey(t.id, "telegram:worker", "approval:delete"),
+    });
+    await ledger.recordDecision(t.id, input.agentId, restore);
+    await ledger.recordDecision(t.id, input.agentId, remove);
+    // a retried/late record of the SAME question cannot rewrite the accepted answer
+    await ledger.recordDecision(t.id, input.agentId, { ...restore, choice: "Leave it", optionIndex: 1, outcome: "declined" });
+    expect((await ledger.get(t.id))?.decisions).toHaveLength(2);
+    expect((await ledger.get(t.id))?.decisions?.[0]?.choice).toBe("Restore from trash");
+    expect((await ledger.get(t.id))?.decisions?.[1]?.action).toBe("delete the draft");
+    await ledger.close();
+
+    let seen: TaskDecision[] | undefined;
+    const second = runner(async (run) => { seen = run.decisions; return "restored"; });
+    ledger = await openTaskLedger({ runner: second.r, storageDir: dir });
+    try {
+      await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      expect(seen?.map((d) => d.questionKey)).toEqual([restore.questionKey, remove.questionKey]);
+    } finally { await ledger.close(); }
+  });
+
+  it("rejects a forged/relayed approval and never rewrites an accepted decision", async () => {
+    const { r } = runner(untilAborted);
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      await until(() => ledger.get(t.id), (e) => e?.status === "running");
+      // A sibling's "owner said yes" is not the canonical answer channel.
+      await expect(ledger.recordDecision(t.id, input.agentId, { ...decisionFor(t.id), source: "sibling_relay" as never })).rejects.toThrow(/canonical owner answer/);
+      expect((await ledger.get(t.id))?.decisions).toBeUndefined();
+      await ledger.recordDecision(t.id, input.agentId, decisionFor(t.id));
+      // another agent cannot stamp a decision onto someone else's task
+      expect(await ledger.recordDecision(t.id, "knower", decisionFor(t.id))).toBeUndefined();
+      // a non-namespaced or fabricated key is rejected before it can become provenance
+      await expect(ledger.recordDecision(t.id, input.agentId, { ...decisionFor(t.id), questionKey: "global:decision" })).rejects.toThrow(/namespaced/);
+      await expect(ledger.recordDecision(t.id, input.agentId, { ...decisionFor(t.id), qid: decisionFor(t.id).questionKey })).rejects.toThrow(/canonical question id/);
+    } finally { await ledger.close(); }
+  });
+
+  it("keeps incomplete when only bookkeeping text changed and no artifact was verified", async () => {
+    const { r, notes } = runner(async () => "Ledger updated: restore decision recorded, file pending.");
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedArtifactPath: "/tmp/never-restored.md" });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial");
+      expect(entry.error).toContain("bookkeeping text is not a restored artifact");
+      expect(entry.artifact).toBeUndefined();
+      await until(async () => notes.length, (n) => n === 1);
+      expect(notes[0]).toContain("Task partial");
+    } finally { await ledger.close(); }
+  });
+
+  it("permits done only with a host artifact readback receipt", async () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "task-artifact-")), "note.md");
+    const bytes = Buffer.from("# restored\n");
+    fs.writeFileSync(file, bytes);
+    const { r } = runner(async () => ({ text: "restored", artifact: { path: file, bytes: bytes.length, sha256: hash(bytes), evidence: "readback", verification: "existence" } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedArtifactPath: file });
+      const done = await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      expect(done.artifact).toMatchObject({ path: file, bytes: bytes.length, evidence: "readback", verification: "existence" });
+      expect(done.artifact?.verifiedAt).toBeTruthy();
+    } finally { await ledger.close(); }
+  });
+
+  it("records the byte-exact verification only when the declared original hash matches", async () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "task-artifact-exact-")), "note.md");
+    const bytes = Buffer.from("# restored exactly\n");
+    fs.writeFileSync(file, bytes);
+    const digest = hash(bytes);
+    const { r } = runner(async () => ({ text: "restored", artifact: { path: file, bytes: bytes.length, sha256: digest, evidence: "readback", verification: "byte-exact" } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedArtifactPath: file, expectedArtifactSha256: digest });
+      const done = await until(() => ledger.get(t.id), (e) => e?.status === "done");
+      expect(done.artifact).toMatchObject({ verification: "byte-exact" });
+      expect(done.artifact?.reconstructed).toBeUndefined();
+    } finally { await ledger.close(); }
+  });
+
+  it("rejects a relative artifact path or a deliverable outside the declared scope", async () => {
+    const { r } = runner(untilAborted);
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      await expect(ledger.start({ ...input, expectedArtifactPath: "relative/note.md" })).rejects.toThrow(/absolute/);
+      await expect(ledger.start({ ...input, expectedArtifactPath: "/tmp/outside/note.md", artifactScope: "/tmp/inside" })).rejects.toThrow(/outside the declared artifactScope/);
+    } finally { await ledger.close(); }
+  });
+
+  it("labels a reconstructed artifact and stays partial when the original hash is known", async () => {
+    const bytes = Buffer.from("rebuilt from the transcript\n");
+    const { r } = runner(async () => ({ text: "reconstructed", artifact: { path: "/tmp/note.md", bytes: bytes.length, sha256: hash(bytes), evidence: "readback", verification: "existence", reconstructed: true } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedArtifactPath: "/tmp/note.md", expectedArtifactSha256: "0".repeat(64) });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial");
+      expect(entry.error).toContain("reconstruction");
+      expect(entry.artifact?.reconstructed).toBe(true);
+    } finally { await ledger.close(); }
+  });
+
+  it("rejects a non-readback artifact claim as unverified", async () => {
+    const { r } = runner(async () => ({ text: "restored", artifact: { path: "/tmp/note.md", bytes: 10, sha256: "ab", evidence: "ack" as never, verification: "existence" as const } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedArtifactPath: "/tmp/note.md" });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial");
+      expect(entry.error).toContain("not a host readback");
+    } finally { await ledger.close(); }
+  });
+
+  it("preserves the accepted decision when execution is blocked by a missing capability", async () => {
+    let ledger: import("./task-ledger.js").TaskLedger;
+    const { r } = runner(async (run) => {
+      await ledger.recordDecision(run.taskId, run.agentId, decisionFor(run.taskId));
+      throw new BlockedError("this executor has no restore tool");
+    });
+    ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(input);
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "blocked");
+      expect(entry.blocker).toContain("no restore tool");
+      expect(entry.decisions?.[0]).toMatchObject({ source: "owner_question", choice: "Restore from trash" });
+    } finally { await ledger.close(); }
+  });
+
+  it("records a wrong-bot-peer delivery as partial, never done (worker→dev→knower)", async () => {
+    const task = { ...input, chatKey: "telegram:worker:8900", expectedMedia: "video" };
+    const delivery = { messageId: 9, mediaType: "video", peer: "telegram:knower:8817", account: "@knower", idProtocol: "bot_api" };
+    const { r } = runner(async () => ({ text: "two clips", delivery }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start(task);
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial");
+      expect(entry.error).toContain("delivered to telegram:knower:8817 instead of telegram:worker:8900");
+    } finally { await ledger.close(); }
+
+    // the same content attested to the invoking peer is done
+    const { r: ok } = runner(async () => ({ text: "two clips", delivery: { ...delivery, peer: "telegram:worker:8900", account: "@worker" } }));
+    const ledger2 = await openTaskLedger({ runner: ok });
+    try {
+      const t = await ledger2.start(task);
+      const done = await until(() => ledger2.get(t.id), (e) => e?.status === "done");
+      expect(done.delivery).toMatchObject({ peer: "telegram:worker:8900" });
+    } finally { await ledger2.close(); }
+  });
+
+  it("treats a different id namespace as unverified", async () => {
+    const { r } = runner(async () => ({ text: "note", delivery: { messageId: 7, mediaType: "video", peer: "telegram:42", account: "@pibot", idProtocol: "mtproto" } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedMedia: "video", expectedIdProtocol: "bot_api" });
+      const entry = await until(() => ledger.get(t.id), (e) => e?.status === "partial");
+      expect(entry.error).toContain("id protocol mtproto instead of bot_api");
+    } finally { await ledger.close(); }
+  });
+
+  it("does not duplicate a text/delivery on a repeated start request", async () => {
+    const { r } = runner(async () => ({ text: "clip", delivery: { messageId: 1, mediaType: "video", peer: "telegram:42", account: "@pibot", idProtocol: "bot_api" } }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const a = await ledger.start({ ...input, expectedMedia: "video" }, "req-once");
+      const b = await ledger.start({ ...input, expectedMedia: "video" }, "req-once");
+      expect(b.id).toBe(a.id);
+      await until(() => ledger.get(a.id), (e) => e?.status === "done");
+      expect(r.run).toHaveBeenCalledTimes(1);
+    } finally { await ledger.close(); }
+  });
+});
+
 describe("owner-facing task completion report (attention budget)", () => {
   it("keeps a short report whole", () => {
     const head = "✅ Task done: **x**";
@@ -752,5 +973,35 @@ describe("owner-facing task completion report (attention budget)", () => {
     expect(out).not.toContain("line five");
     expect(out).not.toContain("line twenty");
     expect(out).toContain("task log");
+  });
+});
+
+// The merge combines independent append-content and restore-artifact contracts. Neither proof
+// substitutes for the other when a task asks for both.
+describe("combined content and artifact completion contracts", () => {
+  const file = "/tmp/pibot-merge-contract-note.md";
+  const addition = "Verified restoration provenance.";
+  const artifact = { path: file, bytes: 34, sha256: "1".repeat(64), evidence: "readback" as const, verification: "existence" as const };
+
+  it.each([
+    { label: "content only", includeArtifact: false, content: addition, expected: "partial", reason: "no post-run readback" },
+    { label: "artifact only", includeArtifact: true, content: "old content", expected: "partial", reason: "does not contain it" },
+    { label: "both proofs", includeArtifact: true, content: addition, expected: "done", reason: undefined },
+  ])("requires both proofs: $label", async ({ includeArtifact, content, expected, reason }) => {
+    const { r } = runner(async () => ({
+      text: "Restoration completed.",
+      readback: { path: file, text: content, afterWrite: true },
+      ...(includeArtifact ? { artifact } : {}),
+    }));
+    const ledger = await openTaskLedger({ runner: r });
+    try {
+      const t = await ledger.start({ ...input, expectedArtifactPath: file, expectedContent: addition, outputLocation: file });
+      const entry = await until(() => ledger.get(t.id), (e) => Boolean(e && e.status !== "queued" && e.status !== "running"));
+      expect(entry.status).toBe(expected);
+      if (reason) expect(entry.error).toContain(reason);
+      else expect(entry.error).toBeUndefined();
+      expect(entry.readback?.text).toBe(content);
+      if (includeArtifact) expect(entry.artifact).toMatchObject(artifact);
+    } finally { await ledger.close(); }
   });
 });

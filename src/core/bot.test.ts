@@ -3905,3 +3905,445 @@ describe("delegation routes through the target's owned chat (bd pibot-cida P0, b
     expect(call?.[7]).toBeUndefined(); // speech stays unwired without ownership
   });
 });
+
+// ─── delegated route identity + owner decision provenance (bd pibot-0xpf.5 review) ───
+
+describe("delegated owner decision provenance (bd pibot-0xpf.5 review)", () => {
+  async function withLedger<T>(fn: (t: ReturnType<typeof makeBot>, ledger: import("../durable/task-ledger.js").TaskLedger) => Promise<T>): Promise<T> {
+    const t = makeBot();
+    const { openTaskLedger } = await import("../durable/task-ledger.js");
+    const ledger = await openTaskLedger({ runner: { run: (task) => t.bot.runLedgerTask(task), notify: async () => {} }, storageDir: t.dir });
+    (t.agents as unknown as { tasks: unknown }).tasks = ledger;
+    try {
+      return await fn(t, ledger);
+    } finally {
+      await ledger.close();
+      fs.rmSync(t.dir, { recursive: true, force: true });
+    }
+  }
+
+  async function runAskingTask(
+    t: ReturnType<typeof makeBot>,
+    ledger: import("../durable/task-ledger.js").TaskLedger,
+    spec: Record<string, unknown>,
+    answer: string,
+    wrongChat?: string,
+  ) {
+    const session = await t.agents.getOrCreateSession("assistant", "seed", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      const ask = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.at(-1)![4] as (s: unknown) => Promise<unknown>;
+      const pending = ask(spec);
+      await Promise.resolve();
+      if (wrongChat) {
+        // a sibling bot dialog cannot answer the owner's question
+        expect((t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText(wrongChat, "Approve")).toBe(false);
+      }
+      (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", answer);
+      await pending;
+      messages.push({ role: "assistant", content: [{ type: "text", text: "recovery result" }], stopReason: "stop", timestamp: 2 });
+    });
+    const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "recover the note", instructions: "restore it" });
+    for (let i = 0; i < 300; i++) {
+      const entry = await ledger.get(task.id);
+      if (entry && entry.status !== "queued" && entry.status !== "running") return entry;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("task did not settle");
+  }
+
+  it("persists the owner's exact APPROVAL through the real task-session ask wiring", async () => {
+    await withLedger(async (t, ledger) => {
+      const entry = await runAskingTask(t, ledger, {
+        text: "Restore the Launch note from trash?",
+        options: ["Approve restore", "Decline"],
+        kind: "approval",
+        approveOption: "Approve restore",
+        timeoutMs: 5_000,
+      }, "Approve restore");
+      const decision = entry.decisions?.[0];
+      expect(decision).toMatchObject({
+        action: "Restore the Launch note from trash?",
+        options: ["Approve restore", "Decline"],
+        choice: "Approve restore",
+        optionIndex: 0,
+        outcome: "approved",
+        source: "owner_question",
+        ownerChatKey: "mock:42",
+      });
+      expect(decision?.qid).toMatch(/^q/);
+      expect(decision?.questionKey).toContain(`task:${entry.id}:owner:mock:42:approval:`);
+    });
+  });
+
+  it("records a DENIAL as declined, never as authorization", async () => {
+    await withLedger(async (t, ledger) => {
+      const entry = await runAskingTask(t, ledger, {
+        text: "Restore the Launch note from trash?",
+        options: ["Approve restore", "Decline"],
+        kind: "approval",
+        approveOption: "Approve restore",
+        timeoutMs: 5_000,
+      }, "Decline");
+      expect(entry.decisions?.[0]).toMatchObject({ choice: "Decline", optionIndex: 1, outcome: "declined", source: "owner_question" });
+    });
+  });
+
+  it("records a clarifying free-text answer as NOT an approval", async () => {
+    await withLedger(async (t, ledger) => {
+      const entry = await runAskingTask(t, ledger, {
+        text: "Restore the Launch note from trash?",
+        options: ["Approve restore", "Decline"],
+        kind: "approval",
+        approveOption: "Approve restore",
+        timeoutMs: 5_000,
+      }, "maybe later, check the transcript first");
+      expect(entry.decisions?.[0]).toMatchObject({ outcome: "answer", optionIndex: -1, source: "owner_question" });
+    });
+  });
+
+  it("does not let a sibling chat turn its own 'Approve' into the owner's decision", async () => {
+    await withLedger(async (t, ledger) => {
+      const entry = await runAskingTask(t, ledger, {
+        text: "Restore the Launch note from trash?",
+        options: ["Approve restore", "Decline"],
+        kind: "approval",
+        approveOption: "Approve restore",
+        timeoutMs: 5_000,
+      }, "Decline", "telegram:knower:8817");
+      expect(entry.decisions?.[0]).toMatchObject({ choice: "Decline", outcome: "declined", ownerChatKey: "mock:42" });
+    });
+  });
+});
+
+describe("delegated route identity scoping (bd pibot-0xpf.5 review)", () => {
+  it("scopes the inter-agent session key to the ORIGINAL owner chat", async () => {
+    const t = makeBot();
+    try {
+      const devTransport = new MockTransport("mockdev", "assistant");
+      (t.bot as unknown as { transports: Map<string, Transport> }).transports.set("mockdev", devTransport);
+      (t.bot as unknown as { agentChats: Map<string, Set<string>> }).agentChats.set("assistant", new Set(["mockdev:77"]));
+      const turn = (a: string, f: string, text: string, timeoutMs?: number, origin?: { transport: string; chatId: string }) =>
+        (t.bot as unknown as { agentTurn(a: string, f: string, text: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentTurn(a, f, text, timeoutMs, origin);
+      await turn("assistant", "worker", "same text", undefined, { transport: "mock", chatId: "42" });
+      await turn("assistant", "worker", "same text", undefined, { transport: "mock", chatId: "43" });
+      const keys = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1]);
+      expect(keys).toEqual([
+        "agent::assistant::from-worker::to-mock:42",
+        "agent::assistant::from-worker::to-mock:43",
+      ]);
+    } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+
+  it("does not join a simultaneous same-text request from a different origin chat", async () => {
+    const t = makeBot();
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      t.promptSpy.mockImplementation(async () => { await gate; });
+      const turn = (a: string, f: string, text: string, timeoutMs?: number, origin?: { transport: string; chatId: string }) =>
+        (t.bot as unknown as { agentTurn(a: string, f: string, text: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentTurn(a, f, text, timeoutMs, origin);
+      const first = turn("assistant", "worker", "same text", undefined, { transport: "mock", chatId: "42" });
+      const second = turn("assistant", "worker", "same text", undefined, { transport: "mock", chatId: "43" });
+      await vi.waitFor(() => expect(t.promptSpy).toHaveBeenCalledTimes(2));
+      release();
+      await Promise.allSettled([first, second]);
+      expect((t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1])).toEqual([
+        "agent::assistant::from-worker::to-mock:42",
+        "agent::assistant::from-worker::to-mock:43",
+      ]);
+    } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+
+  it("routes a delegated executor's owner question to the ORIGINAL chat, not its own bot chat", async () => {
+    const t = makeBot();
+    try {
+      const devTransport = new MockTransport("mockdev", "assistant");
+      (t.bot as unknown as { transports: Map<string, Transport> }).transports.set("mockdev", devTransport);
+      (t.bot as unknown as { agentChats: Map<string, Set<string>> }).agentChats.set("assistant", new Set(["mockdev:77"]));
+      const turn = (a: string, f: string, text: string, timeoutMs?: number, origin?: { transport: string; chatId: string }) =>
+        (t.bot as unknown as { agentTurn(a: string, f: string, text: string, timeoutMs?: number, origin?: { transport: string; chatId: string }): Promise<string> }).agentTurn(a, f, text, timeoutMs, origin);
+      await turn("assistant", "worker", "do the thing", undefined, { transport: "mock", chatId: "42" });
+      const ask = (t.agents.getOrCreateSession as ReturnType<typeof vi.fn>).mock.calls.at(-1)![4] as (spec: unknown) => Promise<unknown>;
+      const pending = ask({ text: "Which file?", options: ["A", "B"], timeoutMs: 5_000 });
+      await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.chatId === "42" && p.opts.text === "Which file?")).toBe(true));
+      expect(devTransport.pushed).toEqual([]); // never the executor's own sub-bot chat
+      (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", "A");
+      await pending;
+    } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+});
+
+describe("task decision rendering in the runner prompt (bd pibot-0xpf.5 review)", () => {
+  const run = (decisions: unknown[]) => ({ agentId: "assistant", chatKey: "mock:42", taskId: "tk-dec", title: "recover", instructions: "restore it", attempt: 2, resumed: true, signal: new AbortController().signal, decisions }) as never;
+  const base = {
+    action: "restore the launch note",
+    options: ["Approve restore", "Decline"],
+    qid: "q_owner",
+    questionKey: "task:tk-dec:owner:mock:42:approval:abc",
+    source: "owner_question" as const,
+    ownerChatKey: "mock:42",
+    answeredAt: 1_700_000_000_000,
+    executor: "assistant",
+  };
+
+  it("says AUTHORIZED only for an approved decision", async () => {
+    const t = makeBot();
+    try {
+      await t.bot.runLedgerTask(run([{ ...base, choice: "Approve restore", optionIndex: 0, outcome: "approved" }]));
+      const prompt = String(t.promptSpy.mock.calls.at(-1)?.[0] ?? "");
+      expect(prompt).toContain("AUTHORIZED");
+      expect(prompt).not.toContain("REFUSED");
+    } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+
+  it("renders a refusal as REFUSED, never as an approval", async () => {
+    const t = makeBot();
+    try {
+      await t.bot.runLedgerTask(run([{ ...base, choice: "Decline", optionIndex: 1, outcome: "declined" }]));
+      const prompt = String(t.promptSpy.mock.calls.at(-1)?.[0] ?? "");
+      expect(prompt).toContain("REFUSED");
+      expect(prompt).not.toContain("AUTHORIZED");
+    } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+
+  it("renders a clarifying answer as NOT AN APPROVAL", async () => {
+    const t = makeBot();
+    try {
+      await t.bot.runLedgerTask(run([{ ...base, choice: "maybe later", optionIndex: -1, outcome: "answer" }]));
+      const prompt = String(t.promptSpy.mock.calls.at(-1)?.[0] ?? "");
+      expect(prompt).toContain("NOT AN APPROVAL");
+      expect(prompt).not.toContain("AUTHORIZED");
+    } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+});
+
+describe("host artifact readback validation (bd pibot-0xpf.5 review)", () => {
+  const baseRun = (extra: Record<string, unknown>) => ({ agentId: "assistant", chatKey: "mock:42", taskId: "tk-art", title: "restore", instructions: "restore it", attempt: 1, resumed: false, signal: new AbortController().signal, ...extra }) as never;
+
+  async function runWithResult(t: ReturnType<typeof makeBot>, extra: Record<string, unknown>) {
+    const session = await t.agents.getOrCreateSession("assistant", "seed", {} as never, t.scheduler);
+    const messages = (session as unknown as { agent: { state: { messages: unknown[] } } }).agent.state.messages;
+    t.promptSpy.mockImplementationOnce(async () => {
+      messages.push({ role: "assistant", content: [{ type: "text", text: "restored" }], stopReason: "stop", timestamp: 2 });
+    });
+    return t.bot.runLedgerTask(baseRun(extra));
+  }
+
+  it("attests a real file by existence when no original hash is declared", async () => {
+    const t = makeBot();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "readback-"));
+    try {
+      const file = path.join(dir, "note.md");
+      fs.writeFileSync(file, "# restored\n");
+      const result = await runWithResult(t, { expectedArtifactPath: file, artifactScope: dir });
+      expect(result).toMatchObject({ artifact: { path: path.resolve(file), evidence: "readback", verification: "existence" } });
+      expect((result as { artifact?: { reconstructed?: boolean } }).artifact?.reconstructed).toBeUndefined();
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+
+  it("labels a hash mismatch as a reconstruction, not a byte-exact restore", async () => {
+    const t = makeBot();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "readback-"));
+    try {
+      const file = path.join(dir, "note.md");
+      fs.writeFileSync(file, "rebuilt from the transcript\n");
+      const result = await runWithResult(t, { expectedArtifactPath: file, expectedArtifactSha256: "0".repeat(64) });
+      expect(result).toMatchObject({ artifact: { verification: "existence", reconstructed: true } });
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+
+  it("returns no artifact receipt for a missing file, a relative path, or a path outside the declared scope", async () => {
+    const t = makeBot();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "readback-"));
+    try {
+      expect(await runWithResult(t, { expectedArtifactPath: path.join(dir, "missing.md") })).toBe("restored");
+      expect(await runWithResult(t, { expectedArtifactPath: "relative/note.md" })).toBe("restored");
+      const inside = path.join(dir, "inside");
+      fs.mkdirSync(inside);
+      const outside = path.join(dir, "outside.md");
+      fs.writeFileSync(outside, "x");
+      expect(await runWithResult(t, { expectedArtifactPath: outside, artifactScope: inside })).toBe("restored");
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+
+  it("refuses to follow a symlink or read an oversized deliverable", async () => {
+    const t = makeBot();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "readback-"));
+    try {
+      const real = path.join(dir, "real.md");
+      fs.writeFileSync(real, "# real\n");
+      const link = path.join(dir, "link.md");
+      fs.symlinkSync(real, link);
+      expect(await runWithResult(t, { expectedArtifactPath: link })).toBe("restored");
+      const huge = path.join(dir, "huge.md");
+      fs.writeFileSync(huge, "x");
+      fs.truncateSync(huge, 64 * 1024 * 1024 + 1);
+      expect(await runWithResult(t, { expectedArtifactPath: huge })).toBe("restored");
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+
+  it("rejects an intermediate symlink that escapes the declared scope", async () => {
+    const t = makeBot();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "readback-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "readback-outside-"));
+    try {
+      fs.writeFileSync(path.join(outside, "secret.md"), "# secret\n");
+      fs.symlinkSync(outside, path.join(dir, "link"), "dir");
+      const escaped = path.join(dir, "link", "secret.md");
+      // Lexically inside `dir`, but its canonical target is outside the declared scope.
+      expect(await runWithResult(t, { expectedArtifactPath: escaped, artifactScope: dir })).toBe("restored");
+      // A direct deliverable inside the scope is still attested normally.
+      const inside = path.join(dir, "note.md");
+      fs.writeFileSync(inside, "# inside\n");
+      const ok = await runWithResult(t, { expectedArtifactPath: inside, artifactScope: dir });
+      expect(ok).toMatchObject({ artifact: { path: path.resolve(inside), evidence: "readback", verification: "existence" } });
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true }); fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+});
+
+describe("task decision replay identity (bd pibot-0xpf.5 review)", () => {
+  it("keeps two actions distinct and replays only the SAME approval without re-asking", async () => {
+    const t = makeBot();
+    const { openTaskLedger } = await import("../durable/task-ledger.js");
+    const ledger = await openTaskLedger({
+      runner: {
+        run: (task) => new Promise((_, reject) => {
+          if (task.signal.aborted) reject(new Error("aborted"));
+          task.signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+        notify: async () => {},
+      },
+      storageDir: t.dir,
+    });
+    (t.agents as unknown as { tasks: unknown }).tasks = ledger;
+    try {
+      const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "recover", instructions: "restore it" });
+      const origin = { transport: "mock", chatId: "42" };
+      const run = { taskId: task.id, agentId: "assistant" } as never;
+      const ask = (spec: unknown) =>
+        (t.bot as unknown as { taskOwnerAsk(r: unknown, c: unknown, s: unknown): Promise<{ choice: string } | null> }).taskOwnerAsk(run, origin, spec);
+      const spec = { text: "Restore A?", options: ["Approve", "Decline"], kind: "approval", approveOption: "Approve", timeoutMs: 5_000 };
+      const pushes = (text: string) => t.transport.pushed.filter((p) => p.chatId === "42" && p.opts.text === text).length;
+
+      const first = ask(spec);
+      await vi.waitFor(() => expect(pushes("Restore A?")).toBe(1));
+      (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", "Approve");
+      await first;
+
+      const second = ask({ ...spec, text: "Delete B?" });
+      await vi.waitFor(() => expect(pushes("Delete B?")).toBe(1));
+      (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", "Approve");
+      await second;
+
+      // The same approval retried after a restart replays the recorded answer instead of asking again.
+      const replay = await ask(spec);
+      expect(replay?.choice).toBe("Approve");
+      expect(pushes("Restore A?")).toBe(1);
+
+      const entry = await ledger.get(task.id);
+      expect(entry?.decisions).toHaveLength(2);
+      expect(new Set(entry?.decisions?.map((d) => d.questionKey)).size).toBe(2);
+    } finally {
+      await ledger.close();
+      fs.rmSync(t.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("binds replay identity to the action contract even when the caller supplies one key", async () => {
+    const t = makeBot();
+    const { openTaskLedger } = await import("../durable/task-ledger.js");
+    const ledger = await openTaskLedger({
+      runner: {
+        run: (task) => new Promise((_, reject) => {
+          if (task.signal.aborted) reject(new Error("aborted"));
+          task.signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+        notify: async () => {},
+      },
+      storageDir: t.dir,
+    });
+    (t.agents as unknown as { tasks: unknown }).tasks = ledger;
+    try {
+      const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "recover", instructions: "restore it" });
+      const origin = { transport: "mock", chatId: "42" };
+      const run = { taskId: task.id, agentId: "assistant" } as never;
+      const ask = (spec: unknown) =>
+        (t.bot as unknown as { taskOwnerAsk(r: unknown, c: unknown, s: unknown): Promise<{ choice: string } | null> }).taskOwnerAsk(run, origin, spec);
+      const pushes = (text: string) => t.transport.pushed.filter((p) => p.chatId === "42" && p.opts.text === text).length;
+      const answer = (text: string) =>
+        (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", text);
+
+      const callerKey = "shared-action-key";
+      const restoreA = { questionKey: callerKey, text: "Restore A?", options: ["Restore A", "Skip"], kind: "approval", approveOption: "Restore A", timeoutMs: 5_000 };
+      const deleteB = { questionKey: callerKey, text: "Delete B?", options: ["Delete B", "Keep"], kind: "approval", approveOption: "Delete B", timeoutMs: 5_000 };
+
+      const first = ask(restoreA);
+      await vi.waitFor(() => expect(pushes("Restore A?")).toBe(1));
+      answer("Restore A");
+      await first;
+
+      // Same caller key, different action: must ask again instead of replaying the restore answer.
+      const second = ask(deleteB);
+      await vi.waitFor(() => expect(pushes("Delete B?")).toBe(1));
+      answer("Delete B");
+      await second;
+
+      // Changed approving-option semantics under the same key + text + options is a different contract.
+      const reapprove = { ...restoreA, approveOption: "Skip" };
+      const third = ask(reapprove);
+      await vi.waitFor(() => expect(pushes("Restore A?")).toBe(2));
+      answer("Skip");
+      await third;
+
+      // Identical contract still replays the recorded answer without asking again.
+      const replay = await ask(restoreA);
+      expect(replay?.choice).toBe("Restore A");
+      expect(pushes("Restore A?")).toBe(2);
+
+      const entry = await ledger.get(task.id);
+      expect(entry?.decisions).toHaveLength(3);
+      expect(new Set(entry?.decisions?.map((d) => d.questionKey)).size).toBe(3);
+    } finally {
+      await ledger.close();
+      fs.rmSync(t.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("task decision persistence failures are surfaced (bd pibot-0xpf.5 review)", () => {
+  it("does not continue as though a rejected decision were durable", async () => {
+    const t = makeBot();
+    try {
+      (t.agents as unknown as { tasks: unknown }).tasks = {
+        recordDecision: vi.fn(async () => { throw new Error("ledger down"); }),
+      };
+      const run = { taskId: "tk-persist", agentId: "assistant" } as never;
+      const origin = { transport: "mock", chatId: "42" };
+      const ask = (spec: unknown) =>
+        (t.bot as unknown as { taskOwnerAsk(r: unknown, c: unknown, s: unknown): Promise<unknown> }).taskOwnerAsk(run, origin, spec);
+      const pending = ask({ text: "Restore?", options: ["Approve", "Decline"], kind: "approval", approveOption: "Approve", timeoutMs: 5_000 });
+      await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.opts.text === "Restore?")).toBe(true));
+      (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", "Approve");
+      await expect(pending).rejects.toThrow(/ledger down/);
+    } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+
+  it("fails closed when recordDecision returns no matching persisted task", async () => {
+    const t = makeBot();
+    try {
+      // A ledger call that resolves undefined persisted nothing (absent/wrong/completed task).
+      (t.agents as unknown as { tasks: unknown }).tasks = {
+        recordDecision: vi.fn(async () => undefined),
+      };
+      const run = { taskId: "tk-missing", agentId: "assistant" } as never;
+      const origin = { transport: "mock", chatId: "42" };
+      const ask = (spec: unknown) =>
+        (t.bot as unknown as { taskOwnerAsk(r: unknown, c: unknown, s: unknown): Promise<unknown> }).taskOwnerAsk(run, origin, spec);
+      const pending = ask({ text: "Restore?", options: ["Approve", "Decline"], kind: "approval", approveOption: "Approve", timeoutMs: 5_000 });
+      await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.opts.text === "Restore?")).toBe(true));
+      (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", "Approve");
+      await expect(pending).rejects.toThrow(/could not persist the owner decision/);
+    } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+});

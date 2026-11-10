@@ -275,6 +275,13 @@ export class AgentManager {
      * kept last so existing positional call sites are unaffected.
      */
     extraExtensions: InlineExtension[] = [],
+    /**
+     * The ORIGINAL invoking owner chat for a delegated/task session (bd pibot-0xpf.5). Delivery-bearing
+     * capabilities target this instead of the executor's transport-bound chat, so a delegated task
+     * cannot silently deliver to the sibling's own bot chat. Kept last so existing positional call
+     * sites are unaffected.
+     */
+    deliveryChat?: ChatRef,
   ): Promise<AgentSession> {
     const key = `${agentId}::${chatKey}`;
     const cached = this.sessions.get(key);
@@ -303,6 +310,7 @@ export class AgentManager {
       codexReportsDir: this.codexReportsDir ?? path.join(os.homedir(), "Documents", "Codex"),
       scheduler,
       chat,
+      ...(deliveryChat ? { deliveryChat } : {}),
       ask,
       comms,
       telegramSend,

@@ -50,6 +50,11 @@ export interface CapabilityContext {
   vaultDir: string;
   scheduler: Scheduler;
   chat: ChatRef;
+  /** The chat of the ORIGINAL invoking owner for a delegated turn (bd pibot-0xpf.5). Delivery-bearing
+   *  capabilities (tasks, agent-comms, speech) must target THIS chat, not the transport-bound chat of
+   *  the executor, so a sibling's own primary bot chat can never silently replace the requested
+   *  destination. Absent for a normal owner turn, where `chat` already is the invoking chat. */
+  deliveryChat?: ChatRef;
   /** shared docs site source root (read-only course content for participant-facing agents) */
   docsDir?: string;
   /** owner's Codex activity-report root (read-only; ~/Documents/Codex default) */
@@ -118,7 +123,7 @@ const installedDelegateClis = () => Object.keys(DELEGATE_CLIS).filter((cli) => {
 
 const confirmMutation = (ctx: CapabilityContext) => async (description: string): Promise<boolean> => {
   if (!ctx.ask) return false;
-  const answer = await ctx.ask({ text: description, options: ["Confirm", "Cancel"], timeoutMs: 5 * 60_000, kind: "approval" });
+  const answer = await ctx.ask({ text: description, options: ["Confirm", "Cancel"], approveOption: "Confirm", timeoutMs: 5 * 60_000, kind: "approval" });
   return answer?.index === 0 && !answer.timedOut && !answer.replaced;
 };
 
@@ -138,8 +143,8 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     available: (ctx) => Boolean(ctx.speech && ctx.chat.transport.startsWith("telegram") && ctx.speech.providers.list().some((provider) => provider.configured)),
     create: (ctx) => speechPlugin({
       agentId: ctx.agent.id,
-      transport: ctx.chat.transport,
-      chatId: ctx.chat.chatId,
+      transport: (ctx.deliveryChat ?? ctx.chat).transport,
+      chatId: (ctx.deliveryChat ?? ctx.chat).chatId,
       providers: ctx.speech!.providers,
       store: ctx.speech!.store,
       send: ctx.speech!.send,
@@ -180,7 +185,7 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     create: (ctx) => tasksPlugin({
       ledger: ctx.tasks!,
       agentId: ctx.agent.id,
-      chat: ctx.chat,
+      chat: ctx.deliveryChat ?? ctx.chat,
       preflight: ctx.dictionary ? resourcePreflight(ctx.dictionary.dataDir) : undefined,
       transcription: {
         policy: { providers: ctx.agent.manifest.speech?.sttProviders, allowExternal: ctx.agent.manifest.speech?.allowExternalStt === true },
@@ -259,7 +264,7 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
   {
     id: "agent-comms", defaultEnabled: true, tools: ["agent_message", "agent_ask", "agent_list", "handoff"],
     prompt: "agent_message (fire-and-forget), agent_ask (blocking), and agent_list coordinate with sibling agents; handoff packages a distilled task brief from the recent conversation and moves the chat to the target agent when it allows rebinding. Messages prefixed `[agent-message from ...]` come from a sibling and should receive a natural reply.",
-    available: (ctx) => Boolean(ctx.comms), create: (ctx) => agentCommsPlugin({ agentId: ctx.agent.id, chat: ctx.chat, ...ctx.comms! }),
+    available: (ctx) => Boolean(ctx.comms), create: (ctx) => agentCommsPlugin({ agentId: ctx.agent.id, chat: ctx.deliveryChat ?? ctx.chat, ...ctx.comms! }),
   },
   {
     id: "questions", defaultEnabled: true, tools: ["ask_user"],

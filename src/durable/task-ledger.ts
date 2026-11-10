@@ -15,6 +15,7 @@ import { Harness, createRegistry, defineDoc, defineExtension, defineTask, type J
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
 import { lockStorageDir, type StorageLock } from "./storage-lock.js";
+import path from "node:path";
 import { truncate } from "../core/util.js";
 import { scanNumericClaims } from "../core/fact-check.js";
 import { correctRelativeDateClaims } from "../core/relative-date-guard.js";
@@ -65,6 +66,72 @@ export class TaskDeadlineError extends Error {
   }
 }
 
+/**
+ * An owner decision correlated to the task's canonical question channel (bd pibot-0xpf.5).
+ * Only a real answer recorded by the owner (the question journal) may create authorization:
+ * a sibling's relayed claim ("Gleb said yes") is prose, not authority. Persisted so a resumed
+ * attempt or an executor handoff can inherit the decision instead of re-asking.
+ *
+ * The record is NEUTRAL: it preserves the exact question/options and the owner's exact answer.
+ * `outcome` is structural (which declared option was chosen), never inferred by matching English
+ * words — "No", "do not restore" and ordinary clarifying answers are never turned into approval.
+ */
+export type TaskDecisionOutcome = "approved" | "declined" | "answer";
+
+export interface TaskDecision {
+  /** exact owner-facing question / requested action */
+  action: string;
+  /** options as shown to the owner at decision time */
+  options: string[];
+  /** the selected option / free-text answer, verbatim */
+  choice: string;
+  /** index into `options`; -1 for free text */
+  optionIndex: number;
+  /** structural outcome: only "approved" authorizes the action */
+  outcome: TaskDecisionOutcome;
+  /** canonical question id (from the owner-question journal) */
+  qid: string;
+  /** stable, namespaced key for the logical question (see taskDecisionKey) */
+  questionKey: string;
+  /** ONLY the canonical owner answer channel may create authorization */
+  source: "owner_question";
+  /** owner chat the answer came from */
+  ownerChatKey: string;
+  answeredAt: number;
+  /** agent that executes the authorized action */
+  executor: string;
+}
+
+/**
+ * Namespaced identity for one owner decision inside a task. A caller may not look up or replay
+ * an arbitrary global journal key: every decision is scoped to the task AND the owner chat that
+ * was asked. Distinct actions therefore cannot collide (a restore answer is never replayed for a
+ * later delete/send question).
+ */
+export function taskDecisionKey(taskId: string, ownerChatKey: string, actionKey: string): string {
+  return `task:${taskId}:owner:${ownerChatKey}:${actionKey}`;
+}
+
+/**
+ * Post-run artifact readback (bd pibot-0xpf.5). Produced by the HOST reading the deliverable
+ * back from disk after the run — never derived from the agent's bookkeeping text. A restore is
+ * only verified when the contract names an artifact and this receipt proves it now exists.
+ */
+export interface ArtifactReceipt {
+  path: string;
+  bytes: number;
+  sha256: string;
+  /** the host read the file back after the run — not an agent claim */
+  evidence: "readback";
+  /** what the readback proves: only that the declared path exists with these bytes, or that those
+   *  bytes match a declared original hash. Without an original hash this is existence/content
+   *  readback, never a claim of byte-exact restoration. */
+  verification: "existence" | "byte-exact";
+  verifiedAt: number;
+  /** true when the bytes differ from a declared original hash: a reconstruction, not an exact restore */
+  reconstructed?: boolean;
+}
+
 export interface LedgerTaskInput {
   agentId: string;
   /** owner chat the task was requested from; the result is posted there */
@@ -108,6 +175,17 @@ export interface LedgerTaskInput {
   inputLocations?: string;
   /** reference-only link to the tracker (Linear/beads) — the ledger stays authoritative */
   linearRef?: string;
+  /** absolute path of the deliverable a restore/repair task must actually produce. When set,
+   *  `done` requires a host readback of THAT file: nonempty bookkeeping text is not a restore
+   *  (bd pibot-0xpf.5). Must be an absolute, non-symlink regular file. */
+  expectedArtifactPath?: string;
+  /** optional declared directory boundary for the readback (absolute). When set, a deliverable
+   *  outside it is not read back, so a model-supplied path cannot wander outside the declared
+   *  restore scope. */
+  artifactScope?: string;
+  /** optional exact sha256 of the original bytes. A different hash means the artifact was
+   *  reconstructed, so completion stays partial and is labelled as reconstruction. */
+  expectedArtifactSha256?: string;
 }
 
 export interface LedgerEntry extends LedgerTaskInput {
@@ -138,6 +216,11 @@ export interface LedgerEntry extends LedgerTaskInput {
   evidenceUsable?: boolean;
   /** structured identity of the failure cause. Only a real deadline may reconcile evidence. */
   failure?: "deadline";
+  /** owner decisions correlated to this task, persisted across resume/handoff (bd pibot-0xpf.5).
+   *  Each entry is scoped by questionKey; a replay only reuses the SAME decision. */
+  decisions?: TaskDecision[];
+  /** host readback of the contracted deliverable, if the task declared one */
+  artifact?: ArtifactReceipt;
   /** pi-durable task id, kept so cancel() works after a restart */
   durableId?: number;
 }
@@ -160,12 +243,16 @@ export interface TaskRun extends LedgerTaskInput {
   /** true when an earlier attempt was cut off by a restart */
   resumed: boolean;
   signal: AbortSignal;
+  /** owner decisions already recorded for this task: a resumed attempt must reuse them, not re-ask */
+  decisions?: TaskDecision[];
 }
 
 /** A runner may report PARTIAL output it can prove (e.g. a correlated delegate result that
  *  arrived before the deadline). It must never be presented as task completion (bd pibot-jiqv). */
 export interface TaskRunResult {
   text: string;
+  /** host readback of a contracted restoration artifact, independent of expected-content proof */
+  artifact?: Omit<ArtifactReceipt, "verifiedAt">;
   delivery?: Omit<Delivery, "deliveredAt">;
   status?: "partial";
   /** why the output is partial; shown in the ledger record */
@@ -178,7 +265,8 @@ export interface TaskRunResult {
 
 export interface TaskRunner {
   /** do the work; resolves with the owner-facing result text — or a result plus a delivery receipt
-   *  (message id and actual media type) so completion can be verified against expected output */
+   *  (message id and actual media type) and/or host artifact readback so completion can be
+   *  verified against expected output */
   run(task: TaskRun): Promise<string | TaskRunResult>;
   /** post a message to the owner chat (at-least-once: a crash right after posting may repeat it;
    *  may return a receipt with the sent message id) */
@@ -212,6 +300,13 @@ export interface TaskLedger {
    */
   appendEvidence(id: string, evidence: string, opts?: { cause?: "deadline" | "late"; usable?: boolean }): Promise<LedgerEntry | undefined>;
   list(filter: { agentId: string; chatKey?: string }): Promise<LedgerEntry[]>;
+  /**
+   * Persist an owner decision correlated to this task (bd pibot-0xpf.5). Host-only: call it only
+   * with an answer from the canonical owner-question journal, never from a sibling's relayed claim.
+   * The questionKey must be namespaced to THIS task and owner chat. First decision per questionKey
+   * wins; a resumed attempt inherits the recorded decisions instead of re-asking the owner.
+   */
+  recordDecision(id: string, agentId: string, decision: TaskDecision): Promise<LedgerEntry | undefined>;
   /** true when an abort was requested for a live task */
   cancel(id: string): Promise<boolean>;
   /** the whole ledger document, for the offline compaction path (bd pibot-b708) */
@@ -284,7 +379,9 @@ const ledgerDoc = async (tx: unknown, conversationId: unknown) =>
 
 type Checkpoint =
   | { phase: "run"; attempts: number }
-  | { phase: "work"; attempt: number }
+  | { phase: "work"; attempt: number;
+      /** owner decisions read from the durable entry at attempt start (bd pibot-0xpf.5) */
+      decisions?: TaskDecision[] }
   | { phase: "notify"; ok: boolean; text: string;
       /** post-work verdict carried into the notice. Older checkpoints predate `final`
        *  (treated from `ok`); the `partial` verdict is always an explicit newer commit. */
@@ -395,7 +492,33 @@ function describeContentGap(
   return undefined;
 }
 
-function prune(doc: LedgerDoc): void {  const finished = Object.values(doc.tasks).filter((t) => !active(t.status)).sort((a, b) => b.updatedAt - a.updatedAt);
+/**
+ * Why a contracted restore/repair deliverable is not verified (bd pibot-0xpf.5). The receipt is a
+ * HOST readback of the exact path after the run. Bookkeeping text — “ledger updated”, “restore
+ * pending”, a nonempty summary — never satisfies it, and a different hash is labelled a
+ * reconstruction rather than a byte-exact restore.
+ */
+function describeArtifactGap(
+  artifact: Omit<ArtifactReceipt, "verifiedAt"> | undefined,
+  input: Pick<LedgerTaskInput, "expectedArtifactPath" | "expectedArtifactSha256">,
+): string | undefined {
+  const expected = input.expectedArtifactPath!.trim();
+  if (!artifact) {
+    return `requested restore of "${expected}" but no post-run readback verified the file (bookkeeping text is not a restored artifact)`;
+  }
+  if (artifact.evidence !== "readback") {
+    return `requested restore of "${expected}" but the receipt is not a host readback`;
+  }
+  if (artifact.path !== expected) return `requested restore of "${expected}" but the readback attested "${artifact.path}"`;
+  if (!(artifact.bytes > 0)) return `requested restore of "${expected}" but the file read back empty`;
+  if (input.expectedArtifactSha256 && artifact.sha256 !== input.expectedArtifactSha256) {
+    return `requested restore of "${expected}" but the readback is a reconstruction (sha256 ${artifact.sha256}) rather than the byte-exact original (expected ${input.expectedArtifactSha256})`;
+  }
+  return undefined;
+}
+
+function prune(doc: LedgerDoc): void {
+  const finished = Object.values(doc.tasks).filter((t) => !active(t.status)).sort((a, b) => b.updatedAt - a.updatedAt);
   for (const old of finished.slice(KEEP_FINISHED)) {
     delete doc.tasks[old.id];
     for (const [rid, tid] of Object.entries(doc.requests)) if (tid === old.id) delete doc.requests[rid];
@@ -484,11 +607,13 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
             return { status: "running", checkpoint: { phase: "notify", ok: false, text } };
           }
           if (entry) Object.assign(entry, { status: "running", attempts: attempt, updatedAt: now() });
-          return { status: "running", checkpoint: { phase: "work", attempt } };
+          // Carry the accepted owner decisions from the durable entry into this attempt so a
+          // resumed run inherits them instead of re-asking (bd pibot-0xpf.5).
+          return { status: "running", checkpoint: { phase: "work", attempt, ...(entry?.decisions?.length ? { decisions: entry.decisions } : {}) } };
         }, ctx);
       },
       work: async (task, rt, ctx) => {
-        const { attempt } = task.state.checkpoint;
+        const { attempt, decisions } = task.state.checkpoint;
         // A durable mark per attempt: finding it already set means this attempt was cut off mid-run.
         if (await rt.memo<boolean>(`started-${attempt}`, ctx)) {
           await rt.commit(() => ({ status: "running", checkpoint: { phase: "run", attempts: attempt } }), ctx);
@@ -503,12 +628,13 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
         let text: string;
         let final: "done" | "partial" | "failed" | "blocked" = "done";
         let delivery: Omit<Delivery, "deliveredAt"> | undefined;
+        let artifact: Omit<ArtifactReceipt, "verifiedAt"> | undefined;
         let runnerPartial: string | undefined;
         let runnerEvidence: string | undefined;
         let readback: ContentReadback | undefined;
         let deadlineFailure = false;
         try {
-          const raw = await runner.run({ ...input, taskId: ledgerId, attempt, resumed: attempt > 1, signal: rt.signal });
+          const raw = await runner.run({ ...input, taskId: ledgerId, attempt, resumed: attempt > 1, signal: rt.signal, ...(decisions?.length ? { decisions } : {}) });
           // A runner may return a bare string or a correlated result receipt
           if (typeof raw === "string") {
             text = raw.trim();
@@ -516,6 +642,7 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
             text = raw.text.trim();
             delivery = raw.delivery;
             readback = raw.readback;
+            artifact = raw.artifact;
             // Correlated evidence proves usable PARTIAL output, never task completion (bd pibot-jiqv).
             if (raw.status === "partial") runnerPartial = raw.partialReason ?? "the run returned a correlated partial result before it stopped";
             runnerEvidence = raw.evidence;
@@ -534,11 +661,14 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
         }
         const validMessageId = typeof delivery?.messageId === "number" && Number.isSafeInteger(delivery.messageId) && delivery.messageId > 0;
         const deliveryProblem = ok && expect ? describeDeliveryGap(delivery, input, expect, validMessageId) : undefined;
-        if (deliveryProblem) {
+        // A contracted restore is complete only when the HOST read the artifact back; bookkeeping
+        // text can never satisfy it (bd pibot-0xpf.5).
+        const artifactProblem = ok && input.expectedArtifactPath ? describeArtifactGap(artifact, input) : undefined;
+        if (deliveryProblem || artifactProblem) {
           // Verified-completion gate (bd pibot-zy70) made destination/account-aware (bd pibot-cida):
           // when the owner asked for a specific medium, `done` requires the receipt to name that same
           // medium, the intended destination, a real bot account and the id namespace — a message id
-          // alone is not proof.
+          // alone is not proof. The same discipline applies to a contracted artifact.
           final = "partial";
         }
         if (runnerPartial) final = "partial";
@@ -576,6 +706,7 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
             if (dateGuard && dateGuard.inconsistent > 0) {
               entry.dateCheck = { checked: dateGuard.checked, inconsistent: dateGuard.inconsistent, corrected: dateGuard.corrected, blocked: dateGuard.blocked, failures: dateGuard.failures };
             }
+            if (artifact) entry.artifact = { ...filterUndefined(artifact), verifiedAt: now() };
             // Merge evidence the runner reported, and evidence appended concurrently while the
             // task was still `running` (a late reply can land before this terminal commit).
             if (deadlineFailure) entry.failure = "deadline";
@@ -592,6 +723,7 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
             if (final === "blocked") Object.assign(entry, { status: "blocked", blocker: text }, { updatedAt: now() });
             else if (final === "partial") {
               const mismatch = deliveryProblem
+                ?? artifactProblem
                 ?? contentProblem
                 ?? runnerPartial
                 ?? (dateGuard?.blocked ? "relative date wording contradicted the absolute date and could not be corrected safely" : "output only partly delivered");
@@ -712,6 +844,35 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
 
   return {
     async start(input, requestId) {
+      // A restore contract names a real file on disk. Validate the identity up front so a
+      // model-supplied relative/ambiguous path can never become a host readback target.
+      if (input.expectedArtifactPath !== undefined) {
+        const artifact = input.expectedArtifactPath.trim();
+        if (!artifact || artifact.includes("\0") || !path.isAbsolute(artifact)) {
+          throw new Error("expectedArtifactPath must be a non-empty absolute path");
+        }
+        if (input.artifactScope !== undefined) {
+          const scope = input.artifactScope.trim();
+          if (!scope || scope.includes("\0") || !path.isAbsolute(scope)) {
+            throw new Error("artifactScope must be a non-empty absolute path");
+          }
+          const rel = path.relative(path.resolve(scope), path.resolve(artifact));
+          if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+            throw new Error(`expectedArtifactPath "${artifact}" is outside the declared artifactScope "${scope}"`);
+          }
+        }
+      }
+      if (input.expectedArtifactSha256 !== undefined && !/^[a-f0-9]{64}$/i.test(input.expectedArtifactSha256)) {
+        throw new Error("expectedArtifactSha256 must be a 64-character hex digest");
+      }
+      if (input.expectedArtifactPath !== undefined) {
+        // Store the canonical absolute paths so the readback receipt is comparable to the contract.
+        input = {
+          ...input,
+          expectedArtifactPath: path.resolve(input.expectedArtifactPath.trim()),
+          ...(input.artifactScope !== undefined ? { artifactScope: path.resolve(input.artifactScope.trim()) } : {}),
+        };
+      }
       let id = "";
       await root.commit(async (tx) => {
         const doc = await ledgerDoc(tx, root.id);
@@ -787,6 +948,42 @@ export async function openTaskLedger(opts: { runner: TaskRunner; storageDir?: st
         return undefined;
       }, C);
       return (await snapshot()).tasks[id];
+    },
+    async recordDecision(id, agentId, decision) {
+      // Only a real owner answer may authorize: reject a relayed/forged source outright.
+      if (decision.source !== "owner_question") throw new Error("only a canonical owner answer can record a task decision");
+      if (!decision.action.trim() || !decision.choice.trim() || !decision.qid.trim() || !decision.questionKey.trim()) {
+        throw new Error("invalid owner decision provenance");
+      }
+      // A caller may not substitute its own key for the canonical question id.
+      if (decision.qid === decision.questionKey) throw new Error("owner decision needs the canonical question id, not a substituted key");
+      // Replay identity must be scoped to THIS task and owner chat, never a global journal lookup.
+      if (!decision.questionKey.startsWith(`task:${id}:owner:`)) {
+        throw new Error(`owner decision questionKey must be namespaced to task "${id}" and its owner chat`);
+      }
+      if (!Array.isArray(decision.options) || !Number.isSafeInteger(decision.optionIndex) || decision.optionIndex < -1 || decision.optionIndex >= decision.options.length) {
+        throw new Error("invalid owner decision option contract");
+      }
+      if (decision.optionIndex >= 0 && decision.choice !== decision.options[decision.optionIndex]) {
+        throw new Error("owner decision choice does not match the declared option");
+      }
+      let found = false;
+      await root.commit(async (tx) => {
+        const doc = await ledgerDoc(tx, root.id);
+        const entry = doc.tasks[id];
+        if (!entry || entry.agentId !== agentId || !active(entry.status)) return undefined;
+        // First decision per logical question wins: a retried/late record cannot overwrite it,
+        // and a decision for a DIFFERENT action can never replay this one.
+        const decisions = entry.decisions ?? [];
+        if (!decisions.some((d) => d.questionKey === decision.questionKey)) {
+          decisions.push({ ...decision, answeredAt: decision.answeredAt || now() });
+          entry.decisions = decisions;
+          entry.updatedAt = now();
+        }
+        found = true;
+        return undefined;
+      }, C);
+      return found ? (await snapshot()).tasks[id] : undefined;
     },
     async exportSnapshot() {
       return (await snapshot()) as unknown as LedgerSnapshot;
