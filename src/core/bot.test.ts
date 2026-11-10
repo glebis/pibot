@@ -3686,6 +3686,24 @@ describe("host artifact readback validation (bd pibot-0xpf.5 review)", () => {
       expect(await runWithResult(t, { expectedArtifactPath: huge })).toBe("restored");
     } finally { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(t.dir, { recursive: true, force: true }); }
   });
+
+  it("rejects an intermediate symlink that escapes the declared scope", async () => {
+    const t = makeBot();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "readback-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "readback-outside-"));
+    try {
+      fs.writeFileSync(path.join(outside, "secret.md"), "# secret\n");
+      fs.symlinkSync(outside, path.join(dir, "link"), "dir");
+      const escaped = path.join(dir, "link", "secret.md");
+      // Lexically inside `dir`, but its canonical target is outside the declared scope.
+      expect(await runWithResult(t, { expectedArtifactPath: escaped, artifactScope: dir })).toBe("restored");
+      // A direct deliverable inside the scope is still attested normally.
+      const inside = path.join(dir, "note.md");
+      fs.writeFileSync(inside, "# inside\n");
+      const ok = await runWithResult(t, { expectedArtifactPath: inside, artifactScope: dir });
+      expect(ok).toMatchObject({ artifact: { path: path.resolve(inside), evidence: "readback", verification: "existence" } });
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true }); fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
 });
 
 describe("task decision replay identity (bd pibot-0xpf.5 review)", () => {
@@ -3735,6 +3753,66 @@ describe("task decision replay identity (bd pibot-0xpf.5 review)", () => {
       fs.rmSync(t.dir, { recursive: true, force: true });
     }
   });
+
+  it("binds replay identity to the action contract even when the caller supplies one key", async () => {
+    const t = makeBot();
+    const { openTaskLedger } = await import("../durable/task-ledger.js");
+    const ledger = await openTaskLedger({
+      runner: {
+        run: (task) => new Promise((_, reject) => {
+          if (task.signal.aborted) reject(new Error("aborted"));
+          task.signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+        notify: async () => {},
+      },
+      storageDir: t.dir,
+    });
+    (t.agents as unknown as { tasks: unknown }).tasks = ledger;
+    try {
+      const task = await ledger.start({ agentId: "assistant", chatKey: "mock:42", title: "recover", instructions: "restore it" });
+      const origin = { transport: "mock", chatId: "42" };
+      const run = { taskId: task.id, agentId: "assistant" } as never;
+      const ask = (spec: unknown) =>
+        (t.bot as unknown as { taskOwnerAsk(r: unknown, c: unknown, s: unknown): Promise<{ choice: string } | null> }).taskOwnerAsk(run, origin, spec);
+      const pushes = (text: string) => t.transport.pushed.filter((p) => p.chatId === "42" && p.opts.text === text).length;
+      const answer = (text: string) =>
+        (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", text);
+
+      const callerKey = "shared-action-key";
+      const restoreA = { questionKey: callerKey, text: "Restore A?", options: ["Restore A", "Skip"], kind: "approval", approveOption: "Restore A", timeoutMs: 5_000 };
+      const deleteB = { questionKey: callerKey, text: "Delete B?", options: ["Delete B", "Keep"], kind: "approval", approveOption: "Delete B", timeoutMs: 5_000 };
+
+      const first = ask(restoreA);
+      await vi.waitFor(() => expect(pushes("Restore A?")).toBe(1));
+      answer("Restore A");
+      await first;
+
+      // Same caller key, different action: must ask again instead of replaying the restore answer.
+      const second = ask(deleteB);
+      await vi.waitFor(() => expect(pushes("Delete B?")).toBe(1));
+      answer("Delete B");
+      await second;
+
+      // Changed approving-option semantics under the same key + text + options is a different contract.
+      const reapprove = { ...restoreA, approveOption: "Skip" };
+      const third = ask(reapprove);
+      await vi.waitFor(() => expect(pushes("Restore A?")).toBe(2));
+      answer("Skip");
+      await third;
+
+      // Identical contract still replays the recorded answer without asking again.
+      const replay = await ask(restoreA);
+      expect(replay?.choice).toBe("Restore A");
+      expect(pushes("Restore A?")).toBe(2);
+
+      const entry = await ledger.get(task.id);
+      expect(entry?.decisions).toHaveLength(3);
+      expect(new Set(entry?.decisions?.map((d) => d.questionKey)).size).toBe(3);
+    } finally {
+      await ledger.close();
+      fs.rmSync(t.dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("task decision persistence failures are surfaced (bd pibot-0xpf.5 review)", () => {
@@ -3752,6 +3830,24 @@ describe("task decision persistence failures are surfaced (bd pibot-0xpf.5 revie
       await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.opts.text === "Restore?")).toBe(true));
       (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", "Approve");
       await expect(pending).rejects.toThrow(/ledger down/);
+    } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+
+  it("fails closed when recordDecision returns no matching persisted task", async () => {
+    const t = makeBot();
+    try {
+      // A ledger call that resolves undefined persisted nothing (absent/wrong/completed task).
+      (t.agents as unknown as { tasks: unknown }).tasks = {
+        recordDecision: vi.fn(async () => undefined),
+      };
+      const run = { taskId: "tk-missing", agentId: "assistant" } as never;
+      const origin = { transport: "mock", chatId: "42" };
+      const ask = (spec: unknown) =>
+        (t.bot as unknown as { taskOwnerAsk(r: unknown, c: unknown, s: unknown): Promise<unknown> }).taskOwnerAsk(run, origin, spec);
+      const pending = ask({ text: "Restore?", options: ["Approve", "Decline"], kind: "approval", approveOption: "Approve", timeoutMs: 5_000 });
+      await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.opts.text === "Restore?")).toBe(true));
+      (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", "Approve");
+      await expect(pending).rejects.toThrow(/could not persist the owner decision/);
     } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
   });
 });

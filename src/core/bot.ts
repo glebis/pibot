@@ -3996,10 +3996,21 @@ export class PiBot implements HeartbeatHost {
    */
   private async taskOwnerAsk(run: TaskRun, originChat: ChatRef, spec: QuestionSpec): Promise<QuestionAnswer | null> {
     const ownerChatKey = `${originChat.transport}:${originChat.chatId}`;
+    // Replay identity is bound to the immutable action contract — question text, options, kind and
+    // the exact approving option — even when the caller supplies its own key. A caller key alone
+    // must never let a changed question/approval contract replay an unrelated recorded answer
+    // (bd pibot-0xpf.5 review). Identical contracts still map to the same key and replay.
+    const contractHash = createHash("sha256").update(JSON.stringify({
+      text: spec.text,
+      options: spec.options,
+      kind: spec.kind ?? "question",
+      approveOption: spec.approveOption ?? null,
+    })).digest("hex").slice(0, 16);
+    const callerKey = spec.questionKey?.trim();
     // Caller keys are namespaced too, never used as an arbitrary global journal key.
-    const actionKey = spec.questionKey?.trim()
-      ? `caller:${spec.questionKey.trim()}`
-      : `${spec.kind === "approval" ? "approval" : "question"}:${createHash("sha256").update(JSON.stringify({ text: spec.text, options: spec.options })).digest("hex").slice(0, 16)}`;
+    const actionKey = callerKey
+      ? `caller:${callerKey}:${contractHash}`
+      : `${spec.kind === "approval" ? "approval" : "question"}:${contractHash}`;
     const questionKey = taskDecisionKey(run.taskId, ownerChatKey, actionKey);
     const answer = await this.questions.ask(run.agentId, originChat, { ...spec, questionKey });
     if (!answer || answer.timedOut || answer.replaced || !answer.choice.trim()) return answer;
@@ -4021,6 +4032,13 @@ export class PiBot implements HeartbeatHost {
       ownerChatKey,
       answeredAt: Date.now(),
       executor: run.agentId,
+    }).then((recorded) => {
+      // recordDecision returns undefined when the task is absent, owned by another agent, or no
+      // longer active; a successful-looking call that persisted nothing must fail closed rather
+      // than let the turn proceed on unrecorded authorization (bd pibot-0xpf.5 review).
+      if (!recorded || !recorded.decisions?.some((d) => d.questionKey === questionKey)) {
+        throw new Error(`task ${run.taskId} could not persist the owner decision — the task is missing, owned by another agent, or no longer active; refusing to proceed on unrecorded authorization`);
+      }
     });
     return answer;
   }
@@ -4036,27 +4054,47 @@ export class PiBot implements HeartbeatHost {
   ): Promise<Omit<ArtifactReceipt, "verifiedAt"> | undefined> {
     try {
       if (!path.isAbsolute(filePath) || filePath.includes("\0")) return undefined;
-      const target = path.resolve(filePath);
+      const declared = path.resolve(filePath);
+      // lstat the FINAL component: a symlink is rejected even when it points at a regular file.
+      const linkStat = await fs.promises.lstat(declared);
+      if (!linkStat.isFile() || linkStat.isSymbolicLink()) return undefined;
+      // Resolve the canonical target and the boundary so an INTERMEDIATE symlink cannot smuggle the
+      // read outside the declared scope (lexical checks alone miss `scope/link/secret.md`).
+      const realTarget = await fs.promises.realpath(declared);
       if (scope !== undefined) {
-        const root = path.resolve(scope);
-        const rel = path.relative(root, target);
+        if (!path.isAbsolute(scope) || scope.includes("\0")) return undefined;
+        const realScope = await fs.promises.realpath(path.resolve(scope));
+        const rel = path.relative(realScope, realTarget);
         if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return undefined;
+      } else {
+        // No declared boundary: the contracted path's own real directory is the limit. An
+        // intermediate symlink that escapes it is rejected rather than read as an extra file.
+        const realDir = await fs.promises.realpath(path.dirname(declared));
+        if (path.dirname(realTarget) !== realDir) return undefined;
       }
-      const stat = await fs.promises.lstat(target);
-      // lstat: a symlink is rejected even when it points at a regular file, so the readback cannot
-      // wander outside the declared artifact.
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > MAX_ARTIFACT_READBACK_BYTES) return undefined;
-      const bytes = await fs.promises.readFile(target);
-      const sha256 = createHash("sha256").update(bytes).digest("hex");
-      const byteExact = Boolean(expectedSha256 && sha256 === expectedSha256);
-      return {
-        path: target,
-        bytes: bytes.length,
-        sha256,
-        evidence: "readback",
-        verification: byteExact ? "byte-exact" : "existence",
-        ...(expectedSha256 && !byteExact ? { reconstructed: true } : {}),
-      };
+      // Open the canonical target without following a final symlink (guards the check→read window)
+      // and bound what we ACTUALLY read from the descriptor, not a pre-read stat.
+      const fh = await fs.promises.open(realTarget, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const stat = await fh.stat();
+        if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_ARTIFACT_READBACK_BYTES) return undefined;
+        const buf = Buffer.alloc(stat.size);
+        const { bytesRead } = await fh.read(buf, 0, stat.size, 0);
+        const bytes = buf.subarray(0, bytesRead);
+        if (bytes.length === 0 || bytes.length > MAX_ARTIFACT_READBACK_BYTES) return undefined;
+        const sha256 = createHash("sha256").update(bytes).digest("hex");
+        const byteExact = Boolean(expectedSha256 && sha256 === expectedSha256);
+        return {
+          path: declared,
+          bytes: bytes.length,
+          sha256,
+          evidence: "readback",
+          verification: byteExact ? "byte-exact" : "existence",
+          ...(expectedSha256 && !byteExact ? { reconstructed: true } : {}),
+        };
+      } finally {
+        await fh.close();
+      }
     } catch {
       return undefined; // missing/unreadable = no receipt; the gate records partial, never done
     }
