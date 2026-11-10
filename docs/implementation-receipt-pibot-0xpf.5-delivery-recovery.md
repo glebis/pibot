@@ -103,7 +103,7 @@ The exact production gaps fixed here:
 npm test -- --configLoader runner src/durable/task-ledger.test.ts src/core/bot.test.ts \
   src/plugins/tasks-plugin.test.ts src/plugins/agent-comms-plugin.test.ts \
   src/plugins/agent-comms-origin.test.ts
-→ 5 files passed, 293 tests passed (2026-11-10)
+→ 5 files passed, 294 tests passed (2026-11-10)
 
 npm run typecheck
 → tsc --noEmit: passed

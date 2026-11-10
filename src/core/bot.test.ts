@@ -3736,3 +3736,22 @@ describe("task decision replay identity (bd pibot-0xpf.5 review)", () => {
     }
   });
 });
+
+describe("task decision persistence failures are surfaced (bd pibot-0xpf.5 review)", () => {
+  it("does not continue as though a rejected decision were durable", async () => {
+    const t = makeBot();
+    try {
+      (t.agents as unknown as { tasks: unknown }).tasks = {
+        recordDecision: vi.fn(async () => { throw new Error("ledger down"); }),
+      };
+      const run = { taskId: "tk-persist", agentId: "assistant" } as never;
+      const origin = { transport: "mock", chatId: "42" };
+      const ask = (spec: unknown) =>
+        (t.bot as unknown as { taskOwnerAsk(r: unknown, c: unknown, s: unknown): Promise<unknown> }).taskOwnerAsk(run, origin, spec);
+      const pending = ask({ text: "Restore?", options: ["Approve", "Decline"], kind: "approval", approveOption: "Approve", timeoutMs: 5_000 });
+      await vi.waitFor(() => expect(t.transport.pushed.some((p) => p.opts.text === "Restore?")).toBe(true));
+      (t.bot as unknown as { questions: { answerViaText: (ck: string, text: string) => boolean } }).questions.answerViaText("mock:42", "Approve");
+      await expect(pending).rejects.toThrow(/ledger down/);
+    } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+  });
+});
