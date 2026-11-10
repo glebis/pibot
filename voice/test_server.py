@@ -368,3 +368,30 @@ def test_hermes_native_approval_voice_message_not_telegram():
             c.get('/api/agents', headers=HEADERS)
         assert 'native Hermes session' in observed['answer'] and 'Telegram' not in observed['answer']
         assert not any(method == 'prompt.submit' for method, _ in transport.rpc.calls)
+
+
+def test_scoped_cleanup_matches_session_without_closing_another():
+    session_id = '7c2c21cc-8215-4ee6-b015-3fdc2d1252ab'
+    other_id = '2613a611-1524-46a8-9ef5-c663378a691d'
+
+    class ScopedBridge(Bridge):
+        async def post(self, path, json):
+            self.calls.append(('post', path))
+            return httpx.Response(200, json={'sessionId': session_id}, request=httpx.Request('POST', 'http://test'))
+
+    b = ScopedBridge()
+    with patch.dict(os.environ, {'DEEPGRAM_API_KEY': 'fake-test-only'}), client(b) as c:
+        body = {'agentId': 'test', 'sdp': 'v=0 fake', 'type': 'offer'}
+        answer = c.post('/api/offer', headers=HEADERS, json=body)
+        assert answer.status_code == 200
+        assert answer.json()['sessionId'] == session_id
+        assert answer.json()['type'] == 'answer'
+        assert c.delete('/api/session?sessionId=invalid', headers=HEADERS).status_code == 400
+        assert c.delete('/api/session?sessionId=' + other_id, headers=HEADERS).status_code == 409
+        assert not any(call[0] == 'delete' for call in b.calls)
+        assert c.post('/api/offer', headers=HEADERS, json=body).status_code == 409
+        assert c.delete('/api/session?sessionId=' + session_id, headers=HEADERS).json() == {'closed': True}
+        assert ('delete', '/v1/sessions/' + session_id) in b.calls
+        count = len(b.calls)
+        assert c.delete('/api/session?sessionId=' + other_id, headers=HEADERS).json() == {'closed': True}
+        assert len(b.calls) == count

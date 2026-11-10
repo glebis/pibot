@@ -2,10 +2,21 @@ import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { truncate } from "../core/util.js";
 
+/** Explicit audience/delivery intent for an inter-agent call (bd pibot-jq9m).
+ *  "internal" (the default): pure coordination — nothing reaches the owner chat,
+ *  no acceptance ack, no reply push, no task ack there.
+ *  "owner": an owner-facing delegated deliverable — acceptance, the final reply,
+ *  and late results are delivered to the origin chat exactly once.
+ *  Never inferred from chat origin, agent identity or message content keywords. */
+export type DeliveryAudience = "internal" | "owner";
+
 export interface CommsHooks {
   /** deliver a message into another agent's session; returns that agent's reply text.
-   *  originChat: the chat the delegating agent is bound to — status/acks route back there. */
-  askAgent(fromAgentId: string, toAgentId: string, text: string, timeoutMs?: number, originChat?: { transport: string; chatId: string }): Promise<string>;
+   *  originChat: the chat the delegating agent is bound to — used only when the
+   *  audience is "owner"; internal calls never touch it.
+   *  intent distinguishes a blocking `agent_ask` from a fire-and-forget `agent_message`
+   *  so a task-scoped host wrapper records only real ask replies (bd pibot-jiqv). */
+  askAgent(fromAgentId: string, toAgentId: string, text: string, timeoutMs?: number, originChat?: { transport: string; chatId: string }, intent?: "ask" | "message", audience?: DeliveryAudience): Promise<string>;
   /** handoff: package this agent's context + deliver to the target; returns the target's ack */
   handoffContext(fromAgentId: string, toAgentId: string, note?: string, originChat?: { transport: string; chatId: string }): Promise<string>;
   /** list available sibling agents */
@@ -36,10 +47,11 @@ export function agentCommsPlugin(deps: AgentCommsPluginDeps): InlineExtension {
         name: "agent_message",
         label: "Message agent",
         description:
-          "Send a message to a sibling agent (fire-and-forget). They will read it in their own session and act on it. Use for coordination that doesn't need an immediate answer.",
+          "Send a message to a sibling agent (fire-and-forget). They will read it in their own session and act on it. Use for coordination that doesn't need an immediate answer. Internal coordination never posts to the user's chat; set audience 'owner' only when the user explicitly asked for the delegated result in their own chat.",
         parameters: Type.Object({
           to: Type.String({ description: "Target agent id (e.g. 'tax')" }),
           text: Type.String({ description: "The message" }),
+          audience: Type.Optional(Type.Union([Type.Literal("internal"), Type.Literal("owner")], { description: "Delivery audience: 'internal' (default) stays agent-only; 'owner' also delivers the reply to the user's chat. Use 'owner' only for explicit user-requested delegated deliverables." })),
         }),
         async execute(_tcid, params) {
           let text: string;
@@ -49,7 +61,7 @@ export function agentCommsPlugin(deps: AgentCommsPluginDeps): InlineExtension {
             details = { ok: false };
           } else {
             try {
-              await deps.askAgent(deps.agentId, params.to, params.text, undefined, deps.chat);
+              await deps.askAgent(deps.agentId, params.to, params.text, undefined, deps.chat, "message", params.audience);
               text = `Delivered to **${params.to}**.`;
               details = { ok: true };
             } catch (e) {
@@ -65,11 +77,12 @@ export function agentCommsPlugin(deps: AgentCommsPluginDeps): InlineExtension {
         name: "agent_ask",
         label: "Ask agent",
         description:
-          "Ask a sibling agent a question and wait for their answer (blocking, up to the timeout). Use for delegation that needs a response — e.g. ask 'tax' about a deadline. Do not use for urgent user-facing things.",
+          "Ask a sibling agent a question and wait for their answer (blocking, up to the timeout). Use for delegation that needs a response — e.g. ask 'tax' about a deadline. Do not use for urgent user-facing things. The answer returns to you here; it is NOT posted to the user's chat unless audience is 'owner' — set that only when the user explicitly requested the delegated deliverable.",
         parameters: Type.Object({
           to: Type.String({ description: "Target agent id" }),
           question: Type.String({ description: "The question" }),
           timeoutMinutes: Type.Optional(Type.String({ description: "Wait limit (default 10m)" })),
+          audience: Type.Optional(Type.Union([Type.Literal("internal"), Type.Literal("owner")], { description: "Delivery audience: 'internal' (default) returns to you only; 'owner' also delivers the reply to the user's chat. Use 'owner' only for explicit user-requested delegated deliverables." })),
         }),
         async execute(_tcid, params) {
           let text: string;
@@ -80,7 +93,7 @@ export function agentCommsPlugin(deps: AgentCommsPluginDeps): InlineExtension {
           } else {
             const timeoutMs = params.timeoutMinutes ? (parseFloat(params.timeoutMinutes) || 10) * 60e3 : undefined;
             try {
-              const reply = await deps.askAgent(deps.agentId, params.to, params.question, timeoutMs, deps.chat);
+              const reply = await deps.askAgent(deps.agentId, params.to, params.question, timeoutMs, deps.chat, "ask", params.audience);
               text = `**${params.to}** replied:\n${truncate(reply, 2500)}`;
               details = { reply };
             } catch (e) {

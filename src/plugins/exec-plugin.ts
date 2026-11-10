@@ -6,10 +6,12 @@ import { promisify } from "node:util";
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { childEnv } from "../core/child-env.js";
+import { classifyGroqPartsFailure, classifyKeySetupInvocation, formatProviderDiagnostic } from "../core/provider-diagnostics.js";
 import { truncate } from "../core/util.js";
 import { appendExecTrace, searchExecTrace, readExecArtifactExtract, ARTIFACT_MAX_PAGE_BYTES, ARTIFACT_PAGE_BYTES, type ExecTraceInput } from "./exec-trace.js";
 
 const execFileAsync = promisify(execFile);
+const GROQ_PARTS_SCRIPT = path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_parts.py");
 
 export const EXEC_TIMEOUT_MS = 600_000;
 export const EXEC_MAX_OUTPUT = 64_000;
@@ -151,6 +153,31 @@ function validateOsascript(rest: string[], deps: ExecPluginDeps): ExecValidateRe
 }
 
 /**
+ * Groq key intake is owner-initiated only (bd pibot-hn90). The script's default path opens
+ * an OS dialog and validates the pasted key over the network; in an unattended background
+ * turn that is an interactive wait, not a health check. Refuse every invocation through
+ * this validator with a setup-vs-auth diagnostic, so the agent cannot conclude from the
+ * refusal that the key is invalid. Owners keep the manual workflow by running the skill
+ * script directly in a terminal — outside unattended exec.
+ */
+export function validateGroqKeySetup(rest: string[], deps: ExecPluginDeps): ExecValidateResult {
+  const category = classifyKeySetupInvocation(rest);
+  const detail =
+    category === "noninteractive-probe-refused"
+      ? "the status probe is not exposed through unattended exec; its absence is not an authentication verdict."
+      : "interactive setup intake runs only in an owner-initiated terminal session using the skill script directly; it is not available through unattended exec. This refusal is setup routing, not an authentication result: the key is NOT thereby shown to be invalid, so do not request a replacement.";
+  return {
+    error: `refused: ${formatProviderDiagnostic({
+      service: "groq-key-setup",
+      executor: path.basename(deps.agentDir) || "unknown",
+      source: "unknown",
+      category,
+      detail,
+    })}`,
+  };
+}
+
+/**
  * Vetted allowlist for the "exec" capability. Deliberately narrow:
  * - binaries are resolved at call time and the resolved path must match the entry (no PATH hijack)
  * - commands run via execFile argv — NO shell, so pipes/redirections/substitutions are inert
@@ -168,6 +195,11 @@ function validateOsascript(rest: string[], deps: ExecPluginDeps): ExecValidateRe
  *   only --json / --jq. No methods, fields, --input, --web.
  */
 export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
+  // Truthful capability check with no URL: the agent can ask what impersonation targets
+  // exist locally instead of asserting "impersonation is installed" from memory (Oct 30).
+  // Listed before the general yt-dlp entry so its exact-match pin wins and so a refusal
+  // reported by the general entry is not overwritten by the pin mismatch.
+  { bin: "yt-dlp", pin: ["--list-impersonate-targets"] },
   {
     bin: "yt-dlp",
     allowFlags: [
@@ -185,6 +217,10 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
       { flag: "--sub-format", takesValue: true, valueRe: SAFE_VALUE },
       { flag: "--convert-subs", takesValue: true, valueRe: /^(srt|vtt|ass|lrc)$/ },
       { flag: "--list-subs" },
+      // Impersonation is the documented remedy for YouTube's bot checks. It was absent
+      // from the allowlist, so every "repair" attempt was refused at the harness and the
+      // agent concluded the wrong thing. Value is a client (and optional OS) token only.
+      { flag: "--impersonate", takesValue: true, valueRe: /^[A-Za-z0-9_-]{1,40}(:[A-Za-z0-9_]{1,20})?$/ },
       { flag: "--dump-json" },
       { flag: "-j" },
       { flag: "--dump-single-json" },
@@ -218,10 +254,18 @@ export const DEFAULT_EXEC_ALLOWLIST: ExecAllowEntry[] = [
   { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/browserbase-fetch/scripts/bb_fetch.py")], allowPositionalRe: /^https:\/\//, positionals: { min: 1, max: 1 } },
   // Groq parts-transcription wrapper (free-tier pinned: key from 0600 file/Keychain at runtime,
   // 1 concurrent + 8 calls/day local caps, <=15-min owner rule, adaptive 22MB part sizing):
-  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_parts.py")], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
-  // Groq key intake (native hidden dialog; stores to 0600 file / Keychain / sops-encrypted copy),
-  // and a no-arg config-setter entry so the sops key path can be registered without shell:
-  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_key_setup.py")] },
+  { bin: "python3", pin: [GROQ_PARTS_SCRIPT], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
+  // VTT caption file → clean plain text (de-rollops YouTube auto-captions, joins prose;
+  // stdout≤60KB else writes <stem>.txt next to the input). Exactly one .vtt positional, no flags.
+  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/vtt-text/scripts/vtt_text.py")], allowPositionalRe: /^[^-]/, positionals: { min: 1, max: 1 } },
+  // ffprobe metadata probe (read-only): exact fixed argv, single file positional. Lets an
+  // agent satisfy "probe duration before choosing a transcription route" without ffprobe
+  // being generally executable.
+  { bin: "ffprobe", pin: ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"], allowPositionalRe: /^[^\-]/, positionals: { min: 1, max: 1 } },
+  // Groq key intake is OWNER-INITIATED ONLY: the script opens an OS dialog and validates over
+  // the network. Unattended exec refuses every invocation through validateGroqKeySetup with a
+  // setup-vs-auth diagnostic; owners run the skill script directly in a terminal instead.
+  { bin: "python3", pin: [path.join(os.homedir(), ".agents/skills/groq-parts/scripts/groq_key_setup.py")], validate: validateGroqKeySetup },
   // read-only GitHub fetches for link-saves (host-pinned curl; exactly one URL, so no extra flags like -o can ride along)
   { bin: "curl", pin: ["-sL", "--max-time", "15"], urlsUnder: ["https://api.github.com/", "https://github.com/", "https://raw.githubusercontent.com/"] },
   // arbitrary-https READ-ONLY GET (link-saves/fetches): pinned flags cap runtime, exactly one URL
@@ -499,12 +543,15 @@ export function execPlugin(deps: ExecPluginDeps): InlineExtension {
             const reason = resolved.error.includes('not found') ? 'command missing'
               : resolved.error.includes('shell metacharacters') ? 'shell syntax denied'
               : resolved.error.includes('denied argument') ? 'argument denied'
+              : resolved.error.includes('is not allowlisted') && /flag /.test(resolved.error) ? 'flag not allowlisted'
+              : resolved.error.includes('value for') ? 'flag value denied'
               : resolved.error.includes('not on this agent') ? 'not allowlisted' : 'constraint denied';
             const logged = trace('refused', reason);
             return refuse(resolved.error + (logged ? '' : ' (audit unavailable)'));
           }
           // Fail closed before executing when durable diagnostic metadata cannot be recorded.
           if (!trace('started')) return refuse('execution audit unavailable; command not started');
+          const groqPartsExecution = resolved.argv[1] === GROQ_PARTS_SCRIPT;
           try {
             const { stdout, stderr } = await execFileAsync(resolved.argv[0], resolved.argv.slice(1), {
               cwd: resolved.cwd,
@@ -524,7 +571,24 @@ export function execPlugin(deps: ExecPluginDeps): InlineExtension {
           } catch (e) {
             const err = e as { code?: number | string; killed?: boolean; stdout?: string; stderr?: string; message?: string };
             const secs = Math.round((Date.now() - started) / 1000);
-            trace(err.killed ? 'timed-out' : 'failed', 'execution failed', typeof err.code === 'number' ? err.code : null);
+            const groqCategory = groqPartsExecution ? classifyGroqPartsFailure({
+              stdout: err.stdout, stderr: err.stderr, code: err.code, killed: err.killed,
+            }) : undefined;
+            trace(err.killed ? 'timed-out' : 'failed', groqCategory ? `groq-parts ${groqCategory}` : 'execution failed', typeof err.code === 'number' ? err.code : null);
+            if (groqCategory) {
+              // The wrapper may include an old "replace your key" instruction, raw provider
+              // payload, or credential-bearing exception. Never forward that prose. Its lookup
+              // traverses several stores but does not identify which one supplied the key.
+              const diagnostic = formatProviderDiagnostic({
+                service: "groq-parts-exec",
+                executor: path.basename(deps.agentDir) || "unknown",
+                source: groqCategory === "credential-missing" ? "none" : "unknown",
+                category: groqCategory,
+                durationMs: Date.now() - started,
+                detail: typeof err.code === "number" ? `exitCode=${err.code}; wrapper output omitted` : "wrapper output omitted",
+              });
+              return { content: [{ type: "text" as const, text: diagnostic }], details: { ok: false, exitCode: typeof err.code === "number" ? err.code : null } };
+            }
             const text = [
               err.killed ? `timed out after ${secs}s` : `exit ${err.code ?? "?"} · ${secs}s`,
               err.stdout?.trim() ? `--- stdout ---\n${truncate(err.stdout, maxOutput)}` : "",

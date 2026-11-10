@@ -40,14 +40,14 @@ describe("scheduler plugin", () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
-  function pluginFor(agentId = "a1") {
+  function pluginFor(agentId = "a1", chat = { transport: "test", chatId: "c1" }) {
     const tools = new Map<string, Tool>();
     const api = {
       registerTool: (t: ToolDefinition) => tools.set(t.name, t as Tool),
       registerCommand: vi.fn(),
       on: vi.fn(),
     } as unknown as ExtensionAPI;
-    factoryOf(schedulerPlugin({ scheduler, agentId, chat: { transport: "test", chatId: "c1" } }))(api);
+    factoryOf(schedulerPlugin({ scheduler, agentId, chat }))(api);
     return { tools };
   }
 
@@ -56,6 +56,21 @@ describe("scheduler plugin", () => {
     for (const name of ["schedule_create", "schedule_list", "schedule_cancel", "schedule_resume", "snooze", "promise_make", "promise_keep"]) {
       expect(tools.has(name)).toBe(true);
     }
+  });
+
+  it("shows the last occurrence's run id and direct-delivery receipt (bd pibot-0xpf.5)", async () => {
+    const { tools } = pluginFor();
+    const job = scheduler.create({
+      agentId: "a1", chat: { transport: "test", chatId: "c1" }, title: "daily digest",
+      kind: "subject", dueAt: Date.now() + 3600_000, wake: "normal", delivery: "direct",
+    });
+    job.lastRunId = "scrun_test1";
+    job.lastAttemptAt = Date.now() - 60_000;
+    job.lastReceipt = { messageId: 987, peer: "test:c1", evidence: "ack" };
+    const listed = (await tools.get("schedule_list")!.execute("l1", {})).content[0].text;
+    expect(listed).toContain("last run scrun_test1");
+    expect(listed).toContain("msg 987");
+    expect(listed).toContain("(ack)");
   });
 
   it("schedule_create accepts wake:'notify' for awareness-only task wakes", async () => {
@@ -101,6 +116,17 @@ describe("scheduler plugin", () => {
     expect(job.dueAt).toBeGreaterThan(Date.now());
     expect(job.cardPending).toBe(true);
     expect(res.details.scheduleId).toBe(job.id);
+  });
+
+  it("schedule_create in a task session routes through agent delivery, never the synthetic chat", async () => {
+    const { tools } = pluginFor("a1", { transport: "agent", chatId: "task-t1" });
+    await tools.get("schedule_create")!.execute("t1", { title: "vault cleanup", when: "in 20m" });
+    const job = scheduler.list("a1")[0];
+    // "agent" is a session marker, not a transport: persisting it produced jobs that
+    // could never route ("delivery transport unavailable: agent"). The job keeps no
+    // chat and resolves through the agent's owned chats when it fires.
+    expect(job.chat).toEqual({ transport: "", chatId: "" });
+    expect(job.delivery).toBe("agent");
   });
 
   it("schedule_create reports unparseable times as ERROR", async () => {

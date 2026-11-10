@@ -1,13 +1,18 @@
+import {ChatAttachmentError,prepareChatAttachments,validateChatAttachments} from './chat-attachments.js';
 import { urgentSourceReceipt } from '../voice/urgent-sources.js';
+import {commandReplyScope} from './command-reply-scope.js';
+import { BbChatError, BbRequestReceipts, BbTransport, bbChatKey, type BbChatInput, type BbConversationControl } from '../transports/bb.js';
 import type { UrgentSourceStore, SourceScope, BlockedDecisionProjection } from '../voice/urgent-sources.js';
 import { CanonicalTurnGate, VOICE_CALL_DIRECTIVE, type ActiveVoiceTurn, type BotVoiceInput, type BotVoiceResult, type VoiceToolGroup } from '../voice/session-control.js';
 import { CAPABILITY_REGISTRY, executableAvailable } from './capabilities.js';
 import type { VoiceOwnerCommands } from '../voice/owner-commands.js';
-import { BlockedError, type TaskRun, type LedgerEntry, type Delivery } from '../durable/task-ledger.js';
+import { BlockedError, TaskDeadlineError, type TaskRun, type TaskRunResult, type LedgerEntry, type Delivery, type ContentReadback } from '../durable/task-ledger.js';
+import { DelegateEvidenceCollector } from './task-reconcile.js';
+import type { CommsHooks } from '../plugins/agent-comms-plugin.js';
 import { listChildProcesses, type ChildProcess, type ProcessControl } from './processes.js';
 import { beginActivity, liveActivities, trackActivity } from './activity.js';
 import { VoiceFront, type CallRecord, type TaskEvent } from '../voice/front.js';
-import type { AssistantMessage, Message, Tool } from '@earendil-works/pi-ai';
+import type { AssistantMessage, Message, Tool, ImageContent } from '@earendil-works/pi-ai';
 import { LabEnrollmentFlow, type LabEnrollmentControl } from "./lab-enrollment-flow.js";
 import { LabPayments } from "./lab-payments.js";
 import { LabAdminInbox } from "./lab-admin-inbox.js";
@@ -30,7 +35,9 @@ import type { EvolutionEngine } from "./evolution.js";
 import type { EventLog } from "./events.js";
 import type { HeartbeatEngine, HeartbeatHost } from "./heartbeat.js";
 import type { TelegramSendHooks, TelegramSendResult } from "../plugins/telegram-send-plugin.js";
-import { QuestionBus, type QuestionSpec } from "./questions.js";
+import { QuestionBus, type QuestionAnswer, type QuestionSpec } from "./questions.js";
+import { QuestionStore } from "./question-store.js";
+import type { DeliveryRow } from "./delivery-ledger.js";
 import { MessageCoalescer } from "./message-coalescer.js";
 import { ScheduleRouteError, type Scheduler } from "./scheduler.js";
 import type { Config } from "../config.js";
@@ -42,10 +49,12 @@ import { PROACTIVITY_INTERVAL, PROACTIVITY_OPTIONS, VIBE_OPTIONS, suggestedSubBo
 import { scorePersonaAmbiguity, AMBIGUITY_THRESHOLD } from "./ambiguity.js";
 import { buildHandoffEnvelope, composeHandoffBrief, handoffNeedsLongAudioRule } from "./handoff-brief.js";
 import { SttService, type SttPolicy } from "./stt.js";
+import { formatCompactProviderDiagnostic, type ProviderDiagnostic } from "./provider-diagnostics.js";
 import { applyCorrections, composeBias, loadDictionary } from "./dictionary.js";
 import { getMediaLinkKey, mediaBase, mediaLinkUrl, stashForLink } from "./media-links.js";
 import { AudioMediaProcessor } from "./audio-media.js";
 import { errorMessage, fmtWhen, nextDailyAt, nextQuietEnd, parseDuration, readJson, truncate, uid, writeJsonAtomic } from "./util.js";
+import { describeImage } from "./vision.js";
 import { applyVoiceStyle, isOperationalNotice, requestsFullPath, VOICE_STYLE_DIRECTIVE } from "./voice-style.js";
 import {
   advanceGoal, goalCard, newGoal, renderGoalBlock, renderGoalStatus, shouldContinue, withMethodBlocker,
@@ -102,6 +111,52 @@ export function parsePendingSubBots(
     out.set(agentId, ts);
   }
   return out;
+}
+
+/**
+ * One inter-agent turn currently running in this process (bd pibot-jiqv). A timeout must
+ * not orphan the run: the transport call and session stay busy, so a later retry of the
+ * same request has to join THIS run rather than submit a second one.
+ */
+interface InFlightAgentRun {
+  id: string;
+  /** normalized request text — the identity a retry must match */
+  fingerprint: string;
+  label: string;
+  startedAt: number;
+  result: Promise<string>;
+}
+
+function agentRunKey(agentId: string, fromAgent: string, correlationId?: string): string {
+  // Task-correlated runs are keyed per task so two tasks of the same agent asking the same
+  // target/text do not join one run and claim each other's reply as their own evidence.
+  const scope = correlationId ? `\u0000task:${correlationId}` : "";
+  return `${agentId}\u0000agent::${agentId}::from-${fromAgent}${scope}`;
+}
+
+function agentRunFingerprint(text: string): string {
+  return truncate(text.replace(/\s+/g, " ").trim(), 240);
+}
+
+/**
+ * Wait for an in-flight run without abandoning it. On timeout the run keeps going and
+ * its result is still delivered to the origin chat; the caller gets a bounded next step
+ * naming the run instead of a blind "try again" (bd pibot-jiqv).
+ */
+function waitForAgentRun(run: InFlightAgentRun, timeoutMs: number): Promise<string> {
+  let timer: NodeJS.Timeout | undefined;
+  const waited = timeoutMs >= 60_000
+    ? `${Math.round(timeoutMs / 60_000)}m`
+    : `${Math.max(1, Math.round(timeoutMs / 1000))}s`;
+  return Promise.race([
+    run.result,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`run ${run.id} is still running after ${waited} — do not resubmit; its result will be delivered when it finishes`)),
+        timeoutMs,
+      );
+    }),
+  ]).finally(() => { if (timer) clearTimeout(timer); });
 }
 
 export class PiBot implements HeartbeatHost {
@@ -206,7 +261,7 @@ export class PiBot implements HeartbeatHost {
           },
           goals: [...this.goals.entries()].filter(([, g]) => g.status === "active")
             .map(([chatKey, g]) => ({ chatKey, objective: g.objective, turnsUsed: g.turnsUsed, maxTurns: g.maxTurns, createdAt: g.createdAt, lastTurnAt: g.lastTurnAt })),
-          voiceCalls: [...this.activeVoiceTurns.values()].filter((v) => !v.detached).map((v) => ({ agentId: v.input.agentId, chatKey: v.input.chatKey })),
+          voiceCalls: [...this.activeVoiceTurns.values()].filter((v) => !v.detached && v.input.purpose!=='chat').map((v) => ({ agentId: v.input.agentId, chatKey: v.input.chatKey })),
           children,
           childrenError,
         };
@@ -305,7 +360,50 @@ export class PiBot implements HeartbeatHost {
     return (this.deps.agents as unknown as { sessions: Map<string, AgentSession> }).sessions;
   }
   private canonicalTurns = new CanonicalTurnGate();
+  private bbTransports = new Map<string,BbTransport>();
+  private bbReceipts?:BbRequestReceipts;
+  /** Availability is metadata-only. The transport and persisted session are lazy. */
+  bbConversationControl():BbConversationControl {
+    return {
+      conversations:(agentId)=>{
+        if(!/^[A-Za-z0-9_-]{1,64}$/.test(agentId)||!this.deps.agents.getAgent(agentId))throw new BbChatError(404,'Agent unavailable.');
+        return [{agentId,chatKey:bbChatKey(agentId),canSend:true,kind:'bb'}];
+      },
+      send:(input)=>this.bbChat(input),
+    };
+  }
+  private async bbChat(input:BbChatInput){
+    const {agentId,chatKey,text}=input;
+    if(!/^[A-Za-z0-9_-]{1,64}$/.test(agentId)||!this.deps.agents.getAgent(agentId))throw new BbChatError(404,'Agent unavailable.');
+    if(chatKey!==bbChatKey(agentId))throw new BbChatError(400,'Invalid BB conversation.');
+    let attachments:ReturnType<typeof validateChatAttachments>;
+    try{attachments=validateChatAttachments(input.attachments,input.allowTools);}catch(e){throw new BbChatError(400,e instanceof Error?e.message:'Invalid attachments.');}
+    const pendingAttachmentQuestion=()=>this.questions.pendingSnapshots().some(q=>q.agentId===agentId&&q.canonicalChatId===chatKey&&q.status==='pending'&&q.pendingUntil>Date.now());
+    if(attachments.length&&pendingAttachmentQuestion())throw new BbChatError(409,'Attachments cannot answer a pending question. Reply without attachments first.');
+    this.bbReceipts??=new BbRequestReceipts(path.join(this.deps.config.dataDir,'bb-request-receipts.json'));
+    return this.bbReceipts.send(input,async()=>{
+      let transport=this.bbTransports.get(agentId);
+      if(!transport){transport=new BbTransport(agentId);this.bbTransports.set(agentId,transport);this.addTransport(transport);}
+      const t=transport;
+      const pending=()=>this.questions.pendingSnapshots().some(q=>q.agentId===agentId&&q.canonicalChatId===chatKey&&q.status==='pending'&&q.pendingUntil>Date.now());
+      if(attachments.length&&pending())throw new BbChatError(409,'Attachments cannot answer a pending question. Reply without attachments first.');
+      return t.exchange(async()=>{
+        await this.canonicalTurns.run(`${agentId}::${chatKey}`,async()=>{
+          if(!this.deps.agents.getAgent(agentId))throw new BbChatError(404,'Agent unavailable.');
+          this.lastUserMessage.set(agentId,Date.now());this.ownerSpokeAt.set(chatKey,Date.now());this.deps.heartbeat.noteUserMessage?.(agentId);
+          const session=await this.sessionFor(t,'owner',agentId,chatKey);
+          const tools=session.getActiveToolNames();
+          if(!input.allowTools)session.setActiveToolsByName([]);
+          try{const prepared=prepareChatAttachments(this.deps.config.dataDir,attachments);
+            const message=[text.trim()?text:'Please review the attached content.',prepared.text].filter(Boolean).join('\n\n');
+            await this.promptAgentUnlocked(t,'owner',agentId,message,{taskAckFrom:null,interactiveOnly:true,noReplay:true,textOnly:true,images:prepared.images});}
+          finally{if(!input.allowTools)session.setActiveToolsByName(tools);}
+        });
+      },()=>this.questions.answerViaText(chatKey,text),pending);
+    });
+  }
   private activeVoiceTurns = new Map<string, ActiveVoiceTurn>();
+  private textOnlyTurns = new Set<string>();
   /** end-of-turn callbacks for the activity registry (/processes page), per agent::chat */
   private turnActivity = new Map<string, () => void>();
   /** utterances queued behind a busy chat during a voice call, per agent::chat */
@@ -355,7 +453,7 @@ export class PiBot implements HeartbeatHost {
           session.setActiveToolsByName(full.filter(n => allow.has(n)));
           restore = () => { session.setActiveToolsByName(full); this.voiceBaseTools.delete(key); };
         }
-        try { await this.promptAgentUnlocked(t,chatId,input.agentId,input.text,{taskAckFrom:null,voiceTurn:true}); }
+        try { await this.promptAgentUnlocked(t,chatId,input.agentId,input.text,{taskAckFrom:null,...(input.purpose==='chat'?{textOnly:true,interactiveOnly:true,noReplay:true}:{voiceTurn:true})}); }
         finally { restore?.(); }
         if(context.detached) return {status:'detached'};
         return context.replies.length ? {status:'completed',text:context.replies.join('\n')} : {status:'no_reply'};
@@ -363,7 +461,7 @@ export class PiBot implements HeartbeatHost {
       finally { input.signal?.removeEventListener('abort',detach); this.activeVoiceTurns.delete(key); }
     });
     const result = run ? await run : {status:'busy' as const};
-    if (result.status !== 'busy') return result;
+    if (result.status !== 'busy' || input.queueIfBusy === false || input.purpose==='chat') return result;
     // The chat is still on an earlier turn (often a voice turn that outlived the 40 s audio wait).
     // Don't drop what was said: queue it behind that turn (at most two); the answers land in the chat.
     const holder=this.activeVoiceTurns.get(key);
@@ -514,6 +612,7 @@ export class PiBot implements HeartbeatHost {
     const key=`${agentId}::${this.chatKey(t,chatId)}`; const voice=this.activeVoiceTurns.get(key);
     if(voice && !this.voiceBindings().some(b=>b.agentId===agentId&&b.chatKey===voice.input.chatKey)) {voice.detached=true;return;}
     if(voice && !voice.detached && !voice.input.signal?.aborted) {
+      if(voice.input.purpose==='chat'){voice.replies.push(text);try{await voice.input.onOutput?.(text);}catch{voice.detached=true;}return;}
       const spoken=applyVoiceStyle(text,{maxSentences:4,maxChars:900,allowFullPaths:false}).slice(0,900);
       voice.replies.push(spoken);
       let spokenDelivered=false;
@@ -556,14 +655,8 @@ export class PiBot implements HeartbeatHost {
 
   /** combines rapid-fire texts (forwards, split messages) into one agent turn; off when messageBufferMs is 0 */
   private coalescer?: MessageCoalescer;
-  private questions = new QuestionBus({
-    getTransport: (name) => this.transports.get(name),
-    notify: (chatKey, text) => {
-      const { transport, chatId } = this.splitChatKey(chatKey);
-      const t = this.transports.get(transport);
-      if (t) void t.push(chatId, { text }).catch((e) => console.error("[bot] notify push failed:", e));
-    },
-  });
+  /** Owner questions with a durable journal (bd pibot-jciq); armed in the constructor once dataDir is known. */
+  private questions!: QuestionBus;
   private statePath: string;
 
   constructor(
@@ -599,6 +692,18 @@ export class PiBot implements HeartbeatHost {
     }
   ) {
     this.statePath = path.join(deps.config.dataDir, "state.json");
+    this.questions = new QuestionBus({
+      getTransport: (name) => this.transports.get(name),
+      notify: (chatKey, text) => {
+        const { transport, chatId } = this.splitChatKey(chatKey);
+        const t = this.transports.get(transport);
+        if (t) void t.push(chatId, { text }).catch((e) => console.error("[bot] notify push failed:", e));
+      },
+      // Restoring here (in the constructor) re-materialises questions a previous
+      // process had already shown the owner, so a late tap is recorded rather
+      // than reported stale (bd pibot-jciq).
+      store: new QuestionStore(path.join(deps.config.dataDir, "questions.json")),
+    });
     const windowMs = deps.config.messageBufferMs ?? 0;
     if (windowMs > 0) {
       this.coalescer = new MessageCoalescer(windowMs, MessageCoalescer.DEFAULT_MAX_PARTS, (turn) => {
@@ -614,7 +719,13 @@ export class PiBot implements HeartbeatHost {
     this._startGate = new Promise<void>((resolve) => { this.resolveStarted = resolve; });
   }
 
+  /** True when this job's delivery route resolves right now (read-only twin of the validator). */
+  canRouteSchedule(job: Pick<Schedule, "agentId" | "chat" | "delivery" | "internal">): boolean {
+    return this.scheduleRouteError(job) === undefined;
+  }
+
   private scheduleRouteError(job: Pick<Schedule, "agentId" | "chat" | "delivery" | "internal">): string | undefined {
+    if(job.chat.transport.startsWith('bb:'))return 'BB conversations accept explicit interactive requests only.';
     if (job.internal) return;
     if (job.delivery === "agent") {
       const ck = this.primaryChat(job);
@@ -734,6 +845,90 @@ export class PiBot implements HeartbeatHost {
     }
   }
 
+  /**
+   * Boot replay for owner questions answered while this process was down (bd pibot-jciq).
+   *
+   * The asking turn died with the old process, so nobody can be woken; what must not
+   * happen is silence. Every such answer is (a) already durable in the question journal
+   * so a resumed task reads it via its `questionKey`, and (b) acknowledged once to the
+   * owner so the tap never looks ignored. Runs after transports are armed, before
+   * `started` resolves, so the acknowledgment has a live delivery route.
+   */
+  /**
+   * Where a transport's durable delivery ledger lives (bd pibot-qy88). Runtime-private:
+   * `data/` is gitignored and the file is written 0600. One file per transport so a
+   * sub-bot restart cannot rewrite the main bot's owed messages.
+   */
+  private deliveryLedgerPath(agentId?: string): string {
+    return path.join(this.deps.config.dataDir, agentId ? `deliveries-${agentId}.json` : "deliveries-main.json");
+  }
+
+  /**
+   * Boot recovery for outbound delivery (bd pibot-qy88).
+   *
+   * Messages a previous process accepted and never sent are re-sent now, BEFORE new
+   * traffic (this runs before `started` resolves). Sends whose outcome is unknown —
+   * the process died mid-call — and definitive API refusals are REPORTED to the log
+   * and left alone: a duplicate outbound message is worse than one human review.
+   */
+  private async recoverOwedDeliveries(): Promise<void> {
+    for (const t of this.transports.values()) {
+      const recovery = (t as { deliveryRecovery?: () => { owed: DeliveryRow[]; ambiguous: DeliveryRow[] } }).deliveryRecovery;
+      const replay = (t as { replayOwed?: (row: DeliveryRow) => Promise<boolean> }).replayOwed;
+      if (!recovery || !replay) continue;
+      let state: { owed: DeliveryRow[]; ambiguous: DeliveryRow[] };
+      try {
+        state = recovery.call(t);
+      } catch (e) {
+        console.error(`[pibot] delivery recovery unavailable on ${t.name}:`, errorMessage(e));
+        continue;
+      }
+      for (const row of state.ambiguous) {
+        this.deps.events.log(
+          "system",
+          "system",
+          `delivery ${row.state} on ${t.name} chat ${row.chatId} (${row.attempts} attempt(s), ${row.dedupeKey}): ${truncate(row.error ?? "no detail", 120)}`,
+        );
+      }
+      let replayed = 0;
+      for (const row of state.owed) {
+        try {
+          if (await replay.call(t, row)) replayed += 1;
+        } catch (e) {
+          console.error(`[pibot] owed delivery replay failed on ${t.name} (${row.dedupeKey}):`, errorMessage(e));
+        }
+      }
+      if (state.owed.length || state.ambiguous.length) {
+        console.log(`[pibot] delivery recovery on ${t.name}: replayed ${replayed}/${state.owed.length} owed, ${state.ambiguous.length} need review`);
+      }
+    }
+  }
+
+  private replayOfflineQuestionAnswers(): void {
+    let recovered: Array<{ qid: string; agentId: string; chatKey: string; questionKey?: string; answer: QuestionAnswer }>;
+    try {
+      recovered = this.questions.answersRecordedOffline();
+    } catch (e) {
+      console.error("[pibot] question journal replay failed:", errorMessage(e));
+      return;
+    }
+    for (const item of recovered) {
+      this.deps.events.log(
+        item.agentId,
+        "system",
+        `question ${item.qid} answered while offline: "${truncate(item.answer.choice, 80)}"${item.questionKey ? ` (${truncate(item.questionKey, 80)})` : ""}`,
+      );
+      const { transport, chatId } = this.splitChatKey(item.chatKey);
+      const t = this.transports.get(transport);
+      if (!t) continue;
+      // One acknowledgment, deduped by qid: a second restart cannot repeat it.
+      void t
+        .push(chatId, { text: `✅ Noted while I was restarting: ${truncate(item.answer.choice, 200)}`, dedupeKey: `question-offline:${item.qid}` })
+        .catch((e) => console.error("[pibot] offline-answer acknowledgment failed:", errorMessage(e)));
+    }
+    if (recovered.length) console.log(`[pibot] replayed ${recovered.length} answer(s) the owner gave while the daemon was down`);
+  }
+
   async start(): Promise<void> {
     await this.deps.agents.discover();
     if (!this.deps.agents.list().length) {
@@ -760,8 +955,8 @@ export class PiBot implements HeartbeatHost {
     if (defaultAgent) this.ensureAttendPassJob(defaultAgent);
 
     const state = readJson<PersistedBotState>(this.statePath, {});
-    for (const [ck, agentId] of Object.entries(state.chats ?? {})) this.chatAgent.set(ck, agentId);
-    for (const [agentId, cks] of Object.entries(state.agentChats ?? {})) this.agentChats.set(agentId, new Set(cks));
+    for (const [ck, agentId] of Object.entries(state.chats ?? {})) if(!ck.startsWith('bb:')) this.chatAgent.set(ck, agentId);
+    for (const [agentId, cks] of Object.entries(state.agentChats ?? {})) this.agentChats.set(agentId, new Set(cks.filter(ck=>!ck.startsWith('bb:'))));
     for (const [ck, on] of Object.entries(state.minimalChats ?? {})) this.minimalChats.set(ck, on === true);
     for (const [ck, goal] of Object.entries(state.goals ?? {})) if (goal?.objective) this.goals.set(ck, goal);
     this.reconcileChatMemories();
@@ -825,6 +1020,8 @@ export class PiBot implements HeartbeatHost {
       this.labTimer.unref();
     }
     console.log(`[pibot] running · agents: ${this.deps.agents.list().map((a) => a.id).join(", ")} · transport: ${[...this.transports.keys()].join("+")}`);
+    this.replayOfflineQuestionAnswers();
+    await this.recoverOwedDeliveries();
     this.resolveStarted?.();
   }
 
@@ -886,7 +1083,7 @@ export class PiBot implements HeartbeatHost {
     const groupMentionOnly = opts?.groupMentionOnly ?? persisted?.groupMentionOnly;
     // persist only an explicit/persisted choice — inheritance stays live so main-allowlist edits propagate
     const pinned = allowedChats ?? persisted?.allowedChats;
-    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0", memberGroups, groupMentionOnly });
+    const t = new TelegramTransport(token, allow, { nameSuffix: agentId, boundAgentId: agentId, openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0", memberGroups, groupMentionOnly, deliveryLedgerPath: this.deliveryLedgerPath(agentId) });
     let botName: string;
     try {
       botName = await t.verify();
@@ -1011,6 +1208,7 @@ export class PiBot implements HeartbeatHost {
     const out = new Map<string, { chat: string; agent: string; dedicated: boolean }>();
     for (const [agentId, cks] of this.agentChats) {
       for (const ck of cks) {
+        if(ck.startsWith('bb:'))continue;
         const idx = ck.lastIndexOf(":");
         const dedicated = this.transports.get(ck.slice(0, idx))?.boundAgentId === agentId;
         out.set(ck, { chat: ck, agent: this.chatAgent.get(ck) ?? agentId, dedicated });
@@ -1045,7 +1243,7 @@ export class PiBot implements HeartbeatHost {
     if (this.transports.has("telegram")) {
       return { ok: false, error: "Telegram is already enabled — disable it first." };
     }
-    const t = new TelegramTransport(token, allowedChats, { openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0" });
+    const t = new TelegramTransport(token, allowedChats, { openWhenEmpty: this.deps.config.telegramOpen, mediaDir: path.join(this.deps.config.dataDir, "media"), reactions: process.env.PIBOT_REACTIONS !== "0", deliveryLedgerPath: this.deliveryLedgerPath() });
     let botName: string;
     try {
       botName = await t.verify();
@@ -1095,6 +1293,8 @@ export class PiBot implements HeartbeatHost {
   }
 
   private rememberChat(agentId: string, ck: string): void {
+    // BB ingress is interactive-only, never an agent home/proactive recipient.
+    if(ck.startsWith('bb:'))return;
     // a chat belongs to one interactive agent at a time — drop it from the previous
     // owner's memory so stale remembered chats can't become delivery targets
     const previous = this.chatAgent.get(ck);
@@ -1174,7 +1374,7 @@ export class PiBot implements HeartbeatHost {
         const voice=this.activeVoiceTurns.get(`${agentId}::${ck}`);
         if(voice && !this.voiceBindings().some(b=>b.agentId===agentId&&b.chatKey===ck)) {voice.detached=true;return Promise.resolve(null);}
         // a clarifying question can't wait for a tap mid-call: the agent asks it out loud instead
-        if(voice && !voice.detached && spec.kind==='question') return Promise.resolve({choice:'',index:-1,via:'text',spoken:true});
+        if(voice && voice.input.purpose!=='chat' && !voice.detached && spec.kind==='question') return Promise.resolve({choice:'',index:-1,via:'text',spoken:true});
         if(voice && !voice.detached) { try { voice.input.onApprovalRequired?.(); } catch { voice.detached=true; } }
         if(voice && !voice.detached) void Promise.resolve().then(()=>voice.input.onOutput?.("Please confirm this request in your existing chat. I will wait for your answer there.")).catch(()=>{voice.detached=true;});
         return this.questions.ask(agentId, { transport: t.name, chatId }, spec);
@@ -1422,9 +1622,9 @@ export class PiBot implements HeartbeatHost {
     if (await lab?.handleFeedback?.(t, chatId, text, incomingMessageId)) return;
     // quick-action keyboard buttons arrive as plain text
     const quick = PiBot.QUICK_ACTIONS[text.toLowerCase()];
-    if (quick) return void (await this.handleCommand(t, chatId, quick));
+    if (quick) return void (await this.handleCommand(t, chatId, quick, incomingMessageId));
     // slash commands always work, even with a question pending
-    if (text.startsWith("/")) return void (await this.handleCommand(t, chatId, text));
+    if (text.startsWith("/")) return void (await this.handleCommand(t, chatId, text, incomingMessageId));
     if (lab?.requiresIsolatedConversation(t, chatId)) {
       await this.answerLabParticipant(t, chatId, text, reply, incomingMessageId);
       return;
@@ -1514,7 +1714,36 @@ export class PiBot implements HeartbeatHost {
       await this.handleVoiceMedia(t, media, agentId);
       return;
     }
-    await this.routeUserTurn(t, media.chatId, mediaPromptText(media));
+    await this.routeUserTurn(t, media.chatId, await this.imageAwareTurnText(t, media));
+  }
+
+  /** bd: image turns on text-only models — a vision-capable model from the agent's
+   *  own allowed providers relays what the pixels show, in text, before the turn.
+   *  Degrades to the old text stub when no permitted vision model exists. */
+  private async imageAwareTurnText(t: Transport, media: IncomingMedia): Promise<string> {
+    const imageLike = media.kind === "photo" || (media.kind === "document" && /\.(png|jpe?g|webp|gif|heic|bmp)$/i.test(media.filePath));
+    const stub = mediaPromptText(media);
+    if (!imageLike) return stub;
+    const agentId = this.currentAgent(this.chatKey(t, media.chatId));
+    const agent = agentId ? this.deps.agents.getAgent(agentId) : undefined;
+    if (!agentId || !agent) return stub;
+    const runtime = this.deps.modelRuntime;
+    if (!runtime) return stub;
+    const res = await describeImage(
+      runtime as never,
+      { filePath: media.filePath, caption: media.caption },
+      agent.manifest.providers,
+      agent.manifest.model,
+    );
+    if (!res.ok) {
+      console.warn(`[vision] ${agentId}: image describe unavailable (${res.error}) — text-only fallback`);
+      return stub;
+    }
+    return (
+      `🖼 [${path.basename(media.filePath)}] described by the vision model ${res.modelSpec}` +
+      `${media.caption ? ` — owner caption: ${media.caption}` : ""}` +
+      `\n\nImage description:\n${res.description}\n\n(file stored at ${media.filePath} — read tool)`
+    );
   }
 
   /** Download-and-transcribe path for voice notes and audio files. */
@@ -1543,10 +1772,11 @@ export class PiBot implements HeartbeatHost {
       const planInput = { durationSec: knownDuration, policy, hostProviders: stt.hostProviderIds, groqCredentialPresent: stt.groqCredentialPresent };
       const plan = planTranscription(planInput);
       const transcribeOnce = () =>
-        stt.transcribe(prepared.filePath, policy, ...(bias ? [{ bias }] as const : [])).catch((e) => ({ ok: false as const, text: "", provider: "none", error: errorMessage(e) }));
+        stt.transcribe(prepared.filePath, policy, ...(bias ? [{ bias }] as const : [])).catch((e) => ({ ok: false as const, text: "", provider: "none", error: errorMessage(e), diagnostic: undefined }));
       let transcriptText = "";
       let ok = false;
       let failure: string | undefined;
+      let diagnosis: ProviderDiagnostic | undefined;
       let actualRoute: string = plan.route;
       if (plan.route === "probe-required" || plan.route === "chunked-external") {
         const chunked = stt.transcribeChunked
@@ -1556,28 +1786,34 @@ export class PiBot implements HeartbeatHost {
               // Keep the custom-vocabulary bias on EVERY chunk — the chunked host path must not lose
               // the dictionary corrections the single-shot transcribe() receives (bd pibot-0xpf.4 review).
               bias ? { transcribeChunk: (file) => stt.transcribe(file, { providers: ["groq"], allowExternal: true }, { bias }) } : {},
-            ).catch((e) => ({ ok: false as const, route: "blocked" as const, provider: "none" as const, text: "", durationSec: null as number | null, chunks: 0, transcripts: [] as string[], error: errorMessage(e) }))
-          : { ok: false as const, route: "blocked" as const, provider: "none" as const, text: "", durationSec: null as number | null, chunks: 0, transcripts: [] as string[], error: "chunked transcription is unavailable on this host" };
+            ).catch((e) => ({ ok: false as const, route: "blocked" as const, provider: "none" as const, text: "", durationSec: null as number | null, chunks: 0, transcripts: [] as string[], error: errorMessage(e), diagnostic: undefined }))
+          : { ok: false as const, route: "blocked" as const, provider: "none" as const, text: "", durationSec: null as number | null, chunks: 0, transcripts: [] as string[], error: "chunked transcription is unavailable on this host", diagnostic: undefined };
         if (chunked.ok) {
           ok = true; transcriptText = chunked.text; actualRoute = "chunked-external";
         } else if (chunked.route === "policy" && chunked.durationSec != null && chunked.durationSec <= LONG_AUDIO_THRESHOLD_SEC) {
           // the probe found it is short after all — the agent's normal chain applies
           const r = await transcribeOnce();
-          ok = r.ok; transcriptText = r.text; failure = r.error; actualRoute = "policy";
+          ok = r.ok; transcriptText = r.text; failure = r.error; diagnosis = r.diagnostic; actualRoute = "policy";
         } else {
-          failure = chunked.error ?? plan.blocker; actualRoute = chunked.route;
+          failure = chunked.error ?? plan.blocker; diagnosis = chunked.diagnostic; actualRoute = chunked.route;
         }
       } else if (plan.route === "blocked") {
         failure = plan.blocker;
       } else {
         const r = await transcribeOnce();
-        ok = r.ok; transcriptText = r.text; failure = r.error; actualRoute = plan.route;
+        ok = r.ok; transcriptText = r.text; failure = r.error; diagnosis = r.diagnostic; actualRoute = plan.route;
       }
       // Record planned vs actually-achieved route truthfully: a reported success must not hide a
       // forbidden substitution (bd pibot-0xpf.4).
       this.deps.events.log(agentId, "system", `${formatTranscriptionPlan(plan)} → actual ${actualRoute}${ok ? " ok" : " blocked"}`);
       if (!ok) {
-        await t.push(media.chatId, { text: `🎙 Transcription failed — ${truncate(failure ?? plan.blocker ?? "unknown error", 200)}` });
+        // The provider result carries the decision separately from prose. Keep the complete
+        // bounded decision at the front; earlier local failures and raw provider payloads
+        // must not hide or leak the Groq verdict in the owner-facing message.
+        const reason = diagnosis
+          ? formatCompactProviderDiagnostic(diagnosis)
+          : truncate(failure ?? plan.blocker ?? "unknown error", 200);
+        await t.push(media.chatId, { text: `🎙 Transcription failed — ${reason}` });
         return;
       }
       const corrected = applyCorrections(transcriptText, dictionary.entries);
@@ -1654,14 +1890,14 @@ export class PiBot implements HeartbeatHost {
    * SPOKEN; text replies lose the technical detail but keep their length.
    */
   private shapeOutbound(agentId: string, ck: string, text: string): string {
-    if (isOperationalNotice(text)) return text;
+    if (this.textOnlyTurns.has(`${agentId}::${ck}`) || isOperationalNotice(text)) return text;
     if (!this.minimalVoice(agentId, ck)) return text;
     return applyVoiceStyle(text, { allowFullPaths: this.wantsFullPath.get(ck) === true });
   }
 
   /** Spoken variant: same stripping plus the 4-sentence / 400-char cap. */
   private shapeSpoken(agentId: string, ck: string, text: string): string {
-    if (isOperationalNotice(text)) return text;
+    if (this.textOnlyTurns.has(`${agentId}::${ck}`) || isOperationalNotice(text)) return text;
     if (!this.minimalVoice(agentId, ck)) return text;
     return applyVoiceStyle(text, { maxSentences: 4, maxChars: 400, allowFullPaths: this.wantsFullPath.get(ck) === true });
   }
@@ -1672,7 +1908,7 @@ export class PiBot implements HeartbeatHost {
     chatId: string,
     agentId: string,
     text: string,
-    opts: { recoveringDeadLetter?: boolean; source?: DeadLetterSource; voiceTurn?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
+    opts: { textOnly?:boolean; images?:ImageContent[]; recoveringDeadLetter?: boolean; source?: DeadLetterSource; voiceTurn?: boolean; interactiveOnly?:boolean; noReplay?:boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
   ): Promise<void> {
     return this.canonicalTurns.run(`${agentId}::${this.chatKey(t,chatId)}`,()=>this.promptAgentUnlocked(t,chatId,agentId,text,opts));
   }
@@ -1682,10 +1918,10 @@ export class PiBot implements HeartbeatHost {
     chatId: string,
     agentId: string,
     text: string,
-    opts: { recoveringDeadLetter?: boolean; source?: DeadLetterSource; voiceTurn?: boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
+    opts: { textOnly?:boolean; images?:ImageContent[]; recoveringDeadLetter?: boolean; source?: DeadLetterSource; voiceTurn?: boolean; interactiveOnly?:boolean; noReplay?:boolean; reply?: ReplyContext; /** null disables task acks (non-owner sources); string overrides the ack attribution */ taskAckFrom?: string | null; /** id of the message being answered — task acks thread to it */ incomingMessageId?: number } = {},
   ): Promise<void> {
     const ck = this.chatKey(t, chatId);
-    if(!opts.voiceTurn) this.rememberChat(agentId, ck);
+    if(!opts.voiceTurn&&!opts.interactiveOnly) this.rememberChat(agentId, ck);
 
     let session: AgentSession;
     try {
@@ -1695,8 +1931,9 @@ export class PiBot implements HeartbeatHost {
       throw e;
     }
 
-    if(opts.voiceTurn && (session as {isStreaming?:boolean}).isStreaming) throw new Error('voice_session_busy');
+    if((opts.voiceTurn||opts.noReplay) && (session as {isStreaming?:boolean}).isStreaming) throw new Error('voice_session_busy');
     t.setTyping?.(chatId, true);
+    if(opts.textOnly)this.textOnlyTurns.add(`${agentId}::${ck}`);
     try {
       this.pendingPushes.delete(`${agentId}::${ck}`);
       // the reply this turn produces is deduped by turn identity, never by text:
@@ -1712,7 +1949,7 @@ export class PiBot implements HeartbeatHost {
       // full path then, and the filter must not undo it
       if (requestsFullPath(text)) this.wantsFullPath.set(ck, true);
       else this.wantsFullPath.delete(ck);
-      let styled = this.minimalVoice(agentId, ck) ? `${text}\n\n${VOICE_STYLE_DIRECTIVE}` : text;
+      let styled = !opts.textOnly && this.minimalVoice(agentId, ck) ? `${text}\n\n${VOICE_STYLE_DIRECTIVE}` : text;
       if (opts.voiceTurn) styled += `\n\n${VOICE_CALL_DIRECTIVE}`;
       if (/^[1-9]\d*$/.test(chatId)) {
         const context = this.labFor(t)?.context(t, chatId);
@@ -1720,13 +1957,13 @@ export class PiBot implements HeartbeatHost {
       }
       // an active goal rides every turn (suffix: internal-prefix detection looks at the start)
       const activeGoal = this.goals.get(ck);
-      if (!opts.voiceTurn && activeGoal && activeGoal.status === "active") styled = `${styled}\n\n${renderGoalBlock(activeGoal)}`;
+      if (!opts.voiceTurn && !opts.interactiveOnly && activeGoal && activeGoal.status === "active") styled = `${styled}\n\n${renderGoalBlock(activeGoal)}`;
       // followUp: concurrent messages queue behind the running turn instead of erroring
-      await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, styled), opts.recoveringDeadLetter ?? false, opts.voiceTurn ?? false, opts.source ?? "user");
+      await this.turnWithCascade(t, chatId, agentId, session, ck, replyPrefix(opts.reply, styled), opts.recoveringDeadLetter ?? false, opts.noReplay||opts.voiceTurn||false, opts.source ?? "user", opts.images);
       // The goal loop: every turn that is genuinely about this chat gets judged —
       // owner turns and the loop's own continuations, never scheduler/heartbeat/handoff
       // traffic. Recursion IS the loop and is bounded by the goal's own turn budget.
-      const drivesGoal = !opts.voiceTurn && !["[scheduler]", "[heartbeat]", "[handoff from", "[cascade-recover]", "[silent-turn]"].some((p) => styled.startsWith(p));
+      const drivesGoal = !opts.voiceTurn && !opts.interactiveOnly && !["[scheduler]", "[heartbeat]", "[handoff from", "[cascade-recover]", "[silent-turn]"].some((p) => styled.startsWith(p));
       if (drivesGoal) {
         // A [goal] continuation that exhausts the cascade THROWS ("internal prompt
         // dropped, will re-fire") — but nothing re-fires a goal turn, so without this
@@ -1759,13 +1996,14 @@ export class PiBot implements HeartbeatHost {
         await delivery;
       }
     } finally {
+      this.textOnlyTurns.delete(`${agentId}::${ck}`);
       this.turnKeys.delete(`${agentId}::${ck}`);
       this.turnActivity.get(`${agentId}::${ck}`)?.();
       this.turnActivity.delete(`${agentId}::${ck}`);
       this.wantsFullPath.delete(ck);
       t.setTyping?.(chatId, false);
     }
-    if(!opts.voiceTurn) await this.flushCards(t, chatId, agentId);
+    if(!opts.voiceTurn&&!opts.interactiveOnly) await this.flushCards(t, chatId, agentId);
   }
 
   /**
@@ -1786,13 +2024,15 @@ export class PiBot implements HeartbeatHost {
     recoveringDeadLetter = false,
     noReplay = false,
     source: DeadLetterSource = "user",
+    images?: ImageContent[],
   ): Promise<void> {
     const cascade = this.deps.cascade;
     const attempts: string[] = [];
     const failures: Array<{ spec: string; cls: ModelErrorClass }> = [];
     if (!cascade) {
       this.sessionTurnFailures.delete(`${agentId}::${ck}`);
-      await session.prompt(envelope(text), noReplay ? undefined : { streamingBehavior: "followUp" });
+      if(images?.length&&!session.model?.input.includes('image'))throw new ChatAttachmentError('This model does not support images. Choose an image-capable model.');
+      await session.prompt(envelope(text), images?.length?{images,...(noReplay?{}:{streamingBehavior:'followUp' as const})}:noReplay?undefined:{streamingBehavior:'followUp'});
       if(noReplay && this.sessionTurnFailures.has(`${agentId}::${ck}`)) throw new Error('voice_turn_failed');
       return;
     }
@@ -1850,7 +2090,9 @@ export class PiBot implements HeartbeatHost {
       if(!voiceModel) throw new Error('voice_model_unavailable');
       await session.setModel(voiceModel);
       this.sessionTurnFailures.delete(wkey);
-      await session.prompt(envelope(text));
+      if(images?.length&&!session.model?.input.includes('image'))throw new ChatAttachmentError('This model does not support images. Choose an image-capable model.');
+      if(images?.length)await session.prompt(envelope(text),{images});
+      else await session.prompt(envelope(text));
       if(this.sessionTurnFailures.has(wkey)) throw new Error('voice_turn_failed');
       return;
     }
@@ -2307,7 +2549,9 @@ export class PiBot implements HeartbeatHost {
 
   // ── commands ──────────────────────────────────────────────────────────────
 
-  async handleCommand(t: Transport, chatId: string, text: string): Promise<void> {
+  async handleCommand(t: Transport, chatId: string, text: string, incomingMessageId?:number): Promise<void> {
+    const scope=commandReplyScope(t,chatId,incomingMessageId);t=scope.transport;
+    try{
     text = text.trim().replace(/^(\/[a-z0-9_]+)@[a-z0-9_]+(?=\s|$)/i, "$1");
     if (await this.enrollmentFor(t)?.handle(t, chatId, text)) return;
     const command = text.split(/\s+/, 1)[0].slice(1).toLowerCase();
@@ -2348,13 +2592,14 @@ export class PiBot implements HeartbeatHost {
     // /minimal owns per-chat state, so it is handled here rather than in the
     // command deps (which have no access to the bot's chat→policy maps).
     const minimal = /^\/minimal(?:\s+(\S+))?$/i.exec(text.trim());
-    if (minimal) return this.commandMinimal(t, chatId, minimal[1]);
+    if (minimal) return await this.commandMinimal(t, chatId, minimal[1]);
     const goal = /^\/goal(?:\s+([\s\S]*))?$/i.exec(text.trim());
-    if (goal) return this.commandGoal(t, chatId, (goal[1] ?? "").trim());
+    if (goal) return await this.commandGoal(t, chatId, (goal[1] ?? "").trim());
     const cont = /^\/continue$/i.exec(text.trim());
-    if (cont) return this.commandContinue(t, chatId);
+    if (cont) return await this.commandContinue(t, chatId);
     this.commandHandler ??= createCommandHandler(this.commandContext());
-    return this.commandHandler(t, chatId, text);
+    return await this.commandHandler(t, chatId, text);
+    }finally{scope.close();}
   }
 
   /** /continue — send "continue" to the current chat agent (resume interrupted work). */
@@ -3255,7 +3500,7 @@ export class PiBot implements HeartbeatHost {
     });
   }
 
-  async deliverFire(job: Schedule, snoozed: boolean): Promise<void> {
+  async deliverFire(job: Schedule, snoozed: boolean): Promise<DeliveryReceipt | void> {
     if (job.kind === "heartbeat") {
       await this.deps.heartbeat.tick(job.agentId);
       // Adaptive wakeup: the agent may request a shorter/longer gap for its next
@@ -3340,7 +3585,10 @@ export class PiBot implements HeartbeatHost {
     if (snoozed) lines.push("_(fired during snooze — marked important)_");
     // shared-bot fallback: attribute the sender (dedicated identity doesn't need it)
     if (t.boundAgentId !== job.agentId) lines[0] = `**[${job.agentId}]** ${lines[0]}`;
-    await t.push(job.chat.chatId, {
+    // Return the transport receipt so the schedule record can bind a received message to
+    // this occurrence (bd pibot-0xpf.5). Agent-delivered jobs return nothing: their output
+    // is pushed inside the agent turn and is not observable from here.
+    return (await t.push(job.chat.chatId, {
       text: lines.join("\n"),
       card: {
         text: "",
@@ -3350,7 +3598,7 @@ export class PiBot implements HeartbeatHost {
           { label: "🗑 Done", action: `scd:${job.id}:cancel` },
         ],
       },
-    });
+    })) ?? undefined;
   }
 
   /**
@@ -3442,6 +3690,45 @@ export class PiBot implements HeartbeatHost {
     };
   }
 
+  /** Comms hooks for ONE background task run: an `agent_ask` reply is recorded as correlated
+   *  evidence for THIS task only (bd pibot-jiqv). No filesystem or sibling-task inference.
+   *  The collector is captured at dispatch time so a cached/resumed session records under the
+   *  attempt that actually issued the ask. */
+  private taskCommsHooks(run: TaskRun, evidence: DelegateEvidenceCollector): CommsHooks {
+    const base = this.commsHooks();
+    return {
+      ...base,
+      askAgent: async (fromAgentId, toAgentId, text, timeoutMs, originChat, intent, audience) => {
+        // Capture the collector at DISPATCH time. A cached session keeps attempt 1's hooks, but
+        // the ask happens during the current attempt; holding it here means a reply after THIS
+        // attempt ends cannot fall back to an earlier attempt's deadline semantics.
+        const collector = this.taskEvidence.get(run.taskId) ?? evidence;
+        // agent_message is a delivery notification, not delegate work evidence.
+        const record = (reply: string) => { if (intent !== "message") collector.record(toAgentId, reply); };
+        try {
+          const reply = await this.agentAsk(fromAgentId, toAgentId, text, timeoutMs, originChat, run.taskId, audience);
+          record(reply);
+          return reply;
+        } catch (error) {
+          // An ask timeout rejects while the underlying turn keeps running (waitForAgentRun).
+          // Attach to that still-live run so its eventual reply reaches this task's evidence.
+          const inFlight = this.agentRuns.get(agentRunKey(toAgentId, fromAgentId, run.taskId));
+          if (inFlight && inFlight.fingerprint === agentRunFingerprint(text)) {
+            void inFlight.result.then(record).catch(() => {});
+          }
+          throw error;
+        }
+      },
+    };
+  }
+
+  /** The hard cap for one background run, separated so the deadline path is testable without
+   *  inventing a different runner. 8h absolute ceiling (bd pibot-0xpf.4 review). */
+  private taskDeadline(run: TaskRun): { minutes: number; ms: number } {
+    const minutes = Math.max(1, Math.min(8 * 60, Math.round(run.timeoutMinutes ?? this.deps.config.taskTimeoutMinutes ?? 30)));
+    return { minutes, ms: minutes * 60_000 };
+  }
+
   /** Host-injected Telegram send hook: the agent posts as its own bot identity. */
   private telegramSendHooks(): TelegramSendHooks {
     return {
@@ -3487,23 +3774,52 @@ export class PiBot implements HeartbeatHost {
    *  originChat: the user chat the delegating agent is bound to — the target's
    *  final reply is auto-pushed back there so owner-facing status never vanishes
    *  into agent-only sessions. */
-  private async agentTurn(agentId: string, fromAgent: string, text: string, timeoutMs?: number, originChat?: ChatRef): Promise<string> {
+  private async agentTurn(agentId: string, fromAgent: string, text: string, timeoutMs?: number, originChat?: ChatRef, correlationId?: string, audience?: "internal" | "owner"): Promise<string> {
     const target = this.deps.agents.getAgent(agentId);
     if (!target) throw new Error(`unknown agent "${agentId}"`);
     const ck = `agent::${agentId}::from-${fromAgent}`;
-    const session = await this.deps.agents.getOrCreateSession(
-      agentId,
-      ck,
-      { transport: "agent", chatId: fromAgent },
-      this.deps.scheduler,
-      // origin-chat routing for inter-agent questions: ask_user from a delegated
-      // turn renders in the chat the owner typed in; answers flow back here
-      originChat
-        ? (spec: QuestionSpec) => this.questions.ask(agentId, originChat, spec)
-        : undefined,
-      this.commsHooks()
+    // A timed-out turn is not a cancelled one: the session is still streaming, so a retry
+    // must join the same run instead of submitting a duplicate (bd pibot-jiqv).
+    const runKey = agentRunKey(agentId, fromAgent, correlationId);
+    const fingerprint = agentRunFingerprint(text);
+    const inFlight = this.agentRuns.get(runKey);
+    if (inFlight) {
+      if (inFlight.fingerprint === fingerprint) {
+        return timeoutMs ? await waitForAgentRun(inFlight, timeoutMs) : inFlight.result;
+      }
+      throw new Error(
+        `target agent ${agentId} is busy with run ${inFlight.id} ("${inFlight.label}") — do not resubmit; its result will be delivered when it finishes`,
+      );
+    }
+    // bd pibot-cida P0 (bd pibot-0r0t): a delegated turn must run with the target's
+    // REAL capability context — its own dedicated transport (sub-bot with boundAgentId).
+    // The synthetic "agent" transport intentionally strips execution caps (tasks/speech/
+    // …) and turned inter-agent work into toolless prose. The pair-session key and
+    // history stay; only the delivery context upgrades. Agents without a dedicated
+    // transport keep the old stripped behavior.
+    const ownedChat = [...(this.agentChats.get(agentId) ?? [])].find(
+      (ck2) => this.transports.get(this.splitChatKey(ck2).transport)?.boundAgentId === agentId,
     );
-    if ((session as { isStreaming?: boolean }).isStreaming) throw new Error("target agent is busy");
+    const ownedTransportInstance = ownedChat ? this.transports.get(this.splitChatKey(ownedChat).transport) : undefined;
+    const session = ownedTransportInstance
+      // full-capability lane: the target's own transport wiring (staleness reset, per-session
+      // hooks, speech/video targets) — the pair key keeps its history; the context is its real chat
+      ? await this.sessionFor(ownedTransportInstance, this.splitChatKey(ownedChat!).chatId, agentId, ck)
+      : await this.deps.agents.getOrCreateSession(
+          agentId,
+          ck,
+          { transport: "agent", chatId: fromAgent },
+          this.deps.scheduler,
+          // origin-chat routing for inter-agent questions: ask_user from a delegated
+          // turn renders in the chat the owner typed in; answers flow back here
+          originChat
+            ? (spec: QuestionSpec) => this.questions.ask(agentId, originChat, spec)
+            : undefined,
+          this.commsHooks()
+        );
+    if ((session as { isStreaming?: boolean }).isStreaming) {
+      throw new Error(`target agent ${agentId} is busy — do not resubmit; wait for the current turn to finish`);
+    }
     // delegation acceptance: record the target session's ACTUAL authorised capability set (bd pibot-4wq1)
     this.logSessionInventory(agentId, ck, `delegation accepted from ${fromAgent}`);
     // pibot-dff: extract only assistant text PRODUCED BY THIS TURN. The old last-assistant
@@ -3511,10 +3827,16 @@ export class PiBot implements HeartbeatHost {
     // return the PREVIOUS turn's text: every fresh ask re-delivered the stale Oct-14
     // digest byte-identically. An ask now either produces new content or fails loudly.
     const beforeCount = (((session as { agent?: { state?: { messages?: unknown[] } } }).agent?.state?.messages) ?? []).length;
-    const envelopeText = originChat
-      ? `${text}\n\n(Reply-to (owner's chat): ${originChat.transport}:${originChat.chatId} — when you finish or need input, your final reply is delivered back to that chat automatically.)`
+    // bd pibot-jq9m: audience is EXPLICIT delivery intent, never inferred from chat
+    // origin or the message content. "internal" (default) is pure coordination: no
+    // acceptance push, no reply push and no task ack reach the origin chat. Only an
+    // owner-audience delegated deliverable posts there — the origin questions hook
+    // stays regardless, so a genuine blocking clarification can still reach the owner.
+    const ownerFacing = originChat !== undefined && audience === "owner";
+    const envelopeText = ownerFacing
+      ? `${text}\n\n(Reply-to (owner's chat): ${originChat!.transport}:${originChat!.chatId} — when you finish or need input, your final reply is delivered back to that chat automatically.)`
       : text;
-    if (originChat) {
+    if (ownerFacing) {
       // acceptance ack: the owner sees the work was accepted BEFORE it begins
       // (interface principle: accepted → visible ack → work starts → status/result)
       const t = this.transports.get(originChat.transport);
@@ -3525,27 +3847,38 @@ export class PiBot implements HeartbeatHost {
     }
     const run = trackActivity({ kind: "agent-message", label: `from ${fromAgent}: ${text}`, agentId, chatKey: originChat ? `${originChat.transport}:${originChat.chatId}` : undefined, session },
       () => this.promptTaskWithCascade(agentId, session, ck, `[agent-message from "${fromAgent}"]\n\n${envelopeText}`));
-    const reply = timeoutMs
-      ? await Promise.race([
-          run.then(() => this.freshAssistantText(session, beforeCount)),
-          new Promise<string>((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
-        ])
-      : await run.then(() => this.freshAssistantText(session, beforeCount));
-    const finalReply = reply || "(no reply)";
-    if (originChat) {
-      // owner-facing status: the reply lands in the chat the work was requested from
-      const t = this.transports.get(originChat.transport);
-      if (t) {
-        // Delegated-reply cap: the old 900 silently ate long tails of agent-to-agent
-        // replies (LinkedIn cue tail delivered 5x, Sep 17 handoff half). Telegram
-        // truncates at ~4096 anyway — keep the attribution, keep the bound sane.
-        const outbound = t.boundAgentId === agentId ? finalReply : `**[${agentId}]** ${truncate(finalReply, 4000)}`;
-        await t.push(originChat.chatId, { text: outbound }).catch(() => {});
-        this.deps.events.log(agentId, "send", `→ ${originChat.transport}:${originChat.chatId}: ${truncate(finalReply, 80)}`);
-      }
-    }
-    this.maybeEmitTaskAck(agentId, fromAgent, text, finalReply);
-    return finalReply;
+    // Delivery is part of the run, not of the caller's wait: a timed-out request keeps
+    // working and its late reply still lands in the origin chat (bd pibot-jiqv).
+    const result = run
+      .then(() => this.freshAssistantText(session, beforeCount))
+      .then(async (reply) => {
+        const finalReply = reply || "(no reply)";
+        if (ownerFacing) {
+          // owner-facing status: the reply lands in the chat the work was requested from
+          const t = this.transports.get(originChat.transport);
+          if (t) {
+            // Delegated-reply cap: the old 900 silently ate long tails of agent-to-agent
+            // replies (LinkedIn cue tail delivered 5x, Sep 17 handoff half). Telegram
+            // truncates at ~4096 anyway — keep the attribution, keep the bound sane.
+            const outbound = t.boundAgentId === agentId ? finalReply : `**[${agentId}]** ${truncate(finalReply, 4000)}`;
+            await t.push(originChat.chatId, { text: outbound }).catch(() => {});
+            this.deps.events.log(agentId, "send", `→ ${originChat.transport}:${originChat.chatId}: ${truncate(finalReply, 80)}`);
+          }
+        }
+        this.maybeEmitTaskAck(agentId, fromAgent, text, finalReply, ownerFacing ? {} : { suppress: true });
+        return finalReply;
+      });
+    const record: InFlightAgentRun = {
+      id: uid("run", 6),
+      fingerprint,
+      label: truncate(text.replace(/\s+/g, " ").trim(), 120),
+      startedAt: Date.now(),
+      result,
+    };
+    this.agentRuns.set(runKey, record);
+    const settle = () => { if (this.agentRuns.get(runKey) === record) this.agentRuns.delete(runKey); };
+    void result.then(settle, settle);
+    return timeoutMs ? await waitForAgentRun(record, timeoutMs) : result;
   }
 
   /**
@@ -3568,13 +3901,23 @@ export class PiBot implements HeartbeatHost {
    *  status and the result post; cancelling or shutting down aborts the turn.
    *  MEDIA lines in the result are delivered to the origin chat (receipts recorded) so the
    *  ledger's verified-completion gate sees the actual medium (bd pibot-zy70). */
-  async runLedgerTask(run: TaskRun): Promise<string | { text: string; delivery?: Omit<Delivery, "deliveredAt"> }> {
+  async runLedgerTask(run: TaskRun): Promise<string | TaskRunResult> {
     if (!this.deps.agents.getAgent(run.agentId)) throw new Error(`unknown agent "${run.agentId}"`);
     // A resumed task may start while the previous process's transports are still arming:
     // wait for start() so result posts and owner questions have a live delivery route.
     await this.started;
     const originChat = this.splitChatKey(run.chatKey);
     const ck = `agent::${run.agentId}::task-${run.taskId}`;
+    // Correlated evidence for THIS task only (bd pibot-jiqv): a delegate reply is recorded when
+    // the task's own session delegates. Nothing is inferred from disk or siblings. Evidence
+    // arriving after the run is appended silently — never a second notification. The per-task
+    // map lets a cached/resumed session capture the CURRENT attempt's collector at ask dispatch
+    // time (not at reply time, which could fall back to an earlier attempt).
+    const ledger = this.deps.agents.tasks;
+    const runState = { endedByDeadline: false };
+    const evidence = new DelegateEvidenceCollector((note, usable) => {
+      if (ledger) void ledger.appendEvidence(run.taskId, note, { cause: usable && runState.endedByDeadline ? "deadline" : "late", usable }).catch(() => {});
+    });
     // The task's DURABLE instructions carry the declared transcription route; attach the matching
     // raw-exec guard to THIS task's own session so a delegated long/unknown-duration audio run
     // cannot reach a local WhisperKit/Whisper binary (bd pibot-0xpf.4 review). Derived from the
@@ -3582,7 +3925,13 @@ export class PiBot implements HeartbeatHost {
     const taskGuard = transcriptionGuardForInstructions(run.instructions);
     const session = await this.deps.agents.getOrCreateSession(
       run.agentId, ck, { transport: "agent", chatId: `task-${run.taskId}` }, this.deps.scheduler,
-      (spec: QuestionSpec) => this.questions.ask(run.agentId, originChat, spec), this.commsHooks(),
+      (spec: QuestionSpec) => this.questions.ask(run.agentId, originChat, {
+        ...spec,
+        // Key omits the attempt so a resumed attempt finds the answer the owner
+        // already gave (bd pibot-jciq). First recorded answer wins: asking the
+        // same question text twice inside one task returns the first answer.
+        questionKey: spec.questionKey ?? `task:${run.taskId}:${spec.text.slice(0, 120)}`,
+      }), this.taskCommsHooks(run, evidence),
       undefined, undefined, undefined, undefined, undefined,
       taskGuard ? [taskGuard] : [],
     );
@@ -3603,19 +3952,64 @@ export class PiBot implements HeartbeatHost {
     // Hard stop for a runaway background run (bead kanban thread, Oct 2026: a two-hour talk's
     // local transcription outlived the fixed 30-min cap and was killed mid-work). The caller
     // can extend via timeoutMinutes; the config can raise the default; 8h absolute ceiling.
-    const capMinutes = Math.max(1, Math.min(8 * 60, Math.round(run.timeoutMinutes ?? this.deps.config.taskTimeoutMinutes ?? 30)));
-    const limit = new Promise<never>((_, reject) => { timer = setTimeout(() => { void session.abort().catch(() => {}); reject(new Error(`Task took longer than ${capMinutes} minutes and was stopped.`)); }, capMinutes * 60_000); });
+    const deadline = this.taskDeadline(run);
+    let capError: Error | undefined;
+    const limit = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        // Settle the deadline identity BEFORE abort(): abort() may synchronously resolve/reject
+        // the prompt, and the limit's reaction must be queued first so the race cannot turn a
+        // timed-out run into a normal result.
+        capError = new TaskDeadlineError(`Task took longer than ${deadline.minutes} minutes and was stopped.`);
+        reject(capError);
+        void session.abort().catch(() => {});
+      }, deadline.ms);
+    });
+    // A deadline is identified by capError AND a live owner signal — not by which promise won the
+    // race. A synchronous abort may settle the prompt before the limit reaction runs.
+    const reconcileDeadline = (): TaskRunResult | undefined => {
+      if (capError === undefined || run.signal.aborted) return undefined;
+      runState.endedByDeadline = true;
+      const report = evidence.report({
+        remainingGate: "the task's final filing/delivery step is not confirmed. Do not repeat the delegate work.",
+      });
+      if (!report) return undefined;
+      this.deps.events.log(run.agentId, "system", `task deadline reconciled with correlated delegate evidence ${run.taskId}: ${truncate(run.title, 60)}`);
+      return {
+        text: report,
+        status: "partial",
+        partialReason: "the parent turn hit its deadline; a correlated delegate reply exists and the filing/delivery gate remains",
+        evidence: report,
+      };
+    };
     try {
+      // Registered INSIDE the guarded block and only after successful session setup: the finally
+      // below always removes it, so a rejected session build or busy-session throw cannot leak a
+      // collector into the per-task map.
+      this.taskEvidence.set(run.taskId, evidence);
+      this.taskRunStartedAt.set(run.taskId, Date.now());
       await Promise.race([
-        trackActivity({ kind: "task", label: run.title, agentId: run.agentId, chatKey: run.chatKey, session }, () => this.promptTaskWithCascade(run.agentId, session, ck, `[background task ${run.taskId}: "${run.title}" — requested from the owner's chat]\n\n${run.instructions}${resume}\n\nWork on it now with your tools. Finish with a short result summary for the owner; it is posted to their chat.`)),
+        trackActivity({ kind: "task", label: run.title, agentId: run.agentId, chatKey: run.chatKey, session }, () => this.promptTaskWithCascade(run.agentId, session, ck, `[background task ${run.taskId}: "${run.title}" — requested from the owner's chat]\n\n${run.instructions}${resume}\n\nWork on it now with your tools. Finish with a result report the owner reads in seconds: first line = the verdict, then up to three short lines (deliverable paths, provenance marker). Keep operational details (tool args, file sizes, failure forensics) in your own notes and event log — they are not posted to the owner's chat.`)),
         stop, limit,
       ]);
+      // Owner cancellation takes precedence over a simultaneous deadline.
+      if (run.signal.aborted) throw new Error("cancelled");
+      // If the deadline fired, never treat a prompt settlement as normal completion: reconcile
+      // usable correlated evidence to partial, otherwise report the deadline itself.
+      const recovered = reconcileDeadline();
+      if (recovered) return recovered;
+      if (capError !== undefined) throw capError;
       this.deps.events.log(run.agentId, "system", `task done ${run.taskId}: ${truncate(run.title, 60)}`);
       // The final assistant message may be committed just after prompt() resolves
       // (especially after a tool call or provider handoff). Yield once before
       // reading the transcript so durable tasks do not finish with an empty result.
       await new Promise<void>((resolve) => setImmediate(resolve));
       const resultText = extractAssistantTextFromSession(session) ?? "";
+      // Post-write readback for a task that promised a specific addition to a named artifact
+      // (bd pibot-cida). The run's own claim is not proof: the Nov 4 creator task answered
+      // "Task done" AND "Not saved" while the note stayed unchanged. Here the runtime reads the
+      // artifact itself, after the turn ended, and hands the extracted text to the ledger — a
+      // missing file, an unchanged file or a read that fails all become `partial`, never `done`.
+      const readback = this.taskContentReadback(run, resultText);
       // MEDIA lines become real sends to the origin chat (they used to travel as literal
       // text in the result post). Successful sends carry receipts; failures are logged —
       // the ledger's gate records the missing receipt as partial, never as done.
@@ -3636,13 +4030,60 @@ export class PiBot implements HeartbeatHost {
           }
         }
       }
-      if (delivery) return { text: cleanText || "📎 (media delivered)", delivery };
+      if (delivery || readback) {
+        return {
+          text: cleanText || (delivery ? "📎 (media delivered)" : cleanText),
+          ...(delivery ? { delivery } : {}),
+          ...(readback ? { readback } : {}),
+        };
+      }
       return cleanText;
+    } catch (error) {
+      // Deadline, not cancellation: a child result this task itself delegated may have arrived
+      // just before the cap (bd pibot-jiqv). This also covers a prompt settled by session.abort()
+      // (resolve or generic rejection) that beat the limit's reaction. Owner cancellation wins.
+      const recovered = reconcileDeadline();
+      if (recovered) return recovered;
+      if (capError !== undefined && !run.signal.aborted) throw capError;
+      throw error;
     } finally {
+      // Any delegate reply that arrives after this run is late evidence, not a second completion.
+      evidence.finish();
+      if (this.taskEvidence.get(run.taskId) === evidence) this.taskEvidence.delete(run.taskId);
+      this.taskRunStartedAt.delete(run.taskId);
       // pi-durable aborts the invocation signal at task end (after a normal result too) —
       // the late abort must not re-trigger the cancel path or session.abort (bd pibot-7jqj e2e)
       if (cancelHandler) run.signal.removeEventListener("abort", cancelHandler);
       clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Read the artifact a task promised to change, AFTER its turn ended (bd pibot-cida).
+   *
+   * Returns undefined when the task names no expected addition — the gate then stays as it was.
+   * When it does, this ALWAYS returns a readback (even an empty one) so the ledger can tell the
+   * three failure shapes apart: nothing was written, something was written but not the requested
+   * text, or the artifact cannot be read. `afterWrite` is true only when the file's mtime is at
+   * least as new as the moment this task's run started — a stale file is not this run's work.
+   */
+  private taskContentReadback(run: TaskRun, resultText: string): ContentReadback | undefined {
+    if (!run.expectedContent?.trim()) return undefined;
+    const target = run.outputLocation?.split(",")[0]?.trim();
+    if (!target || !path.isAbsolute(target)) {
+      return { path: target ?? "(no output location)", text: "", afterWrite: false };
+    }
+    const startedAt = this.taskRunStartedAt.get(run.taskId) ?? Date.now();
+    try {
+      const stat = fs.statSync(target);
+      const text = fs.readFileSync(target, "utf8");
+      return { path: target, text, afterWrite: stat.mtimeMs >= startedAt - 1 };
+    } catch {
+      // A missing/unreadable artifact is the case the owner actually hit ("Not saved"): the
+      // readback is empty and not post-write, so the ledger records `partial` with that reason
+      // instead of trusting the run's own success claim.
+      this.deps.events.log(run.agentId, "system", `task readback failed ${run.taskId}: ${truncate(target, 120)}${resultText ? "" : " (no result text)"}`);
+      return { path: target, text: "", afterWrite: false };
     }
   }
 
@@ -3808,21 +4249,33 @@ export class PiBot implements HeartbeatHost {
   }
 
   /** Blocking inter-agent question — used by the agent_ask tool */
-  async agentAsk(fromAgent: string, toAgent: string, question: string, timeoutMs?: number, originChat?: ChatRef): Promise<string> {
+  async agentAsk(fromAgent: string, toAgent: string, question: string, timeoutMs?: number, originChat?: ChatRef, correlationId?: string, audience?: "internal" | "owner"): Promise<string> {
     if (!this.deps.agents.getAgent(toAgent)) throw new Error(`unknown agent "${toAgent}"`);
     // loop protection: identical asks within 5 minutes are rejected (OpenClaw-style bot loop guard)
     const now = Date.now();
     for (const [k, ts] of this.recentAsks) {
       if (now - ts > 5 * 60e3) this.recentAsks.delete(k);
     }
-    const dedupeKey = `${fromAgent}->${toAgent}:${truncate(question, 120)}`;
+    const scope = correlationId ? `${correlationId}:` : "";
+    const dedupeKey = `${scope}${fromAgent}->${toAgent}:${truncate(question, 120)}`;
     const hit = this.recentAsks.get(dedupeKey);
-    if (hit && now - hit < 5 * 60e3) throw new Error(`loop guard: the same question was sent to ${toAgent} recently`);
-    this.recentAsks.set(dedupeKey, now);
-    return this.agentTurn(toAgent, fromAgent, question, timeoutMs, originChat);
+    // A retry of a request that is still running is the SAME run, not a loop: let it join
+    // that run (bd pibot-jiqv). A completed duplicate stays under the loop guard.
+    const inFlight = this.agentRuns.get(agentRunKey(toAgent, fromAgent, correlationId));
+    const sameInFlight = inFlight?.fingerprint === agentRunFingerprint(question);
+    if (hit && now - hit < 5 * 60e3 && !sameInFlight) throw new Error(`loop guard: the same question was sent to ${toAgent} recently`);
+    if (!hit || now - hit >= 5 * 60e3) this.recentAsks.set(dedupeKey, now);
+    return this.agentTurn(toAgent, fromAgent, question, timeoutMs, originChat, correlationId, audience);
   }
 
   private recentAsks = new Map<string, number>(); // "from->to:text" → ts
+  /** Inter-agent turns in flight, keyed by target session; a timeout does not remove one. */
+  private agentRuns = new Map<string, InFlightAgentRun>();
+  /** Current attempt's evidence collector per durable task id (bd pibot-jiqv). */
+  private taskEvidence = new Map<string, DelegateEvidenceCollector>();
+  /** When each durable task's run started, so a content readback can tell this run's write from a
+   *  stale artifact that merely already contained the requested text (bd pibot-cida). */
+  private taskRunStartedAt = new Map<string, number>();
 
   // ── HeartbeatHost ─────────────────────────────────────────────────────
 
@@ -3877,6 +4330,31 @@ export class PiBot implements HeartbeatHost {
     if (t) await t.push(chatId, { text }).catch((e) => console.error("[bot] notify failed:", e));
   }
 
+  /**
+   * After every transport is attached, report paused schedules whose route has since
+   * become valid. They are NOT resumed automatically: a paused job is a decision the
+   * owner made (or one the host made on their behalf), and silently re-arming it would
+   * re-deliver an occurrence nobody asked for. One consolidated message, no per-job
+   * push (Oct 30: five jobs sat paused with a route that was already repaired).
+   */
+  async reportRepairedSchedules(jobs: Schedule[]): Promise<void> {
+    if (!jobs.length) return;
+    const lines = jobs.map((job) => {
+      const intended = job.delivery === "agent"
+        ? (this.primaryChat(job) ?? `(no owned chat for ${job.agentId})`)
+        : (job.chat.chatId ? `${job.chat.transport}:${job.chat.chatId}` : "(none)");
+      return `· ${job.id} "${truncate(job.title, 60)}" → ${intended}`;
+    });
+    const text = [
+      `⏸ ${jobs.length} scheduled item${jobs.length === 1 ? "" : "s"} stopped earlier because a delivery route was missing.`,
+      `The route works again now, so ${jobs.length === 1 ? "it" : "they"} can be resumed — nothing was sent automatically:`,
+      ...lines,
+      `Resume from the dashboard, or ask me to resume a specific job.`,
+    ].join("\n");
+    this.deps.events.log("system", "system", `repaired schedules reported: ${jobs.map((j) => j.id).join(", ")}`);
+    await this.notifyOwnerEvent(text);
+  }
+
   /** Post-boot confirmation: the owner should always know the daemon came back —
    *  once per boot, one deterministic line, with sub-bot attach failures surfaced.
    *  Sep 20 (owner request): restarts previously ended silently; the only signal
@@ -3929,7 +4407,7 @@ export class PiBot implements HeartbeatHost {
       nudgeId = uid("nv", 8);
       card = nudgeCard(nudgeId);
     }
-    let all = [...(this.agentChats.get(agentId) ?? new Set<string>())];
+    let all = [...(this.agentChats.get(agentId) ?? new Set<string>())].filter(ck=>!ck.startsWith('bb:'));
     if (opts.origin === "heartbeat" && agentId === "lab") {
       all = all.filter((ck) => {
         const { chatId } = this.splitChatKey(ck);
@@ -4005,8 +4483,11 @@ export class PiBot implements HeartbeatHost {
     fromAgent: string,
     taskText: string,
     reply: string,
-    delivery: { replyToMessageId?: number; onlyChat?: string } = {},
+    delivery: { replyToMessageId?: number; onlyChat?: string; suppress?: boolean } = {},
   ): void {
+    // bd pibot-jq9m: internal inter-agent coordination never surfaces an ack anywhere
+    // (no owner feed, no bound-bot chat). Suppression is explicit, not content-derived.
+    if (delivery.suppress) return;
     if (!taskAcksEnabled(this.deps.agents.getAgent(agentId)?.manifest)) return;
     const ack = classifyTaskReply(reply);
     if (!ack) return;
@@ -4080,6 +4561,7 @@ export class PiBot implements HeartbeatHost {
 
   /** Does this agent own the chat: dedicated identity or current interactive binding? */
   private agentOwnsChat(agentId: string, ck: string): boolean {
+    if(ck.startsWith('bb:'))return false;
     const idx = ck.lastIndexOf(":");
     return this.transports.get(ck.slice(0, idx))?.boundAgentId === agentId || this.chatAgent.get(ck) === agentId;
   }
@@ -4087,16 +4569,18 @@ export class PiBot implements HeartbeatHost {
   /** The agent's home chat: a bound subbot chat, else a chat where it is the currently bound agent. */
   private agentOwnedChat(agentId: string): string | null {
     for (const ck of this.agentChats.get(agentId) ?? []) {
+      if(ck.startsWith('bb:'))continue;
       const idx = ck.lastIndexOf(":");
       if (this.transports.get(ck.slice(0, idx))?.boundAgentId === agentId) return ck;
     }
     for (const ck of this.agentChats.get(agentId) ?? []) {
-      if (this.chatAgent.get(ck) === agentId) return ck;
+      if (!ck.startsWith('bb:')&&this.chatAgent.get(ck) === agentId) return ck;
     }
     return null;
   }
 
   private primaryChat(job: Pick<Schedule, "agentId" | "chat">): string | null {
+    if(job.chat?.transport.startsWith('bb:'))return null;
     // "internal" and "agent" are synthetic delivery markers, not transport names —
     // resolve agent-delivered jobs through a chat the agent still OWNS: never the
     // arbitrary first memory (that chat may have rebound to another agent since).

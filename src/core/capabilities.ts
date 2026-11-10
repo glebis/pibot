@@ -7,6 +7,7 @@ import { resourcePreflight } from "./preflight.js";
 import { avatarPlugin } from "../plugins/avatar-plugin.js";
 import { attendPlugin, ATTEND_CLI } from "../plugins/attend-plugin.js";
 import { calendarPlugin } from "../plugins/calendar-plugin.js";
+import { codexReportPlugin } from "../plugins/codex-report-plugin.js";
 import { delegateCommand, delegatePlugin, DELEGATE_CLIS } from "../plugins/delegate-plugin.js";
 import { devToolsPlugin } from "../plugins/dev-tools-plugin.js";
 import { docsPlugin } from "../plugins/docs-plugin.js";
@@ -36,6 +37,7 @@ import type { SpeechArtifactStore, SpeechKind, SpeechProviderRegistry } from "./
 import type { CommitmentPluginEngine } from "../plugins/commitment-plugin.js";
 import { commitmentPlugin } from "../plugins/commitment-plugin.js";
 import { researchIntakePlugin } from "../plugins/research-intake-plugin.js";
+import { digestPlugin } from "../plugins/digest-plugin.js";
 import { linkTriageConfig, linkTriagePlugin } from "../plugins/link-triage-plugin.js";
 import { EventLog } from "./events.js";
 import type { IntakeStore } from "./research-intake.js";
@@ -50,6 +52,8 @@ export interface CapabilityContext {
   chat: ChatRef;
   /** shared docs site source root (read-only course content for participant-facing agents) */
   docsDir?: string;
+  /** owner's Codex activity-report root (read-only; ~/Documents/Codex default) */
+  codexReportsDir?: string;
   ask?: (spec: QuestionSpec) => Promise<QuestionAnswer | null>;
   comms?: CommsHooks;
   /** host-injected send hook for bot-identity Telegram sends */
@@ -170,7 +174,7 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
   {
     id: "tasks", defaultEnabled: true,
     tools: ["start_task", "task_status", "list_tasks", "cancel_task"],
-    prompt: `start_task hands longer work (research, drafting, multi-step tool work) to a durable background run of you that survives restarts and posts its result to this chat; give it self-contained instructions. For heavier work pass timeoutMinutes (default 30, max 480): downloading + transcribing long media with yt-dlp needs ~90 minutes for a two-hour talk; fetch video audio with yt-dlp by default instead of relying on caption APIs (they rate-limit with 429s). When the owner asks how a task is going or what came back, use list_tasks / task_status rather than guessing. cancel_task stops one. In a voice conversation, prefer start_task over long work inside the turn, and say the result will arrive in the chat. LONG AUDIO (owner instruction, bd pibot-0xpf.4): ${LONG_AUDIO_RULE}. When a task will transcribe audio, declare its duration with audioDurationSec (or audioDurationUnknown) so this rule is written into the task contract and cannot be substituted inside the background run.`,
+    prompt: `start_task hands longer work (research, drafting, multi-step tool work) to a durable background run of you that survives restarts and posts its result to this chat; give it self-contained instructions. For heavier work pass timeoutMinutes (default 30, max 480): downloading + transcribing long media with yt-dlp needs ~90 minutes for a two-hour talk; fetch video audio with yt-dlp by default instead of relying on caption APIs (they rate-limit with 429s). When the owner asks how a task is going or what came back, use list_tasks / task_status rather than guessing. cancel_task stops one. In a voice conversation, prefer start_task over long work inside the turn, and say the result will arrive in the chat. LONG AUDIO (owner instruction, bd pibot-0xpf.4): ${LONG_AUDIO_RULE}. When a task will transcribe audio, declare its duration with audioDurationSec (or audioDurationUnknown) so this rule is written into the task contract and cannot be substituted inside the background run. When a task depends on a downloaded or non-reproducible private input (audio/video/PDF), pass inputLocations with its absolute path: retention cleanup must NOT delete a pending task's input, and task_status reports any input that went missing instead of still presenting it as available (bd pibot-7bo).`,
     // never inside agent-only sessions (a task's own run, agent-to-agent): no tasks spawning tasks
     available: (ctx) => Boolean(ctx.tasks) && ctx.chat.transport !== "agent",
     create: (ctx) => tasksPlugin({
@@ -196,6 +200,11 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     prompt: "research_intake_run runs a 3–5 question intake flow in the owner's chat with inline progress, skip/exit, and persisted analytics. Use it for structured research intake instead of asking questions one by one in prose.",
     available: (ctx) => Boolean(ctx.intake && ctx.ask),
     create: (ctx) => researchIntakePlugin({ agentId: ctx.agent.id, chat: ctx.chat, ask: ctx.ask!, store: ctx.intake! }),
+  },
+  {
+    id: "digest", defaultEnabled: false, tools: ["digest_verdict", "digest_late_result"],
+    prompt: "digest_verdict decides the daily research-digest verdict from what actually happened to each subject's search, and returns the exact wording to report; digest_late_result folds a late completion into the verdict already reported without searching anything again. THIN means every subject was searched and nothing qualified — a search that is still running, was deferred, or failed is PARTIAL/UNAVAILABLE and must never be reported as a thin day. Call digest_verdict right before reporting a digest, with one entry per active subject, instead of choosing the wording yourself; call digest_late_result when a digest search answers after you already reported.",
+    create: (ctx) => digestPlugin({ agentId: ctx.agent.id, agentDir: ctx.agent.dir }),
   },
   {
     id: "memory", defaultEnabled: true, tools: ["memory_save", "memory_recall"],
@@ -230,8 +239,8 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     create: (ctx) => knowledgePlugin({ sharedFile: path.join(ctx.vaultDir, "pibot", "SHARED-FINDINGS.md"), agentId: ctx.agent.id }),
   },
   {
-    id: "vault-file", defaultEnabled: false, tools: ["vault_read", "vault_write"],
-    prompt: "vault_read and vault_write read and write files strictly inside the owner's Obsidian vault — the ground truth for personal context. Read freely; write only with owner intent or when following an established vault convention (e.g. Sources/ and Daily notes — match the existing note format exactly). Resolved paths must stay inside the vault; nothing outside it is accessible.",
+    id: "vault-file", defaultEnabled: false, tools: ["vault_search", "vault_read", "vault_write"],
+    prompt: "Use vault_search to discover filenames and note content before guessing paths or asking the owner for title hints. Search reads live files; incomplete coverage is not evidence of absence, so narrow the search scope. vault_read and vault_write read and write files strictly inside the owner's Obsidian vault — the ground truth for personal context. Read freely; write only with owner intent or when following an established vault convention (e.g. Sources/ and Daily notes — match the existing note format exactly). Resolved paths must stay inside the vault; nothing outside it is accessible.",
     available: (ctx) => fs.existsSync(ctx.vaultDir),
     create: (ctx) => vaultPlugin({ vaultDir: ctx.vaultDir }),
   },
@@ -240,6 +249,12 @@ export const CAPABILITY_REGISTRY: readonly CapabilityDefinition[] = [
     prompt: "docs_read and docs_list read files strictly inside the shared docs site source (course content: schedule, meetings, materials, library). Read-only — never modify these files; they are shared with course participants. Check the docs before answering factual questions about the course; never invent dates, links, or prices.",
     available: (ctx) => Boolean(ctx.docsDir && fs.existsSync(ctx.docsDir)),
     create: (ctx) => docsPlugin({ docsDir: ctx.docsDir!, publicOnly: ctx.agent.id === "lab" }),
+  },
+  {
+    id: "codex-reports", defaultEnabled: false, tools: ["codex_report_list", "codex_report_read"],
+    prompt: "codex_report_list and codex_report_read surf the owner's Codex activity reports (~/Documents/Codex/<date>/…) — weekly activity and screen-time data. READ-ONLY: there is no write tool; never claim directory or file changes. Codex regenerates these files, so always list before reading and never cache paths across days.",
+    available: (ctx) => Boolean(ctx.codexReportsDir && fs.existsSync(ctx.codexReportsDir)),
+    create: (ctx) => codexReportPlugin({ reportsDir: ctx.codexReportsDir! }),
   },
   {
     id: "agent-comms", defaultEnabled: true, tools: ["agent_message", "agent_ask", "agent_list", "handoff"],

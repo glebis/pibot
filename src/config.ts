@@ -11,6 +11,8 @@ export interface Config {
   vaultDir: string;
   /** optional shared docs site source (read-only, for participant-facing agents); enables the docs-file capability */
   docsDir?: string;
+  /** owner's Codex activity-report root; enables the codex-reports capability (read-only); default ~/Documents/Codex */
+  codexReportsDir?: string;
   /** Optional Breeze TTS 2 staging: key file on remote hosts (0600), read by wrappers at runtime. */
   breezeApiKeyPath?: string;
   defaultAgentId?: string;
@@ -93,6 +95,7 @@ export function loadConfig(): Config {
     agentsDir: path.resolve(process.env.PIBOT_AGENTS_DIR || privateAgentsDir),
     vaultDir: path.resolve((process.env.PIBOT_VAULT_DIR || "~/Brains/brain").replace("~", os.homedir())),
     docsDir: (process.env.PIBOT_DOCS_DIR || "").trim() ? path.resolve(process.env.PIBOT_DOCS_DIR!.trim().replace("~", os.homedir())) : undefined,
+    codexReportsDir: (process.env.PIBOT_CODEX_REPORTS_DIR || "").trim() ? path.resolve(process.env.PIBOT_CODEX_REPORTS_DIR!.trim().replace("~", os.homedir())) : undefined,
     defaultAgentId: process.env.PIBOT_DEFAULT_AGENT || undefined,
     heartbeatModel: process.env.PIBOT_HEARTBEAT_MODEL && process.env.PIBOT_HEARTBEAT_MODEL !== "same"
       ? process.env.PIBOT_HEARTBEAT_MODEL

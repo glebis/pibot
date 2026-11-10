@@ -14,7 +14,7 @@ function harness() {
  const b=bot as any;b.chatAgent.set('telegram:42','assistant');b.agentChats.set('assistant',new Set(['telegram:42']));
  // No test writes to runtime state or invokes unrelated plugin services.
  b.persistState=vi.fn();b.flushCards=vi.fn(async()=>{});b.continueGoal=vi.fn(async()=>{});b.maybeEmitTaskAck=vi.fn();
- return {bot,b,t,pushed,session,agents,subscribers,input:{agentId:'assistant',chatKey:'telegram:42',text:'Hi',onOutput:vi.fn(async()=>{})}};
+ return {bot,b,t,pushed,session,agents,subscribers,input:{agentId:'assistant',chatKey:'telegram:42',text:'Hi',onOutput:vi.fn(async(_text:string)=>{})}};
 }
 describe('canonical voice bridge',()=>{
  it('shares a cached canonical session, routes voice only, and does not create proactive recipients',async()=>{
@@ -24,6 +24,21 @@ describe('canonical voice bridge',()=>{
   expect(result.status).toBe('completed');expect(h.input.onOutput).toHaveBeenCalledWith('Here is the answer.');expect(h.pushed).toEqual([]);
   expect(h.session.subscribe).toHaveBeenCalledTimes(1);expect(h.agents.getOrCreateSession.mock.calls.at(-1)?.slice(0,3)).toEqual(['assistant','telegram:42',{transport:'telegram',chatId:'42'}]);
   expect(JSON.stringify([...h.b.agentChats].map(([k,v]:any)=>[k,[...v]]))).toBe(before);
+ });
+ it('keeps typed Telegram-binding turns free of listening directives and preserves rich replies without changing sticky minimal state',async()=>{
+  const h=harness();h.b.minimalChats.set('telegram:42',true);h.b.goals.set('telegram:42',{status:'active'});
+  const full='**Detailed answer.**\n\n[Reference](https://example.com/document?source=bb).\n\n```ts\nconst value = 42;\n```\n\n- First item.\n- Second item.\n\nA sixth sentence. A seventh sentence.';
+  const emit=()=>h.subscribers.forEach(f=>f({type:'agent_end',messages:[{role:'assistant',content:[{type:'text',text:full}],stopReason:'stop'}]}));
+  h.session.prompt.mockImplementationOnce(async()=>{emit();});
+  expect(await h.bot.voiceTurn({...h.input,purpose:'chat',queueIfBusy:false})).toEqual({status:'completed',text:full});
+  const typedPrompt=String((h.session.prompt.mock.calls[0] as unknown[])[0]);
+  expect(typedPrompt).toContain('Hi');expect(typedPrompt).not.toContain('Replying for listening');expect(typedPrompt).not.toContain('Live voice call');
+  expect(h.input.onOutput).toHaveBeenCalledWith(full);expect(h.pushed).toEqual([]);expect(h.b.minimalChats.get('telegram:42')).toBe(true);expect(h.b.continueGoal).not.toHaveBeenCalled();
+  h.input.onOutput.mockClear();h.session.prompt.mockImplementationOnce(async()=>{emit();});
+  await h.bot.voiceTurn(h.input);
+  const audioPrompt=String((h.session.prompt.mock.calls[1] as unknown[])[0]);
+  expect(audioPrompt).toContain('Replying for listening');expect(audioPrompt).toContain('Live voice call');
+  expect(h.input.onOutput.mock.calls[0]?.[0]).not.toContain('https://');expect(h.b.minimalChats.get('telegram:42')).toBe(true);
  });
  it('queues voice behind a canonical text turn and serializes incoming text behind voice',async()=>{
   const h=harness();const hold=deferred();h.session.prompt.mockImplementationOnce(()=>hold.promise);
@@ -160,3 +175,17 @@ describe('canonical turn gate',()=>{
 it('sends contract reminders through the bound transport and acknowledges without replacing questions',async()=>{const h=harness();const acknowledge=vi.fn(()=>true);h.b.urgentSourceStores=new Set([{acknowledge}]);h.b.questions.ask=vi.fn();const input={agentId:'assistant',canonicalChatId:'telegram:42',text:'Renewal decision',decisionId:'d1',questionVersion:1,revision:'r1',deadline:Date.now()+600000};expect((await h.bot.sendUrgentSourceMessage(input)).status).toBe('accepted');const args=h.t.push.mock.calls.at(-1)!;expect(args[0]).toBe('42');const action=(args[1] as any).card.buttons[0].action;expect(await h.bot.handleAction(h.t as any,'99',action)).toContain('no longer');expect(acknowledge).not.toHaveBeenCalled();expect(await h.bot.handleAction(h.t as any,'42',action)).toContain('No call');expect(acknowledge).toHaveBeenCalledWith(action.slice(6),'telegram:42');expect(h.b.questions.ask).not.toHaveBeenCalled();h.b.chatAgent.set('telegram:42','other');expect((await h.bot.sendUrgentSourceMessage(input)).status).toBe('rejected');});
 
 it('exposes only live accepted explicit-deadline questions for the exact bound voice agent',()=>{const h=harness();const now=Date.now();const q={qid:'q1',agentId:'assistant',canonicalChatId:'telegram:42',question:'Approve?',options:['Yes','No'],status:'pending',pendingUntil:now+60000,usefulUntil:now+60000,deadlineReason:'Deadline',provenance:'agent_declared_deadline',acceptedMessageAt:now};h.b.questions.pendingSnapshots=()=>[q];expect(h.bot.voicePendingDecision(h.input)).toEqual({decisionId:'q1',question:'Approve?',options:['Yes','No']});expect(h.bot.voicePendingDecision({...h.input,agentId:'other'})).toBeUndefined();for(const patch of [{status:'answered'},{acceptedMessageAt:undefined},{usefulUntil:undefined},{pendingUntil:now-1}]){h.b.questions.pendingSnapshots=()=>[{...q,...patch}];expect(h.bot.voicePendingDecision(h.input)).toBeUndefined();}});
+
+it('returns busy for nonqueueing text without scheduling an unrestricted follow-up, then permits explicit resend',async()=>{
+ const h=harness();const hold=deferred();h.session.prompt.mockImplementationOnce(()=>hold.promise);
+ const original=h.bot.promptAgent.bind(h.bot);const prompt=vi.spyOn(h.bot,'promptAgent');
+ const text=original(h.t as any,'42','assistant','Existing text turn',{taskAckFrom:null});
+ try{
+  expect(await h.bot.voiceTurn({...h.input,allowedTools:[],queueIfBusy:false})).toEqual({status:'busy'});
+  expect(prompt).not.toHaveBeenCalled();expect(h.b.voiceQueued.size).toBe(0);
+  hold.resolve();await text;await Promise.resolve();expect(h.session.prompt).toHaveBeenCalledTimes(1);
+  const tools=Object.assign(h.session,{getActiveToolNames:()=>['read','bash'],setActiveToolsByName:vi.fn()});
+  expect((await h.bot.voiceTurn({...h.input,allowedTools:[],queueIfBusy:false})).status).toBe('completed');
+  expect(h.session.prompt).toHaveBeenCalledTimes(2);expect(tools.setActiveToolsByName).toHaveBeenNthCalledWith(1,[]);
+ }finally{hold.resolve();await text;prompt.mockRestore();}
+});

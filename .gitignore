@@ -13,6 +13,11 @@ agents/*
 !agents/_template/
 !agents/_template/**
 
+# Big binary assets (keep out of repo)
+*.png
+*.mp4
+!voice/assets/**/*.png
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

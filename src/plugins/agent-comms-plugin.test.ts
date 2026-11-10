@@ -92,7 +92,7 @@ describe("agent comms plugin", () => {
       const res = await tools.get("agent_message")!.execute("t1", { to: "tax", text: "file taxes by Friday" });
       expect(res.content[0].text).toBe("Delivered to **tax**.");
       expect(res.details).toEqual({ ok: true });
-      expect(deps.askAgent).toHaveBeenCalledWith("bot-1", "tax", "file taxes by Friday", undefined, { transport: "mock", chatId: "42" });
+      expect(deps.askAgent).toHaveBeenCalledWith("bot-1", "tax", "file taxes by Friday", undefined, { transport: "mock", chatId: "42" }, "message", undefined);
     });
 
     it("blocks message to self with 'That's you — just think it.'", async () => {
@@ -119,21 +119,21 @@ describe("agent comms plugin", () => {
       const res = await tools.get("agent_ask")!.execute("t1", { to: "tax", question: "deadline for filings?" });
       expect(res.content[0].text).toBe("**tax** replied:\nreply from target");
       expect(res.details).toEqual({ reply: "reply from target" });
-      expect(deps.askAgent).toHaveBeenCalledWith("bot-1", "tax", "deadline for filings?", undefined, { transport: "mock", chatId: "42" });
+      expect(deps.askAgent).toHaveBeenCalledWith("bot-1", "tax", "deadline for filings?", undefined, { transport: "mock", chatId: "42" }, "ask", undefined);
     });
 
     it("passes parsed timeoutMinutes to askAgent", async () => {
       const deps = makeDeps();
       const { tools } = captureTools(deps);
       await tools.get("agent_ask")!.execute("t1", { to: "tax", question: "hello", timeoutMinutes: "2.5" });
-      expect(deps.askAgent).toHaveBeenCalledWith("bot-1", "tax", "hello", 150000, { transport: "mock", chatId: "42" });
+      expect(deps.askAgent).toHaveBeenCalledWith("bot-1", "tax", "hello", 150000, { transport: "mock", chatId: "42" }, "ask", undefined);
     });
 
     it("uses default 10m when timeoutMinutes is non-numeric", async () => {
       const deps = makeDeps();
       const { tools } = captureTools(deps);
       await tools.get("agent_ask")!.execute("t1", { to: "tax", question: "hello", timeoutMinutes: "notanumber" });
-      expect(deps.askAgent).toHaveBeenCalledWith("bot-1", "tax", "hello", 600000, { transport: "mock", chatId: "42" });
+      expect(deps.askAgent).toHaveBeenCalledWith("bot-1", "tax", "hello", 600000, { transport: "mock", chatId: "42" }, "ask", undefined);
     });
 
     it("blocks ask to self with 'That's you — answer from your own knowledge.'", async () => {
@@ -150,6 +150,29 @@ describe("agent comms plugin", () => {
       expect(res.content[0].text).toContain("ask failed");
       expect(res.content[0].text).toContain("no reply");
       expect(res.details).toEqual({ ok: false });
+    });
+
+    it("forwards an explicit owner audience through to askAgent (bd pibot-jq9m)", async () => {
+      const deps = makeDeps();
+      const { tools } = captureTools(deps);
+      await tools.get("agent_ask")!.execute("t1", { to: "tax", question: "report", audience: "owner" });
+      expect(deps.askAgent).toHaveBeenCalledWith("bot-1", "tax", "report", undefined, { transport: "mock", chatId: "42" }, "ask", "owner");
+      await tools.get("agent_message")!.execute("t2", { to: "tax", text: "report", audience: "owner" });
+      expect(deps.askAgent).toHaveBeenCalledWith("bot-1", "tax", "report", undefined, { transport: "mock", chatId: "42" }, "message", "owner");
+    });
+
+    it("omitted audience defaults to internal (bd pibot-jq9m)", async () => {
+      const deps = makeDeps();
+      const { tools } = captureTools(deps);
+      await tools.get("agent_ask")!.execute("t1", { to: "tax", question: "internal coordination" });
+      expect(deps.askAgent).toHaveBeenLastCalledWith("bot-1", "tax", "internal coordination", undefined, { transport: "mock", chatId: "42" }, "ask", undefined);
+    });
+
+    it("audience schema rejects a non-literal value", () => {
+      const { tools } = captureTools(makeDeps());
+      const schema = tools.get("agent_ask")!.parameters;
+      expect(Value.Check(schema, { to: "tax", question: "hi", audience: "owner" } as unknown)).toBe(true);
+      expect(Value.Check(schema, { to: "tax", question: "hi", audience: "everyone" } as unknown)).toBe(false);
     });
   });
 

@@ -19,6 +19,7 @@ import { CAPABILITY_REGISTRY } from "./core/capabilities.js";
 import { errorMessage, fmtWhen, nextQuietEnd, parseDuration, readJson, truncate } from "./core/util.js";
 import { providerRowHtml } from "./core/providers.js";
 import { getMediaLinkKey, mediaDirFor, verifyMediaToken } from "./core/media-links.js";
+import { registerBbRoutes } from "./web-bb-routes.js";
 import { registerInboxRoutes, type InboxControl } from "./web-inbox-routes.js";
 import { renderProcesses } from "./web-processes.js";
 import { registerEnrollmentRoutes, type EnrollmentControl } from "./web-enrollment.js";
@@ -52,6 +53,7 @@ export interface TelegramControl {
 }
 
 export interface WebDeps {
+  bbConversations?: import('./transports/bb.js').BbConversationControl;
   coordinator?: CoordinatorControl;
   inbox?: InboxControl;
   /** live turns, durable tasks, goal loops, voice calls and child OS processes */
@@ -824,6 +826,7 @@ ${hasToken ? `<div class="card">
     return c.redirect("/auth?msg=" + encodeURIComponent("Please unlock with Touch ID or token"));
   });
 
+  registerBbRoutes(app, deps, webToken);
   registerCoordinatorRoutes(app, deps, csrfToken, expectedOrigins());
   registerInboxRoutes(app, deps, csrfToken, expectedOrigins());
 

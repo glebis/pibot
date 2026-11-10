@@ -72,6 +72,9 @@ describe("durable satellite (pi-durable harness prototype)", () => {
     // that is exactly what a restarted process finds after a crash.
     const crashedStorage = path.join(dir, "storage-at-crash");
     fs.cpSync(storageDir, crashedStorage, { recursive: true });
+    // the copy must not inherit A's ownership claim: a crashed process leaves its lock
+    // behind, and B is the process allowed to take it over (bd pibot-cea8)
+    fs.rmSync(path.join(crashedStorage, ".pibot-ledger.lock"), { force: true });
 
     // process B: reopens the crashed storage, resumes unfinished work
     const fauxB = fauxProvider();
@@ -86,6 +89,8 @@ describe("durable satellite (pi-durable harness prototype)", () => {
 
     expect(second).toContain("answer two");
     expect(again).toBe(retried); // exactly-once: the retry replays, never re-runs
+    await a.close();
+    await b.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -115,7 +120,9 @@ describe("durable satellite (pi-durable harness prototype)", () => {
     const sub = await a.root.submit({ type: "input", content: "task", requestId: "r-1" }, BACKGROUND_CONTEXT);
     const subId = sub.id;
 
-    // process B: reopen only; no ask(), no explicit resume()
+    // process B: reopen only; no ask(), no explicit resume(). A is closed first —
+    // one writer per storage directory (bd pibot-cea8) — but its ledger is on disk.
+    await a.close();
     const fauxB = fauxProvider();
     fauxB.setResponses([fauxAssistantMessage([fauxText("resumed answer")])]);
     const b = await openSatellite({ provider: fauxB.provider, workspaceDir: workspace, storageDir });
@@ -123,6 +130,41 @@ describe("durable satellite (pi-durable harness prototype)", () => {
     expect(resumed).toBeDefined();
     const settled = await resumed!.wait(BACKGROUND_CONTEXT);
     expect(settled.status).not.toBe("unanswered");
+    await b.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+/**
+ * The phase-1 satellite goal is retired (bd pibot-8ptd, docs/durable-satellite-decision.md):
+ * nothing in the daemon may open a satellite. This test is the guard — the moment a
+ * production module imports this seam, the documented decision is stale and must be made
+ * again deliberately, not by drift.
+ */
+describe("durable satellite is a prototype with no production caller (bd pibot-8ptd)", () => {
+  const root = path.resolve(import.meta.dirname, "../..");
+
+  function importingFiles(): string[] {
+    const hits: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!/\.(ts|mts|js)$/.test(entry.name) || entry.name.endsWith(".test.ts")) continue;
+        const text = fs.readFileSync(full, "utf8");
+        if (/durable\/satellite\.js|durable\/telegram-surface\.js/.test(text)) hits.push(path.relative(root, full));
+      }
+    };
+    walk(path.join(root, "src"));
+    walk(path.join(root, "scripts"));
+    return hits.sort();
+  }
+
+  it("is imported only by the CLI script, never by the daemon or a plugin", () => {
+    expect(importingFiles()).toEqual(["scripts/durable-satellite.mts"]);
   });
 });

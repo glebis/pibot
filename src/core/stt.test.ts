@@ -93,6 +93,110 @@ describe("SttService", () => {
     expect(res.error).toContain("local_whisper: whisper CLI not installed");
   });
 
+  it("attributes a 401 to the host executor without echoing the raw response body", async () => {
+    process.env.GROQ_API_KEY = "test-key";
+    const fetchFn = fakeFetchJson(() => new Response("server-secret-payload", { status: 401 }));
+    const stt = new SttService(["groq"], { fetchFn });
+    const res = await stt.transcribe(tmpOgg(), { providers: ["groq"], allowExternal: true });
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("groq: groq HTTP 401");
+    expect(res.error).toContain("service=groq-stt-host");
+    expect(res.error).toContain("executor=host-stt-daemon");
+    expect(res.error).toContain("source=host-env");
+    expect(res.error).toContain("category=auth");
+    expect(res.error).toContain("rotation=warranted");
+    expect(res.diagnostic).toMatchObject({ service: "groq-stt-host", executor: "host-stt-daemon", source: "host-env", category: "auth" });
+    expect(res.error).not.toContain("server-secret-payload");
+  });
+
+  it("does not turn quota, edge, network or timeout failures into credential rotation", async () => {
+    process.env.GROQ_API_KEY = "test-key";
+    for (const [status, category] of [[429, "quota"], [403, "access-refused"], [503, "network"]] as const) {
+      const stt = new SttService(["groq"], { fetchFn: fakeFetchJson(() => new Response("SENTINEL_RESPONSE_BODY", { status })) });
+      const res = await stt.transcribe(tmpOgg(), { providers: ["groq"], allowExternal: true });
+      expect(res.error).toContain(`category=${category}`);
+      expect(res.error).toContain("rotation=not-warranted");
+      expect(res.error).not.toContain("SENTINEL_RESPONSE_BODY");
+    }
+    const timeoutStt = new SttService(["groq"], {
+      fetchFn: fakeFetchJson(() => {
+        throw Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+      }),
+    });
+    const timedOut = await timeoutStt.transcribe(tmpOgg(), { providers: ["groq"], allowExternal: true });
+    expect(timedOut.error).toContain("category=timeout");
+    expect(timedOut.error).toContain("rotation=not-warranted");
+    const networkStt = new SttService(["groq"], {
+      fetchFn: fakeFetchJson(() => {
+        throw new Error("fetch failed: ECONNREFUSED");
+      }),
+    });
+    const network = await networkStt.transcribe(tmpOgg(), { providers: ["groq"], allowExternal: true });
+    expect(network.error).toContain("category=network");
+    expect(network.error).toContain("rotation=not-warranted");
+  });
+
+  it("omits a thrown exception payload and classifies it without echoing the message", async () => {
+    process.env.GROQ_API_KEY = "test-key";
+    const sentinel = "SENTINEL_EXCEPTION_PAYLOAD https://api.example/?token=leak";
+    const stt = new SttService(["groq"], {
+      fetchFn: fakeFetchJson(() => {
+        throw new Error(sentinel);
+      }),
+    });
+    const res = await stt.transcribe(tmpOgg(), { providers: ["groq"], allowExternal: true });
+    expect(res.ok).toBe(false);
+    expect(res.error).not.toContain("SENTINEL_EXCEPTION_PAYLOAD");
+    expect(res.error).not.toContain("api.example");
+    expect(res.error).not.toContain("token=leak");
+    expect(res.error).toContain("service=groq-stt-host");
+    expect(res.error).toContain("executor=host-stt-daemon");
+    expect(res.error).toContain("category=unknown");
+    expect(res.error).toContain("rotation=not-warranted");
+  });
+
+  it("retains Groq diagnosis after earlier local provider failures exhaust the chain", async () => {
+    process.env.GROQ_API_KEY = "test-key";
+    const stt = new SttService(["local_whisper", "groq"], {
+      whisperBin: null,
+      fetchFn: fakeFetchJson(() => new Response("sensitive body", { status: 429 })),
+    });
+    const result = await stt.transcribe(tmpOgg(), { providers: ["local_whisper", "groq"], allowExternal: true });
+    expect(result.provider).toBe("none");
+    expect(result.error).toContain("local_whisper: whisper CLI not installed");
+    expect(result.diagnostic).toMatchObject({ service: "groq-stt-host", source: "host-env", category: "quota" });
+    expect(result.error).not.toContain("sensitive body");
+  });
+
+  it("survives null and undefined rejections with an unknown, payload-free diagnostic", async () => {
+    process.env.GROQ_API_KEY = "test-key";
+    for (const rejection of [null, undefined]) {
+      const stt = new SttService(["groq"], {
+        fetchFn: fakeFetchJson(() => {
+          throw rejection;
+        }),
+      });
+      const res = await stt.transcribe(tmpOgg(), { providers: ["groq"], allowExternal: true });
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("service=groq-stt-host");
+      expect(res.error).toContain("executor=host-stt-daemon");
+      expect(res.error).toContain("category=unknown");
+      expect(res.error).toContain("rotation=not-warranted");
+      expect(res.error).not.toMatch(/\bnull\b/);
+      expect(res.error).not.toMatch(/\bundefined\b/);
+    }
+  });
+
+  it("reports a missing host credential as owner setup, not rotation", async () => {
+    const stt = new SttService(["groq"], { fetchFn: fakeFetchJson(() => new Response("{}", { status: 200 })) });
+    const res = await stt.transcribe(tmpOgg(), { providers: ["groq"], allowExternal: true });
+    expect(res.error).toContain("category=credential-missing");
+    expect(res.error).toContain("source=none");
+    expect(res.error).toContain("action=setup-manual");
+    expect(res.error).toContain("rotation=not-warranted");
+    expect(res.diagnostic).toMatchObject({ source: "none", category: "credential-missing" });
+  });
+
   it("defaults to Russian transcription when no STT_LANGUAGE is set", async () => {
     const file = tmpOgg();
     let lang: string | undefined;

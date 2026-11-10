@@ -57,6 +57,64 @@ export function vaultPlugin(deps: VaultPluginDeps): InlineExtension {
     name: "vault-file",
     factory: (pi) => {
       pi.registerTool({
+        name: "vault_search",
+        label: "Search vault",
+        description: "Discover exact vault-relative note paths by case-insensitive words in filenames or text. Searches live files, not an index. Use before guessing paths. Bounded results explicitly report partial coverage; narrow path when incomplete. Hidden directories and symlinks are excluded.",
+        parameters: Type.Object({
+          query: Type.String({ minLength: 1, maxLength: 200 }),
+          path: Type.Optional(Type.String({ description: "Vault-relative directory to search; omit for vault root" })),
+        }),
+        async execute(_tcid, params) {
+          const scope = params.path && params.path !== "." ? resolveInsideVault(params.path) : vaultDir;
+          if (!scope || !fs.existsSync(scope)) return refuse("search scope must be an existing directory inside the vault");
+          const words = params.query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+          if (!words.length) return refuse("query must contain words");
+          const matches: Array<{ path: string; excerpt: string }> = [];
+          let entries = 0, bytes = 0, skipped = 0, complete = true;
+          const started = Date.now();
+          const walk = async (dir: string): Promise<void> => {
+            if (!complete) return;
+            let handle;
+            try {
+              handle = await fs.promises.opendir(dir);
+              for await (const entry of handle) {
+                if (++entries > 5000 || Date.now() - started > 2000 || matches.length >= 30) { complete = false; break; }
+                if (entry.name.startsWith(".") || entry.isSymbolicLink()) continue;
+                const target = resolveInsideVault(path.join(dir, entry.name));
+                if (!target) { skipped++; continue; }
+                if (entry.isDirectory()) { await walk(target); if (!complete) break; continue; }
+                if (!entry.isFile() || !/\.(md|txt|mdx)$/i.test(entry.name)) continue;
+                let file;
+                try {
+                  file = await fs.promises.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+                  const stat = await file.stat();
+                  if (!stat.isFile() || stat.size > maxBytes) { skipped++; continue; }
+                  if (bytes + stat.size > 8 * 1024 * 1024) { complete = false; break; }
+                  const buffer = Buffer.alloc(stat.size);
+                  const read = await file.read(buffer, 0, buffer.length, 0);
+                  bytes += read.bytesRead;
+                  const text = buffer.subarray(0, read.bytesRead).toString("utf8");
+                  if (text.includes("\0")) { skipped++; continue; }
+                  const relative = path.relative(vaultDir, target);
+                  const haystack = (relative + "\n" + text).toLowerCase();
+                  if (words.every(word => haystack.includes(word))) {
+                    const at = Math.max(0, text.toLowerCase().indexOf(words[0]));
+                    matches.push({ path: relative, excerpt: text.slice(Math.max(0, at - 80), at + 240) });
+                  }
+                } catch { skipped++; }
+                finally { await file?.close(); }
+              }
+            } catch { skipped++; }
+          };
+          await walk(scope);
+          const report = { scope: path.relative(vaultDir, scope) || ".", source: "live-files", searchedAt: new Date().toISOString(), complete: complete && skipped === 0, entries, bytes, skipped, matches,
+            coverage: "Markdown/text files only; hidden entries and symlinks excluded. Concurrent changes are not a consistent snapshot.",
+            next: !complete || skipped ? "Partial coverage: narrow path to a subdirectory; do not infer vault-wide absence." : "Read a matched exact path with vault_read." };
+          return { content: [{ type: "text", text: JSON.stringify(report) }], details: { ok: true } };
+        },
+      });
+
+      pi.registerTool({
         name: "vault_read",
         label: "Read vault file",
         description:

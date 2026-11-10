@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { appendExecTrace, searchExecTrace, readExecArtifact, readExecArtifactExtract, ARTIFACT_MAX_PAGE_BYTES } from './exec-trace.js';
+import { appendExecTrace, searchExecTrace, readExecArtifact, readExecArtifactExtract, reconcileSnapshots, ARTIFACT_MAX_PAGE_BYTES } from './exec-trace.js';
 
 const dirs: string[] = [];
 function temp() { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'exec-trace-')); dirs.push(d); return d; }
@@ -80,5 +80,38 @@ describe('private exec trace and artifact boundary', () => {
     const clean = temp(); fs.mkdirSync(path.join(clean, 'runtime'));
     fs.writeFileSync(path.join(clean, 'runtime', 'exec-audit.jsonl'), 'broken\n');
     expect(searchExecTrace(clean, 'task-1')).toEqual([]);
+  });
+
+  // bd pibot-wcp0: event/capture/observation times are separate; authority provenance
+  // is explicit; mtime alone never proves backdating; conflicts stay explicit.
+  it('records capture time and authority provenance without relabeling (bd pibot-wcp0)', () => {
+    const d = temp();
+    appendExecTrace(d, { callId: 'call-7', taskId: 'tmw9g1wu99zlj', argv: [], outcome: 'succeeded', authority: { requestedByTaskId: 'tmw9g1wu99zlj', requestedBySessionId: 'session-a', citedOwnerAuthority: 'pibot-wcp0-convention', executor: 'worker' } });
+    const row = searchExecTrace(d, 'call-7')[0];
+    expect(row.times?.capturedAt).toBeTruthy();
+    expect(row.authority).toMatchObject({ requestedByTaskId: 'tmw9g1wu99zlj', requestedBySessionId: 'session-a', citedOwnerAuthority: 'pibot-wcp0-convention', executor: 'worker' });
+    // event time absent (not derivable from the filesystem) — never auto-filled from mtime
+    expect(row.times?.eventAt).toBeUndefined();
+  });
+
+  it('every paged extract carries snapshot identity; same-content new reads reconcile consistently', () => {
+    const d = temp();
+    fs.mkdirSync(path.join(d, 'runtime', 'artifacts'), { recursive: true });
+    fs.writeFileSync(path.join(d, 'runtime', 'artifacts', 'a.txt'), 'hello world');
+    const r1 = readExecArtifactExtract(d, 'a.txt');
+    const r2 = readExecArtifactExtract(d, 'a.txt');
+    expect(r1.snapshot.totalBytes).toBe(11);
+    expect(r1.snapshot.capturedAt).toBeTruthy();
+    expect(reconcileSnapshots(r1.snapshot, r2.snapshot).verdict).toBe('consistent');
+  });
+
+  it('mtime drift is labeled without a backdating verdict; a size change is an explicit conflict', () => {
+    const base = { totalBytes: 100, mtimeMs: 1000, capturedAt: '2026-11-09T21:00:00.000Z' };
+    const drift = reconcileSnapshots(base, { ...base, mtimeMs: 2000, capturedAt: '2026-11-10T08:00:00.000Z' });
+    expect(drift.verdict).toBe('mtime-drift');
+    expect(drift).toMatchObject({ note: expect.stringContaining('cannot prove backdating') });
+    const conflict = reconcileSnapshots(base, { ...base, totalBytes: 80 });
+    expect(conflict.verdict).toBe('conflict');
+    expect(conflict).toMatchObject({ note: expect.stringContaining('not one consistent snapshot') });
   });
 });

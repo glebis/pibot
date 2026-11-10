@@ -21,6 +21,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { errorMessage } from "./util.js";
+import type { ProviderDiagnostic } from "./provider-diagnostics.js";
 import {
   LONG_AUDIO_CHUNK_SEC,
   planTranscription,
@@ -38,6 +39,7 @@ export interface ChunkProviderResult {
   text: string;
   provider: string;
   error?: string;
+  diagnostic?: ProviderDiagnostic;
 }
 
 export interface ChunkedTranscriptionDeps {
@@ -62,6 +64,7 @@ export interface ChunkedTranscriptionResult {
   transcripts: string[];
   /** precise, actionable reason when ok=false — never a silent substitution */
   error?: string;
+  diagnostic?: ProviderDiagnostic;
 }
 
 function blocked(plan: TranscriptionPlan, error: string): ChunkedTranscriptionResult {
@@ -155,6 +158,7 @@ export async function runChunkedTranscription(
           chunks: parts.length,
           transcripts,
           error: `chunk ${i + 1}/${parts.length} failed: ${result.error ?? "unknown error"} — Groq chunks are the only permitted route at this duration; no local fallback attempted`,
+          diagnostic: result.diagnostic,
         };
       }
       transcripts.push(result.text.trim());

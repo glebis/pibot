@@ -519,6 +519,7 @@ export function createCommandHandler(ctx: CommandContext) {
         const pending = active.filter((j) => j.status === "pending");
         const paused = active.filter((j) => j.status === "paused" && !j.internal);
         const next = pending[0];
+        const missed = deps.scheduler.recentMissed?.(agentId) ?? [];
         await reply(
           [
             `**${agent.id}** — ${agent.manifest.description ?? ""}`,
@@ -526,6 +527,9 @@ export function createCommandHandler(ctx: CommandContext) {
             `heartbeat: ${hb?.enabled ? `every ${hb.interval}${hb.model ? ` (${hb.model})` : ""}` : "off"}${hb?.quietHours ? ` · quiet ${hb.quietHours.from}–${hb.quietHours.to}` : ""}`,
             `snoozed: ${sn ? `until ${fmtWhen(sn.until)}` : "no"}`,
             `pending: ${pending.filter((j) => !j.internal).length} · paused: ${paused.length}${next && !next.internal ? ` · next: “${next.title}” ${fmtWhen(next.dueAt)}` : ""}`,
+            ...(missed.length
+              ? [`missed while offline: ${missed.length} — ${missed.slice(0, 3).map((j) => `“${j.title}” (${fmtWhen(j.dueAt)})`).join(", ")}${missed.length > 3 ? ", …" : ""}`]
+              : []),
           ].join("\n")
         );
         return;

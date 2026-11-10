@@ -1,6 +1,7 @@
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Scheduler } from "../core/scheduler.js";
+import { isRoutableChat } from "../core/scheduler.js";
 import type { ChatRef } from "../core/types.js";
 import { fmtWhen, nextQuietEnd, parseDuration, parseWhen, uid } from "../core/util.js";
 
@@ -52,11 +53,15 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
           } else {
             try {
               const wake = params.wake === "important" ? "important" : params.wake === "notify" ? "notify" : "normal";
-              const delivery = params.delivery === "agent" ? "agent" : "direct";
+              // A session bound to a synthetic chat (`agent:task-…`) cannot be routed later:
+              // `agent` is a marker, not a transport. Such a job is agent-delivered and falls
+              // back to the agent's own owned chat at fire time (Oct 30: three jobs stored
+              // transport "agent" and were permanently undeliverable).
+              const delivery = params.delivery === "agent" || !isRoutableChat(chat) ? "agent" : "direct";
               const kind = (params.kind as never) ?? "reminder";
               const job = scheduler.create({
                 agentId,
-                chat,
+                chat: delivery === "direct" ? chat : { transport: "", chatId: "" },
                 title: params.title,
                 detail: params.detail,
                 kind,
@@ -179,9 +184,15 @@ export function schedulerPlugin(deps: SchedulerPluginDeps): InlineExtension {
           if (!jobs.length) {
             return { content: [{ type: "text", text: "Nothing scheduled." }], details: {} };
           }
-          const lines = jobs.slice(0, 30).map(
-            (j) => `- [${j.id}]${j.status === "paused" ? " PAUSED" : ""} ${j.title} — ${fmtWhen(j.dueAt)}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " (!)" : ""}${j.detail ? ` — ${j.detail}` : ""}${j.status === "paused" && j.lastDeliveryError ? ` — last error: ${j.lastDeliveryError}` : ""}`
-          );
+          const lines = jobs.slice(0, 30).map((j) => {
+            // Causal trace for the last occurrence (bd pibot-0xpf.5): run identity and, for
+            // direct delivery, the message the transport actually sent. An agent-composed
+            // digest has no receipt here — distinguish that from "nothing was delivered".
+            const trace = j.lastRunId
+              ? ` — last run ${j.lastRunId}${j.lastAttemptAt ? ` ${fmtWhen(j.lastAttemptAt)}` : ""}${j.lastReceipt?.messageId !== undefined ? `, msg ${j.lastReceipt.messageId}` : ""}${j.lastReceipt?.evidence ? ` (${j.lastReceipt.evidence})` : ""}`
+              : "";
+            return `- [${j.id}]${j.status === "paused" ? " PAUSED" : ""} ${j.title} — ${fmtWhen(j.dueAt)}${j.repeat ? " ↻" : ""}${j.wake === "important" ? " (!)" : ""}${j.detail ? ` — ${j.detail}` : ""}${j.status === "paused" && j.lastDeliveryError ? ` — last error: ${j.lastDeliveryError}` : ""}${trace}`;
+          });
           return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
         },
       });

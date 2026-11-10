@@ -3,10 +3,37 @@
 Per-priority findings for the live fleet: current behavior, evidence, and fixes that exist but lack activation/verification. All paths relative to the pibot repo. Audited 2026-10-24 (assistant session, exec granted).
 
 ## 1. Evidence-based completion claims
-- **Current:** `src/durable/task-ledger.ts:18` defines `LedgerStatus = "queued" | "running" | "done" | "failed" | "cancelled"` — no `partial` or `blocked` states. `done` is set from result text alone (`task-ledger.ts:160`).
-- **Delivery receipts:** `src/transports/telegram.ts:65-67,510` extract `message_id` but only `markIncoming` persists it (inbound side); outbound task completion records ok/fail text in the ledger's `notify` phase, **not** the sent message ID.
-- **Media-type check:** video_note routing exists (`src/core/bot.ts:1536`), but nothing verifies a *requested* media type against the *actually delivered* kind — the open goal text ("a normal video does not satisfy a video-note request") is unimplemented.
-- **Remaining gap:** add `partial`/`blocked` statuses + outbound `message_id`/`mediaType` fields to the ledger.
+
+> **Correction 2026-10-29 (bd pibot-96i3).** The bullets below are the audit as written on
+> 2026-10-24 and are kept as history. Four of their claims no longer hold; the authoritative
+> shape is `src/durable/task-ledger.ts`:
+>
+> - `LedgerStatus` is `"queued" | "running" | "done" | "partial" | "blocked" | "failed" | "cancelled"`
+>   (`src/durable/task-ledger.ts:22`), not the five-state list below. `partial` exists because a
+>   task can run to completion while the delivered medium/destination/account/id-namespace did
+>   not match the declared expectation (bd pibot-cida); `blocked` is set from a `BlockedError`
+>   (same file, `class BlockedError`, line 51) so a missing prerequisite is recorded as a blocker
+>   instead of a retry loop.
+> - The **"Remaining gap"** in this section — add `partial`/`blocked` plus outbound
+>   `message_id`/`mediaType` ledger fields — **is closed**. `Delivery` (`src/durable/task-ledger.ts:32`)
+>   carries `messageId`, `mediaType`, `peer`, `account`, `idProtocol`, `evidence`, `deliveredAt`,
+>   and `LedgerEntry.delivery` records it per task. See the "Activation note" at the end of this
+>   document for the send-path activation.
+> - The **delivery-receipts** bullet is out of date: the ledger's notify phase now records the
+>   full `Delivery` receipt for the sent result, not just ok/fail text.
+> - The **media-type check** bullet is out of date: the requested medium *is* verified against the
+>   delivered one. `LedgerTaskInput.expectedMedia` declares it, `Bot.sendTaskMedia`
+>   (`src/core/bot.ts:3775`) routes an `.mp4` through `sendVideoNote` only for
+>   `expectedMedia: "video_note"`, and a mismatch (or an unverified destination) settles the task
+>   as `partial` with a `blocker` instead of `done`.
+>
+> The line numbers in the bullets below are also stale; they refer to the file as it stood on
+> 2026-10-24.
+
+- **Current (2026-10-24, superseded above):** `src/durable/task-ledger.ts:18` defines `LedgerStatus = "queued" | "running" | "done" | "failed" | "cancelled"` — no `partial` or `blocked` states. `done` is set from result text alone (`task-ledger.ts:160`).
+- **Delivery receipts (superseded above):** `src/transports/telegram.ts:65-67,510` extract `message_id` but only `markIncoming` persists it (inbound side); outbound task completion records ok/fail text in the ledger's `notify` phase, **not** the sent message ID.
+- **Media-type check (superseded above):** video_note routing exists (`src/core/bot.ts:1536`), but nothing verifies a *requested* media type against the *actually delivered* kind — the open goal text ("a normal video does not satisfy a video-note request") is unimplemented.
+- **Remaining gap (closed — see the correction note above):** add `partial`/`blocked` statuses + outbound `message_id`/`mediaType` fields to the ledger.
 
 ## 2. Capability checks before accepting work
 - **Current:** `src/core/capabilities.ts` builds per-agent tool sets from manifests; commit `528835e` added live session capability refresh + heartbeat escalation-loop triage.
@@ -45,6 +72,6 @@ Per-priority findings for the live fleet: current behavior, evidence, and fixes 
 - **Gap:** no enforced cap of three primary outcomes, no blocker-age / manual-handoff metrics collection.
 
 ## Cross-cutting conclusion
-Fixes exist for most backbone behaviors (ledger, dedupe/pause, escalation triage, gates, disk guard, acks). The systemic gap is **not** missing code but missing *activation+verification records*: states 1 (partial/blocked + receipt fields), 5 (verification ledger), 6 (preflight), 7 (forwarded/URL canon), 9 (numeric checks), 10 (outcome cap). `cmd acp` remains nonexistent on this host and in this repo — no implementation target.
+Fixes exist for most backbone behaviors (ledger, dedupe/pause, escalation triage, gates, disk guard, acks). The systemic gap is **not** missing code but missing *activation+verification records*: states 1 (partial/blocked + receipt fields — since **shipped**, see the correction under §1), 5 (verification ledger), 6 (preflight), 7 (forwarded/URL canon), 9 (numeric checks), 10 (outcome cap). `cmd acp` remains nonexistent on this host and in this repo — no implementation target.
 ## Activation note (2026-10-24, later)
 End-to-end activation of the completion gate on the real send path: `Transport.sendMedia`/`sendVideoNote` now return `{ messageId, mediaType }` receipts (photo/document/video_note), and `Bot.runLedgerTask` delivers a task's `MEDIA:` attachments to the origin chat — recording the receipt for the ledger's verified gate. An `.mp4` routes through the native round `sendVideoNote` only when the task declared `expectedMedia: "video_note"`; ordinary attachments keep the document path. Task results with MEDIA lines no longer travel as literal text. Tests: bot.test.ts "task media delivery receipts" (3 cases) + full suite 2285/2285.

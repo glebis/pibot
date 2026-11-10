@@ -92,10 +92,11 @@ describe("runChunkedTranscription", () => {
   });
 
   it("reports the failing chunk precisely and attempts no local fallback", async () => {
+    const diagnostic = { service: "groq-stt-host" as const, executor: "host-stt-daemon", source: "host-env" as const, category: "quota" as const };
     const io = fakeIo({
       segment: vi.fn(async () => ["/tmp/c0.wav", "/tmp/c1.wav", "/tmp/c2.wav"]),
       transcribeChunk: vi.fn(async (_p: string, index: number) =>
-        index === 1 ? { ok: false, text: "", provider: "groq", error: "groq HTTP 429" } : { ok: true, text: `part ${index}`, provider: "groq" },
+        index === 1 ? { ok: false, text: "", provider: "groq", error: "groq HTTP 429", diagnostic } : { ok: true, text: `part ${index}`, provider: "groq" },
       ),
     });
     const r = await runChunkedTranscription(tmpFile(), { durationSec: 45 * 60, policy: AGENT_POLICY, hostProviders: ["whisperkit", "groq"] }, io);
@@ -104,6 +105,7 @@ describe("runChunkedTranscription", () => {
     expect(r.error).toContain("groq HTTP 429");
     expect(r.error).toMatch(/no local fallback/i);
     expect(r.transcripts).toEqual(["part 0"]);
+    expect(r.diagnostic).toEqual(diagnostic);
     expect(io.cleanup).toHaveBeenCalled();
   });
 

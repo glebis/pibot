@@ -152,6 +152,44 @@ describe("DiskGuard response", () => {
     second.guard.dispose();
   });
 
+  it("escalates recurring low-water once per window instead of repeating each run", async () => {
+    const h = makeHarness({ withScript: true, cooldownMs: 0, statfsFree: () => 300 * 1024 * 1024 });
+    // three cleanups inside the sustained window: this is degradation, not three incidents
+    await h.guard.respondToDiskPressure("low-water");
+    await h.guard.respondToDiskPressure("low-water");
+    await h.guard.respondToDiskPressure("low-water");
+    expect(h.calls).toHaveLength(3);
+    // the first runs report a normal cleanup; the third recognises the pattern
+    expect(h.notifies).toHaveLength(3);
+    expect(h.notifies[2]).toContain("recurring, not a one-off");
+    expect(h.notifies[2]).toContain("3 cleanup runs");
+    // a fourth run inside the same window stays silent — one escalation per window
+    await h.guard.respondToDiskPressure("low-water");
+    expect(h.notifies).toHaveLength(3);
+    h.guard.dispose();
+  });
+
+  it("still reports a recovery that leaves the disk healthy during an escalation window", async () => {
+    const h = makeHarness({ withScript: true, cooldownMs: 0, statfsFree: () => 300 * 1024 * 1024 });
+    for (let i = 0; i < 3; i++) await h.guard.respondToDiskPressure("low-water");
+    expect(h.notifies.at(-1)).toContain("recurring, not a one-off");
+    // the disk is healthy again: that is news, not noise, so it is still delivered
+    const healthy = makeHarness({ dataDir: h.dataDir, skillDir: path.join(h.dataDir, "skill"), withScript: true, cooldownMs: 0 });
+    await healthy.guard.respondToDiskPressure("low-water");
+    expect(healthy.notifies).toHaveLength(1);
+    expect(healthy.notifies[0]).toContain("ran the disk-cleanup safe preset");
+    healthy.guard.dispose();
+    h.guard.dispose();
+  });
+
+  it("keeps more than a day of runs so a recurrence stays visible after a restart", async () => {
+    const h = makeHarness({ withScript: true, cooldownMs: 0 });
+    for (let i = 0; i < 14; i++) await h.guard.respondToDiskPressure("low-water");
+    h.guard.dispose();
+    const persisted = JSON.parse(fs.readFileSync(path.join(h.dataDir, "disk-guard.json"), "utf8"));
+    expect(persisted.runs.length).toBe(14);
+  });
+
   it("reports failure when clean.py exits non-zero", async () => {
     const h = makeHarness({ withScript: true, executeResult: { code: 2, stdout: "", stderr: "boom" } });
     const outcome = await h.guard.respondToDiskPressure("test");

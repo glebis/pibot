@@ -69,11 +69,21 @@ describe("capability registry", () => {
     expect(() => resolveCapabilities(baseContext, [defaultDef], ["typo"])).toThrow(/Unknown capability "typo"/);
   });
 
+  it("keeps the digest verdict opt-in and refuses a thin claim for an unsearched subject", () => {
+    const definition = CAPABILITY_REGISTRY.find((item) => item.id === "digest");
+    expect(definition).toMatchObject({ defaultEnabled: false, tools: ["digest_verdict", "digest_late_result"] });
+    // the prompt is the part a model actually follows: it must forbid thin wording for a missed window
+    expect(definition?.prompt).toContain("must never be reported as a thin day");
+    expect(definition?.prompt).toContain("digest_late_result");
+    expect(resolveCapabilities(baseContext, [definition!]).ids).toEqual([]); // opt-in only
+    expect(resolveCapabilities(baseContext, [definition!], ["digest"]).ids).toEqual(["digest"]);
+  });
+
   it("contains every formerly advertised host plugin with its tools and prompt contract", () => {
     const expected = new Map<string, string[]>([
       ["agent-comms", ["agent_message", "agent_ask", "agent_list", "handoff"]],
       ["knowledge", ["knowledge_share", "knowledge_read"]],
-      ["vault-file", ["vault_read", "vault_write"]],
+      ["vault-file", ["vault_search", "vault_read", "vault_write"]],
       ["exec", ["exec_run"]],
       ["attend", ["attend_enqueue", "attend_list", "attend_mark"]],
       ["telegram-responder", ["inbox_pending", "followups_open", "draft_reply"]],

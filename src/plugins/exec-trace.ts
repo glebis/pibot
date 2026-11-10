@@ -7,10 +7,35 @@ export interface ExecTraceInput {
   callId: string; taskId?: string; argv: string[];
   outcome: 'refused' | 'started' | 'succeeded' | 'failed' | 'timed-out';
   reason?: string; exitCode?: number | null;
+  /** bd pibot-wcp0: authority provenance for this row — who actually requested it,
+   *  under which cited owner authority, executed by which session. Sibling narration
+   *  never relabels authority; absent fields stay absent. */
+  authority?: ExecAuthority;
+}
+/** bd pibot-wcp0: when things HAPPENED vs when they were captured vs observed —
+ *  three separate facts. File mtime is a capture-side hint at best; it can never
+ *  prove event creation, delivery time, or backdating on its own. */
+export interface ExecTimes {
+  /** when the underlying event occurred (from the event itself, not metadata) */
+  eventAt?: string;
+  /** when this row/artifact was captured */
+  capturedAt?: string;
+  /** when the consumer/verifier observed it */
+  observedAt?: string;
+}
+export interface ExecAuthority {
+  /** canonical task/session that requested the action */
+  requestedByTaskId?: string;
+  requestedBySessionId?: string;
+  /** the cited owner convention/approval, verbatim reference (e.g. bead id) */
+  citedOwnerAuthority?: string;
+  /** executing agent/session identity */
+  executor?: string;
 }
 interface ExecTraceRow {
   at: string; agent: string; callId: string; taskId?: string; videoIds: string[];
   outcome: ExecTraceInput['outcome']; reason?: string; exitCode?: number | null;
+  times?: ExecTimes; authority?: ExecAuthority;
 }
 function safeId(value: string): string { return /^[\w:.-]{1,160}$/.test(value) ? value : '[invalid-id]'; }
 function videoIds(values: string[]): string[] {
@@ -41,9 +66,16 @@ export function appendExecTrace(agentDir: string, input: ExecTraceInput): void {
   const reasons = ['not allowlisted', 'command missing', 'shell syntax denied', 'argument denied', 'constraint denied', 'resolution failed', 'execution failed'];
   const row: ExecTraceRow = {
     at: new Date().toISOString(), agent: path.basename(agentDir), callId: safeId(input.callId),
+    times: { capturedAt: new Date().toISOString() },
     ...(input.taskId ? { taskId: safeId(input.taskId) } : {}), videoIds: videoIds(input.argv), outcome: input.outcome,
     ...(input.reason ? { reason: reasons.includes(input.reason) ? input.reason : 'constraint denied' } : {}),
     ...(input.exitCode !== undefined ? { exitCode: input.exitCode } : {}),
+    ...(input.authority ? { authority: {
+      ...(input.authority.requestedByTaskId ? { requestedByTaskId: safeId(input.authority.requestedByTaskId) } : {}),
+      ...(input.authority.requestedBySessionId ? { requestedBySessionId: safeId(input.authority.requestedBySessionId) } : {}),
+      ...(input.authority.citedOwnerAuthority ? { citedOwnerAuthority: safeId(input.authority.citedOwnerAuthority) } : {}),
+      ...(input.authority.executor ? { executor: safeId(input.authority.executor) } : {}),
+    } } : {}),
   };
   const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
   try { fs.fchmodSync(fd, 0o600); fs.writeSync(fd, JSON.stringify(row) + '\n'); } finally { fs.closeSync(fd); }
@@ -108,6 +140,10 @@ export interface ArtifactExtract {
   /** Byte offset to request next; null when this extract reaches the end. */
   nextOffset: number | null;
   content: string;
+  /** bd pibot-wcp0: snapshot identity for THIS read — byte length + mtime at capture.
+   *  mtime is a capture hint only, never backdating proof; a conflicting receipt
+   *  between two reads is flagged, not laundered into 'verified'. */
+  snapshot: { totalBytes: number; mtimeMs: number; capturedAt: string };
 }
 
 /**
@@ -115,6 +151,24 @@ export interface ArtifactExtract {
  * range, truncation state and continuation cursor so a consumer can prove coverage of a
  * long transcript instead of asking for ad hoc prose slices (bd pibot-wcp0).
  */
+/** bd pibot-wcp0: reconcile two extract receipts of the same artifact.
+ *  'consistent' = one snapshot; 'conflict' = differing byte length/mtime between
+ *  reads — explicit mismatch, never folded into 'verified'. mtime-only differences
+ *  (same length, same content window) are reported as 'mtime-drift' — a touched or
+ *  synced file can have later metadata without any backdating having occurred. */
+export type SnapshotReconciliation =
+  | { verdict: 'consistent' }
+  | { verdict: 'mtime-drift'; note: string }
+  | { verdict: 'conflict'; note: string };
+
+export function reconcileSnapshots(a: ArtifactExtract['snapshot'], b: ArtifactExtract['snapshot']): SnapshotReconciliation {
+  if (a.totalBytes === b.totalBytes && a.mtimeMs === b.mtimeMs) return { verdict: 'consistent' };
+  if (a.totalBytes === b.totalBytes && a.mtimeMs !== b.mtimeMs) {
+    return { verdict: 'mtime-drift', note: `same byte length (${a.totalBytes}) but mtime ${a.mtimeMs} → ${b.mtimeMs}; mtime alone cannot prove backdating` };
+  }
+  return { verdict: 'conflict', note: `byte length differs ${a.totalBytes} → ${b.totalBytes} (mtime ${a.mtimeMs} → ${b.mtimeMs}); not one consistent snapshot — re-read before closure` };
+}
+
 export function readExecArtifactExtract(agentDir: string, relative: string, opts: { offset?: number; limit?: number } = {}): ArtifactExtract {
   const offset = opts.offset ?? 0;
   const limit = opts.limit ?? ARTIFACT_PAGE_BYTES;
@@ -139,7 +193,8 @@ export function readExecArtifactExtract(agentDir: string, relative: string, opts
     }
     const content = new TextDecoder('utf-8', { fatal: true }).decode(window.subarray(0, take));
     const next = offset + take;
-    return { path: relative, totalBytes: stat.size, offset, bytes: take, truncated: next < stat.size, nextOffset: next < stat.size ? next : null, content };
+    return { path: relative, totalBytes: stat.size, offset, bytes: take, truncated: next < stat.size, nextOffset: next < stat.size ? next : null, content,
+      snapshot: { totalBytes: stat.size, mtimeMs: Math.round(stat.mtimeMs), capturedAt: new Date().toISOString() } };
   } finally { fs.closeSync(fd); }
 }
 

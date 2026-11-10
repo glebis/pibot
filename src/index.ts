@@ -21,6 +21,7 @@ import { CommitmentEngine } from "./core/commitments.js";
 import { IntakeStore } from "./core/research-intake.js";
 import { HeartbeatEngine } from "./core/heartbeat.js";
 import { Scheduler } from "./core/scheduler.js";
+import type { Schedule } from "./core/types.js";
 import { createWebApp } from "./web.js";
 import { CliTransport } from "./transports/cli.js";
 import { TelegramTransport } from "./transports/telegram.js";
@@ -91,6 +92,7 @@ async function main(): Promise<void> {
   const stt = new SttService();
   const agents = new AgentManager(config.agentsDir, modelRuntime, config.vaultDir, process.cwd(), config.dataDir);
   agents.docsDir = config.docsDir;
+  agents.codexReportsDir = config.codexReportsDir;
   // Host STT enablement for route diagnosis (bd pibot-hn90): metadata only, no credential value.
   agents.stt = { hostProviderIds: stt.hostProviderIds, groqCredentialPresent: stt.groqCredentialPresent };
   const events = new EventLog(config.agentsDir);
@@ -224,7 +226,7 @@ async function main(): Promise<void> {
   const mediaDir = path.join(config.dataDir, "media");
   const transports =
     telegramToken && config.transport !== "cli"
-      ? [new TelegramTransport(telegramToken, allowedChats, { coordinatorIngress: coordinator, openWhenEmpty: config.telegramOpen, mediaDir, reactions: process.env.PIBOT_REACTIONS !== "0" })]
+      ? [new TelegramTransport(telegramToken, allowedChats, { coordinatorIngress: coordinator, openWhenEmpty: config.telegramOpen, mediaDir, reactions: process.env.PIBOT_REACTIONS !== "0", deliveryLedgerPath: path.join(config.dataDir, "deliveries-main.json") })]
       : [new CliTransport()];
 
   // /goal's judge + contract drafting: cheap ephemeral sessions on the first
@@ -265,16 +267,35 @@ async function main(): Promise<void> {
   // by the last process resume here; runLedgerTask waits for the started gate, so their result
   // posts and owner questions always have a live delivery route.
   const taskDir = path.join(config.dataDir, "durable", "tasks");
+  let ledgerUnavailable: Error | undefined;
   fs.mkdirSync(taskDir, { recursive: true, mode: 0o700 });
   const taskLedger = await (await import("./durable/task-ledger.js")).openTaskLedger({
     storageDir: taskDir,
+    label: "daemon",
     runner: { run: (t) => bot.runLedgerTask(t), notify: (ck, text) => bot.notifyChat(ck, text) },
-  }).catch((e) => { console.error("[pibot] task ledger unavailable:", e instanceof Error ? e.message : e); return undefined; });
+  }).catch((e) => {
+    // A corrupt or already-owned ledger is an owner-visible incident, not a background
+    // warning: silently continuing would run without durable tasks and hide the damage
+    // (bd pibot-cea8). The error text names what to inspect.
+    console.error("[pibot] task ledger unavailable:", e instanceof Error ? e.message : e);
+    ledgerUnavailable = e instanceof Error ? e : new Error(String(e));
+    return undefined;
+  });
   agents.tasks = taskLedger;
 
+  // Hold the timer wheel until every delivery transport is live. boot creates jobs
+  // (heartbeat/brief/attend) whose rearm() would otherwise fire an overdue job against
+  // an empty route table — ScheduleRouteError, then a self-pause (Oct 30).
+  scheduler.disarm();
   await bot.start();
   await coordinator?.start();
-  scheduler.rearm();
+  if (ledgerUnavailable) {
+    await bot
+      .notifyOwnerEvent(
+        `⚠️ Durable tasks are OFF for this run. The task ledger at ${taskDir} could not be opened:\n${ledgerUnavailable.message}`,
+      )
+      .catch(() => undefined);
+  }
   // pilot governance on boot: weekly scorecard jobs follow the manifest flags
   for (const a of agents.list()) commitments.syncPilotGovernance(a.id);
 
@@ -285,6 +306,7 @@ async function main(): Promise<void> {
     const webToken = config.webToken ?? secretStore.get().web?.token;
     const webApp = createWebApp({
       agents, scheduler, events, evolution, dataDir: config.dataDir, telegram: bot, secrets: secretStore,
+      bbConversations: bot.bbConversationControl(),
       proactiveStore,
       inbox: bot.labInboxControl(),
       processes: bot.processControl(),
@@ -312,6 +334,10 @@ async function main(): Promise<void> {
   // per-agent sub-bots attach INDEPENDENTLY of the main bot's transport source.
   // Retried per bot: a boot-time network blip must not leave a bot silent for days.
   const subBoot = await bot.attachConfiguredSubBots();
+  // Arm due jobs only after the main transport and every sub-bot are attached:
+  // rearming earlier let an overdue agent-delivered job fire against an empty
+  // route table, raising ScheduleRouteError and pausing itself (Oct 30).
+  scheduler.arm();
   // Voice attaches to this daemon's canonical sessions; never starts another AgentManager.
   const voiceRuntime = process.env.PIBOT_VOICE_CONFIG
     ? await (await import('./voice/runtime.js')).startCanonicalVoiceRuntime(bot, process.env.PIBOT_VOICE_CONFIG)
@@ -331,6 +357,16 @@ async function main(): Promise<void> {
   // post-boot confirmation (owner request, Sep 20): one line, every boot —
   // the restart verdict reaches the owner's chat without anyone asking
   await bot.notifyBoot(subBoot).catch(() => {});
+
+  // A paused schedule whose route was repaired during this boot is still paused: nothing
+  // re-checks it. Report them once, together — resuming stays the owner's call.
+  try {
+    const repaired = (scheduler.list(undefined, { includePaused: true }) as Schedule[])
+      .filter((job) => job.status === "paused" && bot.canRouteSchedule(job));
+    await bot.reportRepairedSchedules(repaired);
+  } catch (e) {
+    console.error("[pibot] repaired-schedule report failed:", e);
+  }
 
   const shutdown = () => {
     console.log("\n[pibot] stopping…");

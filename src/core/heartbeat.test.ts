@@ -44,7 +44,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   };
 });
 
-import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine, recordMaintenanceNote, recordPersonaReview, verifyMemoryClaim, triageEscalationLoop, escalationsSimilar, type EscalationLoopState } from "./heartbeat.js";
+import { buildHeartbeatDigest, buildMaintenancePanel, HeartbeatEngine, recordMaintenanceNote, recordPersonaReview, verifyConsolidationClaim, verifyMemoryClaim, triageEscalationLoop, escalationsSimilar, type EscalationLoopState } from "./heartbeat.js";
 import { appendBacklogItems, loadBacklogItems } from "./backlog.js";
 import { clearSignalsCache } from "./research-signals.js";
 import type { LoadedAgent } from "./agent-manager.js";
@@ -633,6 +633,24 @@ describe("HeartbeatEngine backoff", () => {
     it("verifyMemoryClaim: ignores notes without a MEMORY.md write claim", () => {
       expect(verifyMemoryClaim(dir, "memory: consolidated calendar lessons")).toBeNull();
       expect(verifyMemoryClaim(dir, "memory: MEMORY.md reads nicely today")).toBeNull();
+    });
+
+    it("verifyConsolidationClaim: fresh engine lastRunAt verifies; stale cursor flags a ghost service with cursor detail", () => {
+      const blocks = path.join(dir, "memory", "consolidated", "blocks.json");
+      fs.mkdirSync(path.dirname(blocks), { recursive: true });
+      fs.writeFileSync(blocks, JSON.stringify({ meta: { offset: 10, lastT: 1, lastRunAt: Date.now() - 60e3 }, blocks: [] }));
+      const fresh = verifyConsolidationClaim(dir, "events consolidation: 2 pending events folded into durable memory");
+      expect(fresh?.verified).toBe(true);
+
+      fs.writeFileSync(blocks, JSON.stringify({ meta: { offset: 10, lastT: 1, lastRunAt: Date.now() - 96 * 3600e3 }, blocks: [] }));
+      const stale = verifyConsolidationClaim(dir, "events consolidation: 2 pending events folded (facts already durable)");
+      expect(stale?.verified).toBe(false);
+      expect(stale?.detail).toContain("manual folds don't advance it");
+    });
+
+    it("verifyConsolidationClaim: ignores notes without a consolidation claim and handles missing state", () => {
+      expect(verifyConsolidationClaim(dir, "memory: refreshed MEMORY.md digest")).toBeNull();
+      expect(verifyConsolidationClaim(dir, "events consolidation: 3 folded")?.verified).toBe(false); // no blocks.json yet
     });
 
     it("recordMaintenanceNote appends a verification entry for ghost claims", () => {
