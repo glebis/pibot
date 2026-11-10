@@ -40,6 +40,8 @@ export function questionPlugin(deps: QuestionPluginDeps): InlineExtension {
           usefulUntil: Type.Optional(Type.String({description:"Explicit useful decision deadline as an absolute ISO-8601 timestamp with timezone, only when known. This is an agent-declared deadline, not proof of a real-world deadline or permission to call. Never derive it from timeoutMinutes."})),
           deadlineReason: Type.Optional(Type.String({description:"Required with usefulUntil: explain the concrete consequence or source of the declared deadline."})),
           timeoutMinutes: Type.Optional(Type.String({ description: "How long to wait (default 10m)" })),
+          approval: Type.Optional(Type.Boolean({ description: "Set true when this asks the owner to authorize an irreversible or third-party action (restore, delete, send on someone's behalf). Approvals inside a background task use a stable per-task key, so a resumed run inherits the owner's recorded answer instead of re-asking; a sibling's relayed claim is never authority." })),
+          approveOption: Type.Optional(Type.String({ description: "Required with approval: the EXACT option label that authorizes the action. Approval is derived from the chosen option, never from wording, so a denial or clarifying answer can never become authorization." })),
         }),
         async execute(_tcid, params) {
           const options = params.options.map((o) => o.trim()).filter(Boolean);
@@ -52,12 +54,14 @@ export function questionPlugin(deps: QuestionPluginDeps): InlineExtension {
             usefulUntil=Date.parse(params.usefulUntil);
             if(!/T.*(?:Z|[+-]\d{2}:\d{2})$/.test(params.usefulUntil)||!Number.isSafeInteger(usefulUntil)||usefulUntil<=Date.now()||!params.deadlineReason?.trim()||params.deadlineReason.length>500) return {content:[{type:'text',text:'ERROR: usefulUntil must be a future absolute ISO timestamp with timezone and a concrete deadlineReason.'}],details:{choice:'',index:-1,via:'',timedOut:false}};
           }
+          const approveOption = params.approval && params.approveOption?.trim() ? params.approveOption.trim() : undefined;
           const spec: QuestionSpec = {
             text: params.question,
             options,
             timeoutMs,
             poll: options.length > 6,
-            kind: "question",
+            kind: params.approval ? "approval" : "question",
+            ...(approveOption && options.includes(approveOption) ? { approveOption } : {}),
             ...(usefulUntil!==undefined?{usefulUntil,deadlineReason:params.deadlineReason!.trim()}:{})
           };
           let res: QuestionAnswer | null = null;

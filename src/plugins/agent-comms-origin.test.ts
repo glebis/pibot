@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { InlineExtension, ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { agentCommsPlugin, type CommsHooks } from "./agent-comms-plugin.js";
+import { CAPABILITY_REGISTRY, resolveCapabilities, type CapabilityContext } from "../core/capabilities.js";
 import { OWNER_CHAT_ID } from "../test-fixtures.js";
 
 type Tool = ToolDefinition & { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }> };
@@ -58,5 +59,27 @@ describe("agent-comms plugin origin-chat routing", () => {
     const { tools, handoffContext } = makePlugin();
     await tools.get("handoff")!.execute("id", { to: "pibot-dev", note: "keep going" });
     expect(handoffContext).toHaveBeenCalledWith("researcher", "pibot-dev", "keep going", CHAT);
+  });
+});
+
+describe("agent-comms delegated origin propagation (bd pibot-0xpf.5)", () => {
+  it("forwards the ORIGINAL invoking chat through a delegated executor session, not the executor's own chat", async () => {
+    const askAgent = vi.fn(async () => "ok");
+    const ctx = {
+      agent: { id: "dev", dir: "/tmp/dev", manifest: { name: "dev" } },
+      workspace: "/tmp",
+      vaultDir: "/tmp",
+      scheduler: {},
+      // the executor's own sub-bot chat
+      chat: { transport: "telegram:dev", chatId: "8995" },
+      // the chat the owner actually typed in (worker)
+      deliveryChat: { transport: "telegram:worker", chatId: "8900" },
+      comms: { askAgent, handoffContext: vi.fn(async () => "ack"), listAgents: () => [{ id: "knower" }] },
+    } as unknown as CapabilityContext;
+    const caps = resolveCapabilities(ctx, CAPABILITY_REGISTRY, ["agent-comms"]);
+    const tools = toolsOf(caps.extensions.find((e) => e.name === "agent-comms")!);
+    await tools.get("agent_message")!.execute("id", { to: "knower", text: "fetch the clips" });
+    // worker → dev → knower must keep WORKER as the destination, not dev's own bot chat
+    expect(askAgent).toHaveBeenCalledWith("dev", "knower", "fetch the clips", undefined, { transport: "telegram:worker", chatId: "8900" });
   });
 });

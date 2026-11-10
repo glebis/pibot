@@ -16,6 +16,12 @@ export interface QuestionSpec {
   /** "question" = clarifying ask_user (spoken on a live voice call); anything else blocks for an explicit tap */
   kind?: "question" | "approval";
   /**
+   * For an approval question: the EXACT option label that authorizes the action. The host derives
+   * approval structurally from the chosen option, never by matching English yes/no words. Absent
+   * or unknown = fail closed (the answer can inform but never authorize).
+   */
+  approveOption?: string;
+  /**
    * Stable caller-supplied identity for this question (bd pibot-jciq). A resumed
    * ask() with the same key returns the recorded answer instead of asking the
    * owner again after a restart.
@@ -107,6 +113,11 @@ export class QuestionBus {
   answerFor(questionKey: string): QuestionAnswer | undefined {
     const rec = this.deps.store?.findByKey(questionKey);
     return rec?.answer ? { ...rec.answer } : undefined;
+  }
+
+  /** Canonical question id for a logical key, so a decision can cite the owner's actual answer. */
+  qidFor(questionKey: string): string | undefined {
+    return this.deps.store?.findByKey(questionKey)?.snapshot.qid;
   }
 
   /** Questions whose owner answered while this process was down. */

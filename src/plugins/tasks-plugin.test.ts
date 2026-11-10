@@ -268,6 +268,68 @@ describe("resource preflight (bd pibot-kdpg)", () => {
   });
 });
 
+describe("delegated destination contract (bd pibot-0xpf.5)", () => {
+  /** The executor's own sub-bot chat is `chat`; the owner typed in `deliveryChat`. */
+  const delegatedCtx = (ledger: Awaited<ReturnType<typeof openTaskLedger>>) => ({
+    agent: { id: "dev", dir: "/tmp/dev", manifest: { name: "dev" } },
+    workspace: "/tmp",
+    vaultDir: "/tmp",
+    scheduler: {},
+    chat: { transport: "telegram:dev", chatId: "8995" },
+    deliveryChat: { transport: "telegram:worker", chatId: "8900" },
+    tasks: ledger,
+  }) as unknown as CapabilityContext;
+
+  const taskIdOf = (r: { details?: unknown }) => (r.details as { taskId?: string } | undefined)?.taskId ?? "";
+
+  it("binds a task started in a delegated turn to the ORIGINAL invoking chat", async () => {
+    const run = vi.fn(async (_task?: unknown) => "done");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    try {
+      const caps = resolveCapabilities(delegatedCtx(ledger), CAPABILITY_REGISTRY, ["tasks"]);
+      const t = tools(caps.extensions.find((e) => e.name === "tasks")!);
+      const r = await t.get("start_task")!.execute("d1", { title: "restore note", instructions: "do it" });
+      const id = taskIdOf(r as { details?: unknown });
+      const task = await ledger.get(id);
+      // never the executor's own bot chat: the same human in a different bot dialog must not pass the gate
+      expect(task?.chatKey).toBe("telegram:worker:8900");
+      for (let i = 0; i < 200 && (await ledger.get(id))?.status !== "done"; i++) await new Promise((x) => setTimeout(x, 10));
+      expect(run.mock.calls[0][0]).toMatchObject({ chatKey: "telegram:worker:8900" });
+    } finally { await ledger.close(); }
+  });
+
+  it("keeps an explicit alternate target while the invoking chat stays the origin for a wrong-peer check", async () => {
+    const run = vi.fn(async (_task?: unknown) => "saved");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    try {
+      const caps = resolveCapabilities(delegatedCtx(ledger), CAPABILITY_REGISTRY, ["tasks"]);
+      const t = tools(caps.extensions.find((e) => e.name === "tasks")!);
+      const r = await t.get("start_task")!.execute("d2", { title: "save the note", instructions: "save it", expectedPeer: "telegram:knower:8817" });
+      const id = taskIdOf(r as { details?: unknown });
+      expect(await ledger.get(id)).toMatchObject({ chatKey: "telegram:worker:8900", expectedPeer: "telegram:knower:8817" });
+      for (let i = 0; i < 200 && (await ledger.get(id))?.status !== "done"; i++) await new Promise((x) => setTimeout(x, 10));
+      expect(run.mock.calls[0][0]).toMatchObject({ chatKey: "telegram:worker:8900", expectedPeer: "telegram:knower:8817" });
+    } finally { await ledger.close(); }
+  });
+
+  it("persists the artifact readback contract for a restore task", async () => {
+    const run = vi.fn(async () => "restored");
+    const ledger = await openTaskLedger({ runner: { run, notify: async () => {} } });
+    try {
+      const caps = resolveCapabilities(delegatedCtx(ledger), CAPABILITY_REGISTRY, ["tasks"]);
+      const t = tools(caps.extensions.find((e) => e.name === "tasks")!);
+      const r = await t.get("start_task")!.execute("d3", {
+        title: "restore from trash",
+        instructions: "restore it",
+        expectedArtifactPath: "/tmp/launch-note.md",
+        expectedArtifactSha256: "a".repeat(64),
+      });
+      const task = await ledger.get(taskIdOf(r as { details?: unknown }));
+      expect(task).toMatchObject({ expectedArtifactPath: "/tmp/launch-note.md", expectedArtifactSha256: "a".repeat(64) });
+    } finally { await ledger.close(); }
+  });
+});
+
 describe("mandatory transcription policy survives the instructions cap (bd pibot-0xpf.4 review)", () => {
   const started = (r: { details?: unknown }) => (r.details as { taskId?: string } | undefined)?.taskId ?? "";
   const long = "x".repeat(8000);
