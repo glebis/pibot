@@ -1,3 +1,4 @@
+import { prepareDelegatedReply } from "./delegated-delivery.js";
 import {ChatAttachmentError,prepareChatAttachments,validateChatAttachments} from './chat-attachments.js';
 import { urgentSourceReceipt } from '../voice/urgent-sources.js';
 import {commandReplyScope} from './command-reply-scope.js';
@@ -3950,24 +3951,16 @@ export class PiBot implements HeartbeatHost {
         // executor's own bot chat (the observed two clips-in-knower failure, bd pibot-0xpf.5).
         // The delegated session's own event delivery is suppressed, so this is the only send.
         const { text: cleanReply, media } = splitMediaLines(reply ?? "");
-        // Internal coordination returns the complete reply (including MEDIA references) to its
-        // parent evidence collector; only explicit owner delivery strips and sends attachments.
-        const finalReply = ownerFacing
-          ? cleanReply || (media.length ? "📎 (media)" : reply || "(no reply)")
-          : reply || "(no reply)";
+        const t = ownerFacing ? this.transports.get(originChat.transport) : undefined;
+        const prepared = await prepareDelegatedReply({
+          reply, cleanReply, media, ownerFacing, originChat, transport: t,
+          onSent: (source) => this.deps.events.log(agentId, "media", `sent ${truncate(source, 140)} via ${t!.name} → ${originChat!.chatId}`),
+          onError: (source, e) => this.deps.events.log(agentId, "system", `delegated media send failed: ${truncate(source, 120)} — ${truncate(errorMessage(e), 160)}`),
+        });
+        const finalReply = prepared.ownerReply;
         if (ownerFacing) {
-          // owner-facing status: the reply lands in the chat the work was requested from
-          const t = this.transports.get(originChat.transport);
+          // Keep the owner-facing reply clean; transport outcome metadata is for the delegator.
           if (t) {
-            for (const source of media) {
-              try {
-                if (!t.sendMedia) throw new Error(`transport "${t.name}" cannot send media`);
-                await t.sendMedia(originChat.chatId, source);
-                this.deps.events.log(agentId, "media", `sent ${truncate(source, 140)} via ${t.name} → ${originChat.chatId}`);
-              } catch (e) {
-                this.deps.events.log(agentId, "system", `delegated media send failed: ${truncate(source, 120)} — ${truncate(errorMessage(e), 160)}`);
-              }
-            }
             // Delegated-reply cap: the old 900 silently ate long tails of agent-to-agent
             // replies (LinkedIn cue tail delivered 5x, Sep 17 handoff half). Telegram
             // truncates at ~4096 anyway — keep the attribution, keep the bound sane.
@@ -3977,7 +3970,7 @@ export class PiBot implements HeartbeatHost {
           }
         }
         this.maybeEmitTaskAck(agentId, fromAgent, text, finalReply, ownerFacing ? {} : { suppress: true });
-        return finalReply;
+        return prepared.callerReply;
       });
     const record: InFlightAgentRun = {
       id: uid("run", 6),
